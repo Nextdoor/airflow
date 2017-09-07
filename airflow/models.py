@@ -1382,13 +1382,9 @@ class TaskInstance(Base):
                 # if it goes beyond
                 result = None
                 if task_copy.execution_timeout:
-                    try:
-                        with timeout(int(
-                                task_copy.execution_timeout.total_seconds())):
-                            result = task_copy.execute(context=context)
-                    except AirflowTaskTimeout:
-                        task_copy.on_kill()
-                        raise
+                    with timeout(int(
+                            task_copy.execution_timeout.total_seconds())):
+                        result = task_copy.execute(context=context)
                 else:
                     result = task_copy.execute(context=context)
 
