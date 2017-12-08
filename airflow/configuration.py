@@ -34,6 +34,10 @@ from builtins import str
 from collections import OrderedDict
 from six.moves import configparser
 
+import re
+import boto3
+import base64
+
 from airflow.exceptions import AirflowConfigException
 
 # show Airflow's deprecation warnings
@@ -98,6 +102,25 @@ with open(os.path.join(_templates_dir, 'default_airflow.cfg')) as f:
     DEFAULT_CONFIG = f.read()
 with open(os.path.join(_templates_dir, 'default_test.cfg')) as f:
     TEST_CONFIG = f.read()
+
+KMS_PATTERN = re.compile("KMS\[(\w{2}-\w*-\d),(.*)\]")
+
+def check_kms(value):
+    if value is None:
+        return value
+
+    match = KMS_PATTERN.match(value)
+
+    if not match:
+        return value
+
+    kms_region = match.group(1)
+    kms_cipher = base64.b64decode(match.group(2))
+
+    client = boto3.client('kms', region_name=kms_region)
+    resp = client.decrypt(CiphertextBlob=kms_cipher)
+
+    return resp.get('Plaintext', None)
 
 
 class AirflowConfigParser(ConfigParser):
@@ -178,6 +201,18 @@ class AirflowConfigParser(ConfigParser):
                 command = self.get(section, fallback_key)
                 return run_command(command)
 
+    option_cache = {}
+
+    def _decrypt(self, option):
+        if option is None:
+            return option
+
+        if option in self.option_cache:
+            return self.option_cache[option]
+
+        self.option_cache[option] = check_kms(option)
+        return self.option_cache[option]
+
     def get(self, section, key, **kwargs):
         section = str(section).lower()
         key = str(key).lower()
@@ -185,17 +220,17 @@ class AirflowConfigParser(ConfigParser):
         # first check environment variables
         option = self._get_env_var_option(section, key)
         if option is not None:
-            return option
+            return self._decrypt(option)
 
         # ...then the config file
         if self.has_option(section, key):
-            return expand_env_var(
-                ConfigParser.get(self, section, key, **kwargs))
+            return self._decrypt(expand_env_var(
+                ConfigParser.get(self, section, key, **kwargs)))
 
         # ...then commands
         option = self._get_cmd_option(section, key)
         if option:
-            return option
+            return self._decrypt(option)
 
         else:
             logging.warning("section/key [{section}/{key}] not found "
