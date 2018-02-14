@@ -79,6 +79,7 @@ from airflow.utils.operator_resources import Resources
 from airflow.utils.state import State
 from airflow.utils.timeout import timeout
 from airflow.utils.trigger_rule import TriggerRule
+from datadog import api as datadog_api, initialize as dd_initialize
 
 Base = declarative_base()
 ID_LEN = 250
@@ -1487,7 +1488,7 @@ class TaskInstance(Base):
                 self.state = State.UP_FOR_RETRY
                 logging.info('Marking task as UP_FOR_RETRY')
                 if task.email_on_retry and task.email:
-                    self.email_alert(error, is_retry=True)
+                    self.datadog_event_alert(error, is_retry=True)
             else:
                 stats_incr_helper('task_failed', 1, task.dag_id, task.task_id)
                 self.state = State.FAILED
@@ -1496,7 +1497,7 @@ class TaskInstance(Base):
                 else:
                     logging.info('Marking task as FAILED.')
                 if task.email_on_failure and task.email:
-                    self.email_alert(error, is_retry=False)
+                    self.datadog_event_alert(error, is_retry=False)
         except Exception as e2:
             logging.error(
                 'Failed to send email to: ' + str(task.email))
@@ -1635,7 +1636,7 @@ class TaskInstance(Base):
                 rendered_content = rt(attr, content, jinja_context)
                 setattr(task, attr, rendered_content)
 
-    def email_alert(self, exception, is_retry=False):
+    def datadog_event_alert(self, exception, is_retry=False):
         task = self.task
         title = "Airflow alert: {self}".format(**locals())
         exception = str(exception).replace('\n', '<br>')
@@ -1648,7 +1649,16 @@ class TaskInstance(Base):
             "Log file: {self.log_filepath}<br>"
             "Mark success: <a href='{self.mark_success_url}'>Link</a><br>"
         ).format(**locals())
-        send_email(task.email, title, body)
+        args = {'title': title,
+                'text': body,
+                'tags': ['dag_id:' + self.dag_id, 'task_id:' + self.task_id]}
+
+        options = json.loads(Variable.get('datadog', deserialize_json=True, default_var='{}'))
+        if options:
+            dd_initialize(**options)
+            datadog_api.Event.create(**args)
+        else:
+            logging.info("Event: title={title}, text={text}, tags={tags}".format(**args))
 
     def set_duration(self):
         if self.end_date and self.start_date:
