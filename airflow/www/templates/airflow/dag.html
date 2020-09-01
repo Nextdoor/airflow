@@ -154,6 +154,9 @@
           <button id="btn_log" type="button" class="btn btn-primary">
             View Log
           </button>
+          <button id="btn_xcom" type="button" class="btn btn-primary">
+            View XCom
+          </button>
           <hr/>
           <div id="dag_dl_logs">
             <label style="display:inline"> Download Log (by attempts): </label>
@@ -475,6 +478,15 @@ function updateQueryStringParameter(uri, key, value) {
         "&format=json";
       window.location = url;
     });
+
+    $("#btn_xcom").click(function(){
+      url = "{{ url_for('airflow.xcom') }}" +
+        "?task_id=" + encodeURIComponent(task_id) +
+        "&dag_id=" + encodeURIComponent(dag_id) +
+        "&execution_date=" + encodeURIComponent(execution_date);
+      window.location = url;
+    });
+
 
     $("#btn_task").click(function(){
       url = "{{ url_for('airflow.task') }}" +

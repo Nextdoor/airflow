@@ -30,6 +30,7 @@ import pendulum
 import sys
 from typing import Any
 
+from datadog import dogstatsd
 from sqlalchemy import create_engine, exc
 from sqlalchemy.orm import scoped_session, sessionmaker
 from sqlalchemy.pool import NullPool
@@ -55,21 +56,25 @@ except Exception:
 log.info("Configured default timezone %s" % TIMEZONE)
 
 
-class DummyStatsLogger(object):
+class BaseStatsLogger(object):
     @classmethod
-    def incr(cls, stat, count=1, rate=1):
+    def incr(cls, stat, count=1, rate=1, tags=()):
         pass
 
     @classmethod
-    def decr(cls, stat, count=1, rate=1):
+    def decr(cls, stat, count=1, rate=1, tags=()):
         pass
 
     @classmethod
-    def gauge(cls, stat, value, rate=1, delta=False):
+    def gauge(cls, stat, value, rate=1, delta=False, tags=()):
         pass
 
     @classmethod
-    def timing(cls, stat, dt):
+    def timing(cls, stat, dt, tags=()):
+        pass
+
+    @classmethod
+    def set(cls, stat, value, tags=(), rate=1):
         pass
 
 
@@ -111,12 +116,30 @@ class SafeStatsdLogger:
             return self.statsd.timing(stat, dt)
 
 
-Stats = DummyStatsLogger  # type: Any
+class DogStatsWrapper(BaseStatsLogger):
+    def __init__(self, host, port, prefix):
+        self.stats_client = dogstatsd.DogStatsd(host, port)
+        self.prefix = prefix
+
+    def incr(self, stat, count=1, rate=1, tags=()):
+        self.stats_client.increment('{}.{}'.format(self.prefix, stat), count, sample_rate=rate, tags=tags)
+
+    def decr(self, stat, count=1, rate=1, tags=()):
+        self.stats_client.decrement('{}.{}'.format(self.prefix, stat), count, sample_rate=rate, tags=tags)
+
+    def gauge(self, stat, value, rate=1, delta=False, tags=()):
+        self.stats_client.gauge('{}.{}'.format(self.prefix, stat), value, sample_rate=rate, tags=tags)
+
+    def timing(self, stat, dt, tags=()):
+        self.stats_client.timing('{}.{}'.format(self.prefix, stat), dt, tags=tags)
+
+    def set(self, stat, value, tags=(), rate=1):
+        self.stats_client.set('{}.{}'.format(self.prefix, stat), value, tags=tags, sample_rate=rate)
+
+Stats = BaseStatsLogger  # type: Any
 
 if conf.getboolean('scheduler', 'statsd_on'):
-    from statsd import StatsClient
-
-    statsd = StatsClient(
+    statsd = DogStatsWrapper(
         host=conf.get('scheduler', 'statsd_host'),
         port=conf.getint('scheduler', 'statsd_port'),
         prefix=conf.get('scheduler', 'statsd_prefix'))
@@ -125,7 +148,7 @@ if conf.getboolean('scheduler', 'statsd_on'):
 
     Stats = SafeStatsdLogger(statsd, allow_list_validator)
 else:
-    Stats = DummyStatsLogger
+    Stats = BaseStatsLogger
 
 HEADER = '\n'.join([
     r'  ____________       _____________',

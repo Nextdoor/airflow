@@ -30,7 +30,7 @@ from wtforms.validators import InputRequired
 
 from ldap3 import Server, Connection, Tls, set_config_parameter, LEVEL, SUBTREE
 
-from airflow import models
+from airflow import models, configuration
 from airflow.configuration import AirflowConfigException, conf
 from airflow.utils.db import provide_session
 
@@ -66,10 +66,11 @@ def get_ldap_connection(dn=None, password=None):
 
     tls_configuration = Tls(validate=ssl.CERT_REQUIRED,
                             ca_certs_file=cacert)
-
+    search_scope = configuration.get("ldap", "search_scope")
     server = Server(conf.get("ldap", "uri"),
                     use_ssl=True,
-                    tls=tls_configuration)
+                    tls=tls_configuration,
+                    get_info=search_scope)
 
     conn = Connection(server, native(dn), native(password))
 

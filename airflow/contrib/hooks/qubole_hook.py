@@ -110,6 +110,8 @@ class QuboleHook(BaseHook):
         self.cls = COMMAND_CLASSES[self.kwargs['command_type']]
         self.cmd = None
         self.task_instance = None
+        self.url_prefix = kwargs[
+            'url_prefix'] if 'url_prefix' in kwargs else "https://us.qubole.com/v2/analyze?command_id="
 
     @staticmethod
     def handle_failure_retry(context):
@@ -134,9 +136,13 @@ class QuboleHook(BaseHook):
         self.cmd = self.cls.create(**args)
         self.task_instance = context['task_instance']
         context['task_instance'].xcom_push(key='qbol_cmd_id', value=self.cmd.id)
+        context['task_instance'].xcom_push(key='qubole_url', value=self.url_prefix + str(self.cmd.id))
         self.log.info(
             "Qubole command created with Id: %s and Status: %s",
             self.cmd.id, self.cmd.status
+        )
+        self.log.info(
+            "Permalink: %s%s".format(self.url_prefix, str(self.cmd.id))
         )
 
         while not Command.is_done(self.cmd.status):
