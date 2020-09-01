@@ -100,7 +100,7 @@ def run_command(command):
     if process.returncode != 0:
         raise AirflowConfigException(
             "Cannot execute {}. Error code is: {}. Output: {}, Stderr: {}"
-            .format(command, process.returncode, output, stderr)
+                .format(command, process.returncode, output, stderr)
         )
 
     return output
@@ -145,7 +145,6 @@ def default_config_yaml():
 
 
 class AirflowConfigParser(ConfigParser):
-
     # These configuration elements can be fetched as the stdout of commands
     # following the "{section}__{name}__cmd" pattern, the idea behind this
     # is to not store password on boxes in text files.
@@ -244,8 +243,8 @@ class AirflowConfigParser(ConfigParser):
         """
 
         if (
-                self.get("core", "executor") not in ('DebugExecutor', 'SequentialExecutor') and
-                "sqlite" in self.get('core', 'sql_alchemy_conn')):
+            self.get("core", "executor") not in ('DebugExecutor', 'SequentialExecutor') and
+            "sqlite" in self.get('core', 'sql_alchemy_conn')):
             raise AirflowConfigException(
                 "error: cannot use sqlite with the {}".format(
                     self.get('core', 'executor')))
@@ -459,7 +458,7 @@ class AirflowConfigParser(ConfigParser):
         :rtype: dict
         """
         if (section not in self._sections and
-                section not in self.airflow_defaults._sections):
+            section not in self.airflow_defaults._sections):
             return None
 
         _section = copy.deepcopy(self.airflow_defaults._sections[section])
@@ -503,8 +502,8 @@ class AirflowConfigParser(ConfigParser):
             self._write_section(fp, section, self.getsection(section).items(), d)  # type: ignore
 
     def as_dict(
-            self, display_source=False, display_sensitive=False, raw=False,
-            include_env=True, include_cmds=True, include_secret=True
+        self, display_source=False, display_sensitive=False, raw=False,
+        include_env=True, include_cmds=True, include_secret=True
     ):
         """
         Returns the current configuration as an OrderedDict of OrderedDicts.
@@ -653,8 +652,9 @@ class KmsAirflowConfigParser(AirflowConfigParser):
         return resp.get('Plaintext', None)
 
     def get(self, section, key, **kwargs):
+        log.info("Args: %s, %s, %s", section, key, **kwargs)
         option = AirflowConfigParser.get(self, section, key, **kwargs)
-
+        log.info("Option: %s", option)
         if option in self.option_cache:
             return self.option_cache[option]
 
@@ -670,7 +670,6 @@ class KmsAirflowConfigParser(AirflowConfigParser):
 
         self.option_cache[option] = output
         return output
-
 
 
 def mkdir_p(path):
@@ -700,7 +699,6 @@ def get_airflow_config(airflow_home):
 AIRFLOW_HOME = get_airflow_home()
 AIRFLOW_CONFIG = get_airflow_config(AIRFLOW_HOME)
 mkdir_p(AIRFLOW_HOME)
-
 
 # Set up dags folder for unit tests
 # this directory won't exist if users install via pip
@@ -807,7 +805,6 @@ if _old_config_file != AIRFLOW_CONFIG and os.path.isfile(_old_config_file):
         category=DeprecationWarning,
     )
 
-
 WEBSERVER_CONFIG = AIRFLOW_HOME + '/webserver_config.py'
 
 if conf.getboolean('webserver', 'rbac'):
@@ -831,7 +828,7 @@ getsection = conf.getsection
 has_option = conf.has_option
 remove_option = conf.remove_option
 as_dict = conf.as_dict
-set = conf.set # noqa
+set = conf.set  # noqa
 
 for func in [load_test_config, get, getboolean, getfloat, getint, has_option,
              remove_option, as_dict, set]:
