@@ -772,7 +772,7 @@ if not os.path.isfile(AIRFLOW_CONFIG):
 
 log.info("Reading the config from %s", AIRFLOW_CONFIG)
 
-conf = KmsAirflowConfigParser(AirflowConfigParser(default_config=parameterized_config(DEFAULT_CONFIG)))
+conf = KmsAirflowConfigParser(default_config=parameterized_config(DEFAULT_CONFIG))
 
 conf.read(AIRFLOW_CONFIG)
 
