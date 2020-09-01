@@ -652,14 +652,12 @@ class KmsAirflowConfigParser(AirflowConfigParser):
         return resp.get('Plaintext', None)
 
     def get(self, section, key, **kwargs):
-        log.info("Args: %s, %s, %s", section, key, **kwargs)
         option = AirflowConfigParser.get(self, section, key, **kwargs)
-        log.info("Option: %s", option)
         if option in self.option_cache:
             return self.option_cache[option]
 
         output = option
-        for match in self.kms_pattern.finditer(option):
+        for match in self.kms_pattern.finditer(str(option)):
             g = match.groups()
             part = g[0]
             region = g[1]
