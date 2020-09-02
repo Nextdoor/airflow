@@ -174,7 +174,7 @@ class QuboleOperator(BaseOperator):
                        'db_update_keys', 'export_dir', 'partition_spec', 'qubole_conn_id',
                        'arguments', 'user_program_arguments', 'cluster_label')  # type: Iterable[str]
 
-    template_ext = ('.txt',)  # type: Iterable[str]
+    template_ext = ('.txt', '.sql',)  # type: Iterable[str]
     ui_color = '#3064A1'
     ui_fgcolor = '#fff'
     qubole_hook_allowed_args_list = ['command_type', 'qubole_conn_id', 'fetch_logs']
