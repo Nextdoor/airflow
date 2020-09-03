@@ -142,7 +142,7 @@ class QuboleHook(BaseHook):
             self.cmd.id, self.cmd.status
         )
         self.log.info(
-            "Permalink: %s%s".format(self.url_prefix, str(self.cmd.id))
+            "Permalink: {}{}".format(self.url_prefix, str(self.cmd.id))
         )
 
         while not Command.is_done(self.cmd.status):
