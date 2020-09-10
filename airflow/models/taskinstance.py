@@ -49,6 +49,7 @@ from airflow.exceptions import (
 from airflow.models.base import Base, ID_LEN
 from airflow.models.log import Log
 from airflow.models.pool import Pool
+from airflow.models.stats_helper import stats_incr_helper, stats_gauge_helper
 from airflow.models.taskfail import TaskFail
 from airflow.models.taskreschedule import TaskReschedule
 from airflow.models.variable import Variable
@@ -126,7 +127,6 @@ def clear_task_instances(tis,
         for dr in drs:
             dr.state = State.RUNNING
             dr.start_date = timezone.utcnow()
-
 
 class TaskInstance(Base, LoggingMixin):
     """
@@ -449,6 +449,7 @@ class TaskInstance(Base, LoggingMixin):
         Forces the task instance's state to FAILED in the database.
         """
         self.log.error("Recording the task instance as FAILED")
+        stats_incr_helper('task_failed', 1, self.dag_id, self.task_id)
         self.state = State.FAILED
         session.merge(self)
         session.commit()
@@ -535,6 +536,7 @@ class TaskInstance(Base, LoggingMixin):
 
     @provide_session
     def set_state(self, state, session=None, commit=True):
+        stats_incr_helper('task_{}'.format(state), 1, self.dag_id, self.task_id)
         self.state = state
         self.start_date = timezone.utcnow()
         self.end_date = timezone.utcnow()
@@ -819,7 +821,7 @@ class TaskInstance(Base, LoggingMixin):
         self.hostname = get_hostname()
 
         if not ignore_all_deps and not ignore_ti_state and self.state == State.SUCCESS:
-            Stats.incr('previously_succeeded', 1, 1)
+            Stats.incr('previously_succeeded', 1, 1, tags=['dag_id:{}'.format(task.dag_id)])
 
         # TODO: Logging needs cleanup, not clear what is being printed
         hr = "\n" + ("-" * 80)  # Line break
@@ -863,6 +865,7 @@ class TaskInstance(Base, LoggingMixin):
                     dep_context=dep_context,
                     session=session,
                     verbose=True):
+                stats_incr_helper('task_none', 1, self.dag_id, self.task_id)
                 self.state = State.NONE
                 self.log.warning(hr)
                 self.log.warning(
@@ -884,6 +887,10 @@ class TaskInstance(Base, LoggingMixin):
 
         if not test_mode:
             session.add(Log(State.RUNNING, self))
+        if self.execution_date and self.start_date and self.task.dag.schedule_interval:
+            expected_start = self.task.dag.following_schedule(self.execution_date)
+            start_lag = (self.start_date - expected_start).total_seconds()
+            stats_gauge_helper('task_start_lag', start_lag, self.dag_id, self.task_id)
         self.state = State.RUNNING
         self.pid = os.getpid()
         self.end_date = None
@@ -974,6 +981,7 @@ class TaskInstance(Base, LoggingMixin):
                 result = None
                 if task_copy.execution_timeout:
                     try:
+                        stats_incr_helper('task_timeout', 1, task.dag_id, task.task_id)
                         with timeout(int(
                                 task_copy.execution_timeout.total_seconds())):
                             result = task_copy.execute(context=context)
@@ -999,12 +1007,14 @@ class TaskInstance(Base, LoggingMixin):
 
                 Stats.incr('operator_successes_{}'.format(
                     self.task.__class__.__name__), 1, 1)
+                stats_incr_helper('task_timeout', 1, task.dag_id, task.task_id)
                 Stats.incr('ti_successes')
             self.refresh_from_db(lock_for_update=True)
             self.state = State.SUCCESS
         except AirflowSkipException as e:
             # Recording SKIP
             # log only if exception has any arguments to prevent log flooding
+            stats_incr_helper('task_skipped', 1, task.dag_id, task.task_id)
             if e.args:
                 self.log.info(e)
             self.refresh_from_db(lock_for_update=True)
@@ -1043,6 +1053,10 @@ class TaskInstance(Base, LoggingMixin):
         except (Exception, KeyboardInterrupt) as e:
             self.handle_failure(e, test_mode, context)
             raise
+
+        if self.queued_dttm and self.start_date:
+            queued_time = (self.start_date - self.queued_dttm).total_seconds()
+            stats_gauge_helper('task_queue_lag', queued_time, self.dag_id, self.task_id)
 
         # Success callback
         try:
@@ -1171,6 +1185,7 @@ class TaskInstance(Base, LoggingMixin):
         # try_number exceeds the max_tries ... or if force_fail is truthy
 
         if force_fail or not self.is_eligible_to_retry():
+            stats_incr_helper('task_failed', 1, task.dag_id, task.task_id)
             self.state = State.FAILED
             if force_fail:
                 log_message = "Immediate failure requested. Marking task as FAILED."
@@ -1180,6 +1195,7 @@ class TaskInstance(Base, LoggingMixin):
             callback = task.on_failure_callback
         else:
             self.state = State.UP_FOR_RETRY
+            stats_incr_helper('task_up_for_retry', 1, task.dag_id, task.task_id)
             log_message = "Marking task as UP_FOR_RETRY."
             email_for_state = task.email_on_retry
             callback = task.on_retry_callback
@@ -1477,6 +1493,7 @@ class TaskInstance(Base, LoggingMixin):
     def set_duration(self):
         if self.end_date and self.start_date:
             self.duration = (self.end_date - self.start_date).total_seconds()
+            stats_gauge_helper('task_duration', self.duration, self.dag_id, self.task_id)
         else:
             self.duration = None
 
@@ -1517,6 +1534,7 @@ class TaskInstance(Base, LoggingMixin):
             task_ids=None,
             dag_id=None,
             key=XCOM_RETURN_KEY,
+            execution_date=None,
             include_prior_dates=False):
         """
         Pull XComs that optionally meet certain criteria.
@@ -1542,6 +1560,9 @@ class TaskInstance(Base, LoggingMixin):
         :param dag_id: If provided, only pulls XComs from this DAG.
             If None (default), the DAG of the calling task is used.
         :type dag_id: str
+        :param execution_date: If provided, overrides execution_date.
+            If None (default), the execution_date of the task is used.
+        :type execution_date: str
         :param include_prior_dates: If False, only XComs from the current
             execution_date are returned. If True, XComs from previous dates
             are returned as well.
@@ -1551,9 +1572,10 @@ class TaskInstance(Base, LoggingMixin):
         if dag_id is None:
             dag_id = self.dag_id
 
+        execution_date = execution_date if execution_date else self.execution_date
         pull_fn = functools.partial(
             XCom.get_one,
-            execution_date=self.execution_date,
+            execution_date=execution_date,
             key=key,
             dag_id=dag_id,
             include_prior_dates=include_prior_dates)
