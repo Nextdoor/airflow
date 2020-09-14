@@ -144,9 +144,8 @@ if conf.getboolean('scheduler', 'statsd_on'):
         port=conf.getint('scheduler', 'statsd_port'),
         prefix=conf.get('scheduler', 'statsd_prefix'))
 
-    allow_list_validator = AllowListValidator(conf.get('scheduler', 'statsd_allow_list', fallback=None))
-
-    Stats = SafeStatsdLogger(statsd, allow_list_validator)
+    # allow_list_validator = AllowListValidator(conf.get('scheduler', 'statsd_allow_list', fallback=None))
+    Stats = statsd
 else:
     Stats = BaseStatsLogger
 

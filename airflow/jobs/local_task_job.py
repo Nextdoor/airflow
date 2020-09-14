@@ -92,7 +92,9 @@ class LocalTaskJob(BaseJob):
 
         try:
             self.task_runner.start()
-
+            if self.pool:
+                Stats.incr('pool', tags=['pool:{}'.format(self.pool),
+                                         'dag_id:{}'.format(self.task_instance.dag_id)])
             heartbeat_time_limit = conf.getint('scheduler',
                                                'scheduler_zombie_task_threshold')
             while True:
@@ -139,6 +141,13 @@ class LocalTaskJob(BaseJob):
         same_process = ti.pid == os.getpid()
 
         if ti.state == State.RUNNING:
+            Stats.incr('task_heartbeat', 1, 1, tags=['dag_id:{}'.format(self.task_instance.dag_id)])
+            task_id_entity = '.'.join(self.task_instance.task_id.split('.')[:-1])
+            task_id_action = '.'.join(self.task_instance.task_id.split('.')[-1:])
+            Stats.incr('task_heartbeat.by_task', 1, 1,
+                       tags=['dag_id:{}'.format(self.task_instance.dag_id),
+                             'task_id_prefix:{}'.format(task_id_entity),
+                             'task_id_suffix:{}'.format(task_id_action)])
             if not same_hostname:
                 self.log.warning("The recorded hostname %s "
                                  "does not match this instance's hostname "

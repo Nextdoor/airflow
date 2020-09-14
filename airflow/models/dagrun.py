@@ -29,6 +29,7 @@ from sqlalchemy.orm import synonym
 from sqlalchemy.orm.session import Session
 from airflow.exceptions import AirflowException
 from airflow.models.base import ID_LEN, Base
+from airflow.models.stats_helper import stats_incr_helper
 from airflow.settings import Stats, task_instance_mutation_hook
 from airflow.ti_deps.dep_context import DepContext
 from airflow.utils import timezone
@@ -371,6 +372,7 @@ class DagRun(Base, LoggingMixin):
             try:
                 task = dag.get_task(ti.task_id)
             except AirflowException:
+                stats_incr_helper('task_removed', 1, dag.dag_id, ti.task_id)
                 if ti.state == State.REMOVED:
                     pass  # ti has already been removed, just ignore it
                 elif self.state is not State.RUNNING and not dag.partial:

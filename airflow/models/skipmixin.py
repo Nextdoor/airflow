@@ -16,7 +16,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-
+from airflow.models.stats_helper import stats_incr_helper
 from airflow.models.taskinstance import TaskInstance
 from airflow.utils import timezone
 from airflow.utils.db import create_session, provide_session
@@ -45,6 +45,8 @@ class SkipMixin(LoggingMixin):
         now = timezone.utcnow()
 
         if dag_run:
+            for task in tasks:
+                stats_incr_helper('task_skipped', 1, task.dag_id, task.task_id)
             session.query(TaskInstance).filter(
                 TaskInstance.dag_id == dag_run.dag_id,
                 TaskInstance.execution_date == dag_run.execution_date,
@@ -64,6 +66,7 @@ class SkipMixin(LoggingMixin):
             # this is defensive against dag runs that are not complete
             for task in tasks:
                 ti = TaskInstance(task, execution_date=execution_date)
+                stats_incr_helper('task_skipped', 1, task.dag_id, task.task_id)
                 ti.state = State.SKIPPED
                 ti.start_date = now
                 ti.end_date = now
