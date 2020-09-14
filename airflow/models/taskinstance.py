@@ -1534,7 +1534,6 @@ class TaskInstance(Base, LoggingMixin):
             task_ids=None,
             dag_id=None,
             key=XCOM_RETURN_KEY,
-            execution_date=None,
             include_prior_dates=False):
         """
         Pull XComs that optionally meet certain criteria.
@@ -1560,9 +1559,6 @@ class TaskInstance(Base, LoggingMixin):
         :param dag_id: If provided, only pulls XComs from this DAG.
             If None (default), the DAG of the calling task is used.
         :type dag_id: str
-        :param execution_date: If provided, overrides execution_date.
-            If None (default), the execution_date of the task is used.
-        :type execution_date: str
         :param include_prior_dates: If False, only XComs from the current
             execution_date are returned. If True, XComs from previous dates
             are returned as well.
@@ -1572,10 +1568,9 @@ class TaskInstance(Base, LoggingMixin):
         if dag_id is None:
             dag_id = self.dag_id
 
-        execution_date = execution_date if execution_date else self.execution_date
         pull_fn = functools.partial(
             XCom.get_one,
-            execution_date=execution_date,
+            execution_date=self.execution_date,
             key=key,
             dag_id=dag_id,
             include_prior_dates=include_prior_dates)
