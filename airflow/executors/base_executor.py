@@ -123,9 +123,9 @@ class BaseExecutor(LoggingMixin):
         self.log.debug("%s in queue", num_queued_tasks)
         self.log.debug("%s open slots", open_slots)
 
-        Stats.gauge('{}.open_slots'.format(self.__class__.__name__), open_slots)
-        Stats.gauge('{}.queued_tasks'.format(self.__class__.__name__), num_queued_tasks)
-        Stats.gauge('{}.running_tasks'.format(self.__class__.__name__), num_running_tasks)
+        Stats.gauge('executor.open_slots', open_slots)
+        Stats.gauge('executor.queued_tasks', num_queued_tasks)
+        Stats.gauge('executor.running_tasks', num_running_tasks)
 
         self.trigger_tasks(open_slots)
 
