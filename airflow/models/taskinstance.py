@@ -1007,7 +1007,7 @@ class TaskInstance(Base, LoggingMixin):
 
                 Stats.incr('operator_successes_{}'.format(
                     self.task.__class__.__name__), 1, 1)
-                stats_incr_helper('task_timeout', 1, task.dag_id, task.task_id)
+                stats_incr_helper('task_success', 1, task.dag_id, task.task_id)
                 Stats.incr('ti_successes')
             self.refresh_from_db(lock_for_update=True)
             self.state = State.SUCCESS
