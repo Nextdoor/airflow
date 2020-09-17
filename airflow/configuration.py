@@ -649,7 +649,7 @@ class KmsAirflowConfigParser(AirflowConfigParser):
         ciphertext_blob = base64.b64decode(ciphertext)
         resp = client.decrypt(CiphertextBlob=ciphertext_blob)
 
-        return resp.get('Plaintext', None)
+        return str(resp.get('Plaintext', None))
 
     def get(self, section, key, **kwargs):
         option = AirflowConfigParser.get(self, section, key, **kwargs)
