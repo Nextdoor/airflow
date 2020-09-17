@@ -66,7 +66,7 @@ def get_ldap_connection(dn=None, password=None):
 
     tls_configuration = Tls(validate=ssl.CERT_REQUIRED,
                             ca_certs_file=cacert)
-    search_scope = configuration.get("ldap", "search_scope")
+    search_scope = conf.get("ldap", "search_scope")
     server = Server(conf.get("ldap", "uri"),
                     use_ssl=True,
                     tls=tls_configuration,
