@@ -667,7 +667,7 @@ class KmsAirflowConfigParser(AirflowConfigParser):
             output = output.replace(part, plaintext)
 
         self.option_cache[option] = output
-        return output
+        return str(output)
 
 
 def mkdir_p(path):
