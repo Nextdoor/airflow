@@ -649,7 +649,7 @@ class KmsAirflowConfigParser(AirflowConfigParser):
         ciphertext_blob = base64.b64decode(ciphertext)
         resp = client.decrypt(CiphertextBlob=ciphertext_blob)
 
-        return str(resp.get('Plaintext', None))
+        return resp.get('Plaintext', None).decode("utf-8")
 
     def get(self, section, key, **kwargs):
         option = AirflowConfigParser.get(self, section, key, **kwargs)
@@ -667,7 +667,7 @@ class KmsAirflowConfigParser(AirflowConfigParser):
             output = output.replace(part, plaintext)
 
         self.option_cache[option] = output
-        return str(output)
+        return output
 
 
 def mkdir_p(path):
