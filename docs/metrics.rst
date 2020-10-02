@@ -95,7 +95,8 @@ Name                                        Description
 =========================================== =================================================
 ``dagrun.dependency-check.<dag_id>``        Milliseconds taken to check DAG dependencies
 ``dag.<dag_id>.<task_id>.duration``         Milliseconds taken to finish a task
-``dag_processing.last_duration.<dag_file>`` Milliseconds taken to load the given DAG file
+``dag_processing.duration.<dag_file>``      Milliseconds taken to load the given DAG file
+``dag_processing.last_duration.<dag_file>`` Milliseconds taken to load the given DAG file on previous run
 ``dagrun.duration.success.<dag_id>``        Milliseconds taken for a DagRun to reach success state
 ``dagrun.duration.failed.<dag_id>``         Milliseconds taken for a DagRun to reach failed state
 ``dagrun.schedule_delay.<dag_id>``          Milliseconds of delay between the scheduled DagRun
