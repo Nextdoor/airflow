@@ -159,6 +159,8 @@ class DagFileProcessor(AbstractDagFileProcessor, LoggingMixin, MultiprocessingSt
                                                 pickle_dags)
             result_channel.send(result)
             end_time = time.time()
+            file_name = os.path.basename(file_path)
+            Stats.timing('dag_processing.duration.{}'.format(file_name), end_time - start_time)
             log.info(
                 "Processing %s took %.3f seconds", file_path, end_time - start_time
             )
