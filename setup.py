@@ -592,7 +592,7 @@ INSTALL_REQUIREMENTS = [
     'sqlalchemy_jsonfield==0.8.0;python_version<"3.5"',
     'sqlalchemy_jsonfield~=0.9;python_version>="3.5"',
     'tabulate>=0.7.5, <0.9',
-    'tenacity==4.12.0',
+    'tenacity>=4.12.0',
     'thrift>=0.9.2',
     'typing;python_version<"3.5"',
     'typing-extensions>=3.7.4;python_version<"3.8"',
