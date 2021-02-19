@@ -37,6 +37,7 @@ from textwrap import dedent
 
 import sqlalchemy as sqla
 import pendulum
+from ddtrace import tracer
 from flask import (
     abort, jsonify, redirect, url_for, request, Markup, Response,
     current_app, render_template, make_response)
@@ -2238,6 +2239,7 @@ class Airflow(AirflowViewMixin, BaseView):
 class HomeView(AirflowViewMixin, AdminIndexView):
     @expose("/")
     @login_required
+    @tracer.wrap()
     @provide_session
     def index(self, session=None):
         DM = models.DagModel
