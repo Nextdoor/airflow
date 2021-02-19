@@ -27,6 +27,7 @@ from flask_login import login_required, current_user, logout_user  # noqa: F401
 from flask import flash, redirect, url_for
 from wtforms import Form, PasswordField, StringField
 from wtforms.validators import InputRequired
+from ddtrace import tracer
 
 from ldap3 import Server, Connection, Tls, set_config_parameter, LEVEL, SUBTREE
 
@@ -50,6 +51,7 @@ class LdapException(Exception):
     pass
 
 
+@tracer.wrap()
 def get_ldap_connection(dn=None, password=None):
     try:
         cacert = conf.get("ldap", "cacert")
@@ -81,6 +83,7 @@ def get_ldap_connection(dn=None, password=None):
     return conn
 
 
+@tracer.wrap()
 def group_contains_user(conn, search_base, group_filter, user_name_attr, username):
     search_filter = '(&({0}))'.format(group_filter)
 
@@ -96,6 +99,7 @@ def group_contains_user(conn, search_base, group_filter, user_name_attr, usernam
     return False
 
 
+@tracer.wrap()
 def groups_user(conn, search_base, user_filter, user_name_att, username):
     search_filter = "(&({0})({1}={2}))".format(user_filter, user_name_att, username)
     try:
@@ -130,6 +134,7 @@ def groups_user(conn, search_base, user_filter, user_name_att, username):
 
 
 class LdapUser(models.User):
+    @tracer.wrap()
     def __init__(self, user):
         self.user = user
         self.ldap_groups = []
@@ -188,6 +193,7 @@ class LdapUser(models.User):
             log.debug("Missing configuration for ldap settings. Skipping")
 
     @staticmethod
+    @tracer.wrap()
     def try_login(username, password):
         conn = get_ldap_connection(conf.get("ldap", "bind_user"),
                                    conf.get("ldap", "bind_password"))
@@ -281,6 +287,7 @@ def load_user(userid, session=None):
     return LdapUser(user)
 
 
+@tracer.wrap()
 @provide_session
 def login(self, request, session=None):
     if current_user.is_authenticated:
