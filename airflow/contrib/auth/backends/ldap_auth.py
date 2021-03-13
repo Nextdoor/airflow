@@ -101,7 +101,6 @@ def get_ldap_connection(dn=None, password=None):
 
 
 @measure
-@cache.memoize(86400)
 def group_contains_user(conn, search_base, group_filter, user_name_attr, username):
     search_filter = '(&({0}))'.format(group_filter)
 
@@ -118,7 +117,6 @@ def group_contains_user(conn, search_base, group_filter, user_name_attr, usernam
 
 
 @measure
-@cache.memoize(86400)
 def groups_user(conn, search_base, user_filter, user_name_att, username):
     search_filter = "(&({0})({1}={2}))".format(user_filter, user_name_att, username)
     try:
