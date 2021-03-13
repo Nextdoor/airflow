@@ -42,8 +42,7 @@ LOGIN_MANAGER.login_message = None
 
 log = logging.getLogger(__name__)
 
-app = Flask(__name__)
-cache = Cache(app=app, config={'CACHE_TYPE': 'filesystem', 'CACHE_DIR': '/tmp'})
+cache = Cache(app=Flask(__name__), config={'CACHE_TYPE': 'filesystem', 'CACHE_DIR': '/tmp'})
 
 
 class AuthenticationError(Exception):
@@ -68,8 +67,8 @@ def measure(func):
     return _time_it
 
 
-@cache.memoize(86400)
 @measure
+@cache.memoize(86400)
 def get_ldap_connection(dn=None, password=None):
     try:
         cacert = conf.get("ldap", "cacert")
@@ -101,8 +100,8 @@ def get_ldap_connection(dn=None, password=None):
     return conn
 
 
-@cache.memoize(86400)
 @measure
+@cache.memoize(86400)
 def group_contains_user(conn, search_base, group_filter, user_name_attr, username):
     search_filter = '(&({0}))'.format(group_filter)
 
@@ -118,8 +117,8 @@ def group_contains_user(conn, search_base, group_filter, user_name_attr, usernam
     return False
 
 
-@cache.memoize(86400)
 @measure
+@cache.memoize(86400)
 def groups_user(conn, search_base, user_filter, user_name_att, username):
     search_filter = "(&({0})({1}={2}))".format(user_filter, user_name_att, username)
     try:
