@@ -16,6 +16,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+from flask_caching import Cache
 from future.utils import native
 import logging
 import re
@@ -24,7 +25,7 @@ import traceback
 
 import flask_login
 from flask_login import login_required, current_user, logout_user  # noqa: F401
-from flask import flash, redirect, url_for
+from flask import flash, redirect, url_for, Flask
 from wtforms import Form, PasswordField, StringField
 from wtforms.validators import InputRequired
 
@@ -40,6 +41,9 @@ LOGIN_MANAGER.login_view = 'airflow.login'  # Calls login() below
 LOGIN_MANAGER.login_message = None
 
 log = logging.getLogger(__name__)
+
+app = Flask(__name__)
+cache = Cache(app=app, config={'CACHE_TYPE': 'filesystem', 'CACHE_DIR': '/tmp'})
 
 
 class AuthenticationError(Exception):
@@ -64,6 +68,7 @@ def measure(func):
     return _time_it
 
 
+@cache.memoize(86400)
 @measure
 def get_ldap_connection(dn=None, password=None):
     try:
@@ -96,6 +101,7 @@ def get_ldap_connection(dn=None, password=None):
     return conn
 
 
+@cache.memoize(86400)
 @measure
 def group_contains_user(conn, search_base, group_filter, user_name_attr, username):
     search_filter = '(&({0}))'.format(group_filter)
@@ -112,6 +118,7 @@ def group_contains_user(conn, search_base, group_filter, user_name_attr, usernam
     return False
 
 
+@cache.memoize(86400)
 @measure
 def groups_user(conn, search_base, user_filter, user_name_att, username):
     search_filter = "(&({0})({1}={2}))".format(user_filter, user_name_att, username)
