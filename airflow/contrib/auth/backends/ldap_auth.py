@@ -34,7 +34,7 @@ from ldap3 import Server, Connection, Tls, set_config_parameter, LEVEL, SUBTREE
 from airflow import models, configuration
 from airflow.configuration import AirflowConfigException, conf
 from airflow.utils.db import provide_session
-
+from airflow.www import app
 
 LOGIN_MANAGER = flask_login.LoginManager()
 LOGIN_MANAGER.login_view = 'airflow.login'  # Calls login() below
@@ -42,7 +42,7 @@ LOGIN_MANAGER.login_message = None
 
 log = logging.getLogger(__name__)
 
-cache = Cache(app=Flask(__name__), config={'CACHE_TYPE': 'filesystem', 'CACHE_DIR': '/tmp'})
+cache = Cache(app=app, config={'CACHE_TYPE': 'filesystem', 'CACHE_DIR': '/tmp'})
 
 
 class AuthenticationError(Exception):
