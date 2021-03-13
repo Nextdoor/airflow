@@ -16,7 +16,6 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-from flask_caching import Cache
 from future.utils import native
 import logging
 import re
@@ -25,7 +24,7 @@ import traceback
 
 import flask_login
 from flask_login import login_required, current_user, logout_user  # noqa: F401
-from flask import flash, redirect, url_for, Flask
+from flask import flash, redirect, url_for, session as flask_session
 from wtforms import Form, PasswordField, StringField
 from wtforms.validators import InputRequired
 
@@ -34,7 +33,7 @@ from ldap3 import Server, Connection, Tls, set_config_parameter, LEVEL, SUBTREE
 from airflow import models, configuration
 from airflow.configuration import AirflowConfigException, conf
 from airflow.utils.db import provide_session
-from airflow.www.app import app
+
 
 LOGIN_MANAGER = flask_login.LoginManager()
 LOGIN_MANAGER.login_view = 'airflow.login'  # Calls login() below
@@ -42,7 +41,7 @@ LOGIN_MANAGER.login_message = None
 
 log = logging.getLogger(__name__)
 
-cache = Cache(app=app, config={'CACHE_TYPE': 'filesystem', 'CACHE_DIR': '/tmp'})
+cache_user_in_session = True  # Session caching added by ND
 
 
 class AuthenticationError(Exception):
@@ -53,22 +52,6 @@ class LdapException(Exception):
     pass
 
 
-from functools import wraps
-from time import time
-def measure(func):
-    @wraps(func)
-    def _time_it(*args, **kwargs):
-        start = int(round(time() * 1000))
-        try:
-            return func(*args, **kwargs)
-        finally:
-            end_ = int(round(time() * 1000)) - start
-            print(f"Total execution time ::: {func.__name__} ::: {end_ if end_ > 0 else 0} ms")
-    return _time_it
-
-
-@measure
-@cache.memoize(86400)
 def get_ldap_connection(dn=None, password=None):
     try:
         cacert = conf.get("ldap", "cacert")
@@ -100,7 +83,6 @@ def get_ldap_connection(dn=None, password=None):
     return conn
 
 
-@measure
 def group_contains_user(conn, search_base, group_filter, user_name_attr, username):
     search_filter = '(&({0}))'.format(group_filter)
 
@@ -116,7 +98,6 @@ def group_contains_user(conn, search_base, group_filter, user_name_attr, usernam
     return False
 
 
-@measure
 def groups_user(conn, search_base, user_filter, user_name_att, username):
     search_filter = "(&({0})({1}={2}))".format(user_filter, user_name_att, username)
     try:
@@ -151,10 +132,19 @@ def groups_user(conn, search_base, user_filter, user_name_att, username):
 
 
 class LdapUser(models.User):
-    @measure
     def __init__(self, user):
         self.user = user
         self.ldap_groups = []
+
+        # Session caching added by ND
+        session_superuser = flask_session.get("ldap_superuser")
+        session_data_profiler = flask_session.get("ldap_data_profiler")
+        session_ldap_groups = flask_session.get("ldap_groups")
+        if cache_user_in_session and session_superuser and session_data_profiler and session_ldap_groups:
+            self.superuser = session_superuser
+            self.data_profiler = session_data_profiler
+            self.ldap_groups = session_ldap_groups
+            return
 
         # Load and cache superuser and data_profiler settings.
         conn = get_ldap_connection(conf.get("ldap", "bind_user"),
@@ -209,8 +199,12 @@ class LdapUser(models.User):
         except AirflowConfigException:
             log.debug("Missing configuration for ldap settings. Skipping")
 
+        if cache_user_in_session:
+            flask_session.setdefault("ldap_superuser", self.superuser)
+            flask_session.setdefault("ldap_data_profiler", self.data_profiler)
+            flask_session.setdefault("ldap_groups", self.ldap_groups)
+
     @staticmethod
-    @measure
     def try_login(username, password):
         conn = get_ldap_connection(conf.get("ldap", "bind_user"),
                                    conf.get("ldap", "bind_password"))
