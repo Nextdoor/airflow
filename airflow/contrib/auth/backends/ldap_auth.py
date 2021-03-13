@@ -34,7 +34,7 @@ from ldap3 import Server, Connection, Tls, set_config_parameter, LEVEL, SUBTREE
 from airflow import models, configuration
 from airflow.configuration import AirflowConfigException, conf
 from airflow.utils.db import provide_session
-from airflow.www import app
+from airflow.www.app import app
 
 LOGIN_MANAGER = flask_login.LoginManager()
 LOGIN_MANAGER.login_view = 'airflow.login'  # Calls login() below
