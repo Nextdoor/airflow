@@ -1699,10 +1699,13 @@ class Airflow(AirflowViewMixin, BaseView):
 
         root = request.args.get('root')
         if root:
+            rel = request.args.get('rel')
+            include_upstream = False if rel == "downstream" else True
+            include_downstream = False if rel == "upstream" else True
             dag = dag.sub_dag(
                 task_regex=root,
-                include_upstream=True,
-                include_downstream=False)
+                include_upstream=include_upstream,
+                include_downstream=include_downstream)
 
         arrange = request.args.get('arrange', dag.orientation)
 
