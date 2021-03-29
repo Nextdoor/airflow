@@ -39,7 +39,7 @@ import sqlalchemy as sqla
 import pendulum
 from flask import (
     abort, jsonify, redirect, url_for, request, Markup, Response,
-    current_app, render_template, make_response)
+    current_app, render_template, make_response, session as flask_session)
 from flask import flash
 from flask_admin import BaseView, expose, AdminIndexView
 from flask_admin.actions import action
@@ -57,7 +57,8 @@ import six
 from pygments.formatters.html import HtmlFormatter
 from six.moves.urllib.parse import quote, unquote, urlparse
 
-from sqlalchemy import or_, desc, and_, union_all
+from sqlalchemy import or_, desc, func, and_, union_all
+from sqlalchemy.orm import joinedload
 from wtforms import (
     Form, SelectField, TextAreaField, PasswordField,
     StringField, IntegerField, validators)
@@ -73,6 +74,7 @@ from airflow.api.common.experimental.mark_tasks import (set_dag_run_state_to_run
                                                         set_dag_run_state_to_failed)
 from airflow.exceptions import AirflowException
 from airflow.models import BaseOperator, Connection, DagRun, errors, XCom
+from airflow.models.dag import DagTag
 from airflow.models.dagcode import DagCode
 from airflow.settings import STATE_COLORS, STORE_SERIALIZED_DAGS
 from airflow.operators.subdag_operator import SubDagOperator
@@ -104,6 +106,7 @@ logout_user = airflow.login.logout_user
 FILTER_BY_OWNER = False
 
 PAGE_SIZE = conf.getint('webserver', 'page_size')
+FILTER_TAGS_COOKIE = 'tags_filter'
 
 log = logging.getLogger(__name__)
 
@@ -1696,10 +1699,13 @@ class Airflow(AirflowViewMixin, BaseView):
 
         root = request.args.get('root')
         if root:
+            rel = request.args.get('rel')
+            include_upstream = False if rel == "downstream" else True
+            include_downstream = False if rel == "upstream" else True
             dag = dag.sub_dag(
                 task_regex=root,
-                include_upstream=True,
-                include_downstream=False)
+                include_upstream=include_upstream,
+                include_downstream=include_downstream)
 
         arrange = request.args.get('arrange', dag.orientation)
 
@@ -2258,6 +2264,17 @@ class HomeView(AirflowViewMixin, AdminIndexView):
 
         arg_current_page = request.args.get('page', '0')
         arg_search_query = request.args.get('search', None)
+        arg_tags_filter = request.args.getlist('tags', None)
+
+        if request.args.get('reset_tags') is not None:
+            flask_session[FILTER_TAGS_COOKIE] = None
+            arg_tags_filter = None
+        else:
+            cookie_val = flask_session.get(FILTER_TAGS_COOKIE)
+            if arg_tags_filter:
+                flask_session[FILTER_TAGS_COOKIE] = ','.join(arg_tags_filter)
+            elif cookie_val:
+                arg_tags_filter = cookie_val.split(',')
 
         dags_per_page = PAGE_SIZE
         current_page = get_int_arg(arg_current_page, default=0)
@@ -2298,12 +2315,16 @@ class HomeView(AirflowViewMixin, AdminIndexView):
                 DM.owners.ilike('%' + arg_search_query + '%')
             )
 
+        if arg_tags_filter:
+            query = query.filter(DM.tags.any(DagTag.name.in_(arg_tags_filter)))
+
         query = query.order_by(DM.dag_id)
 
         start = current_page * dags_per_page
         end = start + dags_per_page
 
-        dags = query.offset(start).limit(dags_per_page).all()
+        dags = query.order_by(DM.dag_id).options(
+            joinedload(DM.tags)).offset(start).limit(dags_per_page).all()
 
         import_errors = session.query(errors.ImportError).all()
         for ie in import_errors:
