@@ -455,53 +455,54 @@ function updateQueryStringParameter(uri, key, value) {
       return false;
     }
 
-    $("#btn_rendered").click(function(){
-      url = "{{ url_for('airflow.rendered') }}" +
+    function button_link(event, url) {
+      if (event.ctrlKey || event.metaKey) {
+        window.open(url, "_blank");
+      } else {
+        window.location = url;
+      }
+    }
+
+    $("#btn_rendered").click(function(e){
+      button_link(e, "{{ url_for('airflow.rendered') }}" +
         "?task_id=" + encodeURIComponent(task_id) +
         "&dag_id=" + encodeURIComponent(dag_id) +
-        "&execution_date=" + encodeURIComponent(execution_date);
-      window.location = url;
+        "&execution_date=" + encodeURIComponent(execution_date));
     });
 
-    $("#btn_subdag").click(function(){
-      url = "{{ url_for( 'airflow.' + dag.get_default_view() ) }}" +
+    $("#btn_subdag").click(function(e){
+      button_link(e, "{{ url_for( 'airflow.' + dag.get_default_view() ) }}" +
         "?dag_id=" + encodeURIComponent(subdag_id) +
-        "&execution_date=" + encodeURIComponent(execution_date);
-      window.location = url;
+        "&execution_date=" + encodeURIComponent(execution_date));
     });
 
-    $("#btn_log").click(function(){
-      url = "{{ url_for('airflow.log') }}" +
+    $("#btn_log").click(function(e){
+      button_link(e, "{{ url_for('airflow.log') }}" +
         "?task_id=" + encodeURIComponent(task_id) +
         "&dag_id=" + encodeURIComponent(dag_id) +
         "&execution_date=" + encodeURIComponent(execution_date) +
-        "&format=json";
-      window.location = url;
+        "&format=json");
     });
 
-    $("#btn_xcom").click(function(){
-      url = "{{ url_for('airflow.xcom') }}" +
+    $("#btn_xcom").click(function(e){
+      button_link(e, "{{ url_for('airflow.xcom') }}" +
         "?task_id=" + encodeURIComponent(task_id) +
         "&dag_id=" + encodeURIComponent(dag_id) +
-        "&execution_date=" + encodeURIComponent(execution_date);
-      window.location = url;
+        "&execution_date=" + encodeURIComponent(execution_date));
     });
 
-
-    $("#btn_task").click(function(){
-      url = "{{ url_for('airflow.task') }}" +
+    $("#btn_task").click(function(e){
+      button_link(e, "{{ url_for('airflow.task') }}" +
         "?task_id=" + encodeURIComponent(task_id) +
         "&dag_id=" + encodeURIComponent(dag_id) +
-        "&execution_date=" + encodeURIComponent(execution_date);
-      window.location = url;
+        "&execution_date=" + encodeURIComponent(execution_date));
     });
 
-    $("#btn_ti").click(function(){
-      url = "{{ url_for('taskinstance.index_view') }}" +
+    $("#btn_ti").click(function(e){
+      button_link(e, "{{ url_for('taskinstance.index_view') }}" +
         "?flt1_dag_id_equals=" + encodeURIComponent(dag_id) +
         "&flt2_task_id_equals=" + encodeURIComponent(task_id) +
-        "&sort=3&desc=1";
-      window.location = url;
+        "&sort=3&desc=1");
     });
 
     $('form button[data-action]').click(function (e) {
