@@ -2287,7 +2287,8 @@ class HomeView(AirflowViewMixin, AdminIndexView):
             hide_paused = hide_paused_dags_by_default
 
         # read orm_dags from the db
-        query = session.query(DM)
+        query = session.query(DM).filter(
+            ~DM.dag_id.ilike('zz__backfill__%'))
 
         if do_filter and owner_mode == 'ldapgroup':
             query = query.filter(
