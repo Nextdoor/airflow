@@ -1349,6 +1349,16 @@ class Airflow(AirflowViewMixin, BaseView):
         return self._clear_dag_tis(dag, start_date, end_date, origin,
                                    recursive=recursive, confirmed=confirmed, only_failed=only_failed)
 
+    @expose('/all_tasks', methods=['GET'])
+    @login_required
+    def all_tasks(self):
+        payload = []
+        for _, dag in dagbag.dags.items():
+            for task in dag.tasks:
+                payload.append({'dag_id': dag.dag_id, 'task_id': task.task_id, 'name': f'{dag.dag_id} {task.task_id}'})
+        payload.sort(key=lambda x: x['name'])
+        return wwwutils.json_response(payload)
+
     @expose('/dagrun_clear', methods=['POST'])
     @login_required
     @wwwutils.action_logging
