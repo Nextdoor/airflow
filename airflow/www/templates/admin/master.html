@@ -132,7 +132,9 @@ function convertSecsToHumanReadable(seconds) {
 $.getJSON("{{ url_for('airflow.all_tasks') }}", function (data) {
   var typeahead_data = [];
   for (const [dag, tasks] of Object.entries(data)) {
-    typeahead_data = typeahead_data.concat(tasks.flatMap(task => dag + " " + task));
+    typeahead_data = typeahead_data.concat(tasks.flatMap(task => {
+      return {"dag_id": dag, "task_id": task, "name": dag + " " + task};
+    }));
   }
 
   var taskQuery = $("#task_query");
