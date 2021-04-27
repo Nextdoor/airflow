@@ -1351,12 +1351,11 @@ class Airflow(AirflowViewMixin, BaseView):
 
     @expose('/all_tasks', methods=['GET'])
     @login_required
+    @wwwutils.gzipped
     def all_tasks(self):
-        payload = []
+        payload = {}
         for _, dag in dagbag.dags.items():
-            for task in dag.tasks:
-                payload.append({'dag_id': dag.dag_id, 'task_id': task.task_id, 'name': f'{dag.dag_id} {task.task_id}'})
-        payload.sort(key=lambda x: x['name'])
+            payload[dag.dag_id] = dag.task_ids
         return wwwutils.json_response(payload)
 
     @expose('/dagrun_clear', methods=['POST'])
