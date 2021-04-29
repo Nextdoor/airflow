@@ -1353,9 +1353,7 @@ class Airflow(AirflowViewMixin, BaseView):
     @login_required
     @wwwutils.gzipped
     def all_tasks(self):
-        payload = {}
-        for _, dag in dagbag.dags.items():
-            payload[dag.dag_id] = dag.task_ids
+        payload = {dag.dag_id: dag.task_ids for _, dag in dagbag.dags.items()}
         return wwwutils.json_response(payload)
 
     @expose('/dagrun_clear', methods=['POST'])
