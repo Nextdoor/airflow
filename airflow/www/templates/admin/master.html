@@ -128,64 +128,77 @@ function convertSecsToHumanReadable(seconds) {
    return readableFormat
 }
 
-// Capture keyboard shortcuts
-$(document).keyup(function(e) {
-  if (!/^(?:input|textarea|select|button)$/i.test(e.target.tagName)) {
-    let key = e.which || e.keyCode;
-    let letterT = 84;
-    if (key === letterT) {
-      initTaskSearchModal();
-    }
+// Get task search data in the background
+$.getJSON("{{ url_for('airflow.all_tasks') }}", function (data) {
+  var typeahead_data = [];
+  for (const [dag, tasks] of Object.entries(data)) {
+    typeahead_data = typeahead_data.concat(tasks.flatMap(task => {
+      return {"dag_id": dag, "task_id": task, "name": dag + " " + task};
+    }));
   }
+
+  var taskQuery = $("#task_query");
+  taskQuery.typeahead({
+    source: typeahead_data,
+    items: 20,
+    afterSelect: function (value) {
+      $('#taskFinderGraph').attr('href', "{{ url_for('airflow.graph') }}"
+        + "?dag_id=" + encodeURI(value.dag_id)
+        + "&root=" + encodeURI(value.task_id));
+      $('#taskFinderTree').attr('href', "{{ url_for('airflow.tree') }}"
+        + "?dag_id=" + encodeURI(value.dag_id)
+        + "&root=" + encodeURI(value.task_id))
+      .focus();
+    }
+  });
+  $('#taskFinderSearchLoading').hide();
+  $('.task-data-load').show();
+  taskQuery.focus(); // in case it's in the foreground already
 });
 
-function initTaskSearchModal() {
-  let taskSearchInput = $("#task_query");
-  $.getJSON("{{ url_for('airflow.all_tasks') }}", function (data) {
-    $('.typeahead').typeahead('destroy');
-    taskSearchInput.typeahead({
-      source: data,
-      items: 20,
-      afterSelect: function (value) {
-        $('#taskFinderGraph').attr('href', "{{ url_for('airflow.graph') }}"
-          + "?dag_id=" + encodeURI(value.dag_id)
-          + "&root=" + encodeURI(value.task_id));
-        $('#taskFinderTree').attr('href', "{{ url_for('airflow.tree') }}"
-          + "?dag_id=" + encodeURI(value.dag_id)
-          + "&root=" + encodeURI(value.task_id))
-        .focus();
+$(document).ready(function () {
+  $('.task-data-load').hide();
+  // Capture keyboard shortcuts
+  $(document).keyup(function (e) {
+    if (!/^(?:input|textarea|select|button)$/i.test(e.target.tagName)) {
+      var key = e.which || e.keyCode;
+      var letterT = 84;
+      if (key === letterT) {
+        showTaskSearchModal();
       }
-    });
-
-    $("#taskFinderModal").on('shown.bs.modal', function () {
-        taskSearchInput.focus();
-      })
-      .modal({})
-      .css("margin-top", "0px");
+    }
   });
-};
+})
+
+function showTaskSearchModal() {
+  $('.typeahead').typeahead('destroy');
+  $("#taskFinderModal").on('shown.bs.modal', function () {
+      $("#task_query").focus();
+    })
+    .modal({})
+    .css("margin-top", "0px");
+}
 </script>
 {% endblock %}
 
 {% block page_body %}
 <!-- Modal for task finder -->
-<div class="modal fade" id="taskFinderModal"
-      tabindex="-1" role="dialog"
+<div class="modal fade" id="taskFinderModal" tabindex="-1" role="dialog"
     aria-labelledby="dagModalLabel" aria-hidden="true">
   <div class="modal-dialog">
     <div class="modal-content">
       <div class="modal-header">
         <h4 class="modal-title" id="taskFinderModalLabel">
-          <span id='taskFinderSearch'>Task Search</span>
+          <span id="taskFinderSearch" class="task-data-load">Task Search</span>
+          <img id="taskFinderSearchLoading" alt="spinner" src="{{ url_for('static', filename='loading.gif') }}" />
         </h4>
       </div>
-      <div class="modal-body">
-          <label for="task_query" style="display: none;">Search</label>
+      <div class="modal-body task-data-load">
+          <label for="task_query">Search</label>
           <input id="task_query" type="text" class="task-typeahead form-control" data-provide="typeahead"
                  value="" autocomplete="off">
       </div>
-      <div class="modal-footer">
-
+      <div class="modal-footer task-data-load">
         <ul class="nav nav-pills">
           <li><a id="taskFinderTree" href="#">
               <span class="glyphicon glyphicon-filter" aria-hidden="true"></span>
