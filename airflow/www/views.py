@@ -92,9 +92,6 @@ from airflow.www.forms import (DateTimeForm, DateTimeWithNumRunsForm,
 from airflow.www.utils import wrapped_markdown
 from airflow.www.validators import GreaterEqualThan
 
-from server_timing import Timing
-t = Timing(current_app, force_debug=True)
-
 QUERY_LIMIT = 100000
 CHART_LIMIT = 200000
 
