@@ -590,6 +590,7 @@ class Airflow(AirflowViewMixin, BaseView):
 
     @expose('/dag_stats')
     @login_required
+    @wwwutils.gzipped
     @provide_session
     def dag_stats(self, session=None):
         dr = models.DagRun
