@@ -1277,6 +1277,8 @@ def worker(args):
         'autoscale': autoscale,
         'hostname': args.celery_hostname,
         'loglevel': conf.get('core', 'LOGGING_LEVEL'),
+        'without_mingle': args.without_mingle,
+        'without_gossip': args.without_gossip,
     }
 
     if conf.has_option("celery", "pool"):
