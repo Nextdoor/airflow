@@ -2528,12 +2528,12 @@ class CLIFactory(object):
             help=("Set the hostname of celery worker "
                   "if you have multiple workers on a single machine.")),
         'without_mingle': Arg(
-            ("--without-mingle"),
+            ("--without-mingle",),
             default=False,
             help="Don’t synchronize with other workers at start-up",
             action="store_true"),
         'without_gossip': Arg(
-            ("--without-gossip"),
+            ("--without-gossip",),
             default=False,
             help="Don’t subscribe to other workers events",
             action="store_true"),
