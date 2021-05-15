@@ -1277,6 +1277,8 @@ def worker(args):
         'autoscale': autoscale,
         'hostname': args.celery_hostname,
         'loglevel': conf.get('core', 'LOGGING_LEVEL'),
+        'without_mingle': args.without_mingle,
+        'without_gossip': args.without_gossip,
     }
 
     if conf.has_option("celery", "pool"):
@@ -2525,6 +2527,16 @@ class CLIFactory(object):
             ("-cn", "--celery_hostname"),
             help=("Set the hostname of celery worker "
                   "if you have multiple workers on a single machine.")),
+        'without_mingle': Arg(
+            ("--without-mingle",),
+            default=False,
+            help="Don’t synchronize with other workers at start-up",
+            action="store_true"),
+        'without_gossip': Arg(
+            ("--without-gossip",),
+            default=False,
+            help="Don’t subscribe to other workers events",
+            action="store_true"),
         # flower
         'broker_api': Arg(("-a", "--broker_api"), help="Broker api"),
         'flower_hostname': Arg(
@@ -2815,7 +2827,8 @@ class CLIFactory(object):
             'func': worker,
             'help': "Start a Celery worker node",
             'args': ('do_pickle', 'queues', 'concurrency', 'celery_hostname',
-                     'pid', 'daemon', 'stdout', 'stderr', 'log_file', 'autoscale', 'skip_serve_logs'),
+                     'pid', 'daemon', 'stdout', 'stderr', 'log_file', 'autoscale', 'skip_serve_logs',
+                     'without_mingle', 'without_gossip'),
         }, {
             'func': flower,
             'help': "Start a Celery Flower",

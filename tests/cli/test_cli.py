@@ -645,7 +645,9 @@ class TestWorkerStart(unittest.TestCase):
             '--celery_hostname',
             celery_hostname,
             '--queues',
-            queues
+            queues,
+            '--without-mingle',
+            '--without-gossip',
         ])
 
         with mock.patch('celery.platforms.check_privileges') as mock_privil:
@@ -661,6 +663,8 @@ class TestWorkerStart(unittest.TestCase):
             autoscale=autoscale,
             hostname=celery_hostname,
             loglevel=mock.ANY,
+            without_mingle=True,
+            without_gossip=True,
         )
 
 
