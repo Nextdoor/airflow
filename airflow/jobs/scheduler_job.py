@@ -159,6 +159,8 @@ class DagFileProcessor(AbstractDagFileProcessor, LoggingMixin, MultiprocessingSt
                                                 pickle_dags)
             result_channel.send(result)
             end_time = time.time()
+            file_name = os.path.basename(file_path)
+            Stats.timing('dag_processing.duration.{}'.format(file_name), end_time - start_time)
             log.info(
                 "Processing %s took %.3f seconds", file_path, end_time - start_time
             )
@@ -595,6 +597,13 @@ class SchedulerJob(BaseJob):
                 for sla in slas:
                     if email_sent:
                         sla.email_sent = True
+                    if not sla.notification_sent:
+                        Stats.incr('task_sla_miss', 1, 1, tags=['dag_id:{}'.format(sla.dag_id)])
+                        task_id_entity = '.'.join(sla.task_id.split('.')[:-1])
+                        task_id_action = '.'.join(sla.task_id.split('.')[-1:])
+                        Stats.incr('task_sla_miss.by_task', 1, 1, tags=['dag_id:{}'.format(sla.dag_id),
+                                                                        'task_id_prefix:{}'.format(task_id_entity),
+                                                                        'task_id_suffix:{}'.format(task_id_action)])
                     sla.notification_sent = True
                     session.merge(sla)
             session.commit()
@@ -639,6 +648,8 @@ class SchedulerJob(BaseJob):
                 external_trigger=False,
                 session=session
             )
+            Stats.gauge('dagrun.in_use', float(len(active_runs)) / dag.max_active_runs * 100,
+                        tags=['dag_id:{}'.format(dag.dag_id)])
             # return if already reached maximum active runs and no timeout setting
             if len(active_runs) >= dag.max_active_runs and not dag.dagrun_timeout:
                 return
@@ -796,6 +807,7 @@ class SchedulerJob(BaseJob):
                 self.log.debug("Examining active DAG run: %s", run)
                 for ti in ready_tis:
                     self.log.debug('Queuing task: %s', ti)
+                    Stats.incr('scheduler.task_queued', tags=['dag_id:{}'.format(dag.dag_id)])
                     task_instances_list.append(ti.key)
 
     @provide_session
@@ -1023,7 +1035,10 @@ class SchedulerJob(BaseJob):
                     current_task_concurrency = task_concurrency_map[
                         (task_instance.dag_id, task_instance.task_id)
                     ]
-
+                    Stats.gauge('dag_concurrency', current_dag_concurrency, tags=['dag_id:{}'.format(dag_id)])
+                    Stats.gauge('dag_concurrency.in_use',
+                                (float(current_dag_concurrency) / dag_concurrency_limit) * 100,
+                                tags=['dag_id:{}'.format(dag_id)])
                     if current_task_concurrency >= task_concurrency_limit:
                         self.log.info("Not executing %s since the task concurrency for"
                                       " this task has been reached.", task_instance)
@@ -1048,6 +1063,9 @@ class SchedulerJob(BaseJob):
 
                 executable_tis.append(task_instance)
                 open_slots -= task_instance.pool_slots
+                if pool:
+                    pool_percent_full = (1 - float(open_slots) / pools[pool].slots) * 100
+                    Stats.gauge('pool.in_use', pool_percent_full, tags=['pool:{}'.format(pool)])
                 dag_concurrency_map[dag_id] += 1
                 task_concurrency_map[(task_instance.dag_id, task_instance.task_id)] += 1
 
@@ -1296,6 +1314,9 @@ class SchedulerJob(BaseJob):
                     Stats.timing(
                         'dagrun.schedule_delay.{dag_id}'.format(dag_id=dag.dag_id),
                         schedule_delay)
+                    Stats.timing('dagrun.schedule_delay',
+                                 schedule_delay,
+                                 tags=['dag_id:{dag.dag_id}']),
                 self.log.info("Created %s", dag_run)
             self._process_task_instances(dag, tis_out)
             if conf.getboolean('core', 'CHECK_SLAS', fallback=True):
