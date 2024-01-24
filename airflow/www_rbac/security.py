@@ -206,6 +206,7 @@ class AirflowSecurityManager(SecurityManager, LoggingMixin):
         if not role:
             role = self.add_role(role_name)
 
+        # Use same logic as admin update function update_admin_perm_view to recreate role permissions
         self.log.info('Initializing permissions for role:%s in the database.', role_name)
         role_pvms = set()
         for pvm in pvms:
