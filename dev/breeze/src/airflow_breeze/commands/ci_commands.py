@@ -21,46 +21,58 @@ import json
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterable
+from datetime import UTC, datetime, timedelta
 from io import StringIO
 from pathlib import Path
-from typing import Any, Iterable, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import click
 
+from airflow_breeze.branch_defaults import AIRFLOW_BRANCH, DEFAULT_AIRFLOW_CONSTRAINTS_BRANCH
+from airflow_breeze.commands.common_options import (
+    option_answer,
+    option_dry_run,
+    option_github_repository,
+    option_github_token,
+    option_verbose,
+)
 from airflow_breeze.global_constants import (
+    APACHE_AIRFLOW_GITHUB_REPOSITORY,
+    CI_AMD_PLATFORM,
+    CI_PLATFORMS,
     DEFAULT_PYTHON_MAJOR_MINOR_VERSION,
-    RUNS_ON_PUBLIC_RUNNER,
-    RUNS_ON_SELF_HOSTED_RUNNER,
+    MILESTONE_BUG_LABELS,
+    MILESTONE_SKIP_LABELS,
+    PUBLIC_AMD_RUNNERS,
     GithubEvents,
     github_events,
 )
 from airflow_breeze.params.shell_params import ShellParams
 from airflow_breeze.utils.click_utils import BreezeGroup
-from airflow_breeze.utils.common_options import (
-    option_airflow_constraints_reference,
-    option_answer,
-    option_dry_run,
-    option_max_age,
-    option_python,
-    option_timezone,
-    option_updated_on_or_after,
-    option_verbose,
-)
 from airflow_breeze.utils.confirm import Answer, user_confirm
-from airflow_breeze.utils.console import get_console, get_stderr_console
+from airflow_breeze.utils.console import console_print, get_console
 from airflow_breeze.utils.custom_param_types import BetterChoice
 from airflow_breeze.utils.docker_command_utils import (
     check_docker_resources,
     fix_ownership_using_docker,
     perform_environment_checks,
 )
-from airflow_breeze.utils.find_newer_dependencies import find_newer_dependencies
-from airflow_breeze.utils.github_actions import get_ga_output
-from airflow_breeze.utils.path_utils import AIRFLOW_SOURCES_ROOT, MSSQL_TMP_DIR_NAME
+from airflow_breeze.utils.fork_compare import get_fork_changes, get_fork_pull_request_labels, is_fork_push
+from airflow_breeze.utils.gh_workflow_utils import mirror_hardened_base_images
+from airflow_breeze.utils.git_remotes import find_remote, find_remote_for_repo, get_remotes
+from airflow_breeze.utils.github import format_github_token_scope_guidance, retrieve_github_token
+from airflow_breeze.utils.path_utils import AIRFLOW_HOME_PATH, AIRFLOW_ROOT_PATH
 from airflow_breeze.utils.run_utils import run_command
+
+if TYPE_CHECKING:
+    from github import Github
+    from github.IssueEvent import IssueEvent
+    from github.Repository import Issue, Milestone, Repository
 
 
 @click.group(cls=BreezeGroup, name="ci", help="Tools that CI workflows use to cleanup/manage CI environment")
@@ -87,9 +99,9 @@ def free_space():
         run_command(["docker", "system", "prune", "--all", "--force", "--volumes"])
         run_command(["df", "-h"])
         run_command(["docker", "logout", "ghcr.io"], check=False)
-        run_command(
-            ["sudo", "rm", "-f", os.fspath(Path.home() / MSSQL_TMP_DIR_NAME)],
-        )
+        shutil.rmtree(AIRFLOW_HOME_PATH, ignore_errors=True)
+        AIRFLOW_HOME_PATH.mkdir(exist_ok=True, parents=True)
+        run_command(["pip", "uninstall", "apache-airflow", "--yes"], check=False)
 
 
 @ci_group.command(name="resource-check", help="Check if available docker resources are enough.")
@@ -104,24 +116,23 @@ def resource_check():
 HOME_DIR = Path(os.path.expanduser("~")).resolve()
 
 DIRECTORIES_TO_FIX = [
-    AIRFLOW_SOURCES_ROOT,
+    AIRFLOW_ROOT_PATH,
     HOME_DIR / ".aws",
     HOME_DIR / ".azure",
     HOME_DIR / ".config/gcloud",
     HOME_DIR / ".docker",
-    HOME_DIR / MSSQL_TMP_DIR_NAME,
 ]
 
 
 def fix_ownership_for_file(file: Path):
-    get_console().print(f"[info]Fixing ownership of {file}")
+    console_print(f"[info]Fixing ownership of {file}")
     result = run_command(
         ["sudo", "chown", f"{os.getuid}:{os.getgid()}", str(file.resolve())],
         check=False,
         stderr=subprocess.STDOUT,
     )
     if result.returncode != 0:
-        get_console().print(f"[warning]Could not fix ownership for {file}: {result.stdout}")
+        console_print(f"[warning]Could not fix ownership for {file}: {result.stdout}")
 
 
 def fix_ownership_for_path(path: Path):
@@ -151,16 +162,16 @@ def fix_ownership_without_docker():
 def fix_ownership(use_sudo: bool):
     system = platform.system().lower()
     if system != "linux":
-        get_console().print(
+        console_print(
             f"[warning]You should only need to run fix-ownership on Linux and your system is {system}"
         )
         sys.exit(0)
     if use_sudo:
-        get_console().print("[info]Fixing ownership using sudo.")
+        console_print("[info]Fixing ownership using sudo.")
         fix_ownership_without_docker()
         sys.exit(0)
-    get_console().print("[info]Fixing ownership using docker.")
-    fix_ownership_using_docker()
+    console_print("[info]Fixing ownership using docker.")
+    fix_ownership_using_docker(quiet=False)
     # Always succeed
     sys.exit(0)
 
@@ -179,14 +190,32 @@ def get_changed_files(commit_ref: str | None) -> tuple[str, ...]:
     ]
     result = run_command(cmd, check=False, capture_output=True, text=True)
     if result.returncode != 0:
-        get_stderr_console().print(
-            f"[warning] Error when running diff-tree command [/]\n{result.stdout}\n{result.stderr}"
-        )
+        console_print(f"[warning] Error when running diff-tree command [/]\n{result.stdout}\n{result.stderr}")
         return ()
     changed_files = tuple(result.stdout.splitlines()) if result.stdout else ()
-    get_stderr_console().print("\n[info]Changed files:[/]\n")
-    get_stderr_console().print(changed_files)
-    get_stderr_console().print()
+    console_print("\n[info]Changed files:[/]\n")
+    console_print(changed_files)
+    console_print()
+    return changed_files
+
+
+def get_changed_files_since(base_ref: str, commit_ref: str) -> tuple[str, ...] | None:
+    """Return the files changed between two commits, or None when they cannot be computed."""
+    # `--no-renames`, as `diff-tree` in `get_changed_files`: a rename counts as a delete plus an add,
+    # so that the tests of the old path are selected too.
+    result = run_command(
+        ["git", "diff", "--name-only", "--no-renames", base_ref, commit_ref],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        console_print(f"[warning] Error when running diff command [/]\n{result.stdout}\n{result.stderr}")
+        return None
+    changed_files = tuple(result.stdout.splitlines()) if result.stdout else ()
+    console_print(f"\n[info]Changed files since {base_ref}:[/]\n")
+    console_print(changed_files)
+    console_print()
     return changed_files
 
 
@@ -207,14 +236,14 @@ def get_changed_files(commit_ref: str | None) -> tuple[str, ...]:
 @click.option(
     "--default-branch",
     help="Branch against which the PR should be run",
-    default="main",
+    default=AIRFLOW_BRANCH,
     envvar="DEFAULT_BRANCH",
     show_default=True,
 )
 @click.option(
     "--default-constraints-branch",
     help="Constraints Branch against which the PR should be run",
-    default="constraints-main",
+    default=DEFAULT_AIRFLOW_CONSTRAINTS_BRANCH,
     envvar="DEFAULT_CONSTRAINTS_BRANCH",
     show_default=True,
 )
@@ -226,6 +255,52 @@ def get_changed_files(commit_ref: str | None) -> tuple[str, ...]:
     envvar="GITHUB_EVENT_NAME",
     show_default=True,
 )
+@option_github_repository
+@click.option(
+    "--github-actor",
+    help="Actor that triggered the event (GitHub user)",
+    envvar="GITHUB_ACTOR",
+    type=str,
+    default="",
+)
+@click.option(
+    "--platform",
+    "ci_platform",
+    type=BetterChoice(CI_PLATFORMS),
+    default=CI_AMD_PLATFORM,
+    help="Platform the tests of this run execute on. "
+    "It decides which integrations and providers are testable.",
+    envvar="PLATFORM",
+    show_default=True,
+)
+@click.option(
+    "--selective-tests-on-push",
+    help="Select tests for a push event from the changed files, as for a pull request, "
+    "instead of running all tests.",
+    is_flag=True,
+    envvar="SELECTIVE_TESTS_ON_PUSH",
+)
+@click.option(
+    "--push-base-commit",
+    help="With --selective-tests-on-push: select tests from the files changed since this commit. "
+    "Without it, a push runs all tests.",
+    envvar="PUSH_BASE_COMMIT",
+    default="",
+)
+@click.option(
+    "--github-context",
+    help="GitHub context (JSON formatted) passed by GitHub Actions",
+    envvar="GITHUB_CONTEXT",
+    type=str,
+    default="",
+)
+@click.option(
+    "--github-context-input",
+    help="File input (might be `-`) with JSON-formatted github context. "
+    "Use this instead of --github-context for large contexts that would exceed ARG_MAX as an env var.",
+    type=click.File("rt"),
+    envvar="GITHUB_CONTEXT_INPUT",
+)
 @option_verbose
 @option_dry_run
 def selective_check(
@@ -234,41 +309,76 @@ def selective_check(
     default_branch: str,
     default_constraints_branch: str,
     github_event_name: str,
+    github_repository: str,
+    github_actor: str,
+    github_context: str,
+    github_context_input: StringIO | None,
+    ci_platform: str,
+    selective_tests_on_push: bool,
+    push_base_commit: str,
 ):
-    from airflow_breeze.utils.selective_checks import SelectiveChecks
+    try:
+        from airflow_breeze.utils.selective_checks import SelectiveChecks
 
-    github_event = GithubEvents(github_event_name)
-    if commit_ref is not None:
-        changed_files = get_changed_files(commit_ref=commit_ref)
-    else:
-        changed_files = ()
-    sc = SelectiveChecks(
-        commit_ref=commit_ref,
-        files=changed_files,
-        default_branch=default_branch,
-        default_constraints_branch=default_constraints_branch,
-        pr_labels=tuple(ast.literal_eval(pr_labels)) if pr_labels else (),
-        github_event=github_event,
-    )
-    print(str(sc), file=sys.stdout)
-
-
-@ci_group.command(name="find-newer-dependencies", help="Finds which dependencies are being upgraded.")
-@option_timezone
-@option_airflow_constraints_reference
-@option_python
-@option_updated_on_or_after
-@option_max_age
-def breeze_find_newer_dependencies(
-    airflow_constraints_reference: str, python: str, timezone: str, updated_on_or_after: str, max_age: int
-):
-    return find_newer_dependencies(
-        constraints_branch=airflow_constraints_reference,
-        python=python,
-        timezone=timezone,
-        updated_on_or_after=updated_on_or_after,
-        max_age=max_age,
-    )
+        if github_context and github_context_input:
+            console_print("[error]You can only specify one of --github-context or --github-context-input")
+            sys.exit(1)
+        if github_context_input:
+            github_context = github_context_input.read()
+        github_context_dict = json.loads(github_context) if github_context else {}
+        github_event = GithubEvents(github_event_name)
+        changed_files: tuple[str, ...] = ()
+        fork_push = is_fork_push(github_event, github_repository)
+        fork_changes_truncated = False
+        fork_merge_base = None
+        labels = tuple(ast.literal_eval(pr_labels)) if pr_labels else ()
+        fork_owner = github_repository.split("/")[0]
+        if fork_push and github_context_dict.get("ref_name"):
+            labels = get_fork_pull_request_labels(
+                fork_owner=fork_owner, branch=github_context_dict["ref_name"], base=default_branch
+            )
+        if fork_push and commit_ref is not None:
+            fork_changes = get_fork_changes(fork_owner=fork_owner, sha=commit_ref, base=default_branch)
+            changed_files = fork_changes.files
+            fork_changes_truncated = fork_changes.truncated
+            fork_merge_base = fork_changes.merge_base
+            console_print(f"\n[info]Changed files against apache/airflow:[/]\n{changed_files}\n")
+        elif commit_ref is not None and selective_tests_on_push and github_event == GithubEvents.PUSH:
+            # The base is the last successful run of the branch, so this run also covers the commits
+            # whose push runs failed or were cancelled by a newer push. Without one, nothing after the
+            # branch point is known to pass, so everything runs.
+            pushed_files = (
+                get_changed_files_since(base_ref=push_base_commit, commit_ref=commit_ref)
+                if push_base_commit
+                else None
+            )
+            if pushed_files is None:
+                console_print("[warning]No tested base commit for the push, running all tests[/]")
+                commit_ref = None
+            else:
+                changed_files = pushed_files
+        elif commit_ref is not None:
+            changed_files = get_changed_files(commit_ref=commit_ref)
+        sc = SelectiveChecks(
+            commit_ref=commit_ref,
+            files=changed_files,
+            default_branch=default_branch,
+            default_constraints_branch=default_constraints_branch,
+            pr_labels=labels,
+            github_event=github_event,
+            github_repository=github_repository,
+            github_actor=github_actor,
+            github_context_dict=github_context_dict,
+            platform=ci_platform,
+            selective_tests_on_push=selective_tests_on_push,
+            fork_push=fork_push,
+            fork_changes_truncated=fork_changes_truncated,
+            fork_merge_base=fork_merge_base,
+        )
+        print(str(sc), file=sys.stderr)
+    except Exception:
+        get_console().print_exception(show_locals=True)
+        sys.exit(1)
 
 
 TEST_BRANCH_MATCHER = re.compile(r"^v.*test$")
@@ -282,18 +392,20 @@ class WorkflowInfo(NamedTuple):
     ref: str | None
     ref_name: str | None
     pr_number: int | None
+    head_ref: str | None = None
 
     def get_all_ga_outputs(self) -> Iterable[str]:
+        from airflow_breeze.utils.github import get_ga_output
+
         yield get_ga_output(name="pr_labels", value=str(self.pull_request_labels))
         yield get_ga_output(name="target_repo", value=self.target_repo)
         yield get_ga_output(name="head_repo", value=self.head_repo)
         yield get_ga_output(name="pr_number", value=str(self.pr_number) if self.pr_number else "")
         yield get_ga_output(name="event_name", value=str(self.event_name))
         yield get_ga_output(name="runs-on", value=self.get_runs_on())
-        yield get_ga_output(name="in-workflow-build", value=self.in_workflow_build())
-        yield get_ga_output(name="build-job-description", value=self.get_build_job_description())
         yield get_ga_output(name="canary-run", value=self.is_canary_run())
         yield get_ga_output(name="run-coverage", value=self.run_coverage())
+        yield get_ga_output(name="head-ref", value=self.head_ref)
 
     def print_all_ga_outputs(self):
         for output in self.get_all_ga_outputs():
@@ -302,34 +414,35 @@ class WorkflowInfo(NamedTuple):
     def get_runs_on(self) -> str:
         for label in self.pull_request_labels:
             if "use public runners" in label:
-                get_console().print("[info]Force running on public runners")
-                return RUNS_ON_PUBLIC_RUNNER
-        if not os.environ.get("AIRFLOW_SELF_HOSTED_RUNNER"):
-            return RUNS_ON_PUBLIC_RUNNER
-        return RUNS_ON_SELF_HOSTED_RUNNER
-
-    def in_workflow_build(self) -> str:
-        if self.event_name == "push" or self.head_repo == "apache/airflow":
-            return "true"
-        return "false"
-
-    def get_build_job_description(self) -> str:
-        if self.in_workflow_build() == "true":
-            return "Build"
-        return "Skip Build (look in pull_request_target)"
+                console_print("[info]Force running on public runners")
+                return PUBLIC_AMD_RUNNERS
+        return PUBLIC_AMD_RUNNERS
 
     def is_canary_run(self) -> str:
+        # A push is never a canary: the CI workflows build on push only to run the selective tests
+        # of the pushed commit, and full runs of release branches are dispatched by
+        # `release-branch-ci.yml`.
         if (
-            self.event_name == "push"
+            self.event_name
+            in [
+                GithubEvents.WORKFLOW_DISPATCH.value,
+                GithubEvents.SCHEDULE.value,
+            ]
             and self.head_repo == "apache/airflow"
             and self.ref_name
             and (self.ref_name == "main" or TEST_BRANCH_MATCHER.match(self.ref_name))
         ):
             return "true"
+        if "canary" in self.pull_request_labels:
+            return "true"
         return "false"
 
     def run_coverage(self) -> str:
-        if self.event_name == "push" and self.head_repo == "apache/airflow" and self.ref == "refs/heads/main":
+        if (
+            self.event_name == GithubEvents.PUSH.value
+            and self.head_repo == "apache/airflow"
+            and self.ref == "refs/heads/main"
+        ):
             return "true"
         return "false"
 
@@ -338,7 +451,7 @@ def workflow_info(context: str) -> WorkflowInfo:
     ctx: dict[Any, Any] = json.loads(context)
     event_name = ctx.get("event_name")
     if not event_name:
-        get_console().print(f"[error]Missing event_name in: {ctx}")
+        console_print(f"[error]Missing event_name in: {ctx}")
         sys.exit(1)
     pull_request_labels = []
     head_repo = ""
@@ -346,10 +459,11 @@ def workflow_info(context: str) -> WorkflowInfo:
     pr_number: int | None = None
     ref_name = ctx.get("ref_name")
     ref = ctx.get("ref")
-    if event_name == "pull_request":
+    head_ref = ctx.get("head_ref")
+    if event_name == GithubEvents.PULL_REQUEST.value:
         event = ctx.get("event")
         if event:
-            pr = event.get("pull_request")
+            pr = event.get(GithubEvents.PULL_REQUEST.value)
             if pr:
                 labels = pr.get("labels")
                 if labels:
@@ -358,20 +472,24 @@ def workflow_info(context: str) -> WorkflowInfo:
                 target_repo = pr["base"]["repo"]["full_name"]
                 head_repo = pr["head"]["repo"]["full_name"]
                 pr_number = pr["number"]
-    elif event_name == "push":
+    elif event_name == GithubEvents.PUSH.value:
         target_repo = ctx["repository"]
         head_repo = ctx["repository"]
         event_name = ctx["event_name"]
-    elif event_name == "schedule":
+    elif event_name == GithubEvents.SCHEDULE.value:
         target_repo = ctx["repository"]
         head_repo = ctx["repository"]
         event_name = ctx["event_name"]
-    elif event_name == "pull_request_target":
+    elif event_name == GithubEvents.WORKFLOW_DISPATCH.value:
+        target_repo = ctx["repository"]
+        head_repo = ctx["repository"]
+        event_name = ctx["event_name"]
+    elif event_name == GithubEvents.PULL_REQUEST_TARGET.value:
         target_repo = ctx["repository"]
         head_repo = ctx["repository"]
         event_name = ctx["event_name"]
     else:
-        get_console().print(f"[error]Wrong event name: {event_name}")
+        console_print(f"[error]Wrong event name: {event_name}")
         sys.exit(1)
     return WorkflowInfo(
         event_name=event_name,
@@ -381,6 +499,7 @@ def workflow_info(context: str) -> WorkflowInfo:
         pr_number=pr_number,
         ref=ref,
         ref_name=ref_name,
+        head_ref=head_ref,
     )
 
 
@@ -398,18 +517,1385 @@ def workflow_info(context: str) -> WorkflowInfo:
 )
 def get_workflow_info(github_context: str, github_context_input: StringIO):
     if github_context and github_context_input:
-        get_console().print(
-            "[error]You can only specify one of the two --github-context or --github-context-file"
-        )
+        console_print("[error]You can only specify one of the two --github-context or --github-context-file")
         sys.exit(1)
     if github_context:
         context = github_context
     elif github_context_input:
         context = github_context_input.read()
     else:
-        get_console().print(
-            "[error]You must specify one of the two --github-context or --github-context-file"
-        )
+        console_print("[error]You must specify one of the two --github-context or --github-context-file")
         sys.exit(1)
     wi = workflow_info(context=context)
     wi.print_all_ga_outputs()
+
+
+def _check_k8s_schema_published(version: str) -> bool:
+    """Check if K8s schemas for a given version are published on airflow.apache.org."""
+    from urllib.error import HTTPError, URLError
+    from urllib.request import Request, urlopen
+
+    url = f"https://airflow.apache.org/k8s-schemas/v{version}-standalone-strict/configmap-v1.json"
+    req = Request(url, method="HEAD")
+    try:
+        resp = urlopen(req, timeout=15)
+        return resp.status == 200
+    except (HTTPError, URLError):
+        return False
+
+
+def _sync_k8s_schemas_to_airflow_site(airflow_site: Path, force: bool, command_env: dict[str, str]) -> None:
+    """Sync K8s schemas to airflow-site directory if needed."""
+    from airflow_breeze.global_constants import ALLOWED_KUBERNETES_VERSIONS
+
+    versions = [v.lstrip("v") for v in ALLOWED_KUBERNETES_VERSIONS]
+    missing: list[str] = []
+    for version in versions:
+        if not _check_k8s_schema_published(version):
+            missing.append(version)
+
+    if not missing and not force:
+        console_print("[success]All K8s schema versions are already published. Skipping sync.[/]")
+        return
+
+    if missing:
+        console_print(f"[warning]K8s schemas missing for versions: {', '.join(f'v{v}' for v in missing)}[/]")
+    else:
+        console_print("[info]Force sync requested.[/]")
+
+    if not airflow_site.is_dir():
+        console_print(
+            f"[error]airflow-site directory not found at {airflow_site}. "
+            "Use --airflow-site to specify the path to the airflow-site checkout.[/]"
+        )
+        return
+
+    # Verify this is the airflow-site repo by checking git remote
+    remote_result = run_command(
+        ["git", "-C", str(airflow_site), "remote", "-v"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if remote_result.returncode != 0 or "airflow-site" not in remote_result.stdout:
+        console_print(
+            f"[error]{airflow_site} does not appear to be a clone of the airflow-site repository.[/]"
+        )
+        return
+
+    static_dir = airflow_site / "landing-pages" / "site" / "static"
+    if not static_dir.is_dir():
+        console_print(
+            f"[error]Expected directory structure not found: {static_dir}\n"
+            "The airflow-site checkout should contain landing-pages/site/static/.[/]"
+        )
+        return
+
+    output_dir = static_dir / "k8s-schemas"
+
+    # Filter out versions already present in the local airflow-site checkout
+    versions_to_download = missing if (missing and not force) else versions
+    versions_to_download = [
+        v
+        for v in versions_to_download
+        if not (output_dir / f"v{v}-standalone-strict").is_dir()
+        or not any((output_dir / f"v{v}-standalone-strict").iterdir())
+    ]
+
+    if not versions_to_download:
+        console_print(
+            "[success]All required K8s schema versions already exist in airflow-site. Skipping download.[/]"
+        )
+        return
+
+    console_print(
+        f"[info]Downloading K8s schemas for versions "
+        f"{', '.join(f'v{v}' for v in versions_to_download)} to {output_dir}...[/]"
+    )
+    cmd = [
+        "uv",
+        "run",
+        str(AIRFLOW_ROOT_PATH / "scripts" / "ci" / "prek" / "download_k8s_schemas.py"),
+        "--output-dir",
+        str(output_dir),
+        "--versions",
+        *versions_to_download,
+    ]
+    run_command(cmd, check=False, env=command_env)
+
+
+def remove_backport_labels(*, branch_name: str, command_env: dict[str, str]) -> None:
+    """Drop any ``backport-to-*`` label boring-cyborg put on the upgrade PR.
+
+    The CI environment is upgraded on each maintenance branch by that branch's own scheduled
+    run, so backporting main's upgrade would race it with a change that conflicts on the very
+    files it regenerates. boring-cyborg labels by path and cannot tell this PR apart from a
+    hand-written one touching ``dev/`` or ``.github/``, so the label is removed here instead.
+
+    Labelling happens on a webhook and may land after this runs; ``upgrade-check.yml`` sweeps
+    again once the PR has settled, so a miss here is not the last word.
+    """
+    labels_result = run_command(
+        [
+            "gh",
+            "pr",
+            "view",
+            branch_name,
+            "--repo",
+            "apache/airflow",
+            "--json",
+            "labels",
+            "--jq",
+            '[.labels[].name | select(startswith("backport-to-"))] | join(",")',
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=command_env,
+    )
+    if labels_result.returncode != 0:
+        console_print("[warning]Could not read PR labels - leaving any backport labels in place.[/]")
+        return
+    labels = [label for label in labels_result.stdout.strip().split(",") if label]
+    if not labels:
+        return
+    remove_cmd = ["gh", "pr", "edit", branch_name, "--repo", "apache/airflow"]
+    for label in labels:
+        remove_cmd.extend(["--remove-label", label])
+    if run_command(remove_cmd, capture_output=True, text=True, check=False, env=command_env).returncode:
+        console_print(f"[warning]Could not remove backport labels: {', '.join(labels)}[/]")
+    else:
+        console_print(f"[success]Removed backport labels: {', '.join(labels)}.[/]")
+
+
+# All upgrade commands run locally with check=False to continue on errors.
+# The uv lock --upgrade step must run after the steps that change dependencies, so it can
+# incorporate them -- and before the steps that regenerate code from the resolved versions.
+UPGRADE_COMMANDS: list[tuple[str, str]] = [
+    ("autoupdate", "prek autoupdate --cooldown-days 4 --freeze"),
+    (
+        "update-chart-dependencies",
+        "prek --all-files --show-diff-on-failure --color always --verbose --stage manual update-chart-dependencies",
+    ),
+    (
+        "upgrade-important-versions",
+        "prek --all-files --show-diff-on-failure --color always --verbose --stage manual upgrade-important-versions",
+    ),
+    (
+        "upgrade-dependency-floors",
+        "prek --all-files --show-diff-on-failure --color always --verbose --stage manual upgrade-dependency-floors",
+    ),
+    (
+        # Raised floors change provider pyproject.toml files, but the requirement tables rendered
+        # from them into README.rst and docs/index.rst are only refreshed by these hooks, and the
+        # upgrade commit is not made with prek hooks installed, so CI's --all-files run goes red.
+        "regenerate-provider-requirement-tables",
+        "prek --all-files --show-diff-on-failure --color always --verbose "
+        "update-providers-build-files sync-provider-readme",
+    ),
+    (
+        "update-uv-lock",
+        "uv lock --upgrade",
+    ),
+    (
+        # The lock upgrade can bump datamodel-code-generator, whose version is stamped into the
+        # generated files' header. These hooks only watch the API sources, which an upgrade run
+        # never touches, so nothing regenerates them here and CI's --all-files run goes red.
+        "regenerate-datamodels",
+        "prek --all-files --show-diff-on-failure --color always --verbose "
+        "generate-tasksdk-datamodels generate-airflowctl-datamodels",
+    ),
+]
+
+
+DEPENDENCY_FLOORS_REPORT_ENV = "DEPENDENCY_FLOORS_REPORT"
+UPGRADE_PR_BODY = "This PR upgrades important dependencies of the CI environment."
+
+
+def build_upgrade_pr_body(floors_report: str | None) -> str:
+    if not floors_report:
+        return UPGRADE_PR_BODY
+    return f"{UPGRADE_PR_BODY}\n\n{floors_report}"
+
+
+def commit_upgrade_changes(target_branch: str) -> None:
+    run_command(["git", "add", "--all"])
+    try:
+        run_command(["git", "commit", "--message", f"[{target_branch}] CI: Upgrade important CI environment"])
+    except subprocess.CalledProcessError:
+        console_print("[info]Commit failed, assume some auto-fixes might have been made...[/]")
+        run_command(["git", "add", "--all"])
+        run_command(
+            [
+                "git",
+                "commit",
+                # postpone pre-commit checks to CI, not to fail in automation if e.g. mypy changes force code checks
+                "--no-verify",
+                "--message",
+                f"[{target_branch}] CI: Upgrade important CI environment",
+            ]
+        )
+
+
+def push_upgrade_to_target_branch(remote: str | None, target_branch: str, floors_report: str | None) -> None:
+    if not remote:
+        console_print("[error]Pushing to the target branch needs a remote pointing to apache/airflow.[/]")
+        sys.exit(1)
+    commit_upgrade_changes(target_branch)
+    console_print(f"[info]Pushing the upgrade to {remote}/{target_branch}...[/]")
+    push_result = run_command(
+        ["git", "push", remote, f"HEAD:refs/heads/{target_branch}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if push_result.returncode != 0:
+        console_print(f"[error]Failed to push:\n{push_result.stdout}\n{push_result.stderr}[/]")
+        sys.exit(1)
+    console_print(f"[success]The upgrade is pushed to {target_branch}.[/]")
+    if floors_report:
+        console_print(floors_report)
+
+
+def mirror_base_images_before_upgrade(target_branch: str, github_token: str | None) -> None:
+    if github_token:
+        # The mirror's gh calls read the token from the process environment, not the upgrade's env.
+        os.environ["GITHUB_TOKEN"] = github_token
+    mirror_hardened_base_images(
+        "apache/airflow",
+        hint="Or skip it with --no-mirror-base-images.",
+        # The mirror would otherwise start a second main upgrade next to this one.
+        trigger_upgrade_check=target_branch != "main",
+        build_os_deps_images=False,
+    )
+
+
+def get_step_enabled(
+    *,
+    autoupdate: bool,
+    update_chart_dependencies: bool,
+    upgrade_important_versions: bool,
+    upgrade_dependency_floors: bool,
+    update_uv_lock: bool,
+) -> dict[str, bool]:
+    return {
+        "autoupdate": autoupdate,
+        "update-chart-dependencies": update_chart_dependencies,
+        "upgrade-important-versions": upgrade_important_versions,
+        "upgrade-dependency-floors": upgrade_dependency_floors,
+        "regenerate-provider-requirement-tables": upgrade_dependency_floors,
+        "update-uv-lock": update_uv_lock,
+        "regenerate-datamodels": update_uv_lock,
+    }
+
+
+def read_floors_report(report_path: Path) -> str | None:
+    """Return the report the floors step wrote, if any, and remove its temporary directory."""
+    report = report_path.read_text() if report_path.exists() else None
+    shutil.rmtree(report_path.parent, ignore_errors=True)
+    return report
+
+
+def build_update_pr_body_command(branch_name: str, pr_body: str) -> list[str]:
+    return ["gh", "pr", "edit", branch_name, "--repo", "apache/airflow", "--body", pr_body]
+
+
+@ci_group.command(
+    name="upgrade",
+    help="Perform important upgrade steps of the CI environment. And create a PR",
+)
+@click.option(
+    "--target-branch",
+    default=AIRFLOW_BRANCH,
+    help="Branch to work on and make PR against (e.g., 'main' or 'vX-Y-test')",
+    show_default=True,
+)
+@click.option(
+    "--create-pr/--no-create-pr",
+    default=None,
+    help="Automatically create a PR with the upgrade changes (if not specified, will ask)",
+    is_flag=True,
+)
+@click.option(
+    "--push-to-target-branch",
+    is_flag=True,
+    default=False,
+    help="Commit the upgrade onto the target release branch and push it there instead of opening a PR - "
+    "what the release manager does before the test-to-stable PR, whose head is that branch. Needs "
+    "committer rights, as the release branch rules let only committers push without CI having passed",
+)
+@click.option(
+    "--draft/--no-draft",
+    default=False,
+    show_default=True,
+    help="Create the PR as a draft (useful for scheduled CI runs where a human undrafts to trigger CI)",
+    is_flag=True,
+)
+@click.option(
+    "--switch-to-base/--no-switch-to-base",
+    default=None,
+    help="Automatically switch to the base branch if not already on it (if not specified, will ask)",
+    is_flag=True,
+)
+@click.option(
+    "--airflow-site",
+    default="../airflow-site",
+    show_default=True,
+    type=click.Path(file_okay=False, dir_okay=True, resolve_path=True, path_type=Path),
+    help="Path to airflow-site checkout for publishing K8s schemas",
+)
+@click.option(
+    "--force-k8s-schema-sync",
+    is_flag=True,
+    default=False,
+    help="Force syncing K8s schemas to airflow-site even if all versions appear published",
+)
+@click.option(
+    "--autoupdate/--no-autoupdate",
+    default=True,
+    show_default=True,
+    help="Run prek autoupdate to update hook revisions",
+)
+@click.option(
+    "--update-chart-dependencies/--no-update-chart-dependencies",
+    default=True,
+    show_default=True,
+    help="Run update-chart-dependencies to update Helm chart dependencies",
+)
+@click.option(
+    "--upgrade-important-versions/--no-upgrade-important-versions",
+    default=True,
+    show_default=True,
+    help="Run upgrade-important-versions to bump key dependency versions",
+)
+@click.option(
+    "--upgrade-dependency-floors/--no-upgrade-dependency-floors",
+    default=True,
+    show_default=True,
+    help="Raise the floors of the curated dependencies in [tool.airflow.dependency-floors]",
+)
+@click.option(
+    "--mirror-base-images/--no-mirror-base-images",
+    default=True,
+    show_default=True,
+    help="Mirror the latest hardened base images (a workflow run on main) before upgrading important "
+    "versions, so the upgrade can pin them. Needs gh credentials that may dispatch apache/airflow "
+    "workflows",
+)
+@click.option(
+    "--update-uv-lock/--no-update-uv-lock",
+    default=True,
+    show_default=True,
+    help="Run update-uv-lock to regenerate uv.lock with latest resolutions inside Breeze CI image, "
+    "then regenerate the API datamodels the resolved code generator stamps its version into",
+)
+@click.option(
+    "--k8s-schema-sync/--no-k8s-schema-sync",
+    default=True,
+    show_default=True,
+    help="Sync K8s JSON schemas to airflow-site",
+)
+@click.option(
+    "--latest-package-managers/--no-latest-package-managers",
+    default=False,
+    show_default=True,
+    help="Bypass cooldown when upgrading package managers (pip and uv) to use their latest versions",
+)
+@option_github_token
+@option_answer
+@option_verbose
+@option_dry_run
+def upgrade(
+    target_branch: str,
+    create_pr: bool | None,
+    push_to_target_branch: bool,
+    draft: bool,
+    switch_to_base: bool | None,
+    airflow_site: Path,
+    force_k8s_schema_sync: bool,
+    autoupdate: bool,
+    update_chart_dependencies: bool,
+    upgrade_important_versions: bool,
+    upgrade_dependency_floors: bool,
+    mirror_base_images: bool,
+    update_uv_lock: bool,
+    k8s_schema_sync: bool,
+    latest_package_managers: bool,
+    github_token: str | None,
+):
+    # Validate target_branch pattern
+    target_branch_pattern = re.compile(r"^(main|v\d+-\d+-test)$")
+    if not target_branch_pattern.match(target_branch):
+        console_print(
+            f"[error]Invalid target branch: '{target_branch}'. "
+            "Must be 'main' or follow pattern 'vX-Y-test' where X and Y are numbers (e.g., 'v2-10-test').[/]"
+        )
+        sys.exit(1)
+    if push_to_target_branch and target_branch == "main":
+        console_print("[error]main takes changes only through PRs - drop --push-to-target-branch.[/]")
+        sys.exit(1)
+
+    # Check if we're on the main branch
+    branch_result = run_command(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True, check=False
+    )
+    current_branch = branch_result.stdout.strip() if branch_result.returncode == 0 else ""
+
+    # Store the original branch/commit to restore later if needed
+    original_branch = current_branch
+    original_commit_result = run_command(
+        ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=False
+    )
+    original_commit = original_commit_result.stdout.strip() if original_commit_result.returncode == 0 else ""
+
+    # Check if the working directory is clean
+    status_result = run_command(["git", "status", "--porcelain"], capture_output=True, text=True, check=False)
+    is_clean = status_result.returncode == 0 and not status_result.stdout.strip()
+
+    remotes = get_remotes()
+    apache_remote = find_remote_for_repo(remotes, APACHE_AIRFLOW_GITHUB_REPOSITORY)
+    apache_remote_name = apache_remote.name if apache_remote else None
+    origin_remote = find_remote(remotes, "origin")
+    origin_remote_name = origin_remote.name if origin_remote else None
+    origin_repo = origin_remote.repo if origin_remote else None
+
+    has_apache_remote = apache_remote_name is not None
+
+    # Check if we're up to date with apache/airflow on the specified branch
+    if has_apache_remote:
+        # Fetch apache remote to get latest info
+        run_command(["git", "fetch", apache_remote_name], check=False)
+
+        # Check if the target branch exists in the apache remote
+        branch_exists = run_command(
+            ["git", "rev-parse", "--verify", f"{apache_remote_name}/{target_branch}"],
+            capture_output=True,
+            check=False,
+        )
+
+        if branch_exists.returncode != 0:
+            console_print(
+                f"[error]Target branch '{target_branch}' does not exist in remote '{apache_remote_name}'.[/]"
+            )
+            sys.exit(1)
+
+        # Check if current HEAD matches apache_remote/<branch>
+        local_head = run_command(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=False)
+        remote_head = run_command(
+            ["git", "rev-parse", f"{apache_remote_name}/{target_branch}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        at_apache_branch = (
+            current_branch == target_branch
+            and local_head.returncode == 0
+            and remote_head.returncode == 0
+            and local_head.stdout.strip() == remote_head.stdout.strip()
+        )
+    else:
+        at_apache_branch = False
+        console_print(
+            "[warning]No remote pointing to apache/airflow was found. "
+            "Airflow uses `upstream` for this remote by convention — "
+            "run `git remote add upstream https://github.com/apache/airflow.git` to add it.[/]"
+        )
+
+    # Pushing to the branch must neither take local work along nor wipe it, so it never switches,
+    # resets or cleans the checkout.
+    if push_to_target_branch and (not at_apache_branch or not is_clean):
+        remote = apache_remote_name or "upstream"
+        console_print(
+            f"[error]--push-to-target-branch pushes the upgrade straight onto {target_branch}, so it runs "
+            f"only on a clean checkout of {target_branch} at the tip of apache/airflow {target_branch}, "
+            "and it never switches, resets or cleans your checkout for you.[/]\n"
+            f"Current branch: {current_branch}"
+            f"{'' if is_clean else ', with uncommitted or untracked changes'}.\n"
+            "Commit or stash your changes, then bring the branch to the tip and run the command again:\n\n"
+            f"    git switch {target_branch}\n"
+            f"    git pull --ff-only {remote} {target_branch}\n\n"
+            f"If the pull refuses, your local {target_branch} has commits apache/airflow does not - push "
+            "them through a PR or move them to another branch first. Or run the command from a separate "
+            f"worktree: git worktree add ../airflow-{target_branch} {target_branch}"
+        )
+        sys.exit(1)
+
+    # Track whether user chose to reset to target branch
+    user_switched_to_target = False
+
+    if not at_apache_branch or not is_clean:
+        console_print()
+        if not at_apache_branch:
+            console_print(f"[warning]You are not at the top of apache/airflow {target_branch} branch.[/]")
+            console_print(f"[info]Current branch: {current_branch}[/]")
+        if not is_clean:
+            console_print("[warning]Your repository has uncommitted changes.[/]")
+        console_print()
+
+        # Determine whether to switch to base branch
+        should_switch = switch_to_base
+        if should_switch is None:
+            # Not specified, ask the user
+            console_print(
+                f"[warning]Attempting to switch to switch to {target_branch}. "
+                f"This will lose not committed code.[/]\n\n"
+                "NO will continue to get changes on top of current branch, QUIT will exit."
+            )
+            response = user_confirm("Do you want to switch")
+            if response == Answer.YES:
+                should_switch = True
+            elif response == Answer.QUIT:
+                console_print(
+                    f"[error]Upgrade cancelled. Please ensure you are on apache/airflow {target_branch} with a clean repository.[/]"
+                )
+                sys.exit(1)
+            else:
+                should_switch = False
+
+        if should_switch:
+            user_switched_to_target = True
+            console_print(f"[info]Resetting to apache/airflow {target_branch}...[/]")
+            if current_branch != target_branch:
+                run_command(["git", "checkout", target_branch])
+            run_command(["git", "fetch", apache_remote_name])
+            run_command(["git", "reset", "--hard", f"{apache_remote_name}/{target_branch}"])
+            run_command(["git", "clean", "-fdx"])
+            console_print(
+                f"[success]Successfully reset to apache/airflow {target_branch} and cleaned repository.[/]"
+            )
+        else:
+            console_print(
+                f"[info]Continuing with current branch {current_branch}. Changes will be on top of it.[/]"
+            )
+
+    console_print("[info]Running upgrade of important CI environment.[/]")
+
+    github_token = retrieve_github_token(github_token, description="airflow-ci-upgrade", scopes="public_repo")
+
+    # Create a copy of the environment to pass to commands
+    command_env = os.environ.copy()
+
+    if latest_package_managers:
+        command_env["LATEST_PACKAGE_MANAGERS"] = "true"
+        command_env["UPGRADE_LATEST_PACKAGE_MANAGERS"] = "true"
+
+    if github_token:
+        command_env["GITHUB_TOKEN"] = github_token
+        console_print("[success]GitHub token set in environment.[/]")
+    else:
+        console_print(
+            "[warning]Could not retrieve GitHub token from --github-token, gh CLI, or token env. "
+            "Commands may fail if they require authentication. "
+            f"{format_github_token_scope_guidance(description='airflow-ci-upgrade', scopes='public_repo')}[/]"
+        )
+
+    floors_report_path = Path(tempfile.mkdtemp()) / "dependency-floors.md"
+    command_env[DEPENDENCY_FLOORS_REPORT_ENV] = str(floors_report_path)
+
+    step_enabled = get_step_enabled(
+        autoupdate=autoupdate,
+        update_chart_dependencies=update_chart_dependencies,
+        upgrade_important_versions=upgrade_important_versions,
+        upgrade_dependency_floors=upgrade_dependency_floors,
+        update_uv_lock=update_uv_lock,
+    )
+
+    # The upgrade pins the base images to the digests the mirror serves, so the mirror has to be current.
+    if step_enabled["upgrade-important-versions"] and mirror_base_images:
+        mirror_base_images_before_upgrade(target_branch, github_token)
+
+    # Execute upgrade commands
+    for step_name, command in UPGRADE_COMMANDS:
+        if step_enabled[step_name]:
+            run_command(command.split(), check=False, env=command_env)
+        else:
+            console_print(f"[info]Skipping {step_name} (disabled).[/]")
+    floors_report = read_floors_report(floors_report_path)
+
+    # Sync K8s schemas to airflow-site
+    if k8s_schema_sync:
+        _sync_k8s_schemas_to_airflow_site(airflow_site, force_k8s_schema_sync, command_env)
+    else:
+        console_print("[info]Skipping K8s schema sync (disabled).[/]")
+
+    res = run_command(["git", "diff", "--exit-code"], check=False)
+    if res.returncode == 0:
+        console_print("[success]No changes were made during the upgrade. Exiting[/]")
+        sys.exit(0)
+
+    if push_to_target_branch:
+        push_upgrade_to_target_branch(apache_remote_name, target_branch, floors_report)
+        return
+
+    # Determine whether to create a PR
+    should_create_pr = create_pr
+    if should_create_pr is None:
+        # Not specified, ask the user
+        should_create_pr = user_confirm("Do you want to create a PR with the upgrade changes?") == Answer.YES
+
+    if should_create_pr:
+        # Use a stable branch name based on target branch so scheduled runs can reuse/update the same PR
+        branch_name = f"ci-upgrade-{target_branch}"
+
+        # Check if branch already exists and delete it
+        branch_check = run_command(
+            ["git", "rev-parse", "--verify", branch_name], capture_output=True, check=False
+        )
+        if branch_check.returncode == 0:
+            console_print(f"[info]Branch {branch_name} already exists, deleting it...[/]")
+            run_command(["git", "branch", "-D", branch_name])
+
+        run_command(["git", "checkout", "-b", branch_name])
+        commit_upgrade_changes(target_branch)
+
+        # Push the branch to origin (use detected origin or fallback to 'origin')
+        push_remote = origin_remote_name if origin_remote_name else "origin"
+        console_print(f"[info]Pushing branch {branch_name} to {push_remote}...[/]")
+        push_result = run_command(
+            ["git", "push", "-u", push_remote, branch_name, "--force"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if push_result.returncode != 0:
+            console_print(f"[error]Failed to push branch:\n{push_result.stdout}\n{push_result.stderr}[/]")
+            sys.exit(1)
+        console_print(f"[success]Branch {branch_name} pushed to {push_remote}.[/]")
+
+        # Create PR from the pushed branch
+        # gh pr create needs --head in format "username:branch" when creating a PR from a fork
+        # Extract username from origin_repo (e.g., "username/airflow" -> "username")
+        if origin_repo:
+            owner = origin_repo.split("/")[0]
+            head_ref = f"{owner}:{branch_name}"
+            console_print(
+                f"[info]Creating PR from {origin_repo} branch {branch_name} to apache/airflow {target_branch}...[/]"
+            )
+        else:
+            # Fallback to just branch name if we couldn't determine the fork
+            head_ref = branch_name
+            console_print("[warning]Could not determine fork repository. Using branch name only.[/]")
+
+        pr_title = f"[{target_branch}] Upgrade important CI environment"
+        pr_body = build_upgrade_pr_body(floors_report)
+
+        # Check if there's already an open PR for this branch.
+        # gh pr list / gh pr ready filter by the bare head-branch name, not the
+        # "owner:branch" label that gh pr create needs for cross-fork PRs.
+        existing_pr_result = run_command(
+            [
+                "gh",
+                "pr",
+                "list",
+                "--repo",
+                "apache/airflow",
+                "--head",
+                branch_name,
+                "--base",
+                target_branch,
+                "--state",
+                "open",
+                "--json",
+                "number,url",
+                "--jq",
+                ".[0]",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=command_env,
+        )
+
+        existing_pr = existing_pr_result.stdout.strip() if existing_pr_result.returncode == 0 else ""
+
+        if existing_pr and existing_pr != "null" and existing_pr != "":
+            console_print(f"[success]Existing PR found and updated with force push: {existing_pr}[/]")
+            # The body carries this run's dependency-floors report, so it must follow the pushed diff.
+            run_command(
+                build_update_pr_body_command(branch_name, pr_body),
+                capture_output=True,
+                text=True,
+                check=False,
+                env=command_env,
+            )
+            if draft:
+                # Convert back to draft so a human must undraft to trigger CI
+                run_command(
+                    [
+                        "gh",
+                        "pr",
+                        "ready",
+                        "--repo",
+                        "apache/airflow",
+                        "--undo",
+                        branch_name,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env=command_env,
+                )
+                console_print("[info]Existing PR converted back to draft.[/]")
+        else:
+            # Create a new PR
+            gh_create_cmd = [
+                "gh",
+                "pr",
+                "create",
+                "--repo",
+                "apache/airflow",
+                "--head",
+                head_ref,
+                "--base",
+                target_branch,
+                "--title",
+                pr_title,
+                "--body",
+                pr_body,
+            ]
+            if draft:
+                gh_create_cmd.append("--draft")
+
+            pr_result = run_command(
+                gh_create_cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=command_env,
+            )
+            if pr_result.returncode != 0:
+                # The branch was already force-pushed, so an existing PR is already
+                # up to date — treat a duplicate as success rather than failing the run.
+                if "already exists" in pr_result.stderr:
+                    console_print(f"[success]PR already exists for {head_ref}, updated with force push.[/]")
+                else:
+                    console_print(f"[error]Failed to create PR:\n{pr_result.stdout}\n{pr_result.stderr}[/]")
+                    sys.exit(1)
+            else:
+                console_print(f"[success]PR created successfully: {pr_result.stdout.strip()}.[/]")
+
+        remove_backport_labels(branch_name=branch_name, command_env=command_env)
+
+        # Switch back to appropriate branch and delete the temporary branch
+        console_print(f"[info]Cleaning up temporary branch {branch_name}...[/]")
+        if user_switched_to_target:
+            # User explicitly chose to switch to target branch, so stay there
+            run_command(["git", "checkout", target_branch])
+        else:
+            # User didn't switch initially, restore to original branch/commit
+            if original_branch == "HEAD":
+                # Detached HEAD state, restore to original commit
+                console_print(f"[info]Restoring to original commit {original_commit[:8]}...[/]")
+                run_command(["git", "checkout", original_commit])
+            else:
+                # Named branch, restore to it
+                console_print(f"[info]Restoring to original branch {original_branch}...[/]")
+                run_command(["git", "checkout", original_branch])
+
+        # Delete local branch
+        run_command(["git", "branch", "-D", branch_name])
+        console_print(f"[success]Local branch {branch_name} deleted.[/]")
+    else:
+        console_print("[info]PR creation skipped. Changes are committed locally.[/]")
+
+
+# ---------------------------------------------------------------------------
+# Milestone auto-tagging helpers (used by the ``set-milestone`` command and the
+# ``milestone-tag-assistant.yml`` workflow).
+#
+# Skip-decision pipeline
+# ----------------------
+# After fetching the PR (so the ``Issue`` is in scope), the ``set-milestone``
+# command runs these three checks IN ORDER and stops on the first one that
+# returns "skip":
+#
+# 1. **Milestone-already-set guard** (in ``set_milestone``): if
+#    ``issue.milestone`` is non-null, leave the existing milestone alone and
+#    exit.
+# 2. **GitHub events evaluation** (:func:`_should_skip_milestone_tagging`):
+#    if any ``unlabeled`` event in ``issue.get_events()`` removed a
+#    ``backport-to-*`` label AND no ``backport-to-*`` label remains on the
+#    PR, treat the removal as an explicit "don't auto-tag" signal and skip.
+#    GitHub repo settings restrict label changes to committers/triagers, so
+#    the actor's permission is NOT re-verified here — the change is
+#    implicitly authorised.
+# 3. **Static skip labels** (:func:`_should_skip_milestone_tagging`): if any
+#    ``MILESTONE_SKIP_LABELS`` label is currently on the PR, skip.
+#
+# The events check is intentionally ordered before the static-label check so
+# that an explicit maintainer "unbackport" overrides every other condition,
+# including the merge-to-version-branch heuristic that
+# :func:`_determine_milestone_version` would otherwise apply.
+#
+# Inputs the decision uses
+# ------------------------
+# - ``labels`` — the labels currently on the PR (live from ``issue.labels``,
+#   fetched fresh by the caller; the workflow's ``--pr-labels`` snapshot is
+#   no longer consulted for the decision).
+# - ``events`` — the issue events stream from ``issue.get_events()``,
+#   fetched fresh by the caller. Pass ``None`` to disable the events check
+#   (e.g. when the events fetch failed and only the static check should
+#   run).
+#
+# All milestone helpers log via :func:`console_print` with the workflow's
+# Rich console; callers do not need to add their own skip-related log lines.
+# ---------------------------------------------------------------------------
+
+
+VERSION_BRANCH_PATTERN = re.compile(r"^v(\d+)-(\d+)-test$")
+BACKPORT_LABEL_PATTERN = re.compile(r"^backport-to-v(\d+)-(\d+)-test$")
+
+
+def _parse_version_from_branch(branch: str) -> tuple[int, int] | None:
+    """Parse major and minor version from a branch name like 'v3-1-test'."""
+    match = VERSION_BRANCH_PATTERN.match(branch)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    return None
+
+
+def _parse_version_from_backport_label(label: str) -> tuple[int, int] | None:
+    """Parse major and minor version from a backport label like 'backport-to-v3-1-test'."""
+    match = BACKPORT_LABEL_PATTERN.match(label)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    return None
+
+
+def _get_milestone_prefix(major: int, minor: int) -> str:
+    """Get the milestone prefix for a given version like 'Airflow 3.1'."""
+    return f"Airflow {major}.{minor}"
+
+
+def _get_github_client(github_token: str) -> Github:
+    """Create a GitHub client with the given token."""
+    from github import Github
+
+    return Github(github_token)
+
+
+def _find_matching_milestone(repo: Repository, milestone_prefix: str) -> Milestone | None:
+    """Find the latest matching milestone that starts with the given prefix."""
+    try:
+        milestones = list(repo.get_milestones(state="open"))
+        matching = [m for m in milestones if m.title.startswith(milestone_prefix)]
+        if not matching:
+            return None
+        # Sort by title to get the latest patch version (e.g., Airflow 3.1.8 > Airflow 3.1.7)
+        matching.sort(key=lambda m: m.title, reverse=True)
+        return matching[0]
+    except Exception as e:
+        console_print(f"[error]Failed to get milestones: {e}[/]")
+        return None
+
+
+def _get_mention(merged_by_login: str) -> str:
+    """Get the mention string for a user."""
+    return f"@{merged_by_login}" if merged_by_login and merged_by_login != "unknown" else "maintainer"
+
+
+def _get_milestone_notification_comment(
+    milestone_title: str, milestone_number: int, merged_by_login: str, reason: str, github_repository: str
+) -> str:
+    """Generate the notification comment for auto-set milestone."""
+    mention = _get_mention(merged_by_login)
+
+    return f"""Hi {mention}, this PR was merged without a milestone set.
+We've automatically set the milestone to **[{milestone_title}](https://github.com/{github_repository}/milestone/{milestone_number})** based on: {reason}
+If this milestone is not correct, please update it to the appropriate milestone.
+
+> This comment was generated by [Milestone Tag Assistant](https://github.com/{github_repository}/blob/main/.github/workflows/milestone-tag-assistant.yml).
+"""
+
+
+def _get_milestone_not_found_comment(
+    merged_by_login: str, reason: str, github_repository: str, search_criteria: str
+) -> str:
+    """Generate the notification comment when no matching milestone is found."""
+    mention = _get_mention(merged_by_login)
+
+    return f"""Hi {mention}, this PR was merged without a milestone set.
+We tried to automatically set a milestone based on: {reason}
+However, **no open milestone was found** matching: {search_criteria}
+
+**Action required:** Please manually set the appropriate milestone for this PR.
+
+> This comment was generated by [Milestone Tag Assistant](https://github.com/{github_repository}/blob/main/.github/workflows/milestone-tag-assistant.yml).
+"""
+
+
+def _has_bug_fix_indicators(title: str, labels: list[str]) -> bool:
+    """Check if the PR has indicators that it's a bug fix."""
+    title_lower = title.lower()
+    if "fix" in title_lower or "bug" in title_lower:
+        return True
+    if set(labels) & MILESTONE_BUG_LABELS:
+        return True
+    return False
+
+
+def _get_removed_backport_labels_from_events(events: Iterable[IssueEvent]) -> set[str]:
+    """Return ``backport-to-*`` labels that appear in any ``unlabeled`` event.
+
+    Scans the issue events stream for ``unlabeled`` events on ``backport-to-*``
+    labels and returns the set of label names that were removed at any point
+    in the PR's lifecycle. The actor is intentionally NOT checked: GitHub
+    repo settings restrict label changes to users with write or triage
+    access, so any ``unlabeled`` event is implicitly authorised.
+
+    Combined with the live ``backport-to-*`` labels still on the PR, this is
+    enough to distinguish:
+
+    - Full removal (event present, no current backport) → skip signal.
+    - Replacement (event present, different current backport) → no skip;
+      the caller's regular evaluation picks up the new label.
+    - No removal (no event) → no skip.
+    """
+    return {
+        event.label.name
+        for event in events
+        if getattr(event, "event", None) == "unlabeled"
+        and getattr(getattr(event, "label", None), "name", "").startswith("backport-to-")
+    }
+
+
+def _should_skip_milestone_tagging(
+    labels: list[str],
+    events: Iterable[IssueEvent] | None = None,
+) -> bool:
+    """Decide whether milestone auto-tagging should be skipped for the PR.
+
+    Single decision point for the ``set-milestone`` command, covering
+    checks 2 and 3 of the pipeline documented in the module-level comment
+    above. Check 1 (milestone-already-set guard) is handled separately in
+    :func:`set_milestone` because it operates on ``issue.milestone`` rather
+    than labels. Applies the checks IN ORDER and short-circuits on the
+    first hit; each skip outcome emits its own ``console_print`` info log
+    so callers only need to react to the boolean return.
+
+    1. **GitHub events evaluation** (when ``events`` is supplied). If any
+       ``unlabeled`` event in ``events`` removed a ``backport-to-*`` label
+       AND ``labels`` contains no ``backport-to-*`` label now, treat the
+       removal as an explicit "don't auto-tag" signal and skip. Pure label
+       replacement (e.g. ``backport-to-v3-1-test`` swapped for
+       ``backport-to-v3-2-test``) leaves a backport on the PR and does NOT
+       trigger the skip — the caller's regular evaluation picks up the new
+       label. The unlabel actor's permission is NOT re-verified: GitHub
+       repo settings already restrict label changes to committers/triagers.
+    2. **Static skip labels.** If any ``MILESTONE_SKIP_LABELS`` label is
+       in ``labels``, skip.
+    3. Otherwise, do not skip.
+
+    The events check is ordered first so that an explicit unbackport
+    overrides every other condition, including the merge-to-version-branch
+    heuristic that :func:`_determine_milestone_version` would otherwise
+    apply.
+
+    :param labels: Labels currently on the PR (live, from ``issue.labels``).
+    :param events: Issue events stream (live, from ``issue.get_events()``).
+        Pass ``None`` to disable the events check — e.g. when the events
+        fetch failed and only the static skip-label check should run.
+    """
+    if events is not None:
+        removed_backports = _get_removed_backport_labels_from_events(events)
+        current_backports = {label for label in labels if label.startswith("backport-to-")}
+        if removed_backports and not current_backports:
+            console_print(
+                f"[info]Skipping milestone tagging - backport labels were removed during the "
+                f"PR lifecycle and no replacement remains, treated as explicit "
+                f"maintainer/triager signal: {sorted(removed_backports)}[/]"
+            )
+            return True
+
+    skip_labels_present = set(labels) & MILESTONE_SKIP_LABELS
+    if skip_labels_present:
+        console_print(f"[info]Skipping milestone tagging - PR has skip label(s): {skip_labels_present}[/]")
+        return True
+
+    return False
+
+
+def _get_backport_version_from_labels(labels: list[str]) -> tuple[int, int] | None:
+    """Find the first backport label and extract version from it."""
+    for label in labels:
+        if label.startswith("backport-to-"):
+            version = _parse_version_from_backport_label(label)
+            if version:
+                return version
+    return None
+
+
+def _determine_milestone_version(
+    labels: list[str], title: str, base_branch: str
+) -> tuple[tuple[int, int] | None, str]:
+    """Determine which milestone version to use based on PR criteria.
+
+    :returns: Tuple of (version, reason) where version can be:
+        - (major, minor) tuple for specific version milestone (patch releases)
+        - None if no milestone should be set
+    """
+    # Priority 1: Check for backport labels - use specific version milestone
+    backport_version = _get_backport_version_from_labels(labels)
+    if backport_version:
+        return backport_version, f"backport label targeting v{backport_version[0]}-{backport_version[1]}-test"
+
+    # Priority 2: Check if merged to a version branch - use that version's milestone
+    version = _parse_version_from_branch(base_branch)
+    if version:
+        if _has_bug_fix_indicators(title, labels):
+            return version, "bug fix merged to version branch"
+        # Non-bug fix merged to version branch still gets that version's milestone
+        return version, "merged to version branch"
+
+    return None, "no backport label and not merged to a version branch"
+
+
+@ci_group.command(
+    name="set-milestone",
+    help="Set milestone on a merged PR if it doesn't have one. Used by the milestone-tag-assistant workflow.",
+)
+@click.option(
+    "--pr-number",
+    help="The PR number to set milestone on",
+    envvar="PR_NUMBER",
+    required=True,
+    type=int,
+)
+@click.option(
+    "--pr-title",
+    help="The PR title",
+    envvar="PR_TITLE",
+    default="",
+)
+@click.option(
+    "--pr-labels",
+    help="JSON array of PR label names",
+    envvar="PR_LABELS",
+    default="[]",
+)
+@click.option(
+    "--base-branch",
+    help="The base branch the PR was merged to",
+    envvar="BASE_BRANCH",
+    default="",
+)
+@click.option(
+    "--merged-by",
+    help="GitHub username of the person who merged the PR",
+    envvar="MERGED_BY",
+    default="unknown",
+)
+@click.option(
+    "--github-token",
+    help="GitHub token for API access",
+    envvar="GH_TOKEN",
+    required=True,
+)
+@option_github_repository
+@option_verbose
+@option_dry_run
+def set_milestone(
+    pr_number: int,
+    pr_title: str,
+    pr_labels: str,
+    base_branch: str,
+    merged_by: str,
+    github_token: str,
+    github_repository: str,
+):
+    """Set milestone on a merged PR based on backport labels or bug fix indicators."""
+    from github import UnknownObjectException
+
+    console_print(f"[info]Processing PR #{pr_number}[/]")
+    console_print(f"[info]Title: {pr_title}[/]")
+    console_print(f"[info]Base branch: {base_branch}[/]")
+    console_print(f"[info]Merged by: {merged_by}[/]")
+
+    # The workflow's ``--pr-labels`` snapshot is logged for diagnostic visibility
+    # but is no longer used in the decision: live labels and live events are
+    # fetched fresh below. See the milestone-helpers module-level comment for
+    # the full skip-decision pipeline.
+    try:
+        snapshot_labels = json.loads(pr_labels)
+    except json.JSONDecodeError:
+        console_print(f"[warning]Could not parse labels JSON: {pr_labels}[/]")
+        snapshot_labels = []
+    console_print(f"[info]Workflow snapshot labels (diagnostic only): {snapshot_labels}[/]")
+
+    # Initialize GitHub client and get repository.
+    try:
+        gh = _get_github_client(github_token)
+        repo: Repository = gh.get_repo(github_repository)
+    except Exception as e:
+        console_print(f"[error]Failed to connect to GitHub: {e}[/]")
+        return
+
+    # Step 1: milestone-already-set guard — don't override an existing milestone.
+    try:
+        issue: Issue = repo.get_issue(pr_number)
+    except UnknownObjectException:
+        console_print(f"[error]PR #{pr_number} not found when checking existing milestone[/]")
+        return
+    except Exception as e:
+        console_print(f"[error]Failed to check existing milestone: {e}[/]")
+        return
+
+    if issue.milestone is not None:
+        console_print(
+            f"[info]PR #{pr_number} already has milestone '{issue.milestone.title}' set. Skipping.[/]"
+        )
+        return
+
+    # Pull live labels and events. Both feed the skip-decision function below
+    # (events → check 2, labels → check 3) and ``labels`` also feeds
+    # ``_determine_milestone_version`` once the skip pipeline lets the PR
+    # through.
+    try:
+        labels = [label.name for label in issue.labels]
+    except Exception as e:
+        console_print(f"[warning]Could not read live PR labels; falling back to snapshot: {e}[/]")
+        labels = snapshot_labels
+    console_print(f"[info]Live labels: {sorted(labels)}[/]")
+
+    events: list | None
+    try:
+        events = list(issue.get_events())
+    except Exception as e:
+        console_print(f"[warning]Could not fetch issue events; skipping events check: {e}[/]")
+        events = None
+
+    # Steps 2 and 3 of the pipeline: events-based unbackport signal, then
+    # static skip labels. The function logs its own reason when it returns True.
+    if _should_skip_milestone_tagging(labels, events=events):
+        return
+
+    # Determine which milestone to use from the live labels.
+    version, reason = _determine_milestone_version(labels, pr_title, base_branch)
+    if version is None:
+        console_print(f"[info]No milestone to set: {reason}[/]")
+        return
+
+    major, minor = version
+    milestone_prefix = _get_milestone_prefix(major, minor)
+    console_print(f"[info]Looking for milestone with prefix: {milestone_prefix}[/]")
+    milestone = _find_matching_milestone(repo, milestone_prefix)
+    search_criteria = f"prefix '{milestone_prefix}'"
+
+    if not milestone:
+        console_print(f"[warning]No open milestone found matching: {search_criteria}[/]")
+        # Add reminder comment for committer
+        try:
+            issue = repo.get_issue(pr_number)
+            comment = _get_milestone_not_found_comment(merged_by, reason, github_repository, search_criteria)
+            issue.create_comment(comment)
+            console_print(f"[info]Added reminder comment to PR #{pr_number}[/]")
+        except Exception as e:
+            console_print(f"[warning]Failed to add reminder comment: {e}[/]")
+        return
+
+    console_print(f"[info]Found milestone: {milestone.title} (#{milestone.number})[/]")
+
+    # Get the issue (PRs are issues in GitHub API)
+    try:
+        issue = repo.get_issue(pr_number)
+    except UnknownObjectException:
+        console_print(f"[error]PR #{pr_number} not found[/]")
+        return
+
+    # Set milestone on PR
+    try:
+        issue.edit(milestone=milestone)
+        console_print(f"[success]Successfully set milestone '{milestone.title}' on PR #{pr_number}[/]")
+    except Exception as e:
+        console_print(f"[error]Failed to set milestone on PR #{pr_number}: {e}[/]")
+        return
+
+    # Add notification comment
+    comment = _get_milestone_notification_comment(
+        milestone.title, milestone.number, merged_by, reason, github_repository
+    )
+    try:
+        issue.create_comment(comment)
+        console_print(f"[success]Added notification comment to PR #{pr_number}[/]")
+    except Exception as e:
+        console_print(f"[warning]Failed to add notification comment to PR #{pr_number}: {e}[/]")
+
+
+@ci_group.command(
+    name="fork-ci-reconcile",
+    help="Reconcile pull requests whose CI runs in contributor forks (AIP-120). Run on a schedule.",
+)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Fork CI gate configuration. Defaults to .github/fork-ci-gate.toml in the Airflow sources.",
+)
+@click.option(
+    "--output-file",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default="slack-message.json",
+    show_default=True,
+    envvar="OUTPUT_FILE",
+    help="Where the Slack message is written when there are items for maintainers.",
+)
+@click.option(
+    "--reported-file",
+    type=click.Path(dir_okay=False, path_type=Path),
+    envvar="REPORTED_FILE",
+    help="The items the previous run reported, left out of the Slack message, and replaced by "
+    "this run's items. Without it every item is reported on every run.",
+)
+@click.option(
+    "--draft-changes-file",
+    type=click.Path(dir_okay=False, path_type=Path),
+    envvar="DRAFT_CHANGES_FILE",
+    help="Where the draft state changes are written, as JSON, for the job that applies them with "
+    "the permission the reconciler does not get. Without it they are only logged.",
+)
+@click.option(
+    "--run-url",
+    default="",
+    envvar="RUN_URL",
+    help="URL of the workflow run, linked from the Slack message.",
+)
+@option_github_repository
+@option_verbose
+@option_dry_run
+def fork_ci_reconcile(
+    config_path: Path | None,
+    output_file: Path,
+    reported_file: Path | None,
+    draft_changes_file: Path | None,
+    run_url: str,
+    github_repository: str,
+):
+    from datetime import UTC, datetime
+
+    from airflow_breeze.utils.fork_ci_gate import load_config
+    from airflow_breeze.utils.fork_ci_github import GitHubClient
+    from airflow_breeze.utils.fork_ci_reconcile import run_reconcile
+    from airflow_breeze.utils.github import get_ga_output
+    from airflow_breeze.utils.shared_options import get_dry_run
+
+    has_alerts = run_reconcile(
+        GitHubClient(github_repository, dry_run=get_dry_run()),
+        load_config(config_path or AIRFLOW_ROOT_PATH / ".github" / "fork-ci-gate.toml"),
+        now=datetime.now(tz=UTC),
+        run_url=run_url,
+        output_file=output_file,
+        workflows_dir=AIRFLOW_ROOT_PATH / ".github" / "workflows",
+        reported_file=reported_file,
+        draft_changes_file=draft_changes_file,
+    )
+    github_output = os.environ.get("GITHUB_OUTPUT")
+    if github_output:
+        with open(github_output, "a") as f:
+            f.write(get_ga_output("has-alerts", has_alerts) + "\n")
+
+
+@ci_group.command(
+    name="audit",
+    help="Check that your checkout and fork are set up for fork CI (AIP-120), and offer the fixes.",
+)
+@click.option("--fix", is_flag=True, help="Run the offered fix commands, each after confirmation.")
+@option_verbose
+@option_dry_run
+@option_answer
+def audit(fix: bool):
+    import shlex
+
+    import yaml
+    from rich.table import Table
+
+    from airflow_breeze.utils.ci_audit import CheckStatus, find_idle_fork_workflows, run_audit, run_tool
+    from airflow_breeze.utils.fork_ci_gate import load_config
+
+    asf_yaml = yaml.safe_load((AIRFLOW_ROOT_PATH / ".asf.yaml").read_text())
+    collaborators = frozenset((asf_yaml.get("github") or {}).get("collaborators") or [])
+    config = load_config(AIRFLOW_ROOT_PATH / ".github" / "fork-ci-gate.toml")
+    idle_workflows = find_idle_fork_workflows(AIRFLOW_ROOT_PATH / ".github" / "workflows")
+
+    def report():
+        results = run_audit(
+            run=run_tool, config=config, collaborators=collaborators, idle_workflows=idle_workflows
+        )
+        table = Table(title="Fork CI setup")
+        for column in ("#", "Check", "Status", "Finding", "Fix"):
+            table.add_column(column)
+        colors = {CheckStatus.OK: "green", CheckStatus.FAIL: "red", CheckStatus.INFO: "blue"}
+        for result in results:
+            table.add_row(
+                str(result.number),
+                result.name,
+                f"[{colors[result.status]}]{result.status.value}[/]",
+                result.finding,
+                "\n".join(result.fix),
+            )
+        get_console().print(table)
+        return results
+
+    failed = [result for result in report() if result.status == CheckStatus.FAIL]
+    if fix and any(result.fix for result in failed):
+        for result in failed:
+            if result.fix and user_confirm(f"Run the fix for '{result.name}': {'; '.join(result.fix)}?") == (
+                Answer.YES
+            ):
+                for command in result.fix:
+                    run_command(shlex.split(command), check=False)
+        failed = [result for result in report() if result.status == CheckStatus.FAIL]
+    sys.exit(1 if failed else 0)
+
+
+@ci_group.command(
+    name="approve-workflow-runs",
+    help="Approve the waiting workflow runs of external contributors' PRs whose changes are safe "
+    "to run without a maintainer's look, and label the others 'need workflow approval' with a "
+    "'Workflow approval' commit status saying why. Used by the auto-approve-workflow-runs workflow.",
+)
+@click.option(
+    "--github-token",
+    help="GitHub token able to approve workflow runs, label PRs and set commit statuses.",
+    envvar="GITHUB_TOKEN",
+    required=True,
+)
+@click.option(
+    "--max-run-age-hours",
+    help="Only decide on workflow runs created within this many hours; older waiting runs are left alone.",
+    type=click.IntRange(min=1),
+    default=24,
+    show_default=True,
+    envvar="MAX_RUN_AGE_HOURS",
+)
+@click.option(
+    "--report-only",
+    is_flag=True,
+    help="Only report the decisions and estimates, without approving runs or changing labels or statuses.",
+    envvar="REPORT_ONLY",
+)
+@option_github_repository
+@option_verbose
+@option_dry_run
+def approve_workflow_runs(
+    github_token: str, max_run_age_hours: int, report_only: bool, github_repository: str
+):
+    from airflow_breeze.utils.shared_options import get_dry_run
+    from airflow_breeze.utils.workflow_run_approval import (
+        GitHubApi,
+        process_waiting_runs,
+        write_step_summary,
+    )
+
+    api = GitHubApi(
+        github_repository=github_repository,
+        github_token=github_token,
+        report_only=report_only or get_dry_run(),
+    )
+    created_since = datetime.now(UTC) - timedelta(hours=max_run_age_hours)
+    results = process_waiting_runs(api, created_since=created_since)
+    write_step_summary(results, github_repository)
+    failed_prs = [result.pr_number for result in results if result.failed]
+    if failed_prs:
+        console_print(f"[error]Processing failed for PRs: {', '.join(f'#{n}' for n in failed_prs)}[/]")
+        sys.exit(1)

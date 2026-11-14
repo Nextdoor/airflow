@@ -16,12 +16,39 @@
 # under the License.
 #
 ---
-name: 'Prepare breeze && current python image'
-description: 'Installs breeze and pulls current python image'
+name: 'Prepare breeze && current image (CI or PROD)'
+description: 'Installs breeze and recreates current python image from artifact'
 inputs:
-  pull-image-type:
-    description: 'Which image to pull'
-    default: CI
+  python:
+    description: 'Python version for image to prepare'
+    required: true
+  image-type:
+    description: 'Which image type to prepare (ci/prod)'
+    default: "ci"
+  platform:
+    description: 'Platform for the build - linux/amd64 or linux/arm64'
+    required: true
+  use-uv:
+    description: 'Whether to use uv'
+    required: true
+  make-mnt-writeable-and-cleanup:
+    description: 'Whether to cleanup /mnt'
+    required: true
+  min-free-space-gb:
+    description: >
+      Skip removing the runner's unused pre-installed tooling when the root filesystem already has
+      at least this many GB free, in the units df --block-size=1G reports. Empty always removes.
+      The default clears today's runners (86 free on ubuntu-22.04, 110 on ubuntu-22.04-arm) with
+      room over the heaviest measured footprint of a job that prepares an image, 24 for a full CI
+      image build, so a runner shipping less free space brings the removal back on its own.
+    required: false
+    default: "60"
+  image-stash-ref:
+    description: >
+      Ref whose image stash to restore (empty = the per-branch one). An image built for a ref
+      other than the branch tip is stashed under a key of its own by ci-image-build.yml.
+    required: false
+    default: ""
 outputs:
   host-python-version:
     description: Python version used in host
@@ -29,14 +56,38 @@ outputs:
 runs:
   using: "composite"
   steps:
+    - name: "Make /mnt writeable and cleanup"
+      shell: bash
+      run: ./scripts/ci/make_mnt_writeable.sh
+      if: inputs.make-mnt-writeable-and-cleanup == 'true'
+    - name: "Free up disk space"
+      shell: bash
+      env:
+        MIN_FREE_SPACE_GB: ${{ inputs.min-free-space-gb }}
+      run: |
+        FREE_GB=$(df --output=avail --block-size=1G / | tail -1 | tr -d ' ')
+        if [[ -n "${MIN_FREE_SPACE_GB}" && "${FREE_GB}" -ge "${MIN_FREE_SPACE_GB}" ]]; then
+          echo "${FREE_GB} GB free on / (>= ${MIN_FREE_SPACE_GB} GB), skipping the disk cleanup"
+        else
+          ./scripts/tools/free_up_disk_space.sh
+        fi
+    - name: "Configure runner for parallel tests"
+      shell: bash
+      run: ./scripts/ci/configure_runner_for_parallel_tests.sh
+      # Only self-hosted runners are large enough to run more test types at once than the default pools fit.
+      if: runner.environment == 'self-hosted'
     - name: "Install Breeze"
       uses: ./.github/actions/breeze
       id: breeze
-    - name: Pull CI image ${{ env.PYTHON_MAJOR_MINOR_VERSION }}:${{ env.IMAGE_TAG }}
+    - name: "Check free space"
       shell: bash
-      run: breeze ci-image pull --tag-as-latest
-      if: inputs.pull-image-type == 'CI'
-    - name: Pull PROD image ${{ env.PYTHON_MAJOR_MINOR_VERSION }}:${{ env.IMAGE_TAG }}
-      shell: bash
-      run: breeze prod-image pull --tag-as-latest
-      if: inputs.pull-image-type == 'PROD'
+      run: |
+        echo "Checking free space!"
+        df -H
+    - name: "Load ${{ inputs.image-type }} image ${{ inputs.platform }}:${{ inputs.python }}"
+      uses: ./.github/actions/load_image
+      with:
+        python: ${{ inputs.python }}
+        platform: ${{ inputs.platform }}
+        image-type: ${{ inputs.image-type }}
+        image-stash-ref: ${{ inputs.image-stash-ref }}

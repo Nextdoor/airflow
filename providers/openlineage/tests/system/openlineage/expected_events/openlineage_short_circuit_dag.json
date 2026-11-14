@@ -1,0 +1,100 @@
+[
+    {
+        "$absent": "This task should be skipped.",
+        "eventType": "START",
+        "job": {
+            "name": "openlineage_short_circuit_dag.should_be_skipped"
+        }
+    },
+    {
+        "$absent": "This task should be skipped.",
+        "eventType": "COMPLETE",
+        "job": {
+            "name": "openlineage_short_circuit_dag.should_be_skipped"
+        }
+    },
+    {
+        "$absent": "This task should be skipped.",
+        "eventType": "FAIL",
+        "job": {
+            "name": "openlineage_short_circuit_dag.should_be_skipped"
+        }
+    },
+    {
+        "eventType": "START",
+        "job": {
+            "namespace": "{{ result is string }}",
+            "name": "openlineage_short_circuit_dag",
+            "facets": {
+                "airflow": {
+                    "taskGroups": {},
+                    "taskTree": {},
+                    "tasks": {
+                        "should_be_skipped": {
+                            "downstream_task_ids": [
+                                "check_events"
+                            ],
+                            "emits_ol_events": "{{ result == true }}",
+                            "is_setup": false,
+                            "is_teardown": false,
+                            "operator": "airflow.providers.standard.operators.python.PythonOperator",
+                            "ui_color": "#ffefeb",
+                            "ui_fgcolor": "#000",
+                            "ui_label": "should_be_skipped"
+                        },
+                        "skip_tasks": {
+                            "downstream_task_ids": [
+                                "should_be_skipped"
+                            ],
+                            "emits_ol_events": "{{ result == true }}",
+                            "is_setup": false,
+                            "is_teardown": false,
+                            "operator": "airflow.providers.standard.operators.python.ShortCircuitOperator",
+                            "ui_color": "#ffefeb",
+                            "ui_fgcolor": "#000",
+                            "ui_label": "skip_tasks"
+                        }
+                    }
+                }
+            }
+        }
+    },
+    {
+        "eventType": "START",
+        "job": {
+            "name": "openlineage_short_circuit_dag.skip_tasks"
+        },
+        "run": {
+            "facets": {
+                "airflow": {
+                    "taskInstance": {
+                        "try_number": 1,
+                        "max_tries": 0,
+                        "state": "running",
+                        "id": "{{ is_uuid(result) }}",
+                        "map_index": null
+                    }
+                }
+            }
+        }
+    },
+    {
+        "eventType": "COMPLETE",
+        "job": {
+            "name": "openlineage_short_circuit_dag.skip_tasks"
+        },
+        "run": {
+            "facets": {
+                "airflow": {
+                    "taskInstance": {
+                        "try_number": 1,
+                        "max_tries": 0,
+                        "state": "success",
+                        "id": "{{ is_uuid(result) }}",
+                        "map_index": null
+                    }
+                }
+            }
+        }
+    }
+]

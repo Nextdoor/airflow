@@ -1,0 +1,105 @@
+{
+  "auditLog": {
+    "columns": {
+      "event": "Evento",
+      "extra": "Extra",
+      "user": "Usuário",
+      "when": "Quando"
+    },
+    "filters": {
+      "eventType": "Tipo de Evento"
+    }
+  },
+  "dagBundles": {
+    "active": "Ativo",
+    "columns": {
+      "active": "Ativo",
+      "importErrors": "Erros de importação",
+      "lastRefreshed": "Última atualização",
+      "name": "Nome",
+      "version": "Versão"
+    },
+    "detail": {
+      "status": "Estado"
+    },
+    "files": {
+      "columns": {
+        "file": "Arquivo",
+        "lastParsed": "Último parse",
+        "parseDuration": "Duração do parse"
+      },
+      "file_many": "Arquivos",
+      "file_one": "Arquivo",
+      "file_other": "Arquivos",
+      "file_zero": "Nenhum arquivo",
+      "importErrorForbidden": "Você não tem permissão para ler este erro de importação.",
+      "importErrorGone": "Este erro de importação já não está registrado. Provavelmente foi corrigido por um novo parse.",
+      "neverParsed": "Nunca",
+      "showImportError_many": "Ver {{count, number}} de erros",
+      "showImportError_one": "Ver erro",
+      "showImportError_other": "Ver {{count, number}} erros",
+      "showImportError_zero": "Nenhum erro"
+    },
+    "inactive": "Inativo",
+    "neverRefreshed": "Nunca",
+    "notRefreshedYet": "Ainda não atualizado",
+    "notVersioned": "Sem versão"
+  },
+  "deadlines": {
+    "columns": {
+      "alertName": "Nome do alerta",
+      "deadlineTime": "Hora do prazo",
+      "status": "Estado"
+    },
+    "deadline_many": "Prazos",
+    "deadline_one": "Prazo",
+    "deadline_other": "Prazos",
+    "deadline_zero": "Nenhum prazo",
+    "filters": {
+      "status": "Estado",
+      "statusOptions": {
+        "all": "Todos",
+        "missed": "Não cumprido",
+        "pending": "Pendente"
+      }
+    },
+    "title": "Prazos"
+  },
+  "xcom": {
+    "add": {
+      "error": "Falha ao adicionar XCom",
+      "errorTitle": "Erro",
+      "success": "XCom adicionado com sucesso",
+      "successTitle": "XCom Adicionado",
+      "title": "Adicionar XCom"
+    },
+    "columns": {
+      "dag": "Dag",
+      "key": "Chave",
+      "timestamp": "Data e hora",
+      "value": "Valor"
+    },
+    "delete": {
+      "error": "Falha ao excluir XCom",
+      "errorTitle": "Erro",
+      "success": "XCom excluído com sucesso",
+      "successTitle": "XCom Excluído",
+      "title": "Excluir XCom",
+      "warning": "Tem certeza que deseja excluir este XCom? Esta ação não pode ser desfeita."
+    },
+    "edit": {
+      "error": "Falha ao atualizar XCom",
+      "errorTitle": "Erro",
+      "success": "XCom atualizado com sucesso",
+      "successTitle": "XCom Atualizado",
+      "title": "Editar XCom"
+    },
+    "entry_many": "Entradas de XCom",
+    "entry_one": "Entrada de XCom",
+    "entry_other": "Entradas de XCom",
+    "entry_zero": "Nenhuma entrada de XCom",
+    "key": "Chave",
+    "title": "XCom",
+    "value": "Valor"
+  }
+}

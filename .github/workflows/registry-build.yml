@@ -1,0 +1,451 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+---
+name: Build & Publish Registry
+on:  # yamllint disable-line rule:truthy
+  workflow_dispatch:
+    inputs:
+      destination:
+        description: "Publish to live or staging S3 bucket"
+        required: true
+        type: choice
+        options:
+          - staging
+          - live
+        default: staging
+      provider:
+        description: "Provider ID(s) for incremental build (space-separated, empty = full build)"
+        required: false
+        type: string
+        default: ""
+      python-version:
+        description: "Python version of the CI image the extraction runs in"
+        required: false
+        type: string
+        default: "3.12"
+  workflow_call:
+    inputs:
+      destination:
+        description: "Publish to live or staging S3 bucket"
+        required: false
+        type: string
+        default: staging
+      provider:
+        description: "Provider ID(s) for incremental build (space-separated, empty = full build)"
+        required: false
+        type: string
+        default: ""
+      python-version:
+        description: "Python version of the CI image the extraction runs in"
+        required: false
+        type: string
+        default: "3.12"
+      checkout-ref:
+        description: >
+          Ref the registry is built from. Defaults to the branch tip; a release publish passes the
+          tag it is publishing so the extraction reads those sources rather than main's.
+        required: false
+        type: string
+        default: ""
+      # `github.event_name` inside a called workflow reports the *caller's* event, never
+      # `workflow_call`, so it cannot distinguish the two entry points. An input declared
+      # only here can: it defaults to true when called and is undefined (falsy) on a
+      # `workflow_dispatch`. Callers must not pass it.
+      is-workflow-call:
+        description: "Internal: always true on the workflow_call path, do not pass explicitly"
+        required: false
+        type: boolean
+        default: true
+      image-stash-ref:
+        description: >
+          Ref whose CI image stash to use (empty = the per-branch one). Set it to whatever the
+          caller passed to ci-image-build.yml, which stashes an image built for a ref under a
+          key of its own rather than in the branch-wide stash.
+        required: false
+        type: string
+        default: ""
+    secrets:
+      DOCS_AWS_ACCESS_KEY_ID:
+        required: true
+      DOCS_AWS_SECRET_ACCESS_KEY:
+        required: true
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  # Picks the runner the way CI does: RunsOn in apache/airflow, public runners when the repository
+  # variable USE_PUBLIC_RUNNERS is "true". Runs the workflow's own breeze, as the registry job checks
+  # out a ref whose breeze may predate RunsOn.
+  runner-info:
+    timeout-minutes: 10
+    name: "Runner info"
+    runs-on: ["ubuntu-slim"]
+    permissions:
+      contents: read
+    outputs:
+      runner-type: ${{ steps.selective-checks.outputs.runner-type }}
+    steps:
+      - name: "Checkout ${{ github.ref }} ( ${{ github.sha }} )"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: "Install Breeze"
+        uses: ./.github/actions/breeze
+        with:
+          free-space: "false"
+      - name: "Selective checks"
+        id: selective-checks
+        env:
+          COMMIT_REF: "${{ github.sha }}"
+          VERBOSE: "false"
+          # Only what the runner choice reads: the full context would carry the dispatch inputs,
+          # and this job runs before the committer allowlist of the registry job.
+          GITHUB_CONTEXT: '{"run_id": "${{ github.run_id }}", "ref_name": "${{ github.ref_name }}"}'
+          PLATFORM: "linux/amd64"
+          USE_PUBLIC_RUNNERS: "${{ vars.USE_PUBLIC_RUNNERS }}"
+        run: breeze ci selective-check 2>> ${GITHUB_OUTPUT}
+  build-and-publish-registry:
+    needs: [runner-info]
+    timeout-minutes: 45
+    name: "Build & Publish Registry"
+    # An incremental build downloads the bucket's providers.json and modules.json, merges its own
+    # providers in and syncs them back, so two publishes to one bucket at once lose whichever
+    # finishes first. Shared with registry-backfill.yml's publish job; set on the job because this
+    # workflow is also called from publish-docs-to-s3.yml. GitHub keeps one pending run per group,
+    # so a third publish cancels the waiting one: that run shows as cancelled and is re-run, which
+    # beats the silent loss this replaces.
+    concurrency:
+      group: registry-publish-${{ inputs.destination }}
+      cancel-in-progress: false
+    # On a dispatch this enforces the committer allowlist below; on the `workflow_call` path the
+    # caller has already gated on its own allowlist, so this must not re-check it against a
+    # second, separately-maintained copy.
+    if: >
+      inputs.is-workflow-call ||
+      contains(fromJSON('[
+        "ashb",
+        "bugraoz93",
+        "eladkal",
+        "ephraimbuddy",
+        "jedcunningham",
+        "jscheffl",
+        "kaxil",
+        "pierrejeambrun",
+        "shahar1",
+        "potiuk",
+        "uranusjr",
+        "utkarsharma2",
+        "vincbeck"
+        ]'), github.event.sender.login)
+    runs-on: ${{ format(fromJSON(needs.runner-info.outputs.runner-type)[0], '8+16', '32+64') }}
+    env:
+      SCARF_ANALYTICS: "false"
+      DO_NOT_TRACK: "1"
+      EXISTING_REGISTRY_DIR: /tmp/existing-registry
+      REGISTRY_DATA_DIR: dev/registry
+      REGISTRY_PROVIDERS_JSON: providers.json
+      REGISTRY_MODULES_JSON: modules.json
+      REGISTRY_SITE_DATA_DIR: registry/src/_data
+      REGISTRY_SITE_VERSIONS_DIR: registry/src/_data/versions
+      REGISTRY_SITE_LOGOS_DIR: registry/public/logos
+      REGISTRY_CACHE_CONTROL: public, max-age=300
+    permissions:
+      contents: read
+      # The image is built here now, so this job reads the ghcr registry build cache itself.
+      packages: read
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          # Empty means the branch tip; a release publish passes the tag it is publishing, so the
+          # extraction reads the sources being released rather than whatever main holds.
+          ref: ${{ inputs.checkout-ref }}
+          # Tags drive the phantom-version filter in extract_metadata.py
+          # (only versions with a real `providers-<id>/<ver>` tag are
+          # treated as released). The live extract step fails if they are missing.
+          fetch-tags: true
+
+      # A local action is read from the workspace, not from the ref the workflow itself runs from,
+      # so an action added after the checked-out ref was cut is simply absent. Checking the
+      # workflow's own version out alongside supplies the definition; the image is still built
+      # from the sources checked out above.
+      - name: "Checkout the workflow version for its actions"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          path: workflow-version
+
+      # From the workflow's version, not the checked-out ref: an older make_mnt_writeable.sh empties
+      # /mnt, which on RunsOn holds the runner's own disks.
+      - name: "Make /mnt writeable and cleanup"
+        run: ./workflow-version/scripts/ci/make_mnt_writeable.sh
+      - name: "Free up disk space"
+        run: ./workflow-version/scripts/tools/free_up_disk_space.sh
+      - name: "Install Breeze"
+        uses: ./.github/actions/breeze
+        with:
+          python-version: "${{ inputs.python-version }}"
+
+      # Built in this job rather than handed over by one of its own: the image has a single
+      # consumer, so a separate job could only export it and import it straight back. It is still
+      # stashed under this ref, so the next run for the same ref seeds its build from it.
+      - name: "Build CI image linux/amd64:${{ inputs.python-version }}"
+        uses: ./workflow-version/.github/actions/build_ci_image_with_cache
+        with:
+          python: "${{ inputs.python-version }}"
+          platform: "linux/amd64"
+          image-stash-ref: "${{ inputs.image-stash-ref }}"
+          github-token: "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: "Install AWS CLI v2"
+        run: |
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+          unzip -q /tmp/awscliv2.zip -d /tmp
+          rm /tmp/awscliv2.zip
+          sudo /tmp/aws/install --update
+          rm -rf /tmp/aws/
+
+      - name: "Configure AWS credentials"
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd  # v6.3.0
+        with:
+          aws-access-key-id: ${{ secrets.DOCS_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.DOCS_AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-2
+
+      - name: "Determine S3 destination"
+        id: destination
+        env:
+          DESTINATION: ${{ inputs.destination || 'staging' }}
+        run: |
+          if [[ "${DESTINATION}" == "live" ]]; then
+            echo "bucket=s3://live-docs-airflow-apache-org/registry/" >> "${GITHUB_OUTPUT}"
+          else
+            echo "bucket=s3://staging-docs-airflow-apache-org/registry/" >> "${GITHUB_OUTPUT}"
+          fi
+          echo "Publishing registry to ${DESTINATION}"
+
+      # --- Incremental: download existing data from S3 ---
+      - name: "Download existing registry data from S3"
+        id: download-existing
+        if: inputs.provider != ''
+        env:
+          S3_BUCKET: ${{ steps.destination.outputs.bucket }}
+        run: |
+          mkdir -p "${EXISTING_REGISTRY_DIR}"
+          PROVIDERS_URL="${S3_BUCKET}api/${REGISTRY_PROVIDERS_JSON}"
+          MODULES_URL="${S3_BUCKET}api/${REGISTRY_MODULES_JSON}"
+          if aws s3 cp \
+            "${PROVIDERS_URL}" \
+            "${EXISTING_REGISTRY_DIR}/${REGISTRY_PROVIDERS_JSON}" \
+            2>/dev/null; then
+            echo "found=true" >> "${GITHUB_OUTPUT}"
+            aws s3 cp "${MODULES_URL}" "${EXISTING_REGISTRY_DIR}/${REGISTRY_MODULES_JSON}" || true
+          else
+            echo "found=false" >> "${GITHUB_OUTPUT}"
+            echo "No existing registry data on S3"
+          fi
+
+      # --- Extract provider metadata ---
+      - name: "Extract registry data (breeze)"
+        env:
+          PROVIDER: ${{ inputs.provider }}
+          DESTINATION: ${{ inputs.destination }}
+          PYTHON_VERSION: ${{ inputs.python-version }}
+        run: |
+          # Staging dispatches preview unreleased providers (maintainers want to
+          # verify newly-bumped versions look right before tagging). Live builds
+          # filter them so the production registry never ships pointers to
+          # non-existent PyPI releases / GitHub tags / docs pages.
+          ALLOW_UNRELEASED=""
+          if [[ "${DESTINATION}" == "staging" ]]; then
+            ALLOW_UNRELEASED="--allow-unreleased"
+          elif [[ -z "$(git tag --list 'providers-*' | head -n 1)" ]]; then
+            # Without tags extract_metadata.py keeps every version in provider.yaml,
+            # which would publish unreleased providers and versions to live.
+            echo "::error::No providers-* tags in the checkout; refusing to publish the live registry."
+            exit 1
+          fi
+          if [[ -n "${PROVIDER}" ]]; then
+            breeze registry extract-data --python "${PYTHON_VERSION}" \
+              --provider "${PROVIDER}" ${ALLOW_UNRELEASED}
+          else
+            breeze registry extract-data --python "${PYTHON_VERSION}" ${ALLOW_UNRELEASED}
+          fi
+
+      # --- Incremental: merge new data with existing ---
+      - name: "Merge with existing registry data"
+        if: inputs.provider != '' && steps.download-existing.outputs.found == 'true'
+        run: |
+          uv run --project dev/registry dev/registry/merge_registry_data.py \
+            --existing-providers "${EXISTING_REGISTRY_DIR}/${REGISTRY_PROVIDERS_JSON}" \
+            --existing-modules "${EXISTING_REGISTRY_DIR}/${REGISTRY_MODULES_JSON}" \
+            --new-providers "${REGISTRY_DATA_DIR}/${REGISTRY_PROVIDERS_JSON}" \
+            --new-modules "${REGISTRY_DATA_DIR}/${REGISTRY_MODULES_JSON}" \
+            --output "${REGISTRY_DATA_DIR}/"
+
+      - name: "Copy breeze output to registry data"
+        run: |
+          mkdir -p "${REGISTRY_SITE_VERSIONS_DIR}"
+          cp \
+            "${REGISTRY_DATA_DIR}/${REGISTRY_PROVIDERS_JSON}" \
+            "${REGISTRY_SITE_DATA_DIR}/${REGISTRY_PROVIDERS_JSON}"
+          cp \
+            "${REGISTRY_DATA_DIR}/${REGISTRY_MODULES_JSON}" \
+            "${REGISTRY_SITE_DATA_DIR}/${REGISTRY_MODULES_JSON}"
+          VERSIONS_SRC="${REGISTRY_DATA_DIR}/output/versions"
+          if [ -d "${VERSIONS_SRC}" ] && ls "${VERSIONS_SRC}/"* &>/dev/null; then
+            cp -r "${VERSIONS_SRC}/"* "${REGISTRY_SITE_VERSIONS_DIR}/"
+          fi
+          # Copy provider logos extracted by extract_metadata.py.
+          # The directory may exist but be empty (incremental build for
+          # a provider without logos), so check for files before copying.
+          LOGOS_SRC="${REGISTRY_DATA_DIR}/logos"
+          if [ -d "${LOGOS_SRC}" ] && ls "${LOGOS_SRC}/"* &>/dev/null; then
+            mkdir -p "${REGISTRY_SITE_LOGOS_DIR}"
+            cp -r "${LOGOS_SRC}/"* "${REGISTRY_SITE_LOGOS_DIR}/"
+          fi
+
+      - name: "Setup pnpm"
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115  # v6.1.1
+        with:
+          version: 10
+
+      - name: "Setup Node.js"
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: 24
+          cache: 'pnpm'
+          cache-dependency-path: 'registry/pnpm-lock.yaml'
+
+      - name: "Install Node.js dependencies"
+        working-directory: registry
+        run: pnpm install --frozen-lockfile
+
+      - name: "Build registry site"
+        working-directory: registry
+        env:
+          REGISTRY_PATH_PREFIX: "/registry/"
+        run: pnpm build
+
+      - name: "Upload registry artifact"
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: registry-site
+          path: registry/_site
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: "Verify build emitted expected content"
+        env:
+          PROVIDER: ${{ inputs.provider }}
+        run: |
+          # Guard against silent no-op syncs. `aws s3 sync` exits 0 when the
+          # source dir is missing or empty, so without this a partial build
+          # (e.g. extract_metadata.py errored mid-run) would report green
+          # while uploading nothing or stale state. Mirrors the per-provider
+          # guard in the "Sync backfilled version pages to S3" step in
+          # registry-backfill.yml.
+          if [[ -n "${PROVIDER}" ]]; then
+            # Incremental: verify each target provider's pages and versions JSON exist.
+            for pid in ${PROVIDER}; do
+              LOCAL_PROV_DIR="registry/_site/providers/${pid}/"
+              LOCAL_API_DIR="registry/_site/api/providers/${pid}/"
+              LOCAL_VERSIONS_JSON="${LOCAL_API_DIR}versions.json"
+              if [ ! -d "${LOCAL_PROV_DIR}" ] || [ -z "$(ls -A "${LOCAL_PROV_DIR}" 2>/dev/null)" ]; then
+                echo "::error::Build did not emit ${LOCAL_PROV_DIR} -- aborting sync."
+                exit 1
+              fi
+              if [ ! -d "${LOCAL_API_DIR}" ] || [ -z "$(ls -A "${LOCAL_API_DIR}" 2>/dev/null)" ]; then
+                echo "::error::Build did not emit ${LOCAL_API_DIR} -- aborting sync."
+                exit 1
+              fi
+              if [ ! -s "${LOCAL_VERSIONS_JSON}" ]; then
+                echo "::error::${LOCAL_VERSIONS_JSON} missing or empty -- aborting sync."
+                exit 1
+              fi
+            done
+          else
+            # Full build: verify the top-level homepage and provider listing.
+            if [ ! -s "registry/_site/index.html" ]; then
+              echo "::error::Full build did not emit registry/_site/index.html -- aborting sync."
+              exit 1
+            fi
+            if [ ! -s "registry/_site/api/providers.json" ]; then
+              echo "::error::registry/_site/api/providers.json missing or empty -- aborting sync."
+              exit 1
+            fi
+            API_PROVIDERS_DIR="registry/_site/api/providers/"
+            if [ ! -d "${API_PROVIDERS_DIR}" ] || [ -z "$(ls -A "${API_PROVIDERS_DIR}" 2>/dev/null)" ]; then
+              echo "::error::${API_PROVIDERS_DIR} is missing or empty -- aborting sync."
+              exit 1
+            fi
+          fi
+
+      - name: "Sync registry to S3"
+        env:
+          S3_BUCKET: ${{ steps.destination.outputs.bucket }}
+          PROVIDER: ${{ inputs.provider }}
+        run: |
+          # Incremental builds only extract data for the target provider(s).
+          # Eleventy rebuilds all pages, but non-target providers have
+          # incomplete data (no connections/parameters, wrong version info).
+          # Exclude both per-provider API JSON and HTML pages from the main
+          # sync, then selectively upload only the target provider's files.
+          EXCLUDE_PROVIDERS=()
+          if [[ -n "${PROVIDER}" ]]; then
+            # Exclude per-provider subtrees but re-include global listing
+            # pages. AWS CLI processes filters in order — later rules win.
+            EXCLUDE_PROVIDERS=(
+              --exclude "api/providers/*"
+              --exclude "providers/*"
+              --include "providers/index.html"
+            )
+          fi
+
+          aws s3 sync registry/_site/ "${S3_BUCKET}" \
+            --cache-control "${REGISTRY_CACHE_CONTROL}" \
+            --exclude "pagefind/*" \
+            "${EXCLUDE_PROVIDERS[@]}"
+
+          # For incremental builds, sync only the target provider's files.
+          if [[ -n "${PROVIDER}" ]]; then
+            for pid in ${PROVIDER}; do
+              aws s3 sync "registry/_site/api/providers/${pid}/" \
+                "${S3_BUCKET}api/providers/${pid}/" \
+                --cache-control "${REGISTRY_CACHE_CONTROL}"
+              aws s3 sync "registry/_site/providers/${pid}/" \
+                "${S3_BUCKET}providers/${pid}/" \
+                --cache-control "${REGISTRY_CACHE_CONTROL}"
+            done
+          fi
+
+          # Pagefind generates content-hashed filenames (e.g. en_181da6f.pf_index).
+          # Each rebuild produces new hashes, so --delete is needed to remove stale
+          # index files. This is separate from the main sync which intentionally
+          # omits --delete to preserve files written by other steps (publish-versions).
+          aws s3 sync registry/_site/pagefind/ "${S3_BUCKET}pagefind/" \
+            --cache-control "${REGISTRY_CACHE_CONTROL}" --delete
+
+      - name: "Publish version metadata"
+        env:
+          S3_BUCKET: ${{ steps.destination.outputs.bucket }}
+        run: breeze registry publish-versions --s3-bucket "${S3_BUCKET}"

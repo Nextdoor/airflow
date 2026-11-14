@@ -1,0 +1,919 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+from __future__ import annotations
+
+import time
+from enum import Enum
+from functools import cached_property
+from typing import TYPE_CHECKING, Any, BinaryIO, Literal, TypeVar, overload
+
+from deprecated import deprecated
+from openai import AsyncOpenAI, OpenAI
+from openai.auth import (
+    azure_managed_identity_token_provider,
+    gcp_id_token_provider,
+    k8s_service_account_token_provider,
+)
+
+if TYPE_CHECKING:
+    from openai.auth import SubjectTokenProvider, WorkloadIdentity
+    from openai.types import (
+        CreateEmbeddingResponse,
+        FileDeleted,
+        FileObject,
+        VectorStore,
+        VectorStoreDeleted,
+    )
+    from openai.types.batch import Batch
+    from openai.types.beta import Assistant, AssistantDeleted, Thread, ThreadDeleted
+    from openai.types.beta.threads import Message, Run
+    from openai.types.chat import (
+        ChatCompletionAssistantMessageParam,
+        ChatCompletionFunctionMessageParam,
+        ChatCompletionMessage,
+        ChatCompletionSystemMessageParam,
+        ChatCompletionToolMessageParam,
+        ChatCompletionUserMessageParam,
+    )
+    from openai.types.conversations import Conversation, ConversationDeletedResource
+    from openai.types.responses import ParsedResponse, Response
+    from openai.types.vector_stores import VectorStoreFile, VectorStoreFileBatch, VectorStoreFileDeleted
+    from pydantic import BaseModel
+
+    from airflow.providers.common.compat.sdk import Connection
+from airflow.exceptions import AirflowProviderDeprecationWarning
+from airflow.providers.common.compat.connection import get_async_connection, get_async_extra_dejson
+from airflow.providers.common.compat.module_loading import import_string
+from airflow.providers.common.compat.sdk import AirflowException, BaseHook
+from airflow.providers.openai.exceptions import (
+    OpenAIAgentSessionError,
+    OpenAIBatchCancelled,
+    OpenAIBatchJobException,
+    OpenAIBatchTimeout,
+    OpenAITriggerEventError,
+)
+
+#: The OpenAI Assistants API (``beta.assistants``/``beta.threads``) is deprecated by OpenAI. The hook
+#: methods wrapping it warn and point at the Responses and Conversations APIs (``create_response`` /
+#: ``create_conversation``); the removal date is stated once, in the reason string below.
+_ASSISTANTS_DEPRECATION_REASON = (
+    "The OpenAI Assistants API is deprecated and will be removed by OpenAI on 2026-08-26. "
+    "Use the Responses API (create_response) and Conversations API (create_conversation) instead. "
+    "See https://platform.openai.com/docs/guides/migrate-to-responses."
+)
+
+#: Generic type variable for the Pydantic model used as the ``text_format`` in structured-output
+#: Responses API calls. Mirrors the SDK's ``TextFormatT`` so ``parse_response`` returns a
+#: ``ParsedResponse[T]`` — callers get ``output_parsed`` typed as ``T | None``.
+_TextFormatT = TypeVar("_TextFormatT", bound="BaseModel")
+
+
+class BatchStatus(str, Enum):
+    """Enum for the status of a batch."""
+
+    VALIDATING = "validating"
+    FAILED = "failed"
+    IN_PROGRESS = "in_progress"
+    FINALIZING = "finalizing"
+    COMPLETED = "completed"
+    EXPIRED = "expired"
+    CANCELLING = "cancelling"
+    CANCELLED = "cancelled"
+
+    def __str__(self) -> str:
+        return str(self.value)
+
+    @classmethod
+    def is_in_progress(cls, status: str) -> bool:
+        """Check if the batch status is in progress."""
+        return status in (cls.VALIDATING, cls.IN_PROGRESS, cls.FINALIZING)
+
+
+#: Statuses the provider's trigger emits in its terminal event.
+TRIGGER_EVENT_STATUSES = frozenset({"success", "error", "cancelled"})
+
+
+class TerminationReason(str, Enum):
+    """Enum for the ``termination_reason`` field of a trigger's terminal event."""
+
+    TIMEOUT = "timeout"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+    EXPIRED = "expired"
+    UNEXPECTED_STATUS = "unexpected_status"
+    POLLING_ERROR = "polling_error"
+
+
+# Maps the trigger's ``termination_reason`` field to the exception ``execute_complete``
+# should raise. Keyed on the reason field, never on the message text, so that a
+# rewording of the trigger's message never silently changes which exception a
+# downstream task can catch.
+_TERMINATION_REASON_EXCEPTIONS: dict[str, type[AirflowException]] = {
+    TerminationReason.TIMEOUT: OpenAIBatchTimeout,
+    TerminationReason.CANCELLED: OpenAIBatchCancelled,
+}
+
+
+def build_batch_error(message: str, termination_reason: str | None) -> AirflowException:
+    """
+    Build (but do not raise) the exception matching a trigger event's termination reason.
+
+    ``termination_reason`` is ``None`` when the event was produced by a trigger
+    serialized before this field existed (a rolling upgrade in flight); that case
+    falls back to ``OpenAIBatchJobException``, matching today's behavior.
+    """
+    if termination_reason is None:
+        return OpenAIBatchJobException(message)
+    exception_class = _TERMINATION_REASON_EXCEPTIONS.get(termination_reason, OpenAIBatchJobException)
+    return exception_class(message)
+
+
+def validate_execute_complete_event(event: dict[str, Any] | None = None) -> dict[str, Any]:
+    """
+    Validate the event a deferred task resumes with, returning it if well-formed.
+
+    The event crosses the triggerer/worker boundary through the metadata DB, so a
+    resuming task can receive ``None`` or a status its handler does not recognize
+    (version skew, a custom trigger). Both must fail loudly instead of crashing
+    opaquely or being misread as an outcome.
+    """
+    if event is None:
+        raise OpenAITriggerEventError("Trigger error: event is None")
+    if event.get("status") not in TRIGGER_EVENT_STATUSES:
+        raise OpenAITriggerEventError(f"Unexpected trigger event status {event.get('status')!r}: {event!r}")
+    return event
+
+
+class OpenAIHook(BaseHook):
+    """
+    Use OpenAI SDK to interact with OpenAI APIs.
+
+    .. seealso:: https://platform.openai.com/docs/introduction/overview
+
+    :param conn_id: :ref:`OpenAI connection id <howto/connection:openai>`
+    """
+
+    conn_name_attr = "conn_id"
+    default_conn_name = "openai_default"
+    conn_type = "openai"
+    hook_name = "OpenAI"
+
+    def __init__(self, conn_id: str = default_conn_name, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.conn_id = conn_id
+
+    @classmethod
+    def get_ui_field_behaviour(cls) -> dict[str, Any]:
+        """Return custom field behaviour."""
+        return {
+            "hidden_fields": ["schema", "port", "login"],
+            "relabeling": {"password": "API Key"},
+            "placeholders": {},
+        }
+
+    def test_connection(self) -> tuple[bool, str]:
+        try:
+            self.conn.models.list()
+            return True, "Connection established!"
+        except Exception as e:
+            return False, str(e)
+
+    @cached_property
+    def conn(self) -> OpenAI:
+        """Return an OpenAI connection object."""
+        return self.get_conn()
+
+    def get_conn(self) -> OpenAI:
+        """
+        Return an OpenAI connection object.
+
+        The authentication mechanism is selected with the ``auth_type`` key in the connection
+        ``extra`` (default ``"api_key"``):
+
+        * ``"api_key"`` -- use the API key from the connection password (or ``openai_client_kwargs``).
+        * ``"workload_identity"`` -- exchange a short-lived identity token for API access using the
+          OpenAI client's workload identity support. See :meth:`_build_workload_identity`.
+        """
+        conn = self.get_connection(self.conn_id)
+        return OpenAI(**self._client_kwargs(conn, conn.extra_dejson))
+
+    async def aget_conn(self) -> AsyncOpenAI:
+        """
+        Return an ``AsyncOpenAI`` client configured like :meth:`get_conn`.
+
+        From Airflow 3.3.2 the connection is resolved without a blocking call to the
+        supervisor, so this is safe on an event loop with other async calls in flight.
+
+        Each call builds a new client: close it with ``async with`` or ``await client.close()``.
+        With ``workload_identity`` each client exchanges its own token, so reuse one client
+        for many calls.
+        """
+        conn = await get_async_connection(self.conn_id, hook=self)
+        return AsyncOpenAI(**self._client_kwargs(conn, await get_async_extra_dejson(conn)))
+
+    def _client_kwargs(self, conn: Connection, extras: dict[str, Any]) -> dict[str, Any]:
+        """Build the ``OpenAI`` / ``AsyncOpenAI`` constructor kwargs from the connection."""
+        openai_client_kwargs = dict(extras.get("openai_client_kwargs", {}))
+        base_url = openai_client_kwargs.pop("base_url", None) or conn.host or None
+        # Pop api_key for every path so it is never forwarded alongside ``workload_identity``
+        # (the OpenAI client rejects both being set at once).
+        api_key = openai_client_kwargs.pop("api_key", None)
+        auth_type = extras.get("auth_type", "api_key")
+
+        if auth_type == "api_key":
+            return {"api_key": api_key or conn.password, "base_url": base_url, **openai_client_kwargs}
+
+        if auth_type == "workload_identity":
+            return {
+                "workload_identity": self._build_workload_identity(extras),
+                "base_url": base_url,
+                **openai_client_kwargs,
+            }
+
+        raise ValueError(
+            f"Unsupported auth_type {auth_type!r} for OpenAI connection {self.conn_id!r}; "
+            "expected 'api_key' or 'workload_identity'."
+        )
+
+    def _build_workload_identity(self, extras: dict[str, Any]) -> WorkloadIdentity:
+        """
+        Build the OpenAI ``workload_identity`` config from the connection ``extra``.
+
+        Returns the ``workload_identity`` mapping (``identity_provider_id``, ``service_account_id``,
+        ``provider``, and optional ``refresh_buffer_seconds``) for the token source selected by
+        ``workload_identity_provider``. Raises ``ValueError`` when a required key is missing or the
+        source is unknown. See :ref:`howto/connection:openai` for the full key reference.
+        """
+        for key in ("identity_provider_id", "service_account_id"):
+            if key not in extras:
+                raise ValueError(
+                    f"Missing required {key!r} for workload_identity auth on OpenAI connection "
+                    f"{self.conn_id!r}."
+                )
+
+        provider_name = extras.get("workload_identity_provider")
+        provider: SubjectTokenProvider
+        if provider_name == "kubernetes":
+            kwargs = {key: extras[key] for key in ("token_file_path",) if key in extras}
+            provider = k8s_service_account_token_provider(**kwargs)
+        elif provider_name == "azure":
+            kwargs = {
+                key: extras[key]
+                for key in ("resource", "object_id", "client_id", "msi_res_id", "api_version")
+                if key in extras
+            }
+            provider = azure_managed_identity_token_provider(**kwargs)
+        elif provider_name == "gcp":
+            kwargs = {key: extras[key] for key in ("audience",) if key in extras}
+            provider = gcp_id_token_provider(**kwargs)
+        elif provider_name == "custom":
+            if "token_provider" not in extras:
+                raise ValueError(
+                    f"Missing required 'token_provider' for custom workload_identity auth on OpenAI "
+                    f"connection {self.conn_id!r}."
+                )
+            provider = {
+                "token_type": extras.get("token_type", "jwt"),
+                "get_token": import_string(extras["token_provider"]),
+            }
+        else:
+            raise ValueError(
+                f"Unsupported workload_identity_provider {provider_name!r} for OpenAI connection "
+                f"{self.conn_id!r}; expected one of 'kubernetes', 'azure', 'gcp', 'custom'."
+            )
+
+        workload_identity: WorkloadIdentity = {
+            "identity_provider_id": extras["identity_provider_id"],
+            "service_account_id": extras["service_account_id"],
+            "provider": provider,
+        }
+        if "refresh_buffer_seconds" in extras:
+            workload_identity["refresh_buffer_seconds"] = extras["refresh_buffer_seconds"]
+        return workload_identity
+
+    def create_chat_completion(
+        self,
+        messages: list[
+            ChatCompletionSystemMessageParam
+            | ChatCompletionUserMessageParam
+            | ChatCompletionAssistantMessageParam
+            | ChatCompletionToolMessageParam
+            | ChatCompletionFunctionMessageParam
+        ],
+        model: str = "gpt-4o-mini",
+        **kwargs: Any,
+    ) -> list[ChatCompletionMessage]:
+        """
+        Create a model response for the given chat conversation and returns a list of chat completions.
+
+        :param messages: A list of messages comprising the conversation so far
+        :param model: ID of the model to use
+        """
+        response = self.conn.chat.completions.create(model=model, messages=messages, **kwargs)
+        return response.choices
+
+    def create_response(self, input: Any, model: str = "gpt-4o-mini", **kwargs: Any) -> Response:
+        """
+        Create a model response using the Responses API.
+
+        :param input: Text, image, or file input(s) to the model.
+        :param model: ID of the model to use.
+        """
+        return self.conn.responses.create(model=model, input=input, **kwargs)
+
+    def parse_response(
+        self,
+        input: Any,
+        model: str = "gpt-4o-mini",
+        *,
+        text_format: type[_TextFormatT],
+        **kwargs: Any,
+    ) -> ParsedResponse[_TextFormatT]:
+        """
+        Create a model response and parse it into a Pydantic model via the Responses API.
+
+        Wraps :py:meth:`openai.resources.responses.Responses.parse`. The SDK converts
+        ``text_format`` into a JSON schema, sends it as a structured-output request, and
+        returns a :class:`~openai.types.responses.ParsedResponse` whose ``output_parsed``
+        attribute is an instance of ``text_format``, or ``None`` when the response carries no
+        parsed output (for example a refusal).
+
+        :param input: Text, image, or file input(s) to the model.
+        :param model: ID of the model to use.
+        :param text_format: A Pydantic ``BaseModel`` subclass describing the expected
+            structured output. Keyword-only, as in the SDK. The SDK converts it to a JSON schema
+            and sends the structured-output request.
+        """
+        return self.conn.responses.parse(input=input, model=model, text_format=text_format, **kwargs)
+
+    def get_response(self, response_id: str, **kwargs: Any) -> Response:
+        """
+        Retrieve a previously created model response.
+
+        :param response_id: The ID of the response to retrieve.
+        """
+        return self.conn.responses.retrieve(response_id, **kwargs)
+
+    def delete_response(self, response_id: str) -> None:
+        """
+        Delete a model response.
+
+        :param response_id: The ID of the response to delete.
+        """
+        self.conn.responses.delete(response_id)
+
+    def cancel_response(self, response_id: str) -> Response:
+        """
+        Cancel an in-progress response created with ``background=True``.
+
+        :param response_id: The ID of the response to cancel.
+        """
+        return self.conn.responses.cancel(response_id)
+
+    def create_conversation(self, **kwargs: Any) -> Conversation:
+        """Create a conversation that can be reused across responses to persist state."""
+        return self.conn.conversations.create(**kwargs)
+
+    def get_conversation(self, conversation_id: str) -> Conversation:
+        """
+        Retrieve a conversation.
+
+        :param conversation_id: The ID of the conversation to retrieve.
+        """
+        return self.conn.conversations.retrieve(conversation_id)
+
+    def update_conversation(self, conversation_id: str, metadata: dict[str, str]) -> Conversation:
+        """
+        Update a conversation's metadata.
+
+        :param conversation_id: The ID of the conversation to update.
+        :param metadata: Set of key-value pairs to attach to the conversation.
+        """
+        return self.conn.conversations.update(conversation_id, metadata=metadata)
+
+    def delete_conversation(self, conversation_id: str) -> ConversationDeletedResource:
+        """
+        Delete a conversation.
+
+        :param conversation_id: The ID of the conversation to delete.
+        """
+        return self.conn.conversations.delete(conversation_id)
+
+    @deprecated(reason=_ASSISTANTS_DEPRECATION_REASON, category=AirflowProviderDeprecationWarning)
+    def create_assistant(self, model: str = "gpt-4o-mini", **kwargs: Any) -> Assistant:
+        """
+        Create an OpenAI assistant using the given model.
+
+        :param model: The OpenAI model for the assistant to use.
+        """
+        assistant = self.conn.beta.assistants.create(model=model, **kwargs)
+        return assistant
+
+    @deprecated(reason=_ASSISTANTS_DEPRECATION_REASON, category=AirflowProviderDeprecationWarning)
+    def get_assistant(self, assistant_id: str) -> Assistant:
+        """
+        Get an OpenAI assistant.
+
+        :param assistant_id: The ID of the assistant to retrieve.
+        """
+        assistant = self.conn.beta.assistants.retrieve(assistant_id=assistant_id)
+        return assistant
+
+    @deprecated(reason=_ASSISTANTS_DEPRECATION_REASON, category=AirflowProviderDeprecationWarning)
+    def get_assistants(self, **kwargs: Any) -> list[Assistant]:
+        """Get a list of Assistant objects."""
+        assistants = self.conn.beta.assistants.list(**kwargs)
+        return assistants.data
+
+    @deprecated(reason=_ASSISTANTS_DEPRECATION_REASON, category=AirflowProviderDeprecationWarning)
+    def modify_assistant(self, assistant_id: str, **kwargs: Any) -> Assistant:
+        """
+        Modify an existing Assistant object.
+
+        :param assistant_id: The ID of the assistant to be modified.
+        """
+        assistant = self.conn.beta.assistants.update(assistant_id=assistant_id, **kwargs)
+        return assistant
+
+    @deprecated(reason=_ASSISTANTS_DEPRECATION_REASON, category=AirflowProviderDeprecationWarning)
+    def delete_assistant(self, assistant_id: str) -> AssistantDeleted:
+        """
+        Delete an OpenAI Assistant for a given ID.
+
+        :param assistant_id: The ID of the assistant to delete.
+        """
+        response = self.conn.beta.assistants.delete(assistant_id=assistant_id)
+        return response
+
+    @deprecated(reason=_ASSISTANTS_DEPRECATION_REASON, category=AirflowProviderDeprecationWarning)
+    def create_thread(self, **kwargs: Any) -> Thread:
+        """Create an OpenAI thread."""
+        thread = self.conn.beta.threads.create(**kwargs)
+        return thread
+
+    @deprecated(reason=_ASSISTANTS_DEPRECATION_REASON, category=AirflowProviderDeprecationWarning)
+    def modify_thread(self, thread_id: str, metadata: dict[str, Any]) -> Thread:
+        """
+        Modify an existing Thread object.
+
+        :param thread_id: The ID of the thread to modify. Only the metadata can be modified.
+        :param metadata: Set of 16 key-value pairs that can be attached to an object.
+        """
+        thread = self.conn.beta.threads.update(thread_id=thread_id, metadata=metadata)
+        return thread
+
+    @deprecated(reason=_ASSISTANTS_DEPRECATION_REASON, category=AirflowProviderDeprecationWarning)
+    def delete_thread(self, thread_id: str) -> ThreadDeleted:
+        """
+        Delete an OpenAI thread for a given thread_id.
+
+        :param thread_id: The ID of the thread to delete.
+        """
+        response = self.conn.beta.threads.delete(thread_id=thread_id)
+        return response
+
+    @deprecated(reason=_ASSISTANTS_DEPRECATION_REASON, category=AirflowProviderDeprecationWarning)
+    def create_message(
+        self, thread_id: str, role: Literal["user", "assistant"], content: str, **kwargs: Any
+    ) -> Message:
+        """
+        Create a message for a given Thread.
+
+        :param thread_id: The ID of the thread to create a message for.
+        :param role: The role of the entity that is creating the message. Allowed values include: 'user', 'assistant'.
+        :param content: The content of the message.
+        """
+        thread_message = self.conn.beta.threads.messages.create(
+            thread_id=thread_id, role=role, content=content, **kwargs
+        )
+        return thread_message
+
+    @deprecated(reason=_ASSISTANTS_DEPRECATION_REASON, category=AirflowProviderDeprecationWarning)
+    def get_messages(self, thread_id: str, **kwargs: Any) -> list[Message]:
+        """
+        Return a list of messages for a given Thread.
+
+        :param thread_id: The ID of the thread the messages belong to.
+        """
+        messages = self.conn.beta.threads.messages.list(thread_id=thread_id, **kwargs)
+        return messages.data
+
+    @deprecated(reason=_ASSISTANTS_DEPRECATION_REASON, category=AirflowProviderDeprecationWarning)
+    def modify_message(self, thread_id: str, message_id, **kwargs: Any) -> Message:
+        """
+        Modify an existing message for a given Thread.
+
+        :param thread_id: The ID of the thread to which this message belongs.
+        :param message_id: The ID of the message to modify.
+        """
+        thread_message = self.conn.beta.threads.messages.update(
+            thread_id=thread_id, message_id=message_id, **kwargs
+        )
+        return thread_message
+
+    @deprecated(reason=_ASSISTANTS_DEPRECATION_REASON, category=AirflowProviderDeprecationWarning)
+    def create_run(self, thread_id: str, assistant_id: str, **kwargs: Any) -> Run:
+        """
+        Create a run for a given thread and assistant.
+
+        :param thread_id: The ID of the thread to run.
+        :param assistant_id: The ID of the assistant to use to execute this run.
+        """
+        run = self.conn.beta.threads.runs.create(thread_id=thread_id, assistant_id=assistant_id, **kwargs)
+        return run
+
+    @deprecated(reason=_ASSISTANTS_DEPRECATION_REASON, category=AirflowProviderDeprecationWarning)
+    def create_run_and_poll(self, thread_id: str, assistant_id: str, **kwargs: Any) -> Run:
+        """
+        Create a run for a given thread and assistant and then polls until completion.
+
+        :param thread_id: The ID of the thread to run.
+        :param assistant_id: The ID of the assistant to use to execute this run.
+        :return: An OpenAI Run object
+        """
+        run = self.conn.beta.threads.runs.create_and_poll(
+            thread_id=thread_id, assistant_id=assistant_id, **kwargs
+        )
+        return run
+
+    @deprecated(reason=_ASSISTANTS_DEPRECATION_REASON, category=AirflowProviderDeprecationWarning)
+    def get_run(self, thread_id: str, run_id: str) -> Run:
+        """
+        Retrieve a run for a given thread and run.
+
+        :param thread_id: The ID of the thread that was run.
+        :param run_id: The ID of the run to retrieve.
+        """
+        run = self.conn.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run_id)
+        return run
+
+    @deprecated(reason=_ASSISTANTS_DEPRECATION_REASON, category=AirflowProviderDeprecationWarning)
+    def get_runs(self, thread_id: str, **kwargs: Any) -> list[Run]:
+        """
+        Return a list of runs belonging to a thread.
+
+        :param thread_id: The ID of the thread the run belongs to.
+        """
+        runs = self.conn.beta.threads.runs.list(thread_id=thread_id, **kwargs)
+        return runs.data
+
+    @deprecated(reason=_ASSISTANTS_DEPRECATION_REASON, category=AirflowProviderDeprecationWarning)
+    def modify_run(self, thread_id: str, run_id: str, **kwargs: Any) -> Run:
+        """
+        Modify a run on a given thread.
+
+        :param thread_id: The ID of the thread that was run.
+        :param run_id: The ID of the run to modify.
+        """
+        run = self.conn.beta.threads.runs.update(thread_id=thread_id, run_id=run_id, **kwargs)
+        return run
+
+    @overload
+    def create_embeddings(
+        self,
+        text: str | list[int],
+        model: str = "text-embedding-3-small",
+        **kwargs: Any,
+    ) -> list[float]: ...
+
+    @overload
+    def create_embeddings(
+        self,
+        text: list[str] | list[list[int]],
+        model: str = "text-embedding-3-small",
+        **kwargs: Any,
+    ) -> list[list[float]]: ...
+
+    def create_embeddings(
+        self,
+        text: str | list[str] | list[int] | list[list[int]],
+        model: str = "text-embedding-3-small",
+        **kwargs: Any,
+    ) -> list[float] | list[list[float]]:
+        """
+        Generate embeddings for the given text using the given model.
+
+        :param text: The text to generate embeddings for.
+        :param model: The model to use for generating embeddings.
+        :return: One embedding for a single text or token array; one embedding per item for a batch.
+        """
+        response = self.conn.embeddings.create(model=model, input=text, **kwargs)
+        return self._embeddings_result(text, response)
+
+    @overload
+    async def acreate_embeddings(
+        self,
+        text: str | list[int],
+        model: str = "text-embedding-3-small",
+        **kwargs: Any,
+    ) -> list[float]: ...
+
+    @overload
+    async def acreate_embeddings(
+        self,
+        text: list[str] | list[list[int]],
+        model: str = "text-embedding-3-small",
+        **kwargs: Any,
+    ) -> list[list[float]]: ...
+
+    async def acreate_embeddings(
+        self,
+        text: str | list[str] | list[int] | list[list[int]],
+        model: str = "text-embedding-3-small",
+        **kwargs: Any,
+    ) -> list[float] | list[list[float]]:
+        """
+        Async version of :meth:`create_embeddings`.
+
+        Each call opens and closes its own client, so for many inputs pass one batched ``text`` list.
+
+        :param text: The text to generate embeddings for.
+        :param model: The model to use for generating embeddings.
+        :return: One embedding for a single text or token array; one embedding per item for a batch.
+        """
+        async with await self.aget_conn() as client:
+            response = await client.embeddings.create(model=model, input=text, **kwargs)
+        return self._embeddings_result(text, response)
+
+    @staticmethod
+    def _embeddings_result(
+        text: str | list[str] | list[int] | list[list[int]], response: CreateEmbeddingResponse
+    ) -> list[float] | list[list[float]]:
+        """Return one vector for a single text or token array, one vector per item in input order for a batch."""
+        if isinstance(text, str) or (text and isinstance(text[0], int)):
+            return response.data[0].embedding
+        return [item.embedding for item in sorted(response.data, key=lambda item: item.index)]
+
+    def upload_file(self, file: str, purpose: Literal["fine-tune", "assistants", "batch"]) -> FileObject:
+        """
+        Upload a file that can be used across various endpoints. The size of all the files uploaded by one organization can be up to 100 GB.
+
+        :param file: The File object (not file name) to be uploaded.
+        :param purpose: The intended purpose of the uploaded file. Use "fine-tune" for
+            Fine-tuning, "assistants" for Assistants and Messages, and "batch" for Batch API.
+        """
+        with open(file, "rb") as file_stream:
+            file_object = self.conn.files.create(file=file_stream, purpose=purpose)
+        return file_object
+
+    def get_file(self, file_id: str) -> FileObject:
+        """
+        Return information about a specific file.
+
+        :param file_id: The ID of the file to use for this request.
+        """
+        file = self.conn.files.retrieve(file_id=file_id)
+        return file
+
+    def get_files(self) -> list[FileObject]:
+        """Return a list of files that belong to the user's organization."""
+        files = self.conn.files.list()
+        return files.data
+
+    def delete_file(self, file_id: str) -> FileDeleted:
+        """
+        Delete a file.
+
+        :param file_id: The ID of the file to be deleted.
+        """
+        response = self.conn.files.delete(file_id=file_id)
+        return response
+
+    def create_vector_store(self, **kwargs: Any) -> VectorStore:
+        """Create a vector store."""
+        vector_store = self.conn.vector_stores.create(**kwargs)
+        return vector_store
+
+    def get_vector_stores(self, **kwargs: Any) -> list[VectorStore]:
+        """Return a list of vector stores."""
+        vector_stores = self.conn.vector_stores.list(**kwargs)
+        return vector_stores.data
+
+    def get_vector_store(self, vector_store_id: str) -> VectorStore:
+        """
+        Retrieve a vector store.
+
+        :param vector_store_id: The ID of the vector store to retrieve.
+        """
+        vector_store = self.conn.vector_stores.retrieve(vector_store_id=vector_store_id)
+        return vector_store
+
+    def modify_vector_store(self, vector_store_id: str, **kwargs: Any) -> VectorStore:
+        """
+        Modify a vector store.
+
+        :param vector_store_id: The ID of the vector store to modify.
+        """
+        vector_store = self.conn.vector_stores.update(vector_store_id=vector_store_id, **kwargs)
+        return vector_store
+
+    def delete_vector_store(self, vector_store_id: str) -> VectorStoreDeleted:
+        """
+        Delete a vector store.
+
+        :param vector_store_id: The ID of the vector store to delete.
+        """
+        response = self.conn.vector_stores.delete(vector_store_id=vector_store_id)
+        return response
+
+    def upload_files_to_vector_store(
+        self, vector_store_id: str, files: list[BinaryIO]
+    ) -> VectorStoreFileBatch:
+        """
+        Upload files to a vector store and poll until completion.
+
+        :param vector_store_id: The ID of the vector store the files are to be uploaded
+            to.
+        :param files: A list of binary files to upload.
+        """
+        file_batch = self.conn.vector_stores.file_batches.upload_and_poll(
+            vector_store_id=vector_store_id, files=files
+        )
+        return file_batch
+
+    def get_vector_store_files(self, vector_store_id: str) -> list[VectorStoreFile]:
+        """
+        Return a list of vector store files.
+
+        :param vector_store_id:
+        """
+        vector_store_files = self.conn.vector_stores.files.list(vector_store_id=vector_store_id)
+        return vector_store_files.data
+
+    def delete_vector_store_file(self, vector_store_id: str, file_id: str) -> VectorStoreFileDeleted:
+        """
+        Delete a vector store file. This will remove the file from the vector store but the file itself will not be deleted. To delete the file, use delete_file.
+
+        :param vector_store_id: The ID of the vector store that the file belongs to.
+        :param file_id: The ID of the file to delete.
+        """
+        response = self.conn.vector_stores.files.delete(vector_store_id=vector_store_id, file_id=file_id)
+        return response
+
+    def create_batch(
+        self,
+        file_id: str,
+        endpoint: str,
+        metadata: dict[str, str] | None = None,
+        completion_window: Literal["24h"] = "24h",
+        **kwargs: Any,
+    ) -> Batch:
+        """
+        Create a batch for a given model and files.
+
+        :param file_id: The ID of the file to be used for this batch.
+        :param endpoint: The endpoint to use for this batch. Allowed values are determined by the
+            OpenAI Batch API; see https://platform.openai.com/docs/api-reference/batch/create for
+            the current list.
+        :param metadata: A set of key-value pairs that can be attached to an object.
+        :param completion_window: The time window for the batch to complete. Default is 24 hours.
+        """
+        batch = self.conn.batches.create(
+            input_file_id=file_id,
+            # endpoint is intentionally str (not the SDK's Literal) so templated values type-check;
+            # the OpenAI service validates the actual value.
+            endpoint=endpoint,  # type: ignore[arg-type]
+            metadata=metadata,
+            completion_window=completion_window,
+            **kwargs,
+        )
+        return batch
+
+    def get_batch(self, batch_id: str) -> Batch:
+        """
+        Get the status of a batch.
+
+        :param batch_id: The ID of the batch to get the status of.
+        """
+        batch = self.conn.batches.retrieve(batch_id=batch_id)
+        return batch
+
+    def wait_for_batch(self, batch_id: str, wait_seconds: float = 3, timeout: float = 3600) -> None:
+        """
+        Poll a batch to check if it finishes.
+
+        :param batch_id: Id of the Batch to wait for.
+        :param wait_seconds: Optional. Number of seconds between checks.
+        :param timeout: Optional. How many seconds wait for batch to be ready.
+            Used only if not ran in deferred operator.
+        """
+        start = time.monotonic()
+        while True:
+            if start + timeout < time.monotonic():
+                try:
+                    self.cancel_batch(batch_id=batch_id)
+                except Exception as e:
+                    self.log.warning(
+                        "Failed to request cancellation of batch %s after timeout: %s", batch_id, e
+                    )
+                raise OpenAIBatchTimeout(f"Timeout: OpenAI Batch {batch_id} is not ready after {timeout}s")
+            batch = self.get_batch(batch_id=batch_id)
+
+            if BatchStatus.is_in_progress(batch.status):
+                time.sleep(wait_seconds)
+                continue
+            if batch.status == BatchStatus.COMPLETED:
+                return
+            if batch.status == BatchStatus.FAILED:
+                raise OpenAIBatchJobException(f"Batch failed - \n{batch_id}")
+            if batch.status in (BatchStatus.CANCELLED, BatchStatus.CANCELLING):
+                raise OpenAIBatchCancelled(f"Batch failed - batch was cancelled:\n{batch_id}")
+            if batch.status == BatchStatus.EXPIRED:
+                raise OpenAIBatchJobException(
+                    f"Batch failed - batch couldn't be completed within its completion window:\n{batch_id}"
+                )
+
+            raise OpenAIBatchJobException(
+                f"Batch failed - encountered unexpected status `{batch.status}` for batch_id `{batch_id}`"
+            )
+
+    def cancel_batch(self, batch_id: str) -> Batch:
+        """
+        Cancel a batch.
+
+        :param batch_id: The ID of the batch to delete.
+        """
+        batch = self.conn.batches.cancel(batch_id=batch_id)
+        return batch
+
+    #: Consecutive ``poll_agent_session`` failures tolerated before an agent wait gives up.
+    MAX_CONSECUTIVE_POLL_FAILURES = 3
+
+    @cached_property
+    def _managed_agents(self) -> Any:
+        agents = getattr(self.conn.beta, "agents", None)
+        if agents is None:
+            raise OpenAIAgentSessionError(
+                "Managed Agents requires openai>=3.13.0. Upgrade the OpenAI SDK on workers and triggerers."
+            )
+        return agents
+
+    def create_agent(self, **kwargs: Any) -> Any:
+        """Create a reusable Managed Agent using the SDK's agent configuration arguments."""
+        return self._managed_agents.create(**kwargs)
+
+    def create_agent_session(self, *, input: str, environment: dict[str, Any], **kwargs: Any) -> Any:
+        """Create a fresh Managed Agents session and submit its initial turn."""
+        if "stream" in kwargs:
+            raise ValueError("create_agent_session does not support streaming")
+        return self._managed_agents.sessions.create(
+            input=input, environment=environment, stream=False, **kwargs
+        )
+
+    def get_agent_session(self, session_id: str) -> Any:
+        """Retrieve a Managed Agents session, including required actions and usage."""
+        return self._managed_agents.sessions.retrieve(session_id)
+
+    def cancel_agent_session(self, session_id: str) -> None:
+        """Request cancellation of the session's active turn, preserving its history and artifacts."""
+        self._managed_agents.sessions.events.create(
+            session_id, events=[{"type": "agent.session.input.cancel"}]
+        )
+
+    def poll_agent_session(self, session_id: str) -> dict[str, Any] | None:
+        """
+        Check the first turn of a fresh, exclusively owned session.
+
+        Return a terminal result, or ``None`` while waiting. An idle session without
+        a visible turn is not completion: the submitted input may still be queued.
+        This helper must not be used to wait for subsequent turns of a reused session.
+        """
+        session = self.get_agent_session(session_id)
+        turns = self._managed_agents.sessions.turns.list(session_id, order="asc", limit=1)
+        turn = turns.data[0] if turns.data else None
+        result: dict[str, Any] = {"session_id": session_id}
+        if turn is not None:
+            result["turn_id"] = turn.id
+            result["usage"] = turn.usage.model_dump(mode="json") if turn.usage is not None else None
+            if turn.status == "completed":
+                return {**result, "status": "success"}
+            if turn.status in {"failed", "cancelled"}:
+                message = f"Agent turn {turn.id} {turn.status}"
+                if turn.error is not None:
+                    message += f" ({turn.error.code}): {turn.error.message}"
+                return {**result, "status": "error", "message": message}
+        if session.status == "failed":
+            return {**result, "status": "error", "message": f"Agent session failed: {session.error}"}
+        if any(action.type == "function_call" for action in session.required_actions):
+            return {
+                **result,
+                "status": "error",
+                "message": "The agent requested a client-side function tool. Use server-side tools with this operator.",
+            }
+        return None

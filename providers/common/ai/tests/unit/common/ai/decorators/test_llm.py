@@ -1,0 +1,273 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+from enum import Enum
+from unittest.mock import ANY, MagicMock, patch
+from uuid import uuid4
+
+import pytest
+from pydantic_ai.messages import ImageUrl
+
+from airflow.providers.common.ai.decorators.llm import _LLMDecoratedOperator
+from airflow.providers.common.ai.decorators.llm_branch import _LLMBranchDecoratedOperator
+from airflow.providers.common.ai.decorators.llm_schema_compare import _LLMSchemaCompareDecoratedOperator
+from airflow.providers.common.ai.decorators.llm_sql import _LLMSQLDecoratedOperator
+from airflow.providers.common.ai.operators.llm_schema_compare import (
+    LLMSchemaCompareOperator,
+    SchemaCompareResult,
+)
+from airflow.providers.common.compat.sdk import TaskDeferred
+
+from tests_common.test_utils.version_compat import AIRFLOW_V_3_1_PLUS, AIRFLOW_V_3_3_PLUS
+
+if AIRFLOW_V_3_3_PLUS:
+    from airflow.sdk.exceptions import TaskAwaitingInput as ApprovalPauseSignal
+else:
+    ApprovalPauseSignal = TaskDeferred  # type: ignore[assignment, misc]
+
+DownstreamTasks = Enum("DownstreamTasks", {"positive": "positive"})
+
+
+class TestLLMDecoratedOperator:
+    def test_custom_operator_name(self):
+        assert _LLMDecoratedOperator.custom_operator_name == "@task.llm"
+
+    @patch("airflow.providers.common.ai.operators.llm.PydanticAIHook", autospec=True)
+    def test_execute_calls_callable_and_returns_output(self, mock_hook_cls, make_mock_run_result):
+        """The callable's return value becomes the LLM prompt."""
+        mock_agent = MagicMock(spec=["run_sync"])
+        mock_agent.run_sync.return_value = make_mock_run_result("This is a summary.")
+        mock_hook_cls.get_hook.return_value.create_agent.return_value = mock_agent
+
+        def my_prompt():
+            return "Summarize this text"
+
+        op = _LLMDecoratedOperator(task_id="test", python_callable=my_prompt, llm_conn_id="my_llm")
+        result = op.execute(context={})
+
+        assert result == "This is a summary."
+        assert op.prompt == "Summarize this text"
+        mock_agent.run_sync.assert_called_once_with(
+            "Summarize this text", usage=ANY, usage_limits=None, cancellation_token=ANY
+        )
+
+    @patch("airflow.providers.common.ai.operators.llm.PydanticAIHook", autospec=True)
+    def test_execute_forwards_fallback_conn_ids_to_hook(self, mock_hook_cls, make_mock_run_result):
+        """``fallback_conn_ids`` is accepted as a decorator kwarg without a per-decorator code change."""
+        mock_agent = MagicMock(spec=["run_sync"])
+        mock_agent.run_sync.return_value = make_mock_run_result("ok")
+        mock_hook_cls.get_hook.return_value.create_agent.return_value = mock_agent
+
+        op = _LLMDecoratedOperator(
+            task_id="test",
+            python_callable=lambda: "p",
+            llm_conn_id="my_llm",
+            fallback_conn_ids=["conn_a", "conn_b"],
+        )
+        op.execute(context={})
+
+        mock_hook_cls.get_hook.assert_called_once_with(
+            "my_llm", hook_params={"model_id": None, "fallback_conn_ids": ["conn_a", "conn_b"]}
+        )
+
+    @pytest.mark.parametrize(
+        "return_value",
+        [42, "", "   ", None, b"bytes", bytearray(b"x"), [], ()],
+        ids=["non-string", "empty", "whitespace", "none", "bytes", "bytearray", "empty-list", "empty-tuple"],
+    )
+    def test_execute_raises_on_invalid_prompt(self, return_value):
+        """TypeError when the callable returns an unsupported prompt shape."""
+        op = _LLMDecoratedOperator(
+            task_id="test",
+            python_callable=lambda: return_value,
+            llm_conn_id="my_llm",
+        )
+        with pytest.raises(TypeError, match="must be"):
+            op.execute(context={})
+
+    @patch("airflow.providers.common.ai.operators.llm.PydanticAIHook", autospec=True)
+    def test_execute_accepts_sequence_prompt(self, mock_hook_cls, make_mock_run_result):
+        """A non-empty Sequence[UserContent] return value is forwarded to run_sync as-is."""
+        mock_agent = MagicMock(spec=["run_sync"])
+        mock_agent.run_sync.return_value = make_mock_run_result("ok")
+        mock_hook_cls.get_hook.return_value.create_agent.return_value = mock_agent
+
+        image = ImageUrl(url="https://example.com/x.png")
+        prompt = ["Describe this:", image]
+
+        def my_prompt():
+            return prompt
+
+        op = _LLMDecoratedOperator(task_id="test", python_callable=my_prompt, llm_conn_id="my_llm")
+        op.execute(context={})
+
+        assert op.prompt == prompt
+        mock_agent.run_sync.assert_called_once_with(
+            prompt, usage=ANY, usage_limits=None, cancellation_token=ANY
+        )
+
+    @patch("airflow.providers.common.ai.operators.llm.PydanticAIHook", autospec=True)
+    def test_execute_merges_op_kwargs_into_callable(self, mock_hook_cls, make_mock_run_result):
+        """op_kwargs are resolved by the callable to build the prompt."""
+        mock_agent = MagicMock(spec=["run_sync", "instrument"])
+        mock_agent.run_sync.return_value = make_mock_run_result("done")
+        mock_hook_cls.get_hook.return_value.create_agent.return_value = mock_agent
+
+        def my_prompt(topic):
+            return f"Summarize {topic}"
+
+        op = _LLMDecoratedOperator(
+            task_id="test",
+            python_callable=my_prompt,
+            llm_conn_id="my_llm",
+            op_kwargs={"topic": "quantum computing"},
+        )
+        op.execute(context={"task_instance": MagicMock()})
+
+        assert op.prompt == "Summarize quantum computing"
+        mock_agent.run_sync.assert_called_once_with(
+            "Summarize quantum computing", usage=ANY, usage_limits=None, run_id=ANY, cancellation_token=ANY
+        )
+
+    @patch("airflow.providers.common.ai.operators.llm.LLMOperator.execute", autospec=True)
+    def test_execute_renders_only_the_returned_prompt(self, mock_execute):
+        """Fields rendered before execute() are not rendered again; only the returned prompt is."""
+        op = _LLMDecoratedOperator(
+            task_id="test",
+            python_callable=lambda: "Summarize {{ topic }}",
+            llm_conn_id="my_llm",
+            system_prompt="{{ note }}",
+        )
+        context = {"topic": "logs", "note": "{{ other }}", "other": "rendered twice"}
+
+        op.render_template_fields(context)
+        op.execute(context=context)
+
+        assert op.prompt == "Summarize logs"
+        assert op.system_prompt == "{{ other }}"
+
+    @patch("airflow.providers.common.ai.operators.llm.LLMOperator.execute", autospec=True)
+    def test_argument_referenced_in_returned_prompt_is_inserted_as_is(self, mock_execute):
+        """An argument referenced by name in the returned prompt is inserted without being rendered."""
+
+        def analyze_ticket(ticket):
+            return "Analyze this support ticket:\n\n{{ ticket }}"
+
+        op = _LLMDecoratedOperator(
+            task_id="test",
+            python_callable=analyze_ticket,
+            llm_conn_id="my_llm",
+            # As an upstream task's output, already resolved when execute() runs.
+            op_kwargs={"ticket": "Total is {{ 7 * 7 }}"},
+        )
+
+        op.execute(context={"task_instance": MagicMock()})
+
+        assert op.prompt == "Analyze this support ticket:\n\nTotal is {{ 7 * 7 }}"
+
+    @patch("airflow.providers.common.ai.operators.llm.LLMOperator.execute", autospec=True)
+    def test_positional_argument_referenced_in_returned_prompt(self, mock_execute):
+        """A positional call, such as ``summarize("...")``, makes the argument available by name too."""
+
+        def summarize(text):
+            return "Summarize this article: {{ text }}"
+
+        op = _LLMDecoratedOperator(
+            task_id="test",
+            python_callable=summarize,
+            llm_conn_id="my_llm",
+            op_args=["Total is {{ 7 * 7 }}"],
+        )
+
+        op.execute(context={"task_instance": MagicMock()})
+
+        assert op.prompt == "Summarize this article: Total is {{ 7 * 7 }}"
+
+    @patch("airflow.providers.common.ai.operators.llm.LLMOperator.execute", autospec=True)
+    def test_default_argument_does_not_shadow_the_context(self, mock_execute):
+        """A parameter left at its default is not merged, so ``ti=None`` keeps the context's ``ti``."""
+
+        def summarize(text, ti=None):
+            return "{{ text }} from {{ ti }}"
+
+        op = _LLMDecoratedOperator(
+            task_id="test",
+            python_callable=summarize,
+            llm_conn_id="my_llm",
+            op_args=["logs"],
+        )
+
+        op.execute(context={"task_instance": MagicMock(), "ti": "the real ti"})
+
+        assert op.prompt == "logs from the real ti"
+
+
+@pytest.mark.skipif(not AIRFLOW_V_3_1_PLUS, reason="require_approval needs Airflow >= 3.1.0")
+@pytest.mark.parametrize(
+    ("decorated_cls", "extra_kwargs", "output"),
+    [
+        pytest.param(_LLMDecoratedOperator, {}, "LLM response", id="llm"),
+        pytest.param(
+            _LLMBranchDecoratedOperator,
+            {},
+            DownstreamTasks.positive,
+            id="llm_branch",
+        ),
+        pytest.param(
+            _LLMSchemaCompareDecoratedOperator,
+            {"db_conn_ids": ["postgres_default", "snowflake_default"], "table_names": ["t"]},
+            SchemaCompareResult(compatible=True, mismatches=[], summary="All good"),
+            id="llm_schema_compare",
+        ),
+        pytest.param(_LLMSQLDecoratedOperator, {}, "SELECT 1", id="llm_sql"),
+    ],
+)
+@patch.object(LLMSchemaCompareOperator, "_build_schema_context", return_value="mocked schema")
+@patch("airflow.providers.standard.triggers.hitl.HITLTrigger", autospec=True)
+@patch("airflow.sdk.execution_time.hitl.upsert_hitl_detail")
+@patch("airflow.providers.common.ai.operators.llm.PydanticAIHook", autospec=True)
+def test_sequence_prompt_with_require_approval_pauses_for_review(
+    mock_hook_cls,
+    mock_upsert,
+    mock_trigger_cls,
+    mock_build_schema_context,
+    make_mock_run_result,
+    decorated_cls,
+    extra_kwargs,
+    output,
+):
+    mock_agent = MagicMock(spec=["run_sync", "instrument"])
+    mock_agent.run_sync.return_value = make_mock_run_result(output)
+    mock_hook_cls.get_hook.return_value.create_agent.return_value = mock_agent
+    op = decorated_cls(
+        task_id="test",
+        python_callable=lambda: ["Describe this:", ImageUrl(url="https://example.com/x.png")],
+        llm_conn_id="my_llm",
+        require_approval=True,
+        **extra_kwargs,
+    )
+    op.downstream_task_ids = {"positive"}
+
+    with pytest.raises(ApprovalPauseSignal):
+        op.execute(context={"task_instance": MagicMock(id=uuid4())})
+
+    mock_agent.run_sync.assert_called_once()
+    assert (
+        "Prompt: Describe this:\n[image-url: https://example.com/x.png]"
+        in mock_upsert.call_args.kwargs["body"]
+    )

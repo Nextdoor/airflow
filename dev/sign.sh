@@ -17,9 +17,7 @@
 # under the License.
 set -euo pipefail
 
-# Use this to sign the tar balls generated from
-# python setup.py sdist --formats=gztar
-# ie. sign.sh <my_tar_ball>
+# Use this to sign the tarballs and packages generated
 # you will still be required to type in your signing key password
 # or it needs to be available in your keychain
 
@@ -29,6 +27,15 @@ SIGN_WITH="${SIGN_WITH:-apache.org}"
 
 for name in "${@}"
 do
+    # Re-running after an interrupted run must not sign the .asc/.sha512 files
+    # produced earlier, nor re-sign artefacts that already have both of them.
+    case "${name}" in
+        *.asc|*.sha512) continue ;;
+    esac
+    if [[ -f "${name}.asc" && -f "${name}.sha512" ]]; then
+        echo "Skipping ${name}: already signed"
+        continue
+    fi
     gpg --yes --armor --local-user "$SIGN_WITH" --output "${name}.asc" --detach-sig "${name}"
     shasum -a 512 "${name}" > "${name}.sha512"
 done

@@ -23,7 +23,7 @@ import sys
 import xml.etree.ElementTree as ET
 
 # Do not use anything outsdie of standard library in this file!
-from functools import lru_cache
+from functools import cache
 from pathlib import Path
 
 TEXT_RED = "\033[31m"
@@ -31,7 +31,7 @@ TEXT_YELLOW = "\033[33m"
 TEXT_RESET = "\033[0m"
 
 
-@lru_cache(maxsize=None)
+@cache
 def translate_classname(classname):
     # The pytest xunit output has "classname" in the python sense as 'dir.subdir.package.Class' -- we want to
     # convert that back in to a pytest "selector" of dir/subdir/package.py::Class
@@ -43,19 +43,17 @@ def translate_classname(classname):
 
     parts = classname.split(".")
 
-    for i, component in enumerate(parts):
+    for offset, component in enumerate(parts, 1):  # noqa: B007
         candidate = context / component
 
         if candidate.is_dir():
             context = candidate
-            continue
-        candidate = context / (component + ".py")
-        if candidate.is_file():
-            context = candidate
-            i += 1
+        else:
+            candidate = context / (component + ".py")
+            if candidate.is_file():
+                context = candidate
             break
-        break
-    parts = parts[i:]
+    parts = parts[offset:]
 
     val = str(context.relative_to(Path.cwd()))
 
@@ -83,40 +81,33 @@ def summarize_file(input, test_type, backend):
 
     testsuite = root.find(".//testsuite")
 
-    fail_message = ""
+    fail_message_parts = []
 
-    num = int(testsuite.get("failures"))
-    if num:
-        fail_message = f"{num} failure"
-        if num != 1:
-            fail_message += "s"
+    num_failures = int(testsuite.get("failures"))
+    if num_failures:
+        fail_message_parts.append(f"{num_failures} failure{'' if num_failures == 1 else 's'}")
 
-    num = int(testsuite.get("errors"))
-    if num:
-        if fail_message:
-            fail_message += ", "
-        fail_message += f"{num} error"
-        if num != 1:
-            fail_message += "s"
+    num_errors = int(testsuite.get("errors"))
+    if num_errors:
+        fail_message_parts.append(f"{num_errors} error{'' if num_errors == 1 else 's'}")
 
-    if not fail_message:
+    if not fail_message_parts:
         return
-    print(f"\n{TEXT_RED}==== {test_type} {backend}: {fail_message} ===={TEXT_RESET}\n")
+    print(f"\n{TEXT_RED}==== {test_type} {backend}: {', '.join(fail_message_parts)} ===={TEXT_RESET}\n")
 
     for testcase in testsuite.findall(".//testcase[error]"):
         case_name = translate_name(testcase)
         for err in testcase.iterfind("error"):
-            print(f'{case_name}: {TEXT_YELLOW}{err.get("message")}{TEXT_RESET}')
+            print(f"{case_name}: {TEXT_YELLOW}{err.get('message')}{TEXT_RESET}")
     for testcase in testsuite.findall(".//testcase[failure]"):
         case_name = translate_name(testcase)
         for failure in testcase.iterfind("failure"):
-            print(f'{case_name}: {TEXT_YELLOW}{failure.get("message")}{TEXT_RESET}')
+            print(f"{case_name}: {TEXT_YELLOW}{failure.get('message')}{TEXT_RESET}")
 
 
 if __name__ == "__main__":
     fname_pattern = re.compile("^test_result-(?P<test_type>.*?)-(?P<backend>.*).xml$")
     for fname in sys.argv[1:]:
-
         match = fname_pattern.match(os.path.basename(fname))
 
         if not match:

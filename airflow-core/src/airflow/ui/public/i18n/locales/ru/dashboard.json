@@ -1,0 +1,72 @@
+{
+  "alerts": {
+    "seeLessContext": "Свернуть",
+    "seeMoreContext": "Подробнее",
+    "showMoreAlerts_few": "+ ещё {{count, number}} оповещения",
+    "showMoreAlerts_many": "+ ещё {{count, number}} оповещений",
+    "showMoreAlerts_one": "+ ещё {{count, number}} оповещение",
+    "showMoreAlerts_other": "+ ещё {{count, number}} оповещений"
+  },
+  "deadlines": {
+    "pending": {
+      "empty": "Нет предстоящих крайних сроков",
+      "title": "Предстоящие"
+    },
+    "recentlyMissed": {
+      "empty": "Нет пропущенных крайних сроков",
+      "title": "Пропущенные крайние сроки"
+    },
+    "showMore": "Показать больше",
+    "title": "Крайние сроки"
+  },
+  "deferredSlotsNotCounted": "Отложенные не учтены в слотах: {{count, number}}",
+  "deferredSlotsNotCountedTooltip": "Отложенные задачи, показанные на полосе, учитываются в слотах пула. Отложенные задачи под полосой относятся к пулам, которые не учитывают отложенные задачи в слотах.",
+  "favorite": {
+    "favoriteDags_few": "Первые {{count, number}} избранных Dag-а",
+    "favoriteDags_many": "Первые {{count, number}} избранных Dag-ов",
+    "favoriteDags_one": "Первый {{count, number}} избранный Dag",
+    "favoriteDags_other": "Первые {{count, number}} избранных Dag-ов",
+    "noDagRuns": "Для этого Dag-а еще нет запусков.",
+    "noFavoriteDags": "Ещё нет избранных. Нажмите на иконку со звёздочкой рядом с Dag-ом в списке, чтобы добавить его в избранное."
+  },
+  "group": "Группа",
+  "health": {
+    "dagProcessor": "Процессор Dag-а",
+    "health": "Состояние",
+    "healthy": "Исправный",
+    "lastHeartbeat": "Последний heartbeat-сигнал",
+    "metaDatabase": "Метабаза данных",
+    "scheduler": "Планировщик",
+    "status": "Статус",
+    "triggerer": "Триггерер",
+    "unhealthy": "Неисправный"
+  },
+  "history": "История",
+  "importErrors": {
+    "dagImportError_few": "Ошибки импорта Dag-ов",
+    "dagImportError_many": "Ошибки импорта Dag-ов",
+    "dagImportError_one": "Ошибка импорта Dag-ов",
+    "dagImportError_other": "Ошибки импорта Dag-ов",
+    "searchByFile": "Поиск по файлу",
+    "timestamp": "Отметка времени"
+  },
+  "managePools": "Управление пулами",
+  "noAssetEvents": "Нет найденных событий активов.",
+  "poolSlots": "Слоты пула",
+  "sortBy": {
+    "newestFirst": "Сначала новые",
+    "oldestFirst": "Сначала старые",
+    "placeholder": "Сортировать по"
+  },
+  "source": "Источник",
+  "stats": {
+    "activeDags": "Активные Dag-и",
+    "failedDags": "Dag-и с ошибками",
+    "queuedDags": "Dag-и в очереди",
+    "requiredActions": "Необходимые действия",
+    "runningDags": "Выполняющиеся Dag-и",
+    "stats": "Статистика"
+  },
+  "uri": "URI",
+  "welcome": "Добро пожаловать"
+}

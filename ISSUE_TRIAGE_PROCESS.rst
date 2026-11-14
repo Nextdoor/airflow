@@ -26,7 +26,7 @@ An unusual element of the Apache Airflow project is that you can open a PR
 to fix an issue or make an enhancement, without needing to open an issue first.
 This is intended to make it as easy as possible to contribute to the project.
 
-Usually users are report `Issues <https://github.com/apache/airflow/issues>`_ where they describe
+Usually, users report `Issues <https://github.com/apache/airflow/issues>`_ where they describe
 the issues they think are Airflow issues and should be solved. There are two kinds of issues:
 
 * Bugs - when the user thinks the reported issue is a bug in Airflow
@@ -62,18 +62,13 @@ Issue Triage Team
 ''''''''''''''''''
 
 While many of the issues can be responded to by other users and committers, the committer team is not
-big enough to handle all such requests and sometimes they are busy with implementing important
+big enough to handle all such requests and sometimes they are busy with implementing or resolving more important issues.
 Therefore, some people who are regularly contributing and helping other users and shown their deep interest
 in the project can be invited to join the triage team.
 `the .asf.yaml <.asf.yaml>`_ file in the ``collaborators`` section.
 
-Committers can invite people to become members of the triage team if they see that the users are already
-helping and responding to issues and when they see the users are involved regularly. But you can also ask
-to become a member of the team (on devlist) if you can show that you have done that and when you want to have
-more ways to help others.
 
-The triage team members do not have committer privileges but they can
-assign, edit, and close issues and pull requests without having capabilities to merge the code. They can
+The triage team members do not have committer privileges but they can assign, edit, and close issues and pull requests without having capabilities to merge the code. They can
 also convert issues into discussions and back. The expectation for the issue triage team is that they
 spend a bit of their time on those efforts. Triaging means not only assigning the labels but often responding
 to the issues and answering user concerns or if additional input is needed - tagging the committers or other community members who might be able to help provide more complete answers.
@@ -82,13 +77,27 @@ Being an active and helpful member of the "Issue Triage Team" is actually one of
 becoming a committer. By actively helping the users, triaging the issues, responding to them and
 involving others (when needed) shows that you are not only willing to help our users and the community,
 but are also ready to learn about parts of the projects you are not actively contributing to - all of that
-are super valuable components of being eligible to `become a committer <COMMITTERS.md>`_.
+are super valuable components of being eligible to `become a committer <COMMITTERS.rst>`_.
 
 If you are a member of the triage team and not able to make any commitment, it's best to ask to have yourself
 removed from the triage team.
 
-BTW. Every committer is pretty much automatically part of the "Issue Triage Team" - so if you are committer,
+Every committer is pretty much automatically part of the "Issue Triage Team" - so if you are committer,
 feel free to follow the process for every issue you stumble upon.
+
+Joining Issue Triage Team
+'''''''''''''''''''''''''
+
+Joining the team is only by invitation from PMC member. Another PMC member should approve a PR where the triager is added.
+Note: the numbers of people in the triage team is limited by ASF. See `list <https://github.com/apache/airflow/blob/main/.asf.yaml>`_ (``github.collaborators``).
+
+Removal from Issue Triage Team
+''''''''''''''''''''''''''''''
+
+Inactive members will be removed without notice.
+Due to the members limit we and the number of issues in the project we are looking only for active members.
+Note that removal from the team doesn't have any negative impact on you. It's very OK if you moved towards other kind of contributions.
+Removal from the team is not permanent. See above paragraph of Joining the team for clarification about the protocol.
 
 Actions that can be taken by the issue triager
 ''''''''''''''''''''''''''''''''''''''''''''''
@@ -106,7 +115,7 @@ There are several actions an issue triager might take:
 
 * Assigning the issue to a milestone, if the issue seems important enough that it should likely be looked
   at before the next release but there is not enough information or doubts on why and what can be fixed.
-  Usually we assign to the the next bugfix release - then, no matter what the issue will be looked at
+  Usually we assign to the next bugfix release - then, no matter what the issue will be looked at
   by the release manager and it might trigger additional actions during the release preparation.
   This is usually followed by one of the actions below.
 
@@ -129,7 +138,7 @@ There are several actions an issue triager might take:
 Labels
 ''''''
 
-Since Apache Airflow uses "GitHub Issues" and "Github Discussions" as the
+Since Apache Airflow uses "GitHub Issues" and "GitHub Discussions" as the
 issue tracking systems, the use of labels is extensive. Though issue
 labels tend to change over time based on components within the project,
 the majority of the ones listed below should stand the test of time.
@@ -169,19 +178,18 @@ are: Airflow Core and Airflow Providers, which are referenced by ``area:core``
 and ``area:providers``. This is especially important since these are now
 being released and versioned independently.
 
-There are more detailed areas of the Core Airflow project such as Scheduler, Webserver,
-API, UI, Logging, and Kubernetes, which are all conceptually under the
+There are more detailed areas of the Core Airflow project such as Scheduler, API Server,
+API, UI, Logging, and Metrics, which are all conceptually under the
 "Airflow Core" area of the project.
 
 Similarly within Airflow Providers, the larger providers such as Apache, AWS, Azure,
 and Google who have many hooks and operators within them, have labels directly
-associated with them such as ``provider:Apache``, ``provider:AWS``,
-``provider:Azure``, and ``provider:Google``.
+associated with them such as ``provider:amazon-aws``, ``provider:microsoft-azure``, and ``provider:google``.
 
 These make it easier for developers working on a single provider to
 track issues for that provider.
 
-Some provider labels may couple several providers for example: ``provider:Protocols``
+Note: each provider has its own unique label. It is possible for issue to be tagged with more than 1 provider label.
 
 Most issues need a combination of "kind" and "area" labels to be actionable.
 For example:
@@ -251,9 +259,31 @@ the label ``pending-response``.
 Also, during this stage, additional labels may be added to the issue to help
 classification and triage, such as ``affected_version`` and ``area``.
 
-Some issues may need a detailed review by one of the core committers of the project
-and this could be tagged with a ``needs:triage`` label.
+New issues are automatically assigned with ``needs-triage`` label. This labels goal
+is to help us detect issues that are waiting for initial triage. The label will be removed by the triager
+once the issue is accepted (and assigned with relevant kind and area labels). This sometimes can take a while as we might
+ask for other members of the community for consultation or ask for further information from the issue author.
+Removing the ``needs-triage`` label means that the issue has been accepted and awaits implementation (no further triage action required),
+as long as the ``needs-triage`` label remains the triage team will keep an eye on the issue and check periodically
+if it needs to be accepted or closed/converted to GitHub Discussion.
+``needs-triage`` label may also be applied manually by committers if they think a further action from the triage team is required.
 
+**area Label**
+
+``area:providers`` must be present for any provider issue. The ``provider:x`` is specifying the exact provider.
+We have ``provider:x`` for any provider that we own.
+``area:helm-chart`` must be for any helm chart issue.
+``area:core`` must be for any core issue. Additional labels like ``area:scheduler``, ``area:UI`` is specifying the exact
+core area relevant.
+
+This method allow us to quickly filter issues by the 3 major components of our code base: core, providers and helm-chart.
+
+**affected version Label**
+
+The ``affected_version:x`` will never be present with ``kind:feature`` as feature requests are not related to specific Airflow version.
+For bugs, The ``affected_version:x`` is expected to be used with core issues thus normally it appears with ``area:core`` label.
+When issue is reproducible on multiple Airflow versions we apply only the latest version with the label.
+This policy is best effort, we should try to have as little exceptions as possible.
 
 **Good First Issue**
 
@@ -307,3 +337,14 @@ we normally convert such issues to discussions in the Ideas category.
 Issues that seems more like support requests are also converted to discussions in the Q&A category.
 We use judgment about which Issues to convert to discussions, it's best to always clarify with a comment why the issue is being converted.
 Note that we can always convert discussions back to issues.
+
+
+**Stale Policy**
+
+As time passes bug reports that have been accepted may be out dated.
+Bot will scan older bug reports and if the report is inactive it will comment
+and ask the author to recheck if the bug is still reproducible on latest version.
+If the issue is reconfirmed triage team will check if labels needs to be updated (for example: ``reported_version`` label)
+If no one respond after some time, we will consider the issue as resolved (may have already been fixed) and bot will resolve the issue.
+The exact timeframes for each one of the actions is subject to change from time to time.
+The updated values can be checked in ``.github/workflow`` where we define the bots policy.

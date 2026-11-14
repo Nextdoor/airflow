@@ -1,0 +1,963 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+"""Base executor - this is the base class for all the implemented executors."""
+
+from __future__ import annotations
+
+import logging
+import sys
+import warnings
+from collections import defaultdict, deque
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from functools import cached_property, wraps
+from typing import TYPE_CHECKING, Any, ClassVar
+
+import pendulum
+
+from airflow._shared.observability.metrics import stats
+from airflow.cli.cli_config import DefaultHelpParser
+from airflow.configuration import conf
+from airflow.exceptions import RemovedInAirflow4Warning
+from airflow.executors import workloads
+from airflow.executors.executor_loader import ExecutorLoader
+from airflow.executors.workloads import WorkloadType
+from airflow.executors.workloads.callback import ExecuteCallback
+from airflow.executors.workloads.connection_test import TestConnection
+from airflow.executors.workloads.task import ExecuteTask, TaskInstanceDTO
+from airflow.executors.workloads.types import TaskInstanceUuid, state_class_for_key
+from airflow.models import Log
+from airflow.models.taskinstancekey import TaskInstanceKey
+from airflow.observability.metrics import stats_utils
+from airflow.utils.helpers import prune_dict
+from airflow.utils.log.logging_mixin import LoggingMixin
+from airflow.utils.state import State
+
+PARALLELISM: int = conf.getint("core", "PARALLELISM")
+
+
+def get_execution_api_server_url(conf_source: AirflowConfigParser | ExecutorConf = conf) -> str:
+    """
+    Resolve the execution API server URL from configuration.
+
+    :param conf_source: Configuration source to read from. Defaults to the global ``conf``.
+        Team-specific executors can pass their own config (e.g. ``ExecutorConf``) to resolve
+        a team-specific URL.
+    """
+    execution_api_server_url = conf_source.get("core", "execution_api_server_url", fallback=None)
+    if execution_api_server_url is not None:
+        return execution_api_server_url
+    base_url = conf_source.get("api", "base_url", fallback="/")
+    # ExecutorConf.get() is typed as str | None even when fallback= guarantees a str,
+    # so the `not base_url` guard keeps mypy happy.
+    if not base_url or base_url.startswith("/"):
+        base_url = f"http://localhost:{conf_source.getint('api', 'port')}{base_url}"
+    return f"{base_url.rstrip('/')}/execution/"
+
+
+if TYPE_CHECKING:
+    import argparse
+    from datetime import datetime
+
+    from sqlalchemy.orm import Session
+
+    from airflow._shared.logging.remote import StreamingLogResponse
+    from airflow.api_fastapi.auth.tokens import JWTGenerator
+    from airflow.callbacks.base_callback_sink import BaseCallbackSink
+    from airflow.callbacks.callback_requests import CallbackRequest
+    from airflow.cli.cli_config import GroupCommand
+    from airflow.configuration import AirflowConfigParser
+    from airflow.executors.executor_utils import ExecutorName
+    from airflow.executors.workloads import ExecutorWorkload
+    from airflow.executors.workloads.types import WorkloadKey, WorkloadState
+    from airflow.models.connection_test import ConnectionTestKey
+    from airflow.models.taskinstance import TaskInstance
+
+    # Event_buffer dict value type
+    # Tuple of: state, info
+    EventBufferValueType = tuple[str | None, Any]
+
+
+log = logging.getLogger(__name__)
+
+
+def _warn_deprecated_executor_usage(message: str) -> None:
+    warnings.warn(message, RemovedInAirflow4Warning, stacklevel=3)
+    log.warning(message)
+
+
+class _LegacyWorkloadFlag:
+    """Deprecated bool accessor for one ``supported_workload_types`` member, usable on the class and on instances."""
+
+    def __init__(self, workload_type: WorkloadType) -> None:
+        self.workload_type = workload_type
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        self.name = name
+
+    @property
+    def deprecation_message(self) -> str:
+        return (
+            f"{self.name} is deprecated. "
+            f"Use WorkloadType.{self.workload_type.name} in supported_workload_types instead."
+        )
+
+    def __get__(self, obj: BaseExecutor | None, owner: type[BaseExecutor] | None = None) -> bool:
+        target = obj if obj is not None else owner
+        if target is None:
+            raise TypeError(f"{self.name} must be accessed through a BaseExecutor class or instance")
+        target._warn_legacy_property(self.name, self.deprecation_message)
+        return self.workload_type in target.supported_workload_types
+
+    def __set__(self, obj: BaseExecutor, value: bool) -> None:
+        obj._warn_legacy_property(self.name, self.deprecation_message)
+        obj._set_workload_type_supported(self.workload_type, value)
+
+
+@dataclass
+class RunningRetryAttemptType:
+    """
+    For keeping track of attempts to queue again when task still apparently running.
+
+    We don't want to slow down the loop, so we don't block, but we allow it to be
+    re-checked for at least MIN_SECONDS seconds.
+    """
+
+    MIN_SECONDS = 10
+    total_tries: int = field(default=0, init=False)
+    tries_after_min: int = field(default=0, init=False)
+    first_attempt_time: datetime = field(default_factory=lambda: pendulum.now("UTC"), init=False)
+
+    @property
+    def elapsed(self):
+        """Seconds since first attempt."""
+        return (pendulum.now("UTC") - self.first_attempt_time).total_seconds()
+
+    def can_try_again(self):
+        """Return False if there has been at least one try greater than MIN_SECONDS, otherwise return True."""
+        if self.tries_after_min > 0:
+            return False
+
+        self.total_tries += 1
+
+        elapsed = self.elapsed
+        if elapsed > self.MIN_SECONDS:
+            self.tries_after_min += 1
+        log.debug("elapsed=%s tries=%s", elapsed, self.total_tries)
+        return True
+
+
+class ExecutorConf:
+    """
+    This class is used to fetch configuration for an executor for a particular team_name.
+
+    It wraps the implementation of the configuration.get() to look for the particular section and key
+    prefixed with the team_name. This makes it easy for child classes (i.e. concrete executors) to fetch
+    configuration values for a particular team_name without having to worry about passing through the
+    team_name for every call to get configuration.
+
+    Currently config only supports environment variables for team specific configuration.
+    """
+
+    def __init__(self, team_name: str | None = None) -> None:
+        self.team_name: str | None = team_name
+
+    def get(self, *args, **kwargs) -> str | None:
+        return conf.get(*args, **kwargs, team_name=self.team_name)
+
+    def getboolean(self, *args, **kwargs) -> bool:
+        return conf.getboolean(*args, **kwargs, team_name=self.team_name)
+
+    def getjson(self, *args, **kwargs):
+        return conf.getjson(*args, **kwargs, team_name=self.team_name)
+
+    def getint(self, *args, **kwargs):
+        return conf.getint(*args, **kwargs, team_name=self.team_name)
+
+    def getsection(self, section: str) -> dict[str, str | int | float | bool] | None:
+        return conf.getsection(section, team_name=self.team_name)
+
+    def has_option(self, *args, **kwargs) -> bool:
+        return conf.has_option(*args, **kwargs, team_name=self.team_name)
+
+    def get_mandatory_value(self, *args, **kwargs) -> str:
+        return conf.get_mandatory_value(*args, **kwargs, team_name=self.team_name)
+
+
+class BaseExecutor(LoggingMixin):
+    """
+    Base class to inherit for concrete executors such as Celery, Kubernetes, Local, etc.
+
+    :param parallelism: how many jobs should run at one time.
+    """
+
+    supports_ad_hoc_ti_run: bool = False
+    supported_workload_types: frozenset[WorkloadType] = frozenset({WorkloadType.EXECUTE_TASK})
+    supports_callbacks = _LegacyWorkloadFlag(WorkloadType.EXECUTE_CALLBACK)
+    supports_connection_test = _LegacyWorkloadFlag(WorkloadType.TEST_CONNECTION)
+    supports_multi_team: bool = False
+    # Opt in only when submission, adoption, result decoding and cleanup all carry UUIDs.
+    # Coordinate-only providers cannot distinguish attempts that reuse the entire key.
+    supports_task_instance_uuid: ClassVar[bool] = False
+    sentry_integration: str = ""
+
+    _legacy_warned: ClassVar[set[str]] = set()
+
+    is_local: bool = False
+    is_production: bool = True
+
+    # When True, the scheduler pre-assigns external_executor_id (a UUID) at queuing time,
+    # committed atomically with the QUEUED state. The executor can then use this ID to
+    # correlate the task with its external representation (e.g. Celery task_id).
+    pre_assigns_external_executor_id: ClassVar[bool] = False
+
+    serve_logs: bool = False
+
+    job_id: None | int | str = None
+    name: None | ExecutorName = None
+    callback_sink: BaseCallbackSink | None = None
+
+    @cached_property
+    def jwt_generator(self) -> JWTGenerator:
+        from airflow.api_fastapi.auth.tokens import (
+            JWTGenerator,
+            get_signing_args,
+        )
+        from airflow.configuration import conf
+
+        generator = JWTGenerator(
+            valid_for=conf.getint("execution_api", "jwt_expiration_time"),
+            audience=conf.get_mandatory_list_value("execution_api", "jwt_audience")[0],
+            issuer=conf.get("api_auth", "jwt_issuer", fallback=None),
+            # Since this one is used across components/server, there is no point trying to generate one, error
+            # instead
+            **get_signing_args(make_secret_key_if_needed=False),
+        )
+
+        return generator
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        if queue_workload := cls.__dict__.get("queue_workload"):
+
+            @wraps(queue_workload)
+            def register_queued_task(self, workload, *args, **kwargs):
+                if isinstance(workload, ExecuteTask):
+                    self._register_task(workload.ti)
+                return queue_workload(self, workload, *args, **kwargs)
+
+            cls.queue_workload = register_queued_task  # type: ignore[method-assign]
+        if try_adopt := cls.__dict__.get("try_adopt_task_instances"):
+
+            @wraps(try_adopt)
+            def register_adopted_tasks(self, tis, *args, **kwargs):
+                keys = [(ti.id, self.get_task_key(ti)) for ti in tis]
+                for ti in tis:
+                    self._register_task(ti)
+                rejected = try_adopt(self, tis, *args, **kwargs)
+                rejected_ids = {ti.id for ti in rejected}
+                for task_id, key in keys:
+                    state, _ = self.event_buffer.get(key, (None, None))
+                    if task_id not in rejected_ids and state not in State.finished:
+                        self.running.add(key)
+                return rejected
+
+            cls.try_adopt_task_instances = register_adopted_tasks  # type: ignore[method-assign]
+        cls._legacy_warned = set()
+        enabled: set[WorkloadType] = set()
+        disabled: set[WorkloadType] = set()
+        for flag in ("supports_callbacks", "supports_connection_test"):
+            value = cls.__dict__.get(flag)
+            if not isinstance(value, bool):
+                continue
+            workload_type = vars(BaseExecutor)[flag].workload_type
+            verb, preposition = ("Add", "to") if value else ("Remove", "from")
+            _warn_deprecated_executor_usage(
+                f"{cls.__name__}: setting `{flag} = {value}` as a class attribute is deprecated. "
+                f"{verb} `WorkloadType.{workload_type.name}` {preposition} `supported_workload_types` "
+                f"instead.",
+            )
+            (enabled if value else disabled).add(workload_type)
+            delattr(cls, flag)
+        if (enabled or disabled) and "supported_workload_types" not in cls.__dict__:
+            cls.supported_workload_types = (cls.supported_workload_types | enabled) - disabled
+        legacy_override_replacements = {
+            "trigger_tasks": "trigger_workloads",
+            "trigger_connection_tests": "trigger_workloads",
+            "order_queued_tasks_by_priority": "_get_workloads_to_schedule",
+        }
+        for legacy_method, replacement in legacy_override_replacements.items():
+            if legacy_method in cls.__dict__:
+                _warn_deprecated_executor_usage(
+                    f"{cls.__name__} overrides `{legacy_method}`, which BaseExecutor no longer "
+                    f"calls: the override will not be invoked during scheduling. Override "
+                    f"`{replacement}` instead.",
+                )
+
+    @classmethod
+    def _warn_legacy_property(cls, prop_name: str, message: str) -> None:
+        if prop_name in cls._legacy_warned:
+            return
+        cls._legacy_warned.add(prop_name)
+        warnings.warn(message, RemovedInAirflow4Warning, stacklevel=3)
+        log.warning(message)
+
+    def __init__(self, parallelism: int = PARALLELISM, team_name: str | None = None):
+        stats.initialize(
+            factory=stats_utils.get_stats_factory(),
+            export_legacy_names=conf.getboolean("metrics", "legacy_names_on"),
+        )
+        super().__init__()
+        # Ensure we set this now, so that each subprocess gets the same value
+        from airflow.api_fastapi.auth.tokens import get_signing_args
+
+        get_signing_args()
+
+        self.parallelism: int = parallelism
+        self.team_name: str | None = team_name
+        # TODO(airflow 4.0): flatten to dict[WorkloadKey, ExecutorWorkload] once the deprecated
+        # queued_tasks / queued_callbacks compat properties are removed.
+        # The defaultdict is load-bearing: queue_workload, fail_connection_test and the compat
+        # properties rely on auto-vivification of per-type queues, so do not replace it with a
+        # plain dict.
+        self.executor_queues: defaultdict[WorkloadType, dict[WorkloadKey, ExecutorWorkload]] = defaultdict(
+            dict
+        )
+        self.running: set[WorkloadKey] = set()
+        self.event_buffer: dict[WorkloadKey, EventBufferValueType] = {}
+        self._task_coordinates: dict[TaskInstanceUuid, TaskInstanceKey] = {}
+        self._task_event_logs: deque[Log] = deque()
+        self.conf = ExecutorConf(team_name)
+
+        if self.parallelism <= 0:
+            raise ValueError("parallelism is set to 0 or lower")
+
+        """
+        Deque for storing task event log messages.
+
+        This attribute is only internally public and should not be manipulated
+        directly by subclasses.
+
+        :meta private:
+        """
+
+        self.attempts: dict[WorkloadKey, RunningRetryAttemptType] = defaultdict(RunningRetryAttemptType)
+
+    def __repr__(self):
+        _repr = f"{self.__class__.__name__}(parallelism={self.parallelism}"
+        if self.team_name:
+            _repr += f", team_name={self.team_name!r}"
+        _repr += ")"
+        return _repr
+
+    @property
+    def queued_tasks(self) -> dict:
+        """Backward-compat property: delegates to ``executor_queues[WorkloadType.EXECUTE_TASK]``."""
+        self._warn_legacy_property(
+            "queued_tasks",
+            "queued_tasks is deprecated. Use executor_queues[WorkloadType.EXECUTE_TASK] instead.",
+        )
+        return self.executor_queues[WorkloadType.EXECUTE_TASK]
+
+    @queued_tasks.setter
+    def queued_tasks(self, value: dict) -> None:
+        """Backward-compat setter: writes through to ``executor_queues[WorkloadType.EXECUTE_TASK]``."""
+        self._warn_legacy_property(
+            "queued_tasks",
+            "queued_tasks is deprecated. Use executor_queues[WorkloadType.EXECUTE_TASK] instead.",
+        )
+        self.executor_queues[WorkloadType.EXECUTE_TASK] = value
+
+    @property
+    def queued_callbacks(self) -> dict:
+        """Backward-compat property: delegates to ``executor_queues[WorkloadType.EXECUTE_CALLBACK]``."""
+        self._warn_legacy_property(
+            "queued_callbacks",
+            "queued_callbacks is deprecated. Use executor_queues[WorkloadType.EXECUTE_CALLBACK] instead.",
+        )
+        return self.executor_queues[WorkloadType.EXECUTE_CALLBACK]
+
+    @queued_callbacks.setter
+    def queued_callbacks(self, value: dict) -> None:
+        """Backward-compat setter: writes through to ``executor_queues[WorkloadType.EXECUTE_CALLBACK]``."""
+        self._warn_legacy_property(
+            "queued_callbacks",
+            "queued_callbacks is deprecated. Use executor_queues[WorkloadType.EXECUTE_CALLBACK] instead.",
+        )
+        self.executor_queues[WorkloadType.EXECUTE_CALLBACK] = value
+
+    def _set_workload_type_supported(self, workload_type: WorkloadType, supported: bool) -> None:
+        # Assign on the instance so the class-level frozenset shared by all instances is untouched.
+        if supported:
+            self.supported_workload_types = self.supported_workload_types | {workload_type}
+        else:
+            self.supported_workload_types = self.supported_workload_types - {workload_type}
+
+    def start(self):  # pragma: no cover
+        """Executors may need to get things started."""
+
+    def log_task_event(self, *, event: str, extra: str, ti_key: WorkloadKey):
+        """Add an event to the log table."""
+        if not isinstance(ti_key, (TaskInstanceUuid, TaskInstanceKey)):
+            self.log.debug("Skipping log_task_event for callback key %s (event=%s)", ti_key, event)
+            return
+        coordinates = ti_key if isinstance(ti_key, TaskInstanceKey) else self._task_coordinates.get(ti_key)
+        if coordinates is None:
+            extra = f"Task instance {ti_key}: {extra}"
+        task_instance_id = ti_key.id if isinstance(ti_key, TaskInstanceUuid) else None
+        self._task_event_logs.append(
+            Log(event=event, task_instance=coordinates, task_instance_id=task_instance_id, extra=extra)
+        )
+
+    def _register_task(self, ti: TaskInstance | TaskInstanceDTO) -> None:
+        """Snapshot identity before provider submission or adoption can emit events."""
+        self._task_coordinates[TaskInstanceUuid(ti.id)] = ti.key
+
+    @classmethod
+    def get_task_key(cls, ti: TaskInstance | TaskInstanceDTO) -> TaskInstanceUuid | TaskInstanceKey:
+        """Return the task key supported by this executor's provider contract."""
+        return TaskInstanceUuid(ti.id) if cls.supports_task_instance_uuid else ti.key
+
+    @classmethod
+    def get_workload_key(cls, workload: ExecutorWorkload) -> WorkloadKey:
+        """Return the executor key without changing the legacy workload property."""
+        if isinstance(workload, ExecuteTask):
+            return cls.get_task_key(workload.ti)
+        return workload.key
+
+    def queue_workload(self, workload: ExecutorWorkload, session: Session) -> None:
+        if workload.type not in self.supported_workload_types:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support {workload.type.value} workloads. "
+                f"Add WorkloadType.{workload.type.name} to supported_workload_types and implement handling "
+                f"in _process_workloads()."
+            )
+        if isinstance(workload, ExecuteTask):
+            self._register_task(workload.ti)
+        self.executor_queues[workload.type][self.get_workload_key(workload)] = workload
+
+    def _get_workloads_to_schedule(self, open_slots: int) -> list[tuple[WorkloadKey, ExecutorWorkload]]:
+        """
+        Select and return the next batch of workloads to schedule, respecting priority policy.
+
+        Workloads are sorted by ``WORKLOAD_TYPE_PRIORITY`` (priority assigned by workload type) first,
+        then by ``sort_key`` within the same priority.  Lower priority values are scheduled first;
+        within the same priority, lower ``sort_key`` values come first (``sort_key=0`` gives FIFO).
+
+        :param open_slots: Number of available execution slots
+        """
+        all_workloads: list[tuple[WorkloadKey, ExecutorWorkload]] = [
+            (key, workload) for queue in self.executor_queues.values() for key, workload in queue.items()
+        ]
+        all_workloads.sort(
+            key=lambda item: (
+                workloads.WORKLOAD_TYPE_PRIORITY.get(item[1].type, len(workloads.WORKLOAD_TYPE_PRIORITY)),
+                item[1].sort_key,
+            )
+        )
+        return all_workloads[: max(0, open_slots)]
+
+    def _process_workloads(self, workload_items: Sequence[ExecutorWorkload]) -> None:
+        """
+        Process the given workloads.
+
+        This method must be implemented by subclasses to define how they handle
+        the execution of workloads (e.g., queuing them to workers, submitting to
+        external systems, etc.).
+
+        :param workload_items: List of workloads to process
+        """
+        raise NotImplementedError(f"{type(self).__name__} must implement _process_workloads()")
+
+    def has_task(self, task_instance: TaskInstance) -> bool:
+        """
+        Check if a task is either queued or running in this executor.
+
+        :param task_instance: TaskInstance
+        :return: True if the task is known to this executor
+        """
+        task_queue = self.executor_queues.get(WorkloadType.EXECUTE_TASK, {})
+        key = self.get_task_key(task_instance)
+        if (
+            isinstance(key, TaskInstanceKey)
+            and self._task_coordinates.get(TaskInstanceUuid(task_instance.id)) != key
+        ):
+            return False
+        return key in task_queue or key in self.running
+
+    def sync(self) -> None:
+        """
+        Sync will get called periodically by the heartbeat method.
+
+        Executors should override this to perform gather statuses.
+        """
+
+    def heartbeat(self) -> None:
+        """Heartbeat sent to trigger new jobs."""
+        open_slots = self.parallelism - len(self.running)
+
+        num_running_workloads = len(self.running)
+        num_queued_workloads = sum(len(q) for q in self.executor_queues.values())
+
+        self._emit_metrics(open_slots, num_running_workloads, num_queued_workloads)
+        self.trigger_workloads(open_slots)
+
+        # Calling child class sync method
+        self.log.debug("Calling the %s sync method", self.__class__)
+        self.sync()
+
+    def fail_connection_test(self, key: ConnectionTestKey) -> None:
+        """Drop a connection-test workload from in-memory queues (called by the reaper)."""
+        self.executor_queues[WorkloadType.TEST_CONNECTION].pop(key, None)
+        self.running.discard(key)
+
+    def _get_metric_name(self, metric_base_name: str) -> str:
+        return (
+            f"{metric_base_name}.{self.__class__.__name__}"
+            if len(ExecutorLoader.get_executor_names()) > 1
+            else metric_base_name
+        )
+
+    def _emit_metrics(self, open_slots, num_running_tasks, num_queued_tasks):
+        """
+        Emit metrics relevant to the Executor.
+
+        In the case of multiple executors being configured, the metric names include the name of
+        executor to differentiate them from metrics from other executors.
+
+        If only one executor is configured, the metric names will not be changed.
+        """
+        name = self.__class__.__name__
+
+        open_slots_metric_name = self._get_metric_name("executor.open_slots")
+        queued_tasks_metric_name = self._get_metric_name("executor.queued_tasks")
+        running_tasks_metric_name = self._get_metric_name("executor.running_tasks")
+
+        self.log.debug("%s running task instances for executor %s", num_running_tasks, name)
+        self.log.debug("%s in queue for executor %s", num_queued_tasks, name)
+        if open_slots == 0:
+            self.log.info("Executor parallelism limit reached. 0 open slots.")
+        else:
+            self.log.debug("%s open slots for executor %s", open_slots, name)
+
+        stats.gauge(
+            open_slots_metric_name,
+            value=open_slots,
+            tags=prune_dict({"status": "open", "executor_class_name": name, "team_name": self.team_name}),
+        )
+        stats.gauge(
+            queued_tasks_metric_name,
+            value=num_queued_tasks,
+            tags=prune_dict({"status": "queued", "executor_class_name": name, "team_name": self.team_name}),
+        )
+        stats.gauge(
+            running_tasks_metric_name,
+            value=num_running_tasks,
+            tags=prune_dict({"status": "running", "executor_class_name": name, "team_name": self.team_name}),
+        )
+
+    def trigger_workloads(self, open_slots: int) -> None:
+        """
+        Initiate async execution of queued workloads, up to the number of available slots.
+
+        Workloads are scheduled according to their ``WORKLOAD_TYPE_PRIORITY`` and ``sort_key``.
+
+        :param open_slots: Number of open slots
+        """
+        workloads_to_schedule = self._get_workloads_to_schedule(open_slots)
+        workload_list = []
+
+        for key, workload in workloads_to_schedule:
+            # If a task makes it here but is still understood by the executor
+            # to be running, it generally means that the task has been killed
+            # externally and not yet been marked as failed.
+            #
+            # However, when a task is deferred, there is also a possibility of
+            # a race condition where a task might be scheduled again during
+            # trigger processing, even before we are able to register that the
+            # deferred task has completed. In this case and for this reason,
+            # we make a small number of attempts to see if the task has been
+            # removed from the running set in the meantime.
+            if key in self.attempts:
+                del self.attempts[key]
+
+            workload_list.append(workload)
+
+        if workload_list:
+            self._process_workloads(workload_list)
+
+    def trigger_tasks(self, open_slots: int) -> None:
+        """Backward-compat shim: forwards to :meth:`trigger_workloads`."""
+        self._warn_legacy_property(
+            "trigger_tasks",
+            "trigger_tasks is deprecated, use trigger_workloads instead.",
+        )
+        self.trigger_workloads(open_slots)
+
+    def order_queued_tasks_by_priority(self) -> list:
+        """
+        Backward-compat shim: forwards to :meth:`_get_workloads_to_schedule`.
+
+        Note: the return shape differs from the original method. The old implementation returned
+        *all* queued tasks, tasks-only and untruncated. This shim iterates every queue in
+        ``executor_queues`` (so callbacks and other workload types are included) and truncates the
+        result to the number of currently open slots.
+        """
+        self._warn_legacy_property(
+            "order_queued_tasks_by_priority",
+            "order_queued_tasks_by_priority is deprecated, use _get_workloads_to_schedule instead.",
+        )
+        return self._get_workloads_to_schedule(self.parallelism - len(self.running))
+
+    # TODO: This should not be using `TaskInstanceState` here, this is just "did the process complete, or did
+    # it die". It is possible for the task itself to finish with success, but the state of the task to be set
+    # to FAILED. By using TaskInstanceState enum here it confuses matters!
+    def change_state(self, key: WorkloadKey, state: WorkloadState, info=None, remove_running=True) -> None:
+        """
+        Change state of the task.
+
+        :param key: Unique key for the task instance
+        :param state: State to set for the task.
+        :param info: Executor information for the task instance
+        :param remove_running: Whether or not to remove the TI key from running set
+        """
+        self.log.debug("Changing state: %s", key)
+        if remove_running:
+            try:
+                self.running.remove(key)
+            except KeyError:
+                self.log.debug("Could not find key: %s", key)
+        self.event_buffer[key] = state, info
+
+    def fail(self, key: WorkloadKey, info=None) -> None:
+        """
+        Set fail state for the event.
+
+        :param info: Executor information for the task instance
+        :param key: Unique key for the task instance
+        """
+        self.change_state(key, state_class_for_key(key).FAILED, info)
+
+    def success(self, key: WorkloadKey, info=None) -> None:
+        """
+        Set success state for the event.
+
+        :param info: Executor information for the task instance
+        :param key: Unique key for the task instance
+        """
+        self.change_state(key, state_class_for_key(key).SUCCESS, info)
+
+    def queued(self, key: WorkloadKey, info=None) -> None:
+        """
+        Set queued state for the event.
+
+        :param info: Executor information for the task instance
+        :param key: Unique key for the task instance
+        """
+        self.change_state(key, state_class_for_key(key).QUEUED, info)
+
+    def running_state(self, key: WorkloadKey, info=None) -> None:
+        """
+        Set running state for the event.
+
+        :param info: Executor information for the task instance
+        :param key: Unique key for the task instance
+        """
+        self.change_state(key, state_class_for_key(key).RUNNING, info, remove_running=False)
+
+    def get_event_buffer(self, dag_ids=None) -> dict[WorkloadKey, EventBufferValueType]:
+        """
+        Return and flush the event buffer.
+
+        In case dag_ids is specified it will only return and flush events
+        for the given dag_ids. Otherwise, it returns and flushes all events.
+        Note: Callback events (with CallbackKey keys) are always included regardless of dag_ids filter.
+
+        :param dag_ids: the dag_ids to return events for; returns all if given ``None``.
+        :return: a dict of events
+        """
+        cleared_events: dict[WorkloadKey, EventBufferValueType] = {}
+        if dag_ids is None:
+            cleared_events = self.event_buffer
+            self.event_buffer = {}
+        else:
+            for key in list(self.event_buffer.keys()):
+                coordinates = self._task_coordinates.get(key) if isinstance(key, TaskInstanceUuid) else None
+                if isinstance(key, TaskInstanceKey):
+                    coordinates = key
+                if not isinstance(key, (TaskInstanceUuid, TaskInstanceKey)) or (
+                    coordinates is not None and coordinates.dag_id in dag_ids
+                ):
+                    cleared_events[key] = self.event_buffer.pop(key)
+
+        task_queue = self.executor_queues.get(WorkloadType.EXECUTE_TASK, {})
+        for task_id, coordinates in list(self._task_coordinates.items()):
+            if not any(
+                key in container
+                for key in (task_id, coordinates)
+                for container in (self.running, task_queue, self.event_buffer)
+            ):
+                del self._task_coordinates[task_id]
+
+        return cleared_events
+
+    def _drain_events_with_task_ids(
+        self, dag_ids=None
+    ) -> tuple[dict[WorkloadKey, EventBufferValueType], dict[TaskInstanceUuid, TaskInstanceKey]]:
+        """Drain events with captured attempt identities and coordinates."""
+        captured_coordinates = self._task_coordinates.copy()
+        task_ids: dict[TaskInstanceKey, TaskInstanceUuid | None] = {}
+        for task_id, coordinates in captured_coordinates.items():
+            task_ids[coordinates] = None if coordinates in task_ids else task_id
+        events: dict[WorkloadKey, EventBufferValueType] = {}
+        event_coordinates: dict[TaskInstanceUuid, TaskInstanceKey] = {}
+        for key, value in self.get_event_buffer(dag_ids).items():
+            if isinstance(key, TaskInstanceKey):
+                captured_id = task_ids.get(key)
+                if captured_id is None:
+                    self.log.warning(
+                        "Discarding executor event without a unique captured task identity: %s", key
+                    )
+                    continue
+                events[captured_id] = value
+                event_coordinates[captured_id] = key
+            else:
+                events[key] = value
+                if (
+                    isinstance(key, TaskInstanceUuid)
+                    and (captured := captured_coordinates.get(key)) is not None
+                ):
+                    event_coordinates[key] = captured
+        return events, event_coordinates
+
+    def get_task_log(self, ti: TaskInstance, try_number: int) -> tuple[list[str], list[str]]:
+        """
+        Return the task logs.
+
+        :param ti: A TaskInstance object
+        :param try_number: current try_number to read log from
+        :return: tuple of logs and messages
+        """
+        return [], []
+
+    def get_streaming_task_log(self, ti: TaskInstance, try_number: int) -> StreamingLogResponse:
+        """
+        Return a streaming response for task logs.
+
+        Executors that don't implement this method raise ``NotImplementedError``; callers should
+        catch that and fall back to :meth:`get_task_log`.
+
+        :param ti: A TaskInstance object
+        :param try_number: current try_number to read log from
+        :return: StreamingLogResponse
+        """
+        raise NotImplementedError
+
+    def end(self) -> None:  # pragma: no cover
+        """Wait synchronously for the previously submitted job to complete."""
+        raise NotImplementedError
+
+    def terminate(self):
+        """Get called when the daemon receives a SIGTERM."""
+        raise NotImplementedError
+
+    def revoke_task(self, *, ti: TaskInstance):
+        """
+        Attempt to remove task from executor.
+
+        It should attempt to ensure that the task is no longer running on the worker,
+        and ensure that it is cleared out from internal data structures.
+
+        It should *not* change the state of the task in airflow, or add any events
+        to the event buffer.
+
+        It should not raise any error.
+
+        :param ti: Task instance to remove
+        """
+        raise NotImplementedError
+
+    def try_adopt_task_instances(self, tis: Sequence[TaskInstance]) -> Sequence[TaskInstance]:
+        """
+        Try to adopt running task instances that have been abandoned by a SchedulerJob dying.
+
+        Anything that is not adopted will be cleared by the scheduler (and then become eligible for
+        re-scheduling). Accepted unfinished tasks occupy executor slots until completion is reported.
+
+        :return: any TaskInstances that were unable to be adopted
+        """
+        # By default, assume Executors cannot adopt tasks, so just say we failed to adopt anything.
+        # Subclasses can do better!
+        return tis
+
+    @property
+    def slots_available(self):
+        """Number of new workloads this executor instance can accept."""
+        return self.parallelism - self.slots_occupied
+
+    @property
+    def slots_occupied(self):
+        """Number of workloads this executor instance is currently managing."""
+        return len(self.running) + sum(len(q) for q in self.executor_queues.values())
+
+    def debug_dump(self):
+        """Get called in response to SIGUSR2 by the scheduler."""
+        for workload_type in WorkloadType:
+            queue = self.executor_queues.get(workload_type, {})
+            self.log.info(
+                "executor.queued[%s] (%d)\n\t%s",
+                workload_type,
+                len(queue),
+                "\n\t".join(map(repr, queue.items())),
+            )
+        self.log.info("executor.running (%d)\n\t%s", len(self.running), "\n\t".join(map(repr, self.running)))
+        self.log.info(
+            "executor.event_buffer (%d)\n\t%s",
+            len(self.event_buffer),
+            "\n\t".join(map(repr, self.event_buffer.items())),
+        )
+
+    def send_callback(self, request: CallbackRequest) -> None:
+        """
+        Send callback for execution.
+
+        Provides a default implementation which sends the callback to the `callback_sink` object.
+        The scheduler's database sink adds the request to the calling thread's scoped session
+        without committing, so the caller must commit that session.
+
+        :param request: Callback request to be executed.
+        """
+        if not self.callback_sink:
+            raise ValueError("Callback sink is not ready.")
+        self.callback_sink.send(request)
+
+    @staticmethod
+    def get_cli_commands() -> list[GroupCommand]:
+        """
+        Vends CLI commands to be included in Airflow CLI.
+
+        Override this method to expose commands via Airflow CLI to manage this executor. This can
+        be commands to setup/teardown the executor, inspect state, etc.
+        Make sure to choose unique names for those commands, to avoid collisions.
+        """
+        return []
+
+    @staticmethod
+    def run_workload(
+        workload: ExecutorWorkload,
+        *,
+        server: str | None = None,
+        dry_run: bool = False,
+        subprocess_logs_to_stdout: bool | None = None,
+        proctitle: str | None = None,
+    ) -> int:
+        """
+        Pass the workload to the appropriate supervisor based on workload type.
+
+        Workload-specific attributes (log_path, sentry_integration, bundle_info, etc.) are read from the
+        workload object itself.
+
+        :param workload: The ``ExecutorWorkload`` to execute.
+        :param server: Base URL of the API server (used by task workloads).
+        :param dry_run: If True, execute without actual task execution (simulate run).
+        :param subprocess_logs_to_stdout: Should task logs also be sent to stdout via the main logger.
+            When not passed (``None``), falls back to the core ``[logging] task_logs_to_stdout``
+            setting, so executors that do not need a worker-level override can rely on this default.
+        :param proctitle: Process title to set for this workload. If not provided, defaults to
+            ``"airflow supervisor: <workload.display_name>"``.
+        :return: Exit code of the process.
+        """
+        if subprocess_logs_to_stdout is None:
+            subprocess_logs_to_stdout = conf.getboolean("logging", "task_logs_to_stdout", fallback=False)
+
+        try:
+            if sys.platform != "darwin":
+                from setproctitle import setproctitle
+
+                setproctitle(proctitle or f"airflow supervisor: {workload.display_name}")
+        except ImportError:
+            pass
+
+        # Resolve server URL from config when not explicitly provided.
+        # For example, team-specific executors may wish to pass their own server URL.
+        if server is None:
+            server = get_execution_api_server_url()
+
+        if isinstance(workload, ExecuteTask):
+            from airflow.sdk.execution_time.supervisor import supervise_task
+
+            # workload.ti is a TaskInstanceDTO which duck-types as TaskInstance.
+            # TODO: Create a protocol for this.
+            return supervise_task(
+                ti=workload.ti,  # type: ignore[arg-type]
+                bundle_info=workload.bundle_info,
+                dag_rel_path=workload.dag_rel_path,
+                token=workload.token,
+                server=server,
+                dry_run=dry_run,
+                log_path=workload.log_path,
+                subprocess_logs_to_stdout=subprocess_logs_to_stdout,
+                sentry_integration=getattr(workload, "sentry_integration", ""),
+            )
+        if isinstance(workload, ExecuteCallback):
+            from airflow.executors.workloads.callback import CALLBACK_KWARGS_ENCODING_KEY
+            from airflow.sdk.execution_time.callback_supervisor import supervise_callback
+
+            # Only passed when set, so callbacks stored without it run on any Task SDK, while
+            # encoded kwargs fail on a Task SDK that cannot decode them instead of reaching
+            # the callback encoded.
+            encoding_kwargs = {}
+            if kwargs_encoding := workload.callback.data.get(CALLBACK_KWARGS_ENCODING_KEY):
+                encoding_kwargs["callback_kwargs_encoding"] = kwargs_encoding
+            return supervise_callback(
+                id=workload.callback.id,
+                callback_path=workload.callback.data.get("path", ""),
+                callback_kwargs=workload.callback.data.get("kwargs", {}),
+                dag_rel_path=workload.dag_rel_path,
+                log_path=workload.log_path,
+                bundle_info=workload.bundle_info,
+                token=workload.token,
+                server=server,
+                **encoding_kwargs,
+            )
+        if isinstance(workload, TestConnection):
+            from airflow.sdk.execution_time.connection_test_supervisor import supervise_connection_test
+
+            return supervise_connection_test(
+                connection_test_id=workload.connection_test_id,
+                connection_id=workload.connection_id,
+                timeout=workload.timeout,
+                token=workload.token,
+                server=server,
+                team_name=workload.team_name,
+            )
+        raise ValueError(f"Unknown workload type: {type(workload).__name__}")
+
+    @classmethod
+    def _get_parser(cls) -> argparse.ArgumentParser:
+        """
+        Generate documentation; used by Sphinx argparse.
+
+        :meta private:
+        """
+        from airflow.cli.cli_parser import AirflowHelpFormatter, _add_command
+
+        parser = DefaultHelpParser(prog="airflow", formatter_class=AirflowHelpFormatter)
+        subparsers = parser.add_subparsers(dest="subcommand", metavar="GROUP_OR_COMMAND")
+        for group_command in cls.get_cli_commands():
+            _add_command(subparsers, group_command)
+        return parser

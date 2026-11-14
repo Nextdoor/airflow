@@ -1,0 +1,415 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+import contextlib
+import inspect
+import json
+import typing
+from unittest.mock import MagicMock, Mock, patch
+
+import pytest
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.params import Depends as DependsClass
+from fastapi.responses import StreamingResponse
+from fastapi.templating import Jinja2Templates
+from starlette.routing import Mount
+from starlette.testclient import TestClient
+
+from airflow.api_fastapi.app import create_app
+from airflow.api_fastapi.auth.managers.base_auth_manager import BaseAuthManager
+from airflow.api_fastapi.core_api.app import (
+    base_react_app_bundle_urls,
+    init_config,
+    init_middlewares,
+    init_ui_translation_views,
+)
+from airflow.api_fastapi.core_api.routes.public import authenticated_router
+from airflow.api_fastapi.core_api.routes.ui import ui_router
+from airflow.api_fastapi.core_api.security import get_user
+from airflow.plugins_manager import AirflowPlugin
+
+from tests_common.test_utils.config import conf_vars
+from tests_common.test_utils.db import clear_db_jobs
+from tests_common.test_utils.mock_plugins import mock_plugin_manager
+from tests_common.test_utils.paths import AIRFLOW_CORE_SOURCES_PATH
+
+pytestmark = pytest.mark.db_test
+
+
+def _get_all_api_routes(app):
+    """Recursively yield all APIRoutes from the app and its mounted sub-apps."""
+    for route in getattr(app, "routes", []):
+        if isinstance(route, Mount) and hasattr(route, "app"):
+            yield from _get_all_api_routes(route.app)
+        if hasattr(route, "endpoint"):
+            yield route
+
+
+class TestStreamingEndpointSessionScope:
+    def test_no_streaming_endpoint_uses_function_scoped_depends(self):
+        """Streaming endpoints must not use function-scoped generator dependencies.
+
+        FastAPI's ``function_stack`` (used for ``scope="function"`` dependencies)
+        is torn down after the route handler returns but *before* the response body
+        is sent.  For ``StreamingResponse`` endpoints the response body is produced
+        by a generator that runs during sending, so any generator dependency with
+        ``scope="function"`` will have its cleanup run before the generator
+        executes.  This causes the generator to silently reopen the session via
+        autobegin, and the resulting connection is never returned to the pool.
+        """
+        # These endpoints mention StreamingResponse but only use the session
+        # *before* streaming begins — the generator does not capture it.
+        # Function scope is correct for them: close the session early rather
+        # than hold it open for the entire (potentially long) stream.
+        allowed = {
+            "airflow.api_fastapi.core_api.routes.public.log.get_log",
+            "airflow.api_fastapi.core_api.routes.public.dag_run.wait_dag_run_until_finished",
+            "airflow.api_fastapi.core_api.routes.ui.deadlines.get_callback_logs",
+        }
+
+        app = create_app()
+        violations = []
+        for route in _get_all_api_routes(app):
+            try:
+                hints = typing.get_type_hints(route.endpoint, include_extras=True)
+            except Exception:
+                continue
+            returns_streaming = hints.get("return") is StreamingResponse
+            if not returns_streaming:
+                with contextlib.suppress(OSError, TypeError):
+                    returns_streaming = "StreamingResponse" in inspect.getsource(route.endpoint)
+            if not returns_streaming:
+                continue
+            fqn = f"{route.endpoint.__module__}.{route.endpoint.__qualname__}"
+            if fqn in allowed:
+                continue
+            for param_name, hint in hints.items():
+                if param_name == "return":
+                    continue
+                if typing.get_origin(hint) is not typing.Annotated:
+                    continue
+                for metadata in typing.get_args(hint)[1:]:
+                    if isinstance(metadata, DependsClass) and metadata.scope == "function":
+                        violations.append(
+                            f"{route.endpoint.__module__}.{route.endpoint.__qualname__}"
+                            f" parameter '{param_name}'"
+                        )
+
+        assert not violations, (
+            "Streaming endpoints must not use function-scoped dependencies like "
+            "SessionDep — function-scoped cleanup runs before the response body "
+            "is streamed, leaking database connections.\n"
+            "Do NOT use Annotated[Session, Depends(_get_session)] or other session dependencies "
+            "either, as this holds the DB connection open for the entire stream "
+            "duration.\n"
+            "Instead, use create_session() inside the generator to open/close a "
+            "connection for each iteration, releasing it between yields.\n"
+            + "\n".join(f"  - {v}" for v in violations)
+        )
+
+
+class TestGzipMiddleware:
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        clear_db_jobs()
+        yield
+        clear_db_jobs()
+
+    def test_gzip_middleware_should_not_be_chunked(self, test_client) -> None:
+        response = test_client.get("/api/v2/monitor/health")
+        headers = {k.lower(): v for k, v in response.headers.items()}
+
+        # Ensure we do not reintroduce Transfer-Encoding: chunked
+        assert "transfer-encoding" not in headers
+
+
+class TestRouterLevelDefaultDeny:
+    """
+    Authentication is enforced as a router-level default on the routers that
+    serve user-facing endpoints. A future route added under one of these
+    routers cannot accidentally be added without an auth dependency — the
+    router-level Depends(get_user) is the defense-in-depth backstop.
+    """
+
+    def test_authenticated_router_carries_get_user_dependency(self):
+        assert any(
+            getattr(dep, "dependency", None) is get_user for dep in authenticated_router.dependencies
+        ), (
+            "authenticated_router must declare Depends(get_user) at the router level so every "
+            "route below /api/v2 (other than the explicit no-auth carve-outs in public_router) "
+            "default-denies unauthenticated requests."
+        )
+
+    def test_ui_router_carries_get_user_dependency(self):
+        assert any(getattr(dep, "dependency", None) is get_user for dep in ui_router.dependencies), (
+            "ui_router must declare Depends(get_user) at the router level so every UI endpoint "
+            "default-denies unauthenticated requests."
+        )
+
+
+class TestCorsMiddlewareConfig:
+    def test_init_config_enables_credentialed_cors_for_explicit_origins(self):
+        with conf_vars({("api", "access_control_allow_origins"): "https://example.com"}):
+            app = FastAPI()
+            init_config(app)
+
+        cors_middlewares = [m for m in app.user_middleware if m.cls is CORSMiddleware]
+        assert len(cors_middlewares) == 1
+        assert cors_middlewares[0].kwargs["allow_credentials"] is True
+        assert cors_middlewares[0].kwargs["allow_origins"] == ["https://example.com"]
+
+    @pytest.mark.parametrize(
+        "origins",
+        ["*", "https://example.com,*", "*,https://example.com"],
+    )
+    def test_init_config_rejects_wildcard_origin(self, origins):
+        """Wildcard origin is incompatible with credentialed CORS; reject it at startup.
+
+        Browsers refuse any response that combines ``Access-Control-Allow-Origin: *`` with
+        ``Access-Control-Allow-Credentials: true``, so silently accepting ``*`` would just ship
+        a configuration where every cross-origin request fails. Fail loudly instead.
+        """
+        from airflow.exceptions import AirflowConfigException
+
+        with conf_vars({("api", "access_control_allow_origins"): origins}):
+            app = FastAPI()
+            with pytest.raises(AirflowConfigException, match=r"must not contain `\*`"):
+                init_config(app)
+
+    def test_allow_origin_regex_allows_matching_and_blocks_other_origins(self):
+        """A request whose Origin matches the regex is CORS-approved; a non-matching one is not."""
+        with conf_vars({("api", "access_control_allow_origin_regex"): r"https://.*\.example\.com"}):
+            app = FastAPI()
+            init_config(app)
+
+        @app.get("/ping")
+        def ping():
+            return {"ok": True}
+
+        client = TestClient(app)
+
+        allowed = client.get("/ping", headers={"Origin": "https://app.example.com"})
+        assert allowed.status_code == 200
+        assert allowed.headers["access-control-allow-origin"] == "https://app.example.com"
+        assert allowed.headers["access-control-allow-credentials"] == "true"
+
+        blocked = client.get("/ping", headers={"Origin": "https://evil.com"})
+        assert blocked.status_code == 200
+        assert "access-control-allow-origin" not in blocked.headers
+
+
+class TestUiTranslationViews:
+    @staticmethod
+    def _client(plugins, tmp_path) -> TestClient:
+        app = FastAPI()
+        with mock_plugin_manager(plugins=plugins):
+            init_ui_translation_views(app, dev_mode=False, dist_directory=tmp_path)
+        return TestClient(app)
+
+    def test_languages_manifest_lists_plugin_languages_sorted(self, tmp_path):
+        class TranslationPlugin(AirflowPlugin):
+            name = "translations"
+            ui_translations = [{"eo": {"common": {"greeting": "Saluton"}}, "en": {"common": {"a": "A"}}}]
+
+        response = self._client([TranslationPlugin()], tmp_path).get("/static/i18n/languages.json")
+
+        assert response.status_code == 200
+        assert response.json() == {"languages": ["en", "eo"]}
+
+    def test_no_locale_route_without_plugin_translations(self, tmp_path):
+        client = self._client([], tmp_path)
+
+        assert client.get("/static/i18n/languages.json").json() == {"languages": []}
+        # With nothing to override, the per-locale route is not registered, so the bundled files
+        # keep being served straight from the static mount.
+        assert client.get("/static/i18n/locales/en/common.json").status_code == 404
+
+    def test_override_is_deep_merged_over_the_bundled_file(self, tmp_path):
+        (tmp_path / "i18n/locales/en").mkdir(parents=True)
+        (tmp_path / "i18n/locales/en/common.json").write_text(
+            json.dumps({"a": "base", "nested": {"x": "bx", "deep": {"p": "bp", "q": "bq"}}}),
+            encoding="utf-8",
+        )
+
+        class TranslationPlugin(AirflowPlugin):
+            name = "translations"
+            # Override a key three levels deep; siblings at every level must survive.
+            ui_translations = [{"en": {"common": {"a": "override", "nested": {"deep": {"q": "oq"}}}}}]
+
+        response = self._client([TranslationPlugin()], tmp_path).get("/static/i18n/locales/en/common.json")
+
+        assert response.status_code == 200
+        assert response.json() == {"a": "override", "nested": {"x": "bx", "deep": {"p": "bp", "q": "oq"}}}
+
+    def test_only_the_overridden_namespace_is_intercepted(self, tmp_path):
+        # A bundled language override must not intercept its other namespaces; those keep being
+        # served from the static mount (here, the bare app has none, so they simply 404).
+        (tmp_path / "i18n/locales/en").mkdir(parents=True)
+        (tmp_path / "i18n/locales/en/common.json").write_text(json.dumps({"a": "base"}), encoding="utf-8")
+
+        class TranslationPlugin(AirflowPlugin):
+            name = "translations"
+            ui_translations = [{"en": {"common": {"a": "override"}}}]
+
+        client = self._client([TranslationPlugin()], tmp_path)
+
+        assert client.get("/static/i18n/locales/en/common.json").json() == {"a": "override"}
+        assert client.get("/static/i18n/locales/en/dags.json").status_code == 404
+
+    def test_new_language_without_a_bundled_file_serves_its_translations(self, tmp_path):
+        class TranslationPlugin(AirflowPlugin):
+            name = "translations"
+            ui_translations = [{"eo": {"common": {"greeting": "Saluton"}}}]
+
+        client = self._client([TranslationPlugin()], tmp_path)
+
+        assert client.get("/static/i18n/locales/eo/common.json").json() == {"greeting": "Saluton"}
+        # A namespace the new language does not provide returns an empty object so i18next falls
+        # back to English rather than receiving a 404.
+        assert client.get("/static/i18n/locales/eo/dags.json").json() == {}
+
+    def test_invalid_namespace_segment_is_rejected(self, tmp_path):
+        class TranslationPlugin(AirflowPlugin):
+            name = "translations"
+            ui_translations = [{"eo": {"common": {"greeting": "Saluton"}}}]
+
+        # A namespace outside [A-Za-z0-9_-] cannot escape the locales directory.
+        response = self._client([TranslationPlugin()], tmp_path).get("/static/i18n/locales/eo/foo.bar.json")
+
+        assert response.status_code == 404
+
+    def test_unreadable_bundled_file_falls_back_to_the_plugin_translations(self, tmp_path):
+        (tmp_path / "i18n/locales/en").mkdir(parents=True)
+        (tmp_path / "i18n/locales/en/common.json").write_text("{ not valid json", encoding="utf-8")
+
+        class TranslationPlugin(AirflowPlugin):
+            name = "translations"
+            ui_translations = [{"en": {"common": {"a": "override"}}}]
+
+        response = self._client([TranslationPlugin()], tmp_path).get("/static/i18n/locales/en/common.json")
+
+        assert response.status_code == 200
+        assert response.json() == {"a": "override"}
+
+    def test_locale_response_supports_conditional_get(self, tmp_path):
+        class TranslationPlugin(AirflowPlugin):
+            name = "translations"
+            ui_translations = [{"eo": {"common": {"greeting": "Saluton"}}}]
+
+        client = self._client([TranslationPlugin()], tmp_path)
+
+        first = client.get("/static/i18n/locales/eo/common.json")
+        assert first.status_code == 200
+        etag = first.headers["etag"]
+
+        revalidated = client.get("/static/i18n/locales/eo/common.json", headers={"If-None-Match": etag})
+        assert revalidated.status_code == 304
+
+    def test_manifest_asks_the_browser_to_revalidate(self, tmp_path):
+        class TranslationPlugin(AirflowPlugin):
+            name = "translations"
+            ui_translations = [{"eo": {"common": {"greeting": "Saluton"}}}]
+
+        response = self._client([TranslationPlugin()], tmp_path).get("/static/i18n/languages.json")
+
+        assert response.headers["cache-control"] == "no-cache"
+
+
+class TestBaseReactAppPreload:
+    def test_lists_only_global_base_react_apps(self):
+        class BasePlugin(AirflowPlugin):
+            name = "base_plugin"
+            react_apps = [
+                {"name": "Bar", "bundle_url": "/bar/main.js", "destination": "base"},
+                {"name": "Tab", "bundle_url": "/bar/tab.js", "destination": "dag"},
+            ]
+
+        class TeamPlugin(AirflowPlugin):
+            name = "team_plugin"
+            team_name = "team_a"
+            react_apps = [{"name": "TeamBar", "bundle_url": "/team/main.js", "destination": "base"}]
+
+        with mock_plugin_manager(plugins=[BasePlugin(), TeamPlugin()]):
+            assert base_react_app_bundle_urls() == ["/bar/main.js"]
+
+    @staticmethod
+    def _render(template: str, preload_bundle_urls: list[str]) -> str:
+        app = FastAPI()
+        templates = Jinja2Templates(directory=AIRFLOW_CORE_SOURCES_PATH / "airflow/ui")
+
+        @app.get("/")
+        def index(request: Request):
+            return templates.TemplateResponse(
+                request,
+                template,
+                {"backend_server_base_url": "/prefix/", "preload_bundle_urls": preload_bundle_urls},
+            )
+
+        return TestClient(app).get("/").text
+
+    def test_lists_nothing_without_base_react_apps(self):
+        class NavPlugin(AirflowPlugin):
+            name = "nav_plugin"
+            react_apps = [{"name": "Page", "bundle_url": "/page/main.js", "destination": "nav"}]
+
+        with mock_plugin_manager(plugins=[NavPlugin()]):
+            assert base_react_app_bundle_urls() == []
+
+    @pytest.mark.parametrize("template", ["index.html", "dev/index.html"])
+    def test_index_preloads_each_bundle_after_the_base_tag(self, template):
+        html = self._render(template, ["/bar/main.js?a=1&b=2", "https://cdn.example.com/x.js"])
+
+        assert '<link rel="modulepreload" href="/bar/main.js?a=1&amp;b=2" />' in html
+        assert '<link rel="modulepreload" href="https://cdn.example.com/x.js" />' in html
+        assert html.index("<base ") < html.index('rel="modulepreload"')
+
+    @pytest.mark.parametrize("template", ["index.html", "dev/index.html"])
+    def test_index_has_no_preload_without_base_bundles(self, template):
+        assert "modulepreload" not in self._render(template, [])
+
+    def test_index_escapes_a_bundle_url(self):
+        html = self._render("index.html", ['/x.js" onload="alert(1)'])
+
+        assert 'onload="alert(1)"' not in html
+
+
+class TestMiddlewareInitialisation:
+    @patch("airflow.api_fastapi.app.get_auth_manager")
+    def test_jwt_refresh_middleware_init(self, mock_get_auth_manager):
+        app = FastAPI()
+        auth_manager = MagicMock(spec=BaseAuthManager)
+        mock_jwt_middleware = Mock()
+        auth_manager.get_jwt_refresh_middleware.return_value = [(mock_jwt_middleware, {})]
+        auth_manager.get_fastapi_middlewares.return_value = []
+        mock_get_auth_manager.return_value = auth_manager
+        init_middlewares(app)
+        auth_manager.get_jwt_refresh_middleware.assert_called_once()
+        assert [m.cls for m in app.user_middleware] == [GZipMiddleware, mock_jwt_middleware]
+
+    @patch("airflow.api_fastapi.app.get_auth_manager")
+    def test_no_jwt_refresh_middleware_init(self, mock_get_auth_manager):
+        app = FastAPI()
+        auth_manager = MagicMock(spec=BaseAuthManager)
+        auth_manager.get_jwt_refresh_middleware.return_value = []
+        auth_manager.get_fastapi_middlewares.return_value = []
+        mock_get_auth_manager.return_value = auth_manager
+        init_middlewares(app)
+        auth_manager.get_jwt_refresh_middleware.assert_called_once()
+        assert [m.cls for m in app.user_middleware] == [GZipMiddleware]

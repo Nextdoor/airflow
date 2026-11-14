@@ -1,0 +1,149 @@
+/*!
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import { randomUUID } from "node:crypto";
+import { testConfig } from "playwright.config";
+
+import { expect } from "tests/e2e/fixtures";
+import { test } from "tests/e2e/fixtures/asset-data";
+
+test.describe("Assets Page", () => {
+  // assetData is triggered once per worker via beforeEach.
+  test.beforeEach(async ({ assetData: _data, assetListPage }) => {
+    await assetListPage.navigate();
+  });
+
+  test("verify assets table lists assets with name links", async ({ assetListPage }) => {
+    await expect.soft(assetListPage.heading).toBeVisible();
+    await expect.soft(assetListPage.table).toBeVisible();
+    await expect(assetListPage.rows.first()).toBeVisible();
+    await expect.soft(assetListPage.rows.locator("td a").first()).toBeVisible();
+  });
+
+  test("verify clicking an asset navigates to detail page", async ({ assetListPage, page }) => {
+    const name = await assetListPage.openFirstAsset();
+
+    await expect(page).toHaveURL(/\/assets\/.+/);
+    await expect(page.getByRole("heading", { name: new RegExp(name, "i") })).toBeVisible();
+  });
+
+  test("verify assets using search", async ({ assetListPage }) => {
+    await expect(assetListPage.rows.first()).toBeVisible();
+
+    const searchTerm = testConfig.asset.name;
+
+    await assetListPage.searchInput.fill(searchTerm);
+
+    await expect
+      .poll(
+        async () => {
+          const links = await assetListPage.rows.locator("td a").allTextContents();
+
+          return (
+            links.length > 0 && links.every((name) => name.toLowerCase().includes(searchTerm.toLowerCase()))
+          );
+        },
+        { intervals: [500], timeout: 30_000 },
+      )
+      .toBe(true);
+  });
+
+  test("verify asset details and dependencies", async ({ assetDetailPage }) => {
+    const assetName = testConfig.asset.name;
+
+    await assetDetailPage.goto();
+    await assetDetailPage.clickOnAsset(assetName);
+    await expect(assetDetailPage.getHeading(assetName)).toBeVisible();
+    await assetDetailPage.verifyProducingTasks();
+    await assetDetailPage.verifyScheduledDags();
+  });
+
+  test("asset state store entries remain scrollable when the table overflows", async ({
+    assetData: _data,
+    assetDetailPage,
+    authenticatedRequest,
+    browserName,
+    page,
+  }) => {
+    test.skip(browserName !== "chromium", "The asset fixture is shared across browser projects.");
+
+    const assetResponse = await authenticatedRequest.get(
+      `/api/v2/assets?uri=${encodeURIComponent(testConfig.asset.name)}&limit=1`,
+    );
+
+    expect(assetResponse.ok()).toBe(true);
+
+    const { assets } = (await assetResponse.json()) as { assets: Array<{ id: number }> };
+    const [asset] = assets;
+
+    if (asset === undefined) {
+      throw new Error(`Test asset ${testConfig.asset.name} was not found`);
+    }
+
+    const keyPrefix = `000-e2e-scroll-${randomUUID()}`;
+    const keys = Array.from({ length: 20 }, (_, index) => `${keyPrefix}-${String(index).padStart(3, "0")}`);
+
+    try {
+      const responses = await Promise.all(
+        keys.map((key, index) =>
+          authenticatedRequest.put(`/api/v2/assets/${asset.id}/state-store/${encodeURIComponent(key)}`, {
+            data: { value: { index, value: `scroll test ${index}` } },
+          }),
+        ),
+      );
+
+      expect(responses.every((response) => response.ok())).toBe(true);
+
+      await assetDetailPage.goto();
+      await assetDetailPage.clickOnAsset(testConfig.asset.name);
+      await page.getByRole("link", { exact: true, name: "Asset State Store" }).click();
+
+      const table = page.getByTestId("table-list");
+      const lastKey = `${keyPrefix}-019`;
+
+      await expect(table.getByText(lastKey)).toBeAttached();
+
+      const canScroll = await table.evaluate((element) => {
+        let parent = element.parentElement;
+
+        while (parent !== null) {
+          const { overflowY } = window.getComputedStyle(parent);
+
+          if ((overflowY === "auto" || overflowY === "scroll") && parent.scrollHeight > parent.clientHeight) {
+            parent.scrollTop = parent.scrollHeight;
+
+            return parent.scrollTop > 0;
+          }
+
+          parent = parent.parentElement;
+        }
+
+        return false;
+      });
+
+      expect(canScroll).toBe(true);
+      await expect(table.locator("tbody tr").last()).toBeInViewport();
+    } finally {
+      await Promise.all(
+        keys.map((key) =>
+          authenticatedRequest.delete(`/api/v2/assets/${asset.id}/state-store/${encodeURIComponent(key)}`),
+        ),
+      );
+    }
+  });
+});

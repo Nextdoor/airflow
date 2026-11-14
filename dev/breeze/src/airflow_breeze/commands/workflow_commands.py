@@ -1,0 +1,614 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+
+import click
+
+from airflow_breeze.branch_defaults import AIRFLOW_BRANCH
+from airflow_breeze.commands.common_options import argument_doc_packages, option_answer
+from airflow_breeze.global_constants import REGULAR_DOC_PACKAGES
+from airflow_breeze.utils.click_utils import BreezeGroup
+from airflow_breeze.utils.confirm import Answer, user_confirm
+from airflow_breeze.utils.console import console_print
+from airflow_breeze.utils.custom_param_types import BetterChoice
+from airflow_breeze.utils.gh_workflow_utils import (
+    get_staging_only_commits,
+    mirror_hardened_base_images,
+    trigger_workflow_and_monitor,
+)
+from airflow_breeze.utils.github import run_gh_command
+from airflow_breeze.utils.packages import (
+    expand_all_provider_distributions,
+    get_available_distributions,
+    get_long_package_name,
+)
+from airflow_breeze.utils.path_utils import AIRFLOW_ROOT_PATH
+from airflow_breeze.utils.run_utils import run_command
+from airflow_breeze.utils.shared_options import get_dry_run
+
+WORKFLOW_NAME_MAPS = {
+    "publish-docs": "publish-docs-to-s3.yml",
+    "airflow-refresh-site": "build.yml",
+    "sync-s3-to-github": "s3-to-github.yml",
+    "release-constraints": "release-constraints.yml",
+    "reset-staging": "reset-staging.yml",
+}
+
+# Every branch the upgrade check runs for has a scheduled workflow of its own on main.
+UPGRADE_CHECK_WORKFLOW_PREFIX = "scheduled-upgrade-check-"
+UPGRADE_CHECK_BRANCHES = sorted(
+    {AIRFLOW_BRANCH}
+    | {
+        path.stem.removeprefix(UPGRADE_CHECK_WORKFLOW_PREFIX)
+        for path in (AIRFLOW_ROOT_PATH / ".github" / "workflows").glob(
+            f"{UPGRADE_CHECK_WORKFLOW_PREFIX}*.yml"
+        )
+    }
+)
+
+# X.Y.Z or X.Y.ZrcN - the workflow derives the release stage from which of the two it is given,
+# so there is no separate switch that could disagree with the version.
+RELEASE_VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+(rc\d+)?$")
+
+APACHE_AIRFLOW_REPO = "apache/airflow"
+APACHE_AIRFLOW_SITE_REPO = "apache/airflow-site"
+APACHE_AIRFLOW_SITE_ARCHIVE_REPO = "apache/airflow-site-archive"
+# The "Active providers" list on https://airflow.apache.org/docs/ is maintained by hand in this file.
+AIRFLOW_SITE_DOCS_INDEX_PATH = "landing-pages/site/content/en/docs/_index.md"
+
+
+@click.group(cls=BreezeGroup, name="workflow-run", help="Tools to manage Airflow repository workflows ")
+def workflow_run_group():
+    pass
+
+
+@workflow_run_group.command(name="publish-docs", help="Trigger publish docs to S3 workflow")
+@click.option(
+    "--ref",
+    help="Git reference tag to checkout to build documentation.",
+    required=True,
+)
+@click.option(
+    "--skip-tag-validation",
+    help="Skip validation of the tag. Allows to use `main` or commit hash. Use with caution.",
+    is_flag=True,
+)
+@click.option(
+    "--exclude-docs",
+    help="Comma separated short name list of docs packages to exclude from the publish. (example: apache.druid,google)",
+    default="no-docs-excluded",
+)
+@click.option(
+    "--site-env",
+    help="S3 bucket to which the documentation will be published.",
+    default="auto",
+    type=BetterChoice(["auto", "live", "staging"]),
+)
+@click.option(
+    "--skip-write-to-stable-folder",
+    help="Skip writing to stable folder.",
+    is_flag=True,
+)
+@click.option(
+    "--airflow-version",
+    help="Override Airflow Version to use for the docs build. "
+    "If not provided, it will be extracted from the ref. If only base version is provided, it will be "
+    "set to the same as the base version.",
+    default=None,
+    type=str,
+)
+@click.option(
+    "--airflow-base-version",
+    help="Override Airflow Base Version to use for the docs build. "
+    "If not provided, it will be extracted from the ref. If airflow-version is provided, the "
+    "base version of the version provided (i.e. stripped pre-/post-/dev- suffixes).",
+    default=None,
+    type=str,
+)
+@click.option(
+    "--apply-commits",
+    help="Apply commits before building the docs - for example to patch fixes "
+    "to the docs (comma separated list of commits). ",
+    default=None,
+    type=str,
+)
+@click.option(
+    "--workflow-branch",
+    help="Git ref the workflow DEFINITION runs from. Defaults to the value of --ref, so the "
+    "workflow version matches the content being built (running main's workflow against an "
+    "older tag breaks when inputs/jobs have since changed). Pass an explicit ref to override "
+    "(e.g. 'main').",
+    default=None,
+    type=str,
+)
+@click.option(
+    "--ignore-missing-inventories",
+    help="Do not fail the build on missing third-party inventories.",
+    is_flag=True,
+)
+@click.option(
+    "--skip-site-index-check",
+    help="Do not fail when a published provider is missing from the docs index in apache/airflow-site.",
+    is_flag=True,
+)
+@argument_doc_packages
+def workflow_run_publish(
+    ref: str,
+    exclude_docs: str,
+    site_env: str,
+    skip_tag_validation: bool,
+    doc_packages: tuple[str, ...],
+    skip_write_to_stable_folder: bool = False,
+    airflow_version: str | None = None,
+    airflow_base_version: str | None = None,
+    apply_commits: str | None = None,
+    workflow_branch: str | None = None,
+    ignore_missing_inventories: bool = False,
+    skip_site_index_check: bool = False,
+):
+    # Default the workflow-definition ref to the ref being built, so the workflow version
+    # matches the content. Running main's workflow against an older tag breaks when the
+    # workflow's inputs/jobs have changed since that tag (e.g. a newly required input).
+    if workflow_branch is None:
+        workflow_branch = ref
+    if len(doc_packages) == 0:
+        console_print(
+            "[red]Error: No doc packages provided. Please provide at least one doc package.[/red]",
+        )
+        sys.exit(1)
+    if os.environ.get("GITHUB_TOKEN", ""):
+        console_print(
+            "\n[warning]GITHUB_TOKEN is set; Breeze will try your `gh auth login` first and only "
+            "use this token as a fallback. The fallback token must have workflow-trigger scope."
+        )
+    console_print(
+        f"[blue]Validating ref: {ref}[/blue]",
+    )
+
+    if not skip_tag_validation:
+        tag_result = run_gh_command(
+            ["gh", "api", f"repos/apache/airflow/git/refs/tags/{ref}"],
+            capture_output=True,
+        )
+
+        stdout = tag_result.stdout.decode("utf-8")
+        tag_respo = json.loads(stdout)
+
+        if not tag_respo.get("ref"):
+            # Check whether the ref exists as a branch (common case for -docs branches)
+            branch_result = run_gh_command(
+                ["gh", "api", f"repos/apache/airflow/git/refs/heads/{ref}"],
+                capture_output=True,
+                check=False,
+            )
+            branch_stdout = branch_result.stdout.decode("utf-8")
+            branch_respo = json.loads(branch_stdout)
+
+            if branch_respo.get("ref"):
+                console_print(
+                    f"[red]Error: Ref {ref} exists as a branch but not as a tag.[/red]",
+                )
+                console_print(
+                    "\nTo publish docs from a branch (e.g. a `providers/YYYY-MM-DD-docs` "
+                    "post-release fix branch), add [bold]--skip-tag-validation[/bold] to your command."
+                )
+            else:
+                console_print(
+                    f"[red]Error: Ref {ref} does not exist as a tag or branch in repo apache/airflow.[/red]",
+                )
+                console_print("\nYou can add --skip-tag-validation to skip this validation.")
+            sys.exit(1)
+
+    resolved_site_env = resolve_site_env(site_env, ref)
+    site_index_pr_urls: list[str] = []
+    if resolved_site_env == "live" and not skip_site_index_check:
+        site_index_pr_urls = check_providers_are_in_site_index(doc_packages, exclude_docs)
+
+    console_print(
+        f"[blue]Triggering workflow {WORKFLOW_NAME_MAPS['publish-docs']}: at {APACHE_AIRFLOW_REPO}[/blue]",
+    )
+    from packaging.version import InvalidVersion, Version
+
+    if airflow_version:
+        try:
+            Version(airflow_version)
+        except InvalidVersion as e:
+            f"[red]Invalid version passed as --airflow-version:  {airflow_version}[/red]: {e}"
+            sys.exit(1)
+        console_print(
+            f"[blue]Using provided Airflow version: {airflow_version}[/blue]",
+        )
+    if airflow_base_version:
+        try:
+            Version(airflow_base_version)
+        except InvalidVersion as e:
+            f"[red]Invalid base version passed as --airflow-base-version:  {airflow_version}[/red]: {e}"
+            sys.exit(1)
+        console_print(
+            f"[blue]Using provided Airflow base version: {airflow_base_version}[/blue]",
+        )
+    if not airflow_version and airflow_base_version:
+        airflow_version = airflow_base_version
+    if airflow_version and not airflow_base_version:
+        airflow_base_version = Version(airflow_version).base_version
+
+    joined_packages = " ".join(doc_packages)
+    if "providers" in joined_packages and "apache-airflow-providers" not in joined_packages:
+        joined_packages = joined_packages + " apache-airflow-providers"
+
+    workflow_fields = {
+        "ref": ref,
+        "destination": site_env,
+        "include-docs": joined_packages,
+        "exclude-docs": exclude_docs,
+        "skip-write-to-stable-folder": skip_write_to_stable_folder,
+        "build-sboms": "true" if "apache-airflow" in doc_packages else "false",
+        "apply-commits": apply_commits if apply_commits else "",
+        "ignore-missing-inventories": str(ignore_missing_inventories).lower(),
+    }
+
+    if airflow_version:
+        workflow_fields["airflow-version"] = airflow_version
+    if airflow_base_version:
+        workflow_fields["airflow-base-version"] = airflow_base_version
+
+    trigger_workflow_and_monitor(
+        workflow_name=WORKFLOW_NAME_MAPS["publish-docs"],
+        repo=APACHE_AIRFLOW_REPO,
+        branch=workflow_branch,
+        **workflow_fields,
+    )
+
+    site_env = resolved_site_env
+    branch = "main" if site_env == "live" else "staging"
+
+    console_print(
+        f"[blue]Refreshing site at {APACHE_AIRFLOW_SITE_REPO}[/blue]",
+    )
+    wf_name = WORKFLOW_NAME_MAPS["airflow-refresh-site"]
+
+    console_print(
+        f"[blue]Triggering workflow {wf_name}: at {APACHE_AIRFLOW_SITE_REPO}[/blue]",
+    )
+
+    trigger_workflow_and_monitor(
+        workflow_name=wf_name,
+        repo=APACHE_AIRFLOW_SITE_REPO,
+        branch=branch,
+    )
+
+    console_print(
+        f"[blue]Refreshing completed workflow {wf_name}: at {APACHE_AIRFLOW_SITE_REPO}[/blue]",
+    )
+
+    workflow_fields = {"source": site_env}
+
+    console_print(
+        f"[blue]Syncing S3 docs to GitHub repository at {APACHE_AIRFLOW_SITE_ARCHIVE_REPO}[/blue]",
+    )
+    trigger_workflow_and_monitor(
+        workflow_name=WORKFLOW_NAME_MAPS["sync-s3-to-github"],
+        repo=APACHE_AIRFLOW_SITE_ARCHIVE_REPO,
+        branch=branch,
+        **workflow_fields,
+        monitor=False,
+    )
+
+    if site_index_pr_urls:
+        console_print(
+            "\n[warning]The docs are published. Now merge the PRs that add the new providers to the "
+            f"docs index of {APACHE_AIRFLOW_SITE_REPO}:[/warning]"
+        )
+        for url in site_index_pr_urls:
+            console_print(f"  {url}")
+
+
+def resolve_site_env(site_env: str, ref: str) -> str:
+    if site_env != "auto":
+        return site_env
+    return "live" if re.match(r"^.*[0-9]+\.[0-9]+\.[0-9]+$", ref) else "staging"
+
+
+def find_providers_missing_from_site_index(
+    doc_packages: tuple[str, ...], exclude_docs: str, site_index: str
+) -> list[str]:
+    # Removed and not-ready providers are not expected in the index of active providers.
+    released_provider_ids = set(get_available_distributions())
+    # Split like S3DocsPublish.get_all_excluded_docs, so only docs the upload skips are skipped here.
+    excluded = set(exclude_docs.split(" "))
+    # The publish workflow builds every package for "all".
+    doc_packages = tuple("all-providers" if package == "all" else package for package in doc_packages)
+    provider_ids = sorted(
+        package
+        for package in expand_all_provider_distributions(doc_packages)
+        if package in released_provider_ids and package not in excluded
+    )
+    return [
+        provider_id
+        for provider_id in provider_ids
+        if f"/docs/{get_long_package_name(provider_id)}/" not in site_index
+    ]
+
+
+def read_site_index_from_main() -> str:
+    result = run_gh_command(
+        [
+            "gh",
+            "api",
+            "-H",
+            "Accept: application/vnd.github.raw",
+            f"repos/{APACHE_AIRFLOW_SITE_REPO}/contents/{AIRFLOW_SITE_DOCS_INDEX_PATH}?ref=main",
+        ],
+        capture_output=True,
+        check=True,
+    )
+    return result.stdout.decode("utf-8")
+
+
+def find_open_site_index_prs() -> dict[str, str]:
+    """Return the lines that open PRs add to the docs index, keyed by PR URL."""
+    result = run_gh_command(
+        [
+            "gh",
+            "pr",
+            "list",
+            "--repo",
+            APACHE_AIRFLOW_SITE_REPO,
+            "--state",
+            "open",
+            "--limit",
+            "100",
+            "--json",
+            "number,url,files",
+        ],
+        capture_output=True,
+        check=True,
+    )
+    added_lines_by_pr: dict[str, str] = {}
+    for pr in json.loads(result.stdout):
+        if not any(file["path"] == AIRFLOW_SITE_DOCS_INDEX_PATH for file in pr["files"]):
+            continue
+        diff = run_gh_command(
+            ["gh", "pr", "diff", str(pr["number"]), "--repo", APACHE_AIRFLOW_SITE_REPO],
+            capture_output=True,
+            check=True,
+        )
+        added_lines_by_pr[pr["url"]] = "\n".join(get_lines_added_to_site_index(diff.stdout.decode("utf-8")))
+    return added_lines_by_pr
+
+
+def get_lines_added_to_site_index(diff: str) -> list[str]:
+    added_lines = []
+    in_site_index = False
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            in_site_index = line.endswith(f" b/{AIRFLOW_SITE_DOCS_INDEX_PATH}")
+        elif in_site_index and line.startswith("+") and not line.startswith("+++"):
+            added_lines.append(line)
+    return added_lines
+
+
+def check_providers_are_in_site_index(doc_packages: tuple[str, ...], exclude_docs: str) -> list[str]:
+    """
+    Fail unless every published provider is in the docs index on main or added to it by an open PR.
+
+    Returns the URLs of the open PRs that add providers, which must be merged after the docs are published.
+    """
+    if all(package in REGULAR_DOC_PACKAGES for package in doc_packages):
+        return []
+    if get_dry_run():
+        console_print("[warning]Skipping the docs index check in dry-run mode.[/warning]")
+        return []
+    console_print(
+        f"[blue]Checking that published providers are in the docs index of {APACHE_AIRFLOW_SITE_REPO}[/blue]"
+    )
+    try:
+        missing = find_providers_missing_from_site_index(
+            doc_packages, exclude_docs, read_site_index_from_main()
+        )
+        pr_urls_to_merge = []
+        if missing:
+            for url, added_lines in find_open_site_index_prs().items():
+                still_missing = find_providers_missing_from_site_index(
+                    tuple(missing), exclude_docs, added_lines
+                )
+                if len(still_missing) < len(missing):
+                    pr_urls_to_merge.append(url)
+                    missing = still_missing
+    except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError) as e:
+        console_print(
+            f"[red]Error: Could not check the docs index of {APACHE_AIRFLOW_SITE_REPO}: {e!r}[/red]"
+        )
+        console_print("\nAdd --skip-site-index-check to publish without this check.")
+        sys.exit(1)
+    if missing:
+        console_print(
+            f"[red]Error: These providers are missing from {AIRFLOW_SITE_DOCS_INDEX_PATH} on main of "
+            f"{APACHE_AIRFLOW_SITE_REPO}, and no open PR there adds them:[/red]"
+        )
+        for provider_id in missing:
+            console_print(f"  {get_long_package_name(provider_id)}")
+        console_print(
+            "\nOpen a PR adding them to the index before publishing, and merge it after the docs are "
+            "published - see 'Update airflow-site index for new providers' in "
+            "dev/README_RELEASE_PROVIDERS.md. Add --skip-site-index-check to publish without this check."
+        )
+        sys.exit(1)
+    return pr_urls_to_merge
+
+
+@workflow_run_group.command(
+    name="release-constraints",
+    help="Trigger the workflow that resolves, publishes and tags the constraints for a release.",
+)
+@click.option(
+    "--version",
+    help="Version the constraints belong to. A candidate (3.1.3rc1) resolves with pre-releases "
+    "allowed and lands on a branch of its own; a final (3.1.3) resolves without them and commits "
+    "onto constraints-X-Y. The stage is derived from this, so it cannot be set inconsistently.",
+    required=True,
+)
+@click.option(
+    "--ref",
+    help="Git ref the constraints are resolved from, e.g. 'v3-1-stable' or the release tag.",
+    required=True,
+)
+@click.option(
+    "--workflow-branch",
+    help="Git ref the workflow DEFINITION runs from. Defaults to 'main', which is normally what "
+    "you want: unlike the docs build, the constraints do not have to be produced by the workflow "
+    "as it stood at the ref being released.",
+    default="main",
+    show_default=True,
+)
+@click.option(
+    "--fail-on-pending-provider-candidates",
+    type=click.Choice(["true", "false"]),
+    default=None,
+    help="Override the final-release guard. Unset derives it from the version (a final fails when a "
+    "provider's newest PyPI version is a pending rc). Set 'false' to pin the currently-released "
+    "providers and proceed through an overlapping provider wave.",
+)
+def workflow_run_release_constraints(
+    version: str, ref: str, workflow_branch: str, fail_on_pending_provider_candidates: str | None
+):
+    if not RELEASE_VERSION_PATTERN.match(version):
+        console_print(f"[red]Error: '{version}' is not a release version - expected X.Y.Z or X.Y.ZrcN.[/red]")
+        sys.exit(1)
+    stage = "candidate" if "rc" in version else "final"
+    console_print(f"[blue]Triggering constraints generation for the {stage} {version} from {ref}[/blue]")
+    overrides = {"fail-on-pending-provider-candidates": fail_on_pending_provider_candidates or ""}
+    trigger_workflow_and_monitor(
+        workflow_name=WORKFLOW_NAME_MAPS["release-constraints"],
+        repo=APACHE_AIRFLOW_REPO,
+        branch=workflow_branch,
+        version=version,
+        ref=ref,
+        **overrides,
+    )
+
+
+@workflow_run_group.command(
+    name="mirror-base-images",
+    help="Mirror the latest hardened base images and wait until they are mirrored.",
+)
+@click.option(
+    "--trigger-upgrade-check/--no-trigger-upgrade-check",
+    default=True,
+    show_default=True,
+    help="Let the mirror run the main upgrade check when a tag moves past its pin. Turn it off when the "
+    "main upgrade check is what runs the mirror.",
+)
+@click.option(
+    "--build-os-deps-images/--no-build-os-deps-images",
+    default=True,
+    show_default=True,
+    help="Also build the OS-dependencies images on the mirrored base images. Turn it off when the "
+    "upgrade check is what runs the mirror: it pins the images the daily build published.",
+)
+def workflow_run_mirror_base_images(trigger_upgrade_check: bool, build_os_deps_images: bool):
+    mirror_hardened_base_images(
+        APACHE_AIRFLOW_REPO,
+        trigger_upgrade_check=trigger_upgrade_check,
+        build_os_deps_images=build_os_deps_images,
+    )
+
+
+@workflow_run_group.command(
+    name="upgrade-check",
+    help="Upgrade the important CI environment of a branch before a release, mirroring the latest "
+    "hardened base images first. For main (before a beta) it runs the upgrade check workflow, which opens "
+    "an upgrade PR, and waits for it. For a vX-Y-test branch (before its test-to-stable PR) it runs the "
+    "upgrade locally and pushes it to the branch, which needs committer rights.",
+)
+@click.option(
+    "--branch",
+    help="Branch to upgrade.",
+    type=BetterChoice(UPGRADE_CHECK_BRANCHES),
+    default=AIRFLOW_BRANCH,
+    show_default=True,
+)
+def workflow_run_upgrade_check(branch: str):
+    if branch == "main":
+        console_print("[blue]Running the upgrade check for main[/blue]")
+        # The scheduled workflow lives on main and checks the branch out itself.
+        trigger_workflow_and_monitor(
+            workflow_name=f"{UPGRADE_CHECK_WORKFLOW_PREFIX}{branch}.yml",
+            repo=APACHE_AIRFLOW_REPO,
+            branch="main",
+        )
+        return
+    # The release branch rules let only committers push without CI having passed, and the workflow's
+    # token is not one, so the upgrade that goes straight onto the branch runs here.
+    console_print(f"[blue]Upgrading {branch} locally and pushing the upgrade to it[/blue]")
+    result = run_command(
+        ["breeze", "ci", "upgrade", "--target-branch", branch, "--push-to-target-branch"],
+        check=False,
+        cwd=AIRFLOW_ROOT_PATH,
+    )
+    if result.returncode != 0:
+        sys.exit(result.returncode)
+
+
+@workflow_run_group.command(
+    name="sync-staging-to-main",
+    help="Reset the staging branches of apache/airflow-site and apache/airflow-site-archive to main.",
+)
+@option_answer
+def workflow_run_sync_staging_to_main():
+    console_print(
+        f"[warning]This force-updates the `staging` branches of {APACHE_AIRFLOW_SITE_REPO} and "
+        f"{APACHE_AIRFLOW_SITE_ARCHIVE_REPO} to their current `main` commits, dropping everything that "
+        "is only on `staging`.[/warning]\n"
+        "[warning]If a vote for ANY other release is in progress, its staging docs live on those "
+        "branches - SKIP this step, or you will overwrite the docs prepared for that vote.[/warning]"
+    )
+    dropped_commits_count = 0
+    for repo in (APACHE_AIRFLOW_SITE_REPO, APACHE_AIRFLOW_SITE_ARCHIVE_REPO):
+        try:
+            staging_only_commits = get_staging_only_commits(repo)
+        except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError) as e:
+            console_print(f"[warning]Could not compare staging to main in {repo}: {e!r}[/warning]")
+            continue
+        if staging_only_commits:
+            dropped_commits_count += len(staging_only_commits)
+            console_print(f"[warning]Commits only on `staging` in {repo} that will be dropped:[/warning]")
+            for commit in staging_only_commits:
+                console_print(f"  {commit}")
+    prompt = "Is no other release vote in progress, and should staging be reset to main?"
+    if dropped_commits_count:
+        prompt = (
+            f"{dropped_commits_count} commit(s) only on staging will be dropped. "
+            "Is no other release vote in progress, and should staging be reset to main?"
+        )
+    answer = user_confirm(prompt)
+    if answer != Answer.YES:
+        console_print("[info]Skipping the reset of staging to main.[/info]")
+        sys.exit(0 if answer == Answer.NO else 1)
+    for repo in (APACHE_AIRFLOW_SITE_REPO, APACHE_AIRFLOW_SITE_ARCHIVE_REPO):
+        console_print(f"[blue]Resetting staging to main in {repo}[/blue]")
+        trigger_workflow_and_monitor(
+            workflow_name=WORKFLOW_NAME_MAPS["reset-staging"],
+            repo=repo,
+            branch="main",
+        )

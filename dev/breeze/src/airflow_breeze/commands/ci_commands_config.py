@@ -23,8 +23,12 @@ CI_COMMANDS: dict[str, str | list[str]] = {
         "free-space",
         "resource-check",
         "selective-check",
-        "find-newer-dependencies",
         "get-workflow-info",
+        "upgrade",
+        "set-milestone",
+        "fork-ci-reconcile",
+        "audit",
+        "approve-workflow-runs",
     ],
 }
 CI_PARAMETERS: dict[str, list[dict[str, str | list[str]]]] = {
@@ -36,6 +40,7 @@ CI_PARAMETERS: dict[str, list[dict[str, str | list[str]]]] = {
             ],
         }
     ],
+    "breeze ci free-space": [],
     "breeze ci selective-check": [
         {
             "name": "Selective check flags",
@@ -44,21 +49,21 @@ CI_PARAMETERS: dict[str, list[dict[str, str | list[str]]]] = {
                 "--pr-labels",
                 "--default-branch",
                 "--default-constraints-branch",
-                "--github-event-name",
+                "--platform",
+                "--selective-tests-on-push",
+                "--push-base-commit",
             ],
-        }
-    ],
-    "breeze ci find-newer-dependencies": [
+        },
         {
-            "name": "Find newer dependencies flags",
+            "name": "GitHub parameters",
             "options": [
-                "--python",
-                "--timezone",
-                "--airflow-constraints-reference",
-                "--updated-on-or-after",
-                "--max-age",
+                "--github-event-name",
+                "--github-repository",
+                "--github-actor",
+                "--github-context",
+                "--github-context-input",
             ],
-        }
+        },
     ],
     "breeze ci get-workflow-info": [
         {
@@ -68,5 +73,90 @@ CI_PARAMETERS: dict[str, list[dict[str, str | list[str]]]] = {
                 "--github-context-input",
             ],
         }
+    ],
+    "breeze ci resource-check": [],
+    "breeze ci upgrade": [
+        {
+            "name": "Upgrade flags",
+            "options": [
+                "--target-branch",
+                "--create-pr",
+                "--push-to-target-branch",
+                "--draft",
+                "--switch-to-base",
+                "--airflow-site",
+                "--force-k8s-schema-sync",
+                "--latest-package-managers",
+                "--github-token",
+            ],
+        },
+        {
+            "name": "Upgrade steps",
+            "options": [
+                "--autoupdate",
+                "--update-chart-dependencies",
+                "--upgrade-important-versions",
+                "--upgrade-dependency-floors",
+                "--mirror-base-images",
+                "--update-uv-lock",
+                "--k8s-schema-sync",
+            ],
+        },
+    ],
+    "breeze ci set-milestone": [
+        {
+            "name": "PR information",
+            "options": [
+                "--pr-number",
+                "--pr-title",
+                "--pr-labels",
+                "--base-branch",
+                "--merged-by",
+            ],
+        },
+        {
+            "name": "GitHub parameters",
+            "options": [
+                "--github-token",
+                "--github-repository",
+            ],
+        },
+    ],
+    "breeze ci fork-ci-reconcile": [
+        {
+            "name": "Fork CI reconcile flags",
+            "options": [
+                "--config",
+                "--output-file",
+                "--reported-file",
+                "--draft-changes-file",
+                "--run-url",
+                "--github-repository",
+            ],
+        },
+    ],
+    "breeze ci audit": [
+        {
+            "name": "Audit flags",
+            "options": [
+                "--fix",
+            ],
+        },
+    ],
+    "breeze ci approve-workflow-runs": [
+        {
+            "name": "Approval flags",
+            "options": [
+                "--max-run-age-hours",
+                "--report-only",
+            ],
+        },
+        {
+            "name": "GitHub parameters",
+            "options": [
+                "--github-token",
+                "--github-repository",
+            ],
+        },
     ],
 }

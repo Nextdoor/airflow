@@ -1,0 +1,510 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+import pytest
+from sqlalchemy import delete
+
+from airflow.models.dynamic_region import DynamicRegion, ProducerContext
+from airflow.models.expandinput import NotFullyPopulated
+from airflow.models.taskinstance import TaskInstance
+from airflow.models.xcom import XCOM_RETURN_KEY, XComModel
+from airflow.models.xcom_arg import XComArg
+from airflow.providers.standard.operators.bash import BashOperator
+from airflow.providers.standard.operators.python import PythonOperator
+from airflow.sdk import task_group
+from airflow.serialization.definitions.mappedoperator import get_mapped_ti_count
+from airflow.serialization.definitions.notset import NOTSET
+from airflow.serialization.definitions.xcom_arg import (
+    SchedulerConcatXComArg,
+    SchedulerMapXComArg,
+    SchedulerPlainXComArg,
+    SchedulerZipXComArg,
+    get_task_map_length,
+)
+from airflow.utils.state import TaskInstanceState
+
+from tests_common.test_utils.asserts import assert_queries_count, count_loaded_task_instances
+from tests_common.test_utils.db import clear_db_dags, clear_db_runs
+
+pytestmark = pytest.mark.db_test
+
+
+VALUE = 42
+
+
+def assert_is_value(num: int):
+    if num != VALUE:
+        raise Exception("The test has failed")
+
+
+def build_python_op(dag_maker):
+    def f(task_id):
+        return f"OP:{task_id}"
+
+    with dag_maker(dag_id="test_xcom_dag"):
+        operator = PythonOperator(
+            python_callable=f,
+            task_id="test_xcom_op",
+            do_xcom_push=True,
+        )
+    dag_maker.create_dagrun()
+    return operator
+
+
+@pytest.fixture(autouse=True)
+def clear_db():
+    clear_db_runs()
+    clear_db_dags()
+
+
+class TestXComArgBuild:
+    def test_xcom_ctor(self, dag_maker):
+        python_op = build_python_op(dag_maker)
+        actual = XComArg(python_op, "test_key")
+        assert actual
+        assert actual.operator == python_op
+        assert actual.key == "test_key"
+        # Asserting the overridden __eq__ method
+        assert actual == XComArg(python_op, "test_key")
+        expected_str = (
+            "{{ task_instance.xcom_pull(task_ids='test_xcom_op', dag_id='test_xcom_dag', key='test_key') }}"
+        )
+        assert str(actual) == expected_str
+        assert (
+            f"echo {actual}" == "echo {{ task_instance.xcom_pull(task_ids='test_xcom_op', "
+            "dag_id='test_xcom_dag', key='test_key') }}"
+        )
+
+    def test_xcom_key_is_empty_str(self, dag_maker):
+        python_op = build_python_op(dag_maker)
+        actual = XComArg(python_op, key="")
+        assert actual.key == ""
+        assert (
+            str(actual) == "{{ task_instance.xcom_pull(task_ids='test_xcom_op', "
+            "dag_id='test_xcom_dag', key='') }}"
+        )
+
+    def test_set_downstream(self, dag_maker):
+        with dag_maker("test_set_downstream"):
+            op_a = BashOperator(task_id="a", bash_command="echo a")
+            op_b = BashOperator(task_id="b", bash_command="echo b")
+            bash_op1 = BashOperator(task_id="c", bash_command="echo c")
+            bash_op2 = BashOperator(task_id="d", bash_command="echo c")
+            xcom_args_a = XComArg(op_a)
+            xcom_args_b = XComArg(op_b)
+
+            bash_op1 >> xcom_args_a >> xcom_args_b >> bash_op2
+        dag_maker.create_dagrun()
+        assert op_a in bash_op1.downstream_list
+        assert op_b in op_a.downstream_list
+        assert bash_op2 in op_b.downstream_list
+
+    def test_set_upstream(self, dag_maker):
+        with dag_maker("test_set_upstream"):
+            op_a = BashOperator(task_id="a", bash_command="echo a")
+            op_b = BashOperator(task_id="b", bash_command="echo b")
+            bash_op1 = BashOperator(task_id="c", bash_command="echo c")
+            bash_op2 = BashOperator(task_id="d", bash_command="echo c")
+            xcom_args_a = XComArg(op_a)
+            xcom_args_b = XComArg(op_b)
+
+            bash_op1 << xcom_args_a << xcom_args_b << bash_op2
+        dag_maker.create_dagrun()
+        assert op_a in bash_op1.upstream_list
+        assert op_b in op_a.upstream_list
+        assert bash_op2 in op_b.upstream_list
+
+    def test_xcom_arg_property_of_base_operator(self, dag_maker):
+        with dag_maker("test_xcom_arg_property_of_base_operator"):
+            op_a = BashOperator(task_id="a", bash_command="echo a")
+        dag_maker.create_dagrun()
+
+        assert op_a.output == XComArg(op_a)
+
+    def test_xcom_key_getitem_not_str(self, dag_maker):
+        python_op = build_python_op(dag_maker)
+        actual = XComArg(python_op)
+        with pytest.raises(ValueError, match="XComArg only supports str lookup, received int"):
+            actual[1]
+
+    def test_xcom_key_getitem(self, dag_maker):
+        python_op = build_python_op(dag_maker)
+        actual = XComArg(python_op, key="another_key")
+        assert actual.key == "another_key"
+        actual_new_key = actual["another_key_2"]
+        assert actual_new_key.key == "another_key_2"
+
+    def test_xcom_not_iterable(self, dag_maker):
+        python_op = build_python_op(dag_maker)
+        actual = XComArg(python_op)
+        with pytest.raises(TypeError) as ctx:
+            list(actual)
+        assert str(ctx.value) == "'XComArg' object is not iterable"
+
+
+@pytest.mark.system
+class TestXComArgRuntime:
+    def test_xcom_pass_to_op(self, dag_maker):
+        with dag_maker(dag_id="test_xcom_pass_to_op") as dag:
+            operator = PythonOperator(
+                python_callable=lambda: VALUE,
+                task_id="return_value_1",
+                do_xcom_push=True,
+            )
+            xarg = XComArg(operator)
+            operator2 = PythonOperator(
+                python_callable=assert_is_value,
+                op_args=[xarg],
+                task_id="assert_is_value_1",
+            )
+            operator >> operator2
+        dag.test()
+
+    def test_xcom_push_and_pass(self, dag_maker):
+        def push_xcom_value(key, value, **context):
+            ti = context["task_instance"]
+            ti.xcom_push(key, value)
+
+        with dag_maker(dag_id="test_xcom_push_and_pass") as dag:
+            op1 = PythonOperator(
+                python_callable=push_xcom_value,
+                task_id="push_xcom_value",
+                op_args=["my_key", VALUE],
+            )
+            xarg = XComArg(op1, key="my_key")
+            op2 = PythonOperator(
+                python_callable=assert_is_value,
+                task_id="assert_is_value_1",
+                op_args=[xarg],
+            )
+            op1 >> op2
+        dag.test()
+
+
+@pytest.mark.parametrize(
+    ("fillvalue", "expected_results"),
+    [
+        (NOTSET, {("a", 1), ("b", 2), ("c", 3)}),
+        (None, {("a", 1), ("b", 2), ("c", 3), (None, 4)}),
+    ],
+)
+def test_xcom_zip(dag_maker, session, fillvalue, expected_results):
+    results = set()
+    with dag_maker(session=session, serialized=True) as dag:
+
+        @dag.task
+        def push_letters():
+            return ["a", "b", "c"]
+
+        @dag.task
+        def push_numbers():
+            return [1, 2, 3, 4]
+
+        @dag.task
+        def pull(value):
+            results.add(value)
+
+        pull.expand(value=push_letters().zip(push_numbers(), fillvalue=fillvalue))
+
+    dr = dag_maker.create_dagrun()
+
+    # Run "push_letters" and "push_numbers".
+    decision = dr.task_instance_scheduling_decisions(session=session)
+    assert sorted(ti.task_id for ti in decision.schedulable_tis) == ["push_letters", "push_numbers"]
+    for ti in decision.schedulable_tis:
+        dag_maker.run_ti(task_id=ti.task_id, map_index=ti.map_index, dag_run=dr, session=session)
+    session.commit()
+
+    # Run "pull".
+    decision = dr.task_instance_scheduling_decisions(session=session)
+    assert sorted(ti.task_id for ti in decision.schedulable_tis) == ["pull"] * len(expected_results)
+    for ti in decision.schedulable_tis:
+        dag_maker.run_ti(task_id=ti.task_id, map_index=ti.map_index, dag_run=dr, session=session)
+
+    assert results == expected_results
+
+
+def test_mapped_length_dies_with_the_pushed_value(dag_maker, session):
+    """Purging the producer's XCom must take its mapped length with it.
+
+    The retry-time purge is issued worker-side so custom XCom backends are purged too; it
+    deletes XCom rows only. With the length on the row, a downstream expanding while the
+    producer retries correctly sees "not ready" instead of a length for a value that is gone.
+    """
+    with dag_maker(session=session, serialized=True) as dag:
+
+        @dag.task
+        def emit():
+            return [1, 2, 3]
+
+        @dag.task
+        def consume(value): ...
+
+        consume.expand(value=emit())
+
+    dr = dag_maker.create_dagrun()
+    dag_maker.run_ti(task_id="emit", dag_run=dr, session=session)
+    session.commit()
+
+    consume_task = dag_maker.serialized_dag.get_task("consume")
+    assert get_mapped_ti_count(consume_task, dr.run_id, session=session) == 3
+
+    XComModel.clear(dag_id=dr.dag_id, task_id="emit", run_id=dr.run_id, map_index=-1, session=session)
+
+    with pytest.raises(NotFullyPopulated):
+        get_mapped_ti_count(consume_task, dr.run_id, session=session)
+
+    XComModel.set(
+        key=XCOM_RETURN_KEY,
+        value=[1, 2],
+        dag_id=dr.dag_id,
+        task_id="emit",
+        run_id=dr.run_id,
+        mapped_length=2,
+        session=session,
+    )
+    assert get_mapped_ti_count(consume_task, dr.run_id, session=session) == 2
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected_length"),
+    [("plain", 2), ("map", 2), ("zip", 2), ("zip_longest", 5), ("concat", 7)],
+)
+def test_map_length_selects_retained_producer_in_callers_iteration(
+    dag_maker, session, operation, expected_length
+):
+    with dag_maker(session=session, serialized=True) as dag:
+
+        @dag.task
+        def source():
+            return [1, 2]
+
+        @dag.task
+        def outside():
+            return [1, 2, 3, 4, 5]
+
+        source()
+        outside()
+
+    dr = dag_maker.create_dagrun()
+    original = DynamicRegion(dag_id=dr.dag_id, run_id=dr.run_id, node_id="loop")
+    session.add(original)
+    session.flush()
+    replacement = DynamicRegion(
+        dag_id=dr.dag_id,
+        run_id=dr.run_id,
+        node_id="loop",
+        forked_from_region_id=original.id,
+        resumes_from_index=1,
+    )
+    session.add(replacement)
+    source_ti = next(ti for ti in dr.task_instances if ti.task_id == "source")
+    outside_ti = next(ti for ti in dr.task_instances if ti.task_id == "outside")
+    source_ti.region_id = original.id
+    source_ti.region_index = 1
+    source_ti.state = TaskInstanceState.SUCCESS
+    earlier_ti = TaskInstance(
+        task=dag_maker.serialized_dag.get_task("source"),
+        run_id=dr.run_id,
+        map_index=0,
+        dag_version_id=source_ti.dag_version_id,
+    )
+    earlier_ti.region_id = original.id
+    earlier_ti.state = TaskInstanceState.SUCCESS
+    session.add(earlier_ti)
+    session.flush()
+    for ti, length in ((earlier_ti, 99), (source_ti, 2), (outside_ti, 5)):
+        XComModel.set_for_attempt(
+            task_instance_id=ti.id,
+            key=XCOM_RETURN_KEY,
+            value=list(range(length)),
+            mapped_length=length,
+            session=session,
+        )
+    session.flush()
+    source_arg = SchedulerPlainXComArg(dag_maker.serialized_dag.get_task("source"), XCOM_RETURN_KEY)
+    outside_arg = SchedulerPlainXComArg(dag_maker.serialized_dag.get_task("outside"), XCOM_RETURN_KEY)
+    argument = {
+        "plain": source_arg,
+        "map": SchedulerMapXComArg(source_arg, ["str"]),
+        "zip": SchedulerZipXComArg([source_arg, outside_arg], NOTSET),
+        "zip_longest": SchedulerZipXComArg([source_arg, outside_arg], None),
+        "concat": SchedulerConcatXComArg([source_arg, outside_arg]),
+    }[operation]
+    contexts = {"source": ProducerContext(replacement.id, 1, loop_node_id="loop")}
+
+    assert (
+        get_task_map_length(argument, dr.run_id, producer_contexts=contexts, session=session)
+        == expected_length
+    )
+
+
+@pytest.mark.parametrize(
+    ("count", "unfinished", "expected_length"), [(0, False, 0), (2, False, 2), (2, True, None)]
+)
+def test_mapped_producer_length_ignores_other_iterations(
+    dag_maker, session, count, unfinished, expected_length
+):
+    with dag_maker(session=session, serialized=True) as dag:
+
+        @dag.task
+        def source(value):
+            return value
+
+        source.expand(value=list(range(count)))
+
+    dr = dag_maker.create_dagrun()
+    loop = DynamicRegion(dag_id=dr.dag_id, run_id=dr.run_id, node_id="loop")
+    session.add(loop)
+    session.flush()
+    expansions = [
+        DynamicRegion(
+            dag_id=dr.dag_id,
+            run_id=dr.run_id,
+            node_id="source",
+            parent_region_id=loop.id,
+            parent_region_index=index,
+        )
+        for index in range(2)
+    ]
+    session.add_all(expansions)
+    session.flush()
+    for ti in dr.task_instances:
+        ti.region_id = expansions[1].id
+        ti.state = TaskInstanceState.SUCCESS if count else TaskInstanceState.SKIPPED
+    session.flush()
+    for ti in dr.task_instances:
+        if ti.map_index >= 0:
+            XComModel.set_for_attempt(
+                task_instance_id=ti.id, key=XCOM_RETURN_KEY, value=ti.map_index, session=session
+            )
+    if unfinished:
+        dr.task_instances[0].state = TaskInstanceState.RUNNING
+    earlier_ti = TaskInstance(
+        task=dag_maker.serialized_dag.get_task("source"),
+        run_id=dr.run_id,
+        map_index=0,
+        dag_version_id=dr.task_instances[0].dag_version_id,
+    )
+    earlier_ti.region_id = expansions[0].id
+    earlier_ti.state = TaskInstanceState.RUNNING
+    session.add(earlier_ti)
+    session.flush()
+    XComModel.set_for_attempt(
+        task_instance_id=earlier_ti.id, key=XCOM_RETURN_KEY, value="other iteration", session=session
+    )
+    session.flush()
+    argument = SchedulerPlainXComArg(dag_maker.serialized_dag.get_task("source"), XCOM_RETURN_KEY)
+
+    assert (
+        get_task_map_length(
+            argument,
+            dr.run_id,
+            producer_contexts={"source": ProducerContext(loop.id, 1, loop_node_id="loop")},
+            session=session,
+        )
+        == expected_length
+    )
+
+
+def test_member_of_mapped_task_group_has_no_map_length(dag_maker, session):
+
+    with dag_maker(session=session, serialized=True):
+
+        @task_group
+        def group(value):
+            BashOperator(task_id="member", bash_command="true")
+
+        group.expand(value=[1, 2])
+
+    dr = dag_maker.create_dagrun()
+    loop = DynamicRegion(dag_id=dr.dag_id, run_id=dr.run_id, node_id="loop")
+    session.add(loop)
+    session.flush()
+    expansion = DynamicRegion(
+        dag_id=dr.dag_id,
+        run_id=dr.run_id,
+        node_id="group",
+        parent_region_id=loop.id,
+        parent_region_index=1,
+    )
+    session.add(expansion)
+    session.flush()
+    member_task = dag_maker.serialized_dag.get_task("group.member")
+    first = next(ti for ti in dr.task_instances if ti.task_id == "group.member")
+    first.region_id = expansion.id
+    first.region_index = 0
+    second = TaskInstance(task=member_task, run_id=dr.run_id, dag_version_id=first.dag_version_id)
+    second.region_id = expansion.id
+    second.region_index = 1
+    session.add(second)
+    session.flush()
+    argument = SchedulerPlainXComArg(member_task, XCOM_RETURN_KEY)
+
+    assert (
+        get_task_map_length(
+            argument,
+            dr.run_id,
+            producer_contexts={"group.member": ProducerContext(loop.id, 1, loop_node_id="loop")},
+            session=session,
+        )
+        is None
+    )
+
+
+def test_mapped_producer_without_live_instances_has_zero_length(dag_maker, session):
+    with dag_maker(session=session, serialized=True) as dag:
+
+        @dag.task
+        def source(value):
+            return value
+
+        source.expand(value=[1, 2])
+
+    dr = dag_maker.create_dagrun()
+    session.execute(delete(TaskInstance).where(TaskInstance.run_id == dr.run_id))
+    session.flush()
+    argument = SchedulerPlainXComArg(dag_maker.serialized_dag.get_task("source"), XCOM_RETURN_KEY)
+
+    assert get_task_map_length(argument, dr.run_id, session=session) == 0
+
+
+@pytest.mark.parametrize("mapped_count", [3, 60])
+def test_mapped_producer_length_loads_no_producer_rows(dag_maker, session, mapped_count):
+    with dag_maker(session=session, serialized=True) as dag:
+
+        @dag.task
+        def source(value):
+            return value
+
+        source.expand(value=list(range(mapped_count)))
+
+    dr = dag_maker.create_dagrun()
+    for ti in dr.task_instances:
+        ti.state = TaskInstanceState.SUCCESS
+        XComModel.set_for_attempt(
+            task_instance_id=ti.id, key=XCOM_RETURN_KEY, value=ti.map_index, session=session
+        )
+    session.flush()
+    session.expire_all()
+    argument = SchedulerPlainXComArg(dag_maker.serialized_dag.get_task("source"), XCOM_RETURN_KEY)
+    with count_loaded_task_instances("source") as loaded, assert_queries_count(4):
+        length = get_task_map_length(argument, dr.run_id, session=session)
+
+    assert length == mapped_count
+    assert loaded == []

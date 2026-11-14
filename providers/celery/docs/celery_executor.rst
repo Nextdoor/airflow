@@ -1,0 +1,380 @@
+ .. Licensed to the Apache Software Foundation (ASF) under one
+    or more contributor license agreements.  See the NOTICE file
+    distributed with this work for additional information
+    regarding copyright ownership.  The ASF licenses this file
+    to you under the Apache License, Version 2.0 (the
+    "License"); you may not use this file except in compliance
+    with the License.  You may obtain a copy of the License at
+
+ ..   http://www.apache.org/licenses/LICENSE-2.0
+
+ .. Unless required by applicable law or agreed to in writing,
+    software distributed under the License is distributed on an
+    "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+    KIND, either express or implied.  See the License for the
+    specific language governing permissions and limitations
+    under the License.
+
+Celery Executor
+===============
+
+``CeleryExecutor`` is one of the ways you can scale out the number of workers. For this
+to work, you need to setup a Celery backend (**RabbitMQ**, **Redis**, **Redis Sentinel** ...),
+install the required dependencies (such as ``librabbitmq``, ``redis`` ...) and
+change your ``airflow.cfg`` to point the executor parameter to
+``CeleryExecutor`` and provide the related Celery settings.
+
+For more information about setting up a Celery broker, refer to the
+exhaustive `Celery documentation on the topic <https://docs.celeryq.dev/en/latest/getting-started/>`_.
+
+The configuration parameters of the Celery Executor can be found in the Celery provider's :doc:`configurations-ref`.
+
+Here are a few imperative requirements for your workers:
+
+- ``airflow`` needs to be installed, and the CLI needs to be in the path
+- Airflow configuration settings should be homogeneous across the cluster
+- Operators that are executed on the worker need to have their dependencies
+  met in that context. For example, if you use the ``HiveOperator``,
+  the Hive CLI needs to be installed on that box, or if you use the
+  ``MySqlOperator``, the required Python library needs to be available in
+  the :envvar:`PYTHONPATH` somehow
+- The worker needs to have access to its ``DAGS_FOLDER``, and you need to
+  synchronize the filesystems by your own means. A common setup would be to
+  store your ``DAGS_FOLDER`` in a Git repository and sync it across machines using
+  Chef, Puppet, Ansible, or whatever you use to configure machines in your
+  environment. If all your boxes have a common mount point, having your
+  pipelines files shared there should work as well
+
+
+To kick off a worker, you need to setup Airflow and kick off the worker
+subcommand
+
+.. code-block:: bash
+
+    airflow celery worker
+
+Your worker should start picking up tasks as soon as they get fired in
+its direction. To stop a worker running on a machine you can use:
+
+.. code-block:: bash
+
+    airflow celery stop
+
+It will try to stop the worker gracefully by sending ``SIGTERM`` signal to main Celery
+process as recommended by
+`Celery documentation <https://docs.celeryq.dev/en/latest/userguide/workers.html>`__.
+
+Note that you can also run `Celery Flower <https://flower.readthedocs.io/en/latest/>`__,
+a web UI built on top of Celery, to monitor your workers. You can use the shortcut command
+to start a Flower web server:
+
+.. code-block:: bash
+
+    airflow celery flower
+
+Please note that you must have the ``flower`` python library already installed on your system. The recommended way is to install the Airflow celery bundle.
+
+.. code-block:: bash
+
+    pip install 'apache-airflow[celery]'
+
+
+Some caveats:
+
+- Make sure to use a database backed result backend
+- Make sure to set a visibility timeout in ``[celery_broker_transport_options]`` that exceeds the ETA of your longest running task (see `Visibility timeout and long-running tasks`_)
+- Make sure to specify the password for Redis Server in the ``[celery_broker_transport_options]`` section if you are using Redis Sentinel as your broker and the Redis servers are password-protected
+- Make sure to set umask in ``[worker_umask]`` to set permissions for newly created files by workers.
+- Tasks can consume resources. Make sure your worker has enough resources to run ``worker_concurrency`` tasks
+- Queue names are limited to 256 characters, but each broker backend might have its own restrictions
+
+Visibility timeout and long-running tasks
+-----------------------------------------
+
+Brokers that redeliver unacknowledged messages -- Redis and Amazon SQS -- hide a delivered message for
+``[celery_broker_transport_options] visibility_timeout`` seconds. Because ``[celery] task_acks_late``
+is enabled by default, a message is acknowledged only once its task finishes, so any task that runs
+for longer than the visibility timeout is redelivered while it is still running.
+
+Setting ``task_acks_late`` does not prevent this. For Redis and SQS it does not override
+``visibility_timeout``: the broker redelivers the message regardless.
+
+Both deliveries carry the same Celery task id, so a failure reported for the redelivery cannot be
+told apart from one reported for the original task.
+
+With ``apache-airflow-providers-celery`` 3.18.0 or newer running on Airflow 3.2.0 or newer, the
+redelivered message is detected and discarded. The worker logs ``Task already running elsewhere,
+ignoring redelivered message``, and the original task runs to completion. Both version floors are
+required: the provider recognizes the condition, but it relies on the ``TaskAlreadyRunningError``
+that the Task SDK raises in Airflow 3.2.0 and newer when a task instance is already running.
+
+On earlier versions the redelivery terminates the still-running original task, which surfaces only as
+``'Task Instance Not Running' FAILED: Task is in the running state``.
+
+Set ``visibility_timeout`` to exceed the ETA of your longest running task. Note that Amazon SQS caps
+the visibility timeout at 43200 seconds (12 hours), so on SQS it cannot be raised any further and
+tasks running for longer than 12 hours are always redelivered.
+
+PostgreSQL result backends
+--------------------------
+
+For result backends using psycopg (v3), Airflow defaults ``connect_args.prepare_threshold`` to
+``None`` to disable automatic prepared statements. This supports a transaction-mode connection
+pooler that does not track prepared statements. The setting also works when connecting directly
+to PostgreSQL. Other database drivers, including psycopg2, do not receive this parameter.
+
+An explicit value in ``[celery] result_backend_sqlalchemy_engine_options`` takes precedence.
+For example, when connecting directly to PostgreSQL or using a pooler configured to support
+prepared statements, you can restore psycopg's default preparation threshold:
+
+.. code-block:: ini
+
+    [celery]
+    result_backend_sqlalchemy_engine_options = {"connect_args": {"prepare_threshold": 5}}
+
+Redis maintenance
+-----------------
+
+When Redis is used as the Celery broker, Airflow uses it for transient Celery messages: queued task
+commands, task acknowledgement data, and other broker-side state. Airflow task history, Dag runs,
+connections, Variables, and XCom records are stored in the Airflow metadata database and should be
+maintained with database tooling such as ``airflow db clean``. Cleaning the metadata database does not
+clean Redis, and cleaning Redis does not clean Airflow's metadata database.
+
+Do not flush or delete keys from the Redis database used by Airflow while schedulers or Celery workers
+are running. Removing broker keys while tasks are queued, running, or being acknowledged can lose
+pending work or make task state temporarily inconsistent. If you need to discard stale broker data
+after an outage, first stop Airflow schedulers and Celery workers, make sure there are no tasks that
+you intend to preserve in ``queued`` or ``running`` state, back up the Redis database if it is
+persistent, and then remove only the Redis database or keyspace configured in ``[celery] broker_url``.
+
+If you configured Redis as the Celery ``result_backend``, the same maintenance window should also
+account for result backend keys. Deleting those keys can remove Celery task result information that the
+scheduler may still query. For production deployments, Airflow recommends a database-backed result
+backend so broker cleanup and task-result storage are handled separately.
+
+See :doc:`apache-airflow:administration-and-deployment/modules_management` for details on how Python and Airflow manage modules.
+
+Architecture
+------------
+
+.. graphviz::
+
+    digraph A{
+        rankdir="TB"
+        node[shape="rectangle", style="rounded"]
+
+
+        subgraph cluster {
+            label="Cluster";
+            {rank = same; dag; database}
+            {rank = same; workers; scheduler; web}
+
+            workers[label="Workers"]
+            scheduler[label="Scheduler"]
+            web[label="Web server"]
+            database[label="Database"]
+            dag[label="Dag files"]
+
+            subgraph cluster_queue {
+                label="Celery";
+                {rank = same; queue_broker; queue_result_backend}
+                queue_broker[label="Queue broker"]
+                queue_result_backend[label="Result backend"]
+            }
+
+            web->workers[label="1"]
+            web->dag[label="2"]
+            web->database[label="3"]
+
+            workers->dag[label="4"]
+            workers->database[label="5"]
+            workers->queue_result_backend[label="6"]
+            workers->queue_broker[label="7"]
+
+            scheduler->dag[label="8"]
+            scheduler->database[label="9"]
+            scheduler->queue_result_backend[label="10"]
+            scheduler->queue_broker[label="11"]
+        }
+    }
+
+Airflow consist of several components:
+
+* **Workers** - Execute the assigned tasks
+* **Scheduler** - Responsible for adding the necessary tasks to the queue
+* **Web server** - HTTP Server provides access to Dag/task status information
+* **Database** - Contains information about the status of tasks, Dags, Variables, connections, etc.
+* **Celery** - Queue mechanism
+
+Please note that the queue at Celery consists of two components:
+
+* **Broker** - Stores commands for execution
+* **Result backend** - Stores status of completed commands
+
+The components communicate with each other in many places
+
+* [1] **Web server** --> **Workers** - Fetches task execution logs
+* [2] **Web server** --> **Dag files** - Reveal the Dag structure
+* [3] **Web server** --> **Database** - Fetch the status of the tasks
+* [4] **Workers** --> **Dag files** - Reveal the Dag structure and execute the tasks
+* [5] **Workers** --> **Database** - Gets and stores information about connection configuration, variables and XCOM.
+* [6] **Workers** --> **Celery's result backend** - Saves the status of tasks
+* [7] **Workers** --> **Celery's broker** - Stores commands for execution
+* [8] **Scheduler** --> **Dag files** - Reveal the Dag structure and execute the tasks
+* [9] **Scheduler** --> **Database** - Store a Dag run and related tasks
+* [10] **Scheduler** --> **Celery's result backend** - Gets information about the status of completed tasks
+* [11] **Scheduler** --> **Celery's broker** - Put the commands to be executed
+
+Task execution process
+----------------------
+
+.. figure:: img/run_task_on_celery_executor.png
+    :scale: 50 %
+
+    Sequence diagram - task execution process
+
+Initially, two processes are running:
+
+- SchedulerProcess - process the tasks and run using CeleryExecutor
+- WorkerProcess - observes the queue waiting for new tasks to appear
+- WorkerChildProcess - waits for new tasks
+
+Two databases are also available:
+
+- QueueBroker
+- ResultBackend
+
+During this process, two processes are created:
+
+- LocalTaskJobProcess - Its logic is described by LocalTaskJob. It is monitoring RawTaskProcess. New processes are started using TaskRunner.
+- RawTaskProcess - It is a process with the user code e.g. :meth:`~airflow.models.baseoperator.BaseOperator.execute`.
+
+| [1] **SchedulerProcess** processes the tasks and when it finds a task that needs to be done, sends it to the **QueueBroker**.
+| [2] **SchedulerProcess** also begins to periodically query **ResultBackend** for the status of the task.
+| [3] **QueueBroker**, when it becomes aware of the task, sends information about it to one WorkerProcess.
+| [4] **WorkerProcess** assigns a single task to a one **WorkerChildProcess**.
+| [5] **WorkerChildProcess** performs the proper task handling functions - :meth:`~airflow.executor.celery_executor.execute_command`. It creates a new process - **LocalTaskJobProcess**.
+| [6] LocalTaskJobProcess logic is described by :class:`~airflow.jobs.local_task_job.LocalTaskJob` class. It starts new process using TaskRunner.
+| [7][8] Process **RawTaskProcess** and **LocalTaskJobProcess** is stopped when they have finished their work.
+| [10][12] **WorkerChildProcess** notifies the main process - **WorkerProcess** about the end of the task and the availability of subsequent tasks.
+| [11] **WorkerProcess** saves status information in **ResultBackend**.
+| [13] When **SchedulerProcess** asks **ResultBackend** again about the status, it will get information about the status of the task.
+
+.. _celery_executor:logging:
+
+Worker logging
+--------------
+
+By default the Celery worker writes plain-text logs to stdout. To emit structured
+JSON instead, enable it via the ``[logging]`` section (applies to all Airflow
+components) or override it for the worker alone with the ``[celery]`` section:
+
+.. code-block:: ini
+
+    # Global — affects the API server, scheduler, and workers:
+    [logging]
+    json_logs = True
+
+    # Or override for the Celery worker only, leaving other components unchanged:
+    [celery]
+    json_logs = True
+
+A Celery worker runs up to ``worker_concurrency`` tasks at once, so lines from concurrent
+tasks interleave on the worker's stdout. Raw ``print``/stderr lines are forwarded with
+only ``logger="task.stdout"`` and carry no task instance ID, so a log collector cannot
+attribute them to a task.
+
+The lookup order is:
+
+1. ``[celery] json_logs`` — if set, takes precedence.
+2. ``[logging] json_logs`` — used when the celery-specific key is absent.
+3. ``False`` — the default when neither key is configured.
+
+This mirrors the existing ``[logging] CELERY_LOGGING_LEVEL`` /
+``[logging] LOGGING_LEVEL`` fallback already present in the worker startup
+code.
+
+.. note::
+
+    ``[logging] json_logs`` was added in Airflow 3.2.0. On older 3.x versions the
+    global key is silently ignored (``fallback=False``), so setting only
+    ``[celery] json_logs = True`` is the safe way to enable JSON logs regardless
+    of the core version.
+
+Task log forwarding to stdout
+------------------------------
+
+Task logs are normally only written to the task-log handler (and surfaced in the
+UI). To also forward each task's subprocess stdout/stderr to the Celery worker's
+own stdout — so a container-level log collector (e.g. Kubernetes/Loki) captures
+them too — enable it via the ``[logging]`` section or override it for the Celery
+worker alone with the ``[celery]`` section. ``[logging] task_logs_to_stdout`` is not a
+global switch: it only applies to components that read it, or that leave
+``subprocess_logs_to_stdout`` unset when calling ``run_workload`` (currently the Celery
+worker and the Edge3 worker's fork path). Executors that always forward task logs to stdout, such as the
+LocalExecutor and the Kubernetes, ECS, Batch and Lambda executors, ignore it:
+
+.. code-block:: ini
+
+    # Default for components that don't set the behaviour themselves (Celery, Edge3):
+    [logging]
+    task_logs_to_stdout = True
+
+    # Or override for the Celery worker only, leaving other components unchanged:
+    [celery]
+    task_logs_to_stdout = True
+
+A Celery worker runs up to ``worker_concurrency`` tasks at once, so lines from concurrent
+tasks interleave on the worker's stdout. Raw ``print``/stderr lines are forwarded with
+only ``logger="task.stdout"`` and carry no task instance ID, so a log collector cannot
+attribute them to a task.
+
+The lookup order is:
+
+1. ``[celery] task_logs_to_stdout`` — if set, takes precedence.
+2. ``[logging] task_logs_to_stdout`` — used when the celery-specific key is absent.
+3. ``False`` — the default when neither key is configured.
+
+.. note::
+
+    This is Airflow 3+ only. On ``apache-airflow<3.0.0``, Celery tasks are routed
+    through ``execute_command`` and never reach ``supervise``, so setting either key
+    has no effect there.
+
+    ``[logging] task_logs_to_stdout`` is consulted natively by Airflow core starting
+    in 3.4.0. On earlier 3.x versions this provider resolves the ``[celery]``/
+    ``[logging]`` fallback itself, so the global key still takes effect on
+    Airflow 3.0–3.3 as long as this provider version is installed — it is not
+    limited to 3.4+.
+
+.. _celery_executor:queue:
+
+Queues
+------
+
+When using the CeleryExecutor, the Celery queues that tasks are sent to
+can be specified. ``queue`` is an attribute of BaseOperator, so any
+task can be assigned to any queue. The default queue for the environment
+is defined in the ``airflow.cfg``'s ``operators -> default_queue``. This defines
+the queue that tasks get assigned to when not specified, as well as which
+queue Airflow workers listen to when started.
+
+Workers can listen to one or multiple queues of tasks. When a worker is
+started (using command ``airflow celery worker``), a set of comma-delimited queue
+names (with no whitespace) can be given (e.g. ``airflow celery worker -q spark,quark``).
+This worker will then only pick up tasks wired to the specified queue(s).
+
+This can be useful if you need specialized workers, either from a
+resource perspective (for say very lightweight tasks where one worker
+could take thousands of tasks without a problem), or from an environment
+perspective (you want a worker running from within the Spark cluster
+itself because it needs a very specific environment and security rights).
+
+Task-instance identity
+----------------------
+
+CeleryExecutor uses task-instance UUIDs for scheduler bookkeeping when the Airflow version supports
+them, including adoption and revocation. Celery's external task identifier remains the
+transport identity, so existing work can be adopted after a scheduler upgrade. Older
+supported Airflow versions retain coordinate keys; the provider's minimum Airflow version is unchanged.

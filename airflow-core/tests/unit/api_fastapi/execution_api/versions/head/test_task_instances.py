@@ -1,0 +1,7506 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+from __future__ import annotations
+
+import re
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
+from datetime import datetime, timedelta
+from threading import Barrier, Event
+from types import SimpleNamespace
+from typing import TYPE_CHECKING
+from unittest import mock
+from uuid import UUID, uuid4
+
+import pytest
+import uuid6
+from fastapi import Request
+from opentelemetry import trace as otel_trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import StatusCode
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+from pydantic import ValidationError
+from sqlalchemy import delete, select, update
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
+from sqlalchemy.orm.exc import StaleDataError
+from sqlalchemy.sql.selectable import Select
+
+from airflow._shared.observability.traces import OverrideableRandomIdGenerator
+from airflow._shared.state import TaskScope
+from airflow._shared.timezones import timezone
+from airflow.api_fastapi.auth.tokens import JWTGenerator, JWTValidator
+from airflow.api_fastapi.execution_api.app import lifespan
+from airflow.api_fastapi.execution_api.datamodels.taskinstance import (
+    LoopDecisionPayload,
+    TISuccessStatePayload,
+    TITerminalStatePayload,
+)
+from airflow.api_fastapi.execution_api.datamodels.token import ExecutionToken, TIClaims, TIToken
+from airflow.api_fastapi.execution_api.routes import task_instances as task_instances_route
+from airflow.api_fastapi.execution_api.routes.task_instances import _emit_task_span, ti_update_state
+from airflow.api_fastapi.execution_api.security import require_auth
+from airflow.exceptions import AirflowSkipException, TaskNotFound
+from airflow.jobs.scheduler_job_runner import SchedulerJobRunner
+from airflow.models import DagRun, RenderedTaskInstanceFields, TaskReschedule, Trigger
+from airflow.models.asset import AssetActive, AssetAliasModel, AssetEvent, AssetModel
+from airflow.models.dag import DagModel
+from airflow.models.dag_version import DagVersion
+from airflow.models.dagbag import DBDagBag
+from airflow.models.dynamic_region import LOOP_DECISION_REASON_KEY, DynamicRegion
+from airflow.models.log import Log
+from airflow.models.task_coordinates import LOOP_GATE_OPERATOR, TaskCoordinateResolver
+from airflow.models.task_state_store import TaskStateStoreModel
+from airflow.models.taskinstance import TaskInstance, clear_loop_task_instances, clear_task_instances
+from airflow.models.xcom import EXTERNAL_CLEAR_TARGET_XCOM_KEY, XComModel, XComModelV2
+from airflow.providers.standard.operators.empty import EmptyOperator
+from airflow.providers.standard.operators.python import PythonOperator
+from airflow.sdk import Asset, TaskGroup, TriggerRule, task, task_group
+from airflow.sdk.definitions._internal.loop import create_loop
+from airflow.state.metastore import MetastoreBackend
+from airflow.utils.state import DagRunState, State, TaskInstanceState, TerminalTIState
+
+from tests_common.test_utils.asserts import assert_queries_count, capture_orm_selects
+from tests_common.test_utils.config import conf_vars
+from tests_common.test_utils.db import (
+    clear_db_assets,
+    clear_db_dags,
+    clear_db_logs,
+    clear_db_runs,
+    clear_db_serialized_dags,
+    clear_rendered_ti_fields,
+)
+from tests_common.test_utils.mock_executor import MockExecutor
+from unit.listeners import asset_listener
+
+if TYPE_CHECKING:
+    from airflow.sdk.api.client import Client
+
+    from tests_common.pytest_plugin import DagMaker
+
+pytestmark = pytest.mark.db_test
+
+
+DEFAULT_START_DATE = timezone.parse("2024-10-31T11:00:00Z")
+DEFAULT_END_DATE = timezone.parse("2024-10-31T12:00:00Z")
+DEFAULT_RENDERED_MAP_INDEX = "test rendered map index"
+
+CONTINUE = {"stop": False}
+
+
+def _stored_loop_decision_reasons(session, ti_id):
+    return session.scalars(
+        select(XComModelV2.value).where(
+            XComModelV2.task_instance_id == ti_id, XComModelV2.key == LOOP_DECISION_REASON_KEY
+        )
+    ).all()
+
+
+def _where_column_keys(statement) -> set[str]:
+    whereclause = getattr(statement, "whereclause", None)
+    if whereclause is None:
+        return set()
+
+    keys: set[str] = set()
+    stack = [whereclause]
+    while stack:
+        clause = stack.pop()
+        left = getattr(clause, "left", None)
+        if left is not None and getattr(left, "key", None) is not None:
+            keys.add(left.key)
+        stack.extend(clause.get_children())
+    return keys
+
+
+def _is_task_instance_update(statement) -> bool:
+    return getattr(statement, "is_update", False) and statement.table.name == TaskInstance.__table__.name
+
+
+def _is_select_for_update(statement) -> bool:
+    return getattr(statement, "is_select", False) and "FOR UPDATE" in str(statement.compile()).upper()
+
+
+def _create_asset_aliases(session, num: int = 2) -> None:
+    asset_aliases = [
+        AssetAliasModel(
+            id=i,
+            name=f"simple{i}",
+            group="alias",
+        )
+        for i in range(1, 1 + num)
+    ]
+    session.add_all(asset_aliases)
+    session.commit()
+
+
+@pytest.fixture
+def _use_real_jwt_bearer(exec_app):
+    """Remove the mock require_auth override so the real JWT validation runs end-to-end."""
+    exec_app.dependency_overrides.pop(require_auth, None)
+
+
+@pytest.mark.usefixtures("_use_real_jwt_bearer")
+def test_id_matches_sub_claim(client, session, create_task_instance):
+    """Test that scope validation (ti:self) is enforced at the router level."""
+    ti = create_task_instance(
+        task_id="test_ti_run_state_conflict_if_not_queued",
+        state="queued",
+    )
+    session.commit()
+
+    validator = mock.AsyncMock(spec=JWTValidator)
+    validator.avalidated_claims.return_value = {
+        "sub": str(ti.id),
+        "scope": "execution",
+        "exp": 9999999999,
+        "iat": 1000000000,
+        "nbf": 1000000000,
+    }
+    lifespan.registry.register_value(JWTValidator, validator)
+
+    payload = {
+        "state": "running",
+        "hostname": "random-hostname",
+        "unixname": "random-unixname",
+        "pid": 100,
+        "start_date": "2024-10-31T12:00:00Z",
+    }
+
+    resp = client.patch("/execution/task-instances/9c230b40-da03-451d-8bd7-be30471be383/run", json=payload)
+    assert resp.status_code == 403
+    validator.avalidated_claims.reset_mock()
+
+    resp = client.patch(f"/execution/task-instances/{ti.id}/run", json=payload)
+    assert resp.status_code == 200, resp.json()
+    validator.avalidated_claims.assert_awaited()
+
+
+def test_legacy_expansion_waits_for_all_cleared_workers_before_replacement(client, dag_maker, session):
+    with dag_maker(serialized=True):
+        PythonOperator.partial(task_id="mapped", python_callable=str).expand(op_args=[[1], [2]])
+    dr = dag_maker.create_dagrun()
+    session.execute(delete(TaskInstance).where(TaskInstance.dag_id == dr.dag_id))
+    session.execute(delete(DynamicRegion).where(DynamicRegion.dag_id == dr.dag_id))
+    old = [
+        TaskInstance(
+            dag_maker.serialized_dag.get_task("mapped"),
+            run_id=dr.run_id,
+            dag_version_id=dr.created_dag_version_id,
+            region_index=index,
+            state=State.QUEUED,
+        )
+        for index in range(2)
+    ]
+    session.add_all(old)
+    session.commit()
+    old_ids = [ti.id for ti in old]
+    for ti_id in old_ids:
+        response = client.patch(
+            f"/execution/task-instances/{ti_id}/run",
+            json={
+                "state": "running",
+                "hostname": "original",
+                "unixname": "airflow",
+                "pid": 123,
+                "start_date": DEFAULT_START_DATE.isoformat(),
+            },
+        )
+        assert response.status_code == 200, response.text
+
+    session.expire_all()
+    for _ in range(2):
+        dag_maker.serialized_dag.clear(task_ids=["mapped"], run_id=dr.run_id, session=session)
+        dr.dag = dag_maker.serialized_dag
+        dr.verify_integrity(dag_version_id=dr.created_dag_version_id, session=session)
+        session.commit()
+        session.expire_all()
+        assert all(session.get(TaskInstance, ti_id).state == State.RESTARTING for ti_id in old_ids)
+    region = session.scalars(select(DynamicRegion).where(DynamicRegion.dag_id == dr.dag_id)).one()
+    assert not session.scalars(select(TaskInstance).where(TaskInstance.region_id == region.id)).all()
+
+    payload = {
+        "state": "server_terminated",
+        "end_date": DEFAULT_END_DATE.isoformat(),
+        "hostname": "original",
+        "pid": 123,
+    }
+    for index, ti_id in enumerate(old_ids):
+        response = client.patch(f"/execution/task-instances/{ti_id}/state", json=payload)
+        assert response.status_code == 204, response.text
+        session.expire_all()
+        archived = session.get(TaskInstance, ti_id)
+        assert (archived.working_set, archived.archived_reason) == (None, "superseded")
+        assert archived.region_id.int == 0
+        if index == 0:
+            dr.dag = dag_maker.serialized_dag
+            dr.update_state(session=session)
+            assert dr.state == DagRunState.RUNNING
+            assert not session.scalars(select(TaskInstance).where(TaskInstance.region_id == region.id)).all()
+            session.commit()
+        assert client.patch(f"/execution/task-instances/{ti_id}/state", json=payload).status_code == 204
+
+    session.expire_all()
+    placeholders = session.scalars(select(TaskInstance).where(TaskInstance.region_id == region.id)).all()
+    assert [ti.region_index for ti in placeholders] == [-1]
+    dr.dag = dag_maker.serialized_dag
+    dr.update_state(session=session)
+    assert dr.state == DagRunState.RUNNING
+    replacements = session.scalars(select(TaskInstance).where(TaskInstance.region_id == region.id)).all()
+    replacement_ids = {ti.id for ti in replacements}
+    assert len(replacement_ids) == 2
+    assert replacement_ids.isdisjoint(old_ids)
+    dr.update_state(session=session)
+    assert {ti.id for ti in dr.get_task_instances(session=session)} == replacement_ids
+
+
+@pytest.fixture
+def loop_reader_tis(dag_maker, session):
+    @task_group
+    def body():
+        EmptyOperator(task_id="task")
+
+    with dag_maker(serialized=True) as dag:
+        create_loop(body, max_iterations=3)
+    dr = dag_maker.create_dagrun()
+    region = DynamicRegion.get_or_create(dag_id=dr.dag_id, run_id=dr.run_id, node_id="body", session=session)
+    session.add(region)
+    session.flush()
+    current = next(ti for ti in dr.task_instances if ti.task_id == "body.task")
+    current.region_id, current.region_index, current.state = region.id, 2, State.SUCCESS
+    previous = TaskInstance(
+        task=dag.get_task(current.task_id), run_id=dr.run_id, dag_version_id=current.dag_version_id
+    )
+    previous.region_id, previous.region_index, previous.state = region.id, 1, State.FAILED
+    session.add(previous)
+    session.commit()
+    return current, previous
+
+
+def test_execution_count_reports_the_latest_loop_pass(client, loop_reader_tis):
+    current, _ = loop_reader_tis
+    params = {"dag_id": current.dag_id, "task_ids": [current.task_id], "map_index": -1}
+    url = "/execution/task-instances/count"
+    assert client.get(url, params=params).json() == 1
+    assert client.get(url, params={**params, "states": ["success"]}).json() == 1
+    assert client.get(url, params={**params, "states": ["failed"]}).json() == 0
+
+
+@pytest.mark.parametrize("older_row_is_last", [False, True])
+def test_execution_states_report_the_latest_loop_pass(client, session, loop_reader_tis, older_row_is_last):
+    current, previous = loop_reader_tis
+    latest = current
+    if older_row_is_last:
+        current.region_index, previous.region_index = 0, 2
+        latest = previous
+    session.commit()
+    params = {"dag_id": current.dag_id, "task_ids": [current.task_id], "map_index": -1}
+
+    response = client.get("/execution/task-instances/states", params=params)
+
+    assert response.status_code == 200
+    assert response.json() == {"task_states": {current.run_id: {current.task_id: latest.state}}}
+
+
+@pytest.mark.parametrize("endpoint", ["count", "states"])
+def test_execution_reads_reject_live_task_instances_in_one_slot_that_the_loop_cannot_tell_apart(
+    client, session, loop_reader_tis, endpoint
+):
+    current, _ = loop_reader_tis
+    stray = TaskInstance(task=current.task, run_id=current.run_id, dag_version_id=current.dag_version_id)
+    stray.region_id, stray.region_index, stray.state = uuid4(), 5, State.SUCCESS
+    session.add(stray)
+    session.commit()
+
+    response = client.get(
+        f"/execution/task-instances/{endpoint}",
+        params={"dag_id": current.dag_id, "task_ids": [current.task_id], "map_index": -1},
+    )
+
+    assert response.status_code == 409
+
+
+@pytest.mark.parametrize("endpoint", ["count", "states"])
+def test_execution_reads_reject_two_live_task_instances_in_one_loop_pass(
+    client, session, loop_reader_tis, endpoint
+):
+    current, _ = loop_reader_tis
+    fork = DynamicRegion(
+        dag_id=current.dag_id, run_id=current.run_id, node_id="body", forked_from_region_id=current.region_id
+    )
+    session.add(fork)
+    session.flush()
+    twin = TaskInstance(task=current.task, run_id=current.run_id, dag_version_id=current.dag_version_id)
+    twin.region_id, twin.region_index, twin.state = fork.id, 2, State.SUCCESS
+    session.add(twin)
+    session.commit()
+
+    response = client.get(
+        f"/execution/task-instances/{endpoint}",
+        params={"dag_id": current.dag_id, "task_ids": [current.task_id], "map_index": -1},
+    )
+
+    assert response.status_code == 409
+
+
+def test_execution_previous_reports_the_latest_loop_pass(client, loop_reader_tis):
+    current, _ = loop_reader_tis
+
+    response = client.get(
+        f"/execution/task-instances/previous/{current.dag_id}/{current.task_id}", params={"map_index": -1}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["map_index"] == -1
+    assert response.json()["region_index"] == 2
+
+
+@pytest.fixture
+def mapped_loop_runs(dag_maker, session):
+    """A loop over a mapped task: the old run has one pass of two items, the current run two passes."""
+
+    @task_group(group_id="body")
+    def body():
+        PythonOperator.partial(task_id="mapped", python_callable=str).expand(op_args=[[1], [2]])
+
+    with dag_maker(serialized=True) as dag:
+        create_loop(body, max_iterations=3)
+
+    def add_pass(run, loop_region, iteration, states):
+        region = DynamicRegion.get_or_create(
+            dag_id=run.dag_id,
+            run_id=run.run_id,
+            node_id="body.mapped",
+            parent_region_id=loop_region.id,
+            parent_region_index=iteration,
+            session=session,
+        )
+        session.flush()
+        expanded = sorted(
+            (ti for ti in run.task_instances if ti.task_id == "body.mapped"), key=lambda ti: ti.map_index
+        )
+        for index, state in enumerate(states):
+            if iteration == 0:
+                ti = expanded[index]
+            else:
+                ti = TaskInstance(
+                    task=dag.get_task("body.mapped"),
+                    run_id=run.run_id,
+                    dag_version_id=expanded[0].dag_version_id,
+                )
+                session.add(ti)
+            ti.region_id, ti.region_index, ti.state = region.id, index, state
+
+    runs = {}
+    for run_id, logical_date, passes in [
+        ("old", timezone.datetime(2026, 1, 1), [[State.SUCCESS, State.SUCCESS]]),
+        ("current", timezone.datetime(2026, 1, 2), [[State.SUCCESS, State.SUCCESS], [State.FAILED]]),
+    ]:
+        run = dag_maker.create_dagrun(run_id=run_id, logical_date=logical_date)
+        loop_region = DynamicRegion.get_or_create(
+            dag_id=run.dag_id, run_id=run.run_id, node_id="body", session=session
+        )
+        session.flush()
+        for iteration, states in enumerate(passes):
+            add_pass(run, loop_region, iteration, states)
+        runs[run_id] = run
+    session.commit()
+    return runs
+
+
+@pytest.mark.parametrize(
+    ("map_index", "expected_count"),
+    [
+        pytest.param(None, 1, id="all-slots"),
+        pytest.param(0, 1, id="slot-of-the-latest-pass"),
+        pytest.param(1, 0, id="slot-only-an-older-pass-has"),
+    ],
+)
+def test_execution_count_ignores_slots_of_older_passes_that_the_latest_pass_lacks(
+    client, mapped_loop_runs, map_index, expected_count
+):
+    run = mapped_loop_runs["current"]
+    params = {"dag_id": run.dag_id, "task_ids": ["body.mapped"], "run_ids": [run.run_id]}
+    if map_index is not None:
+        params["map_index"] = map_index
+
+    response = client.get("/execution/task-instances/count", params=params)
+
+    assert response.json() == expected_count
+
+
+def test_execution_states_ignore_slots_of_older_passes_that_the_latest_pass_lacks(client, mapped_loop_runs):
+    run = mapped_loop_runs["current"]
+
+    response = client.get(
+        "/execution/task-instances/states",
+        params={"dag_id": run.dag_id, "task_ids": ["body.mapped"], "run_ids": ["old", "current"]},
+    )
+
+    assert response.json() == {
+        "task_states": {
+            "old": {"body.mapped_0": "success", "body.mapped_1": "success"},
+            "current": {"body.mapped_0": "failed"},
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    ("map_index", "expected_run", "expected_pass"),
+    [
+        pytest.param(0, "current", 1, id="slot-of-the-latest-pass"),
+        pytest.param(1, "old", 0, id="slot-only-an-older-pass-has-skips-to-the-earlier-run"),
+    ],
+)
+def test_execution_previous_skips_slots_of_older_passes_that_the_latest_pass_lacks(
+    client, session, mapped_loop_runs, map_index, expected_run, expected_pass
+):
+    run = mapped_loop_runs["current"]
+
+    response = client.get(
+        f"/execution/task-instances/previous/{run.dag_id}/body.mapped", params={"map_index": map_index}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["run_id"] == expected_run
+    assert response.json()["map_index"] == map_index
+    region = session.get(DynamicRegion, UUID(response.json()["region_id"]))
+    assert region.parent_region_index == expected_pass
+
+
+def test_execution_breadcrumbs_keep_regional_identity_separate_from_map_index(client, loop_reader_tis):
+    current, _ = loop_reader_tis
+    response = client.get(
+        "/execution/task-instances/breadcrumbs", params={"dag_id": current.dag_id, "run_id": current.run_id}
+    )
+    assert response.status_code == 200
+    breadcrumbs = response.json()["breadcrumbs"]
+    assert len(breadcrumbs) == 2
+    assert [row["map_index"] for row in breadcrumbs] == [-1, -1]
+    assert {row["region_index"] for row in breadcrumbs} == {1, 2}
+
+
+@pytest.fixture
+def two_run_loop_tis(dag_maker, session):
+    @task_group
+    def body():
+        EmptyOperator(task_id="task") >> EmptyOperator(task_id="other")
+
+    with dag_maker(serialized=True) as dag:
+        create_loop(body, max_iterations=3)
+    runs = {
+        "old": dag_maker.create_dagrun(run_id="old", logical_date=timezone.datetime(2025, 1, 1)),
+        "current": dag_maker.create_dagrun(run_id="current", logical_date=timezone.datetime(2025, 1, 2)),
+    }
+    passes = {}
+    for name, dr in runs.items():
+        region = DynamicRegion.get_or_create(
+            dag_id=dr.dag_id, run_id=dr.run_id, node_id="body", session=session
+        )
+        session.add(region)
+        session.flush()
+        for task_id, key in (("body.task", name), ("body.other", f"{name}_other")):
+            first = next(ti for ti in dr.task_instances if ti.task_id == task_id)
+            first.region_id, first.region_index, first.state = region.id, 0, State.SUCCESS
+            second = TaskInstance(
+                task=dag.get_task(first.task_id), run_id=dr.run_id, dag_version_id=first.dag_version_id
+            )
+            second.region_id, second.region_index, second.state = region.id, 1, State.SUCCESS
+            session.add(second)
+            passes[key] = {0: first, 1: second}
+    session.commit()
+    return passes
+
+
+@pytest.mark.parametrize("requester_pass", [0, 1])
+def test_previous_ti_for_loop_task_uses_requester_pass(client, two_run_loop_tis, requester_pass):
+    requester = two_run_loop_tis["current"][requester_pass]
+    exec_app = client.app.routes[-1].app
+    exec_app.dependency_overrides[require_auth] = lambda: TIToken(id=requester.id, claims=TIClaims())
+
+    response = client.get(
+        f"/execution/task-instances/previous/{requester.dag_id}/{requester.task_id}",
+        params={"logical_date": "2025-01-02T00:00:00Z"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["run_id"] == "old"
+    assert response.json()["region_index"] == requester_pass
+
+
+def test_parsing_token_reads_latest_loop_pass_without_task_identity(client, session, two_run_loop_tis):
+    requester = two_run_loop_tis["current"][0]
+    token = ExecutionToken.model_validate(
+        {
+            "id": requester.id,
+            "claims": {
+                "scope": "dag_parse",
+                "exp": 2000000000,
+                "dag_bundles": [session.get(DagModel, requester.dag_id).bundle_name],
+                "job_id": 1,
+                "session_id": UUID(int=1),
+                "relative_fileloc": "dag.py",
+            },
+        }
+    )
+    exec_app = client.app.routes[-1].app
+    exec_app.dependency_overrides[require_auth] = lambda: token
+
+    response = client.get(
+        f"/execution/task-instances/previous/{requester.dag_id}/{requester.task_id}",
+        params={"logical_date": "2025-01-02T00:00:00Z"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["run_id"] == "old"
+    assert response.json()["region_index"] == 1
+
+
+def test_previous_ti_for_loop_task_finds_a_pass_beyond_the_scan_limit(client, session, two_run_loop_tis):
+    requester = two_run_loop_tis["current"][0]
+    old_pass = two_run_loop_tis["old"][0]
+    later_passes = [
+        TaskInstance(task=old_pass.task, run_id="old", dag_version_id=old_pass.dag_version_id)
+        for _ in range(task_instances_route._MAX_PREVIOUS_TIS_SCANNED + 2)
+    ]
+    for index, ti in enumerate(later_passes, start=2):
+        ti.region_id, ti.region_index, ti.state = old_pass.region_id, index, State.SUCCESS
+    session.add_all(later_passes)
+    session.commit()
+    exec_app = client.app.routes[-1].app
+    exec_app.dependency_overrides[require_auth] = lambda: TIToken(id=requester.id, claims=TIClaims())
+
+    response = client.get(
+        f"/execution/task-instances/previous/{requester.dag_id}/{requester.task_id}",
+        params={"logical_date": "2025-01-02T00:00:00Z"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["run_id"] == "old"
+    assert response.json()["region_index"] == 0
+
+
+def test_previous_ti_for_other_loop_task_returns_latest_pass(client, two_run_loop_tis):
+    requester = two_run_loop_tis["current_other"][0]
+    exec_app = client.app.routes[-1].app
+    exec_app.dependency_overrides[require_auth] = lambda: TIToken(id=requester.id, claims=TIClaims())
+
+    response = client.get(
+        f"/execution/task-instances/previous/{requester.dag_id}/body.task",
+        params={"logical_date": "2025-01-02T00:00:00Z"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["run_id"] == "old"
+    assert response.json()["region_index"] == 1
+
+
+class TestTIRunState:
+    @pytest.mark.parametrize("mapped", [False, True])
+    @pytest.mark.parametrize("version", ["2026-06-30", "2026-10-30"])
+    def test_startup_loop_context_uses_enclosing_iteration(self, client, session, dag_maker, mapped, version):
+        @task_group
+        def body():
+            if mapped:
+                PythonOperator.partial(task_id="terminal", python_callable=str).expand(op_args=[[1], [2]])
+            else:
+                EmptyOperator(task_id="terminal")
+
+        with dag_maker(serialized=True):
+            loop = create_loop(body, max_iterations=4)
+        dr = dag_maker.create_dagrun(state=DagRunState.RUNNING)
+        ti = next(ti for ti in dr.task_instances if ti.task_id == loop.terminal_task_id)
+        parent = DynamicRegion.get_or_create(
+            dag_id=dr.dag_id, run_id=dr.run_id, node_id=loop.group_id, session=session
+        )
+        session.add(parent)
+        session.flush()
+        ti.region_id, ti.region_index = parent.id, 2
+        if mapped:
+            child = DynamicRegion.get_or_create(
+                dag_id=dr.dag_id,
+                run_id=dr.run_id,
+                node_id=ti.task_id,
+                parent_region_id=parent.id,
+                parent_region_index=2,
+                session=session,
+            )
+            session.add(child)
+            session.flush()
+            ti.region_id, ti.region_index = child.id, 0
+        ti.state = State.QUEUED
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/run",
+            json=self.RUN_PAYLOAD,
+            headers={"Airflow-API-Version": version},
+        )
+
+        assert response.status_code == 200
+        if version == "2026-06-30":
+            assert "loop" not in response.json()
+            assert "expanded_ti_count" not in response.json()
+            return
+        assert response.json()["loop"] == {
+            "node_id": loop.group_id,
+            "index": 2,
+            "max_iterations": 4,
+            "terminal_task_id": loop.terminal_task_id,
+            "terminal_is_mapped": mapped,
+            "region_id": str(parent.id),
+            "trajectory": 1,
+        }
+        assert response.json().get("expanded_ti_count") == (1 if mapped else None)
+
+    def test_startup_loop_context_describes_the_fork_holding_the_iteration(self, client, session, dag_maker):
+        @task_group
+        def body():
+            EmptyOperator(task_id="terminal")
+
+        with dag_maker(serialized=True):
+            loop = create_loop(body, max_iterations=4)
+        dr = dag_maker.create_dagrun(state=DagRunState.RUNNING)
+        ti = next(ti for ti in dr.task_instances if ti.task_id == loop.terminal_task_id)
+        original = DynamicRegion.get_or_create(
+            dag_id=dr.dag_id, run_id=dr.run_id, node_id=loop.group_id, session=session
+        )
+        session.add(original)
+        session.flush()
+        fork = DynamicRegion.fork_family(original.id, 2, {original.id: original}, session=session)
+        session.flush()
+        ti.region_id, ti.region_index = fork.id, 2
+        ti.state = State.QUEUED
+        session.commit()
+
+        response = client.patch(f"/execution/task-instances/{ti.id}/run", json=self.RUN_PAYLOAD)
+
+        assert response.status_code == 200
+        loop_context = response.json()["loop"]
+        assert loop_context["region_id"] == str(fork.id)
+        assert loop_context["trajectory"] == 2
+        assert loop_context["forked_from_region_id"] == str(original.id)
+        assert loop_context["resumes_from_index"] == 2
+
+    @pytest.mark.parametrize("removed", [0, 1])
+    def test_startup_expanded_ti_count_counts_live_instances_of_the_expansion(
+        self, client, session, dag_maker, removed
+    ):
+        with dag_maker(serialized=True):
+            PythonOperator.partial(task_id="mapped", python_callable=str).expand(op_args=[[1], [2], [3]])
+        dr = dag_maker.create_dagrun(state=DagRunState.RUNNING)
+        tis = sorted(dr.task_instances, key=lambda ti: ti.map_index)
+        for ti in tis[3 - removed :]:
+            ti.state = State.REMOVED
+        tis[0].state = State.QUEUED
+        session.commit()
+
+        response = client.patch(f"/execution/task-instances/{tis[0].id}/run", json=self.RUN_PAYLOAD)
+
+        assert response.status_code == 200
+        assert response.json()["expanded_ti_count"] == 3 - removed
+
+    @pytest.mark.parametrize("regional", [False, True])
+    def test_startup_xcom_cleanup_keys_belong_to_the_starting_try(
+        self, client, session, create_task_instance, regional
+    ):
+        ti = create_task_instance(state=State.QUEUED, session=session)
+        region = DynamicRegion.get_or_create(
+            dag_id=ti.dag_id, run_id=ti.run_id, node_id="loop", session=session
+        )
+        session.add(region)
+        session.flush()
+        if regional:
+            ti.region_id, ti.region_index = region.id, 2
+        sibling = TaskInstance(ti.task, ti.dag_version_id, run_id=ti.run_id, map_index=ti.map_index)
+        sibling.region_id = region.id if not regional else UUID(int=0)
+        session.add(sibling)
+        session.flush()
+        for candidate, key in [(ti, "own"), (sibling, "sibling")]:
+            XComModel.set_for_attempt(task_instance_id=candidate.id, key=key, value="value", session=session)
+        session.commit()
+
+        response = client.patch(f"/execution/task-instances/{ti.id}/run", json=self.RUN_PAYLOAD)
+
+        assert response.status_code == 200
+        assert response.json()["xcom_keys_to_clear"] == ["own"]
+
+    @pytest.mark.parametrize("matching_worker", [True, False])
+    def test_restarting_start_distinguishes_original_worker(
+        self, client, session, create_task_instance, matching_worker
+    ):
+        ti = create_task_instance(task_id="restarting_start", state=State.RESTARTING)
+        ti.hostname = "worker"
+        ti.unixname = "airflow"
+        ti.pid = 123
+        session.commit()
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/run",
+            json={
+                "state": "running",
+                "hostname": "worker",
+                "unixname": "airflow",
+                "pid": 123 if matching_worker else 456,
+                "start_date": DEFAULT_START_DATE.isoformat(),
+            },
+        )
+        assert response.status_code == 409
+        assert response.json()["detail"]["reason"] == (
+            "invalid_state" if matching_worker else "running_elsewhere"
+        )
+        session.refresh(ti)
+        assert ti.state == State.RESTARTING
+        assert ti.pid == 123
+
+    RUN_PAYLOAD = {
+        "state": "running",
+        "hostname": "random-hostname",
+        "unixname": "random-unixname",
+        "pid": 100,
+        "start_date": "2024-09-30T12:00:00Z",
+    }
+
+    def setup_method(self):
+        clear_db_logs()
+        clear_db_runs()
+        clear_db_serialized_dags()
+        clear_db_dags()
+        clear_db_assets()
+
+    def teardown_method(self):
+        clear_db_logs()
+        clear_db_runs()
+        clear_db_serialized_dags()
+        clear_db_dags()
+        clear_db_assets()
+
+    def test_ti_run_context_exposes_consumed_event_partition_key(self, client, session, create_task_instance):
+        """The partition key of each consumed asset event is returned in the run context."""
+        ti = create_task_instance(
+            task_id="test_consumed_event_partition_key",
+            state=State.QUEUED,
+            session=session,
+        )
+        asset = AssetModel(name="upstream", uri="s3://bucket/upstream", group="asset", extra={})
+        session.add_all([asset, AssetActive.for_asset(asset)])
+        session.flush()
+        ti.dag_run.consumed_asset_events.append(
+            AssetEvent(asset_id=asset.id, source_dag_id="src", source_run_id="r1", partition_key="2024-01-15")
+        )
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/run",
+            json={
+                "state": "running",
+                "hostname": "h",
+                "unixname": "u",
+                "pid": 1,
+                "start_date": "2024-09-30T12:00:00Z",
+            },
+        )
+
+        assert response.status_code == 200
+        events = response.json()["dag_run"]["consumed_asset_events"]
+        assert [e["partition_key"] for e in events] == ["2024-01-15"]
+
+    def test_ti_run_loads_consumed_event_assets_and_aliases_in_bulk(
+        self, client, session, create_task_instance
+    ):
+        ti = create_task_instance(
+            task_id="test_consumed_events_in_bulk",
+            state=State.QUEUED,
+            session=session,
+        )
+        assets = [
+            AssetModel(name=f"upstream_{i}", uri=f"s3://bucket/upstream_{i}", group="asset", extra={})
+            for i in range(3)
+        ]
+        alias = AssetAliasModel(name="upstream_alias", group="asset")
+        session.add_all([*assets, *(AssetActive.for_asset(asset) for asset in assets), alias])
+        session.flush()
+        for asset in assets:
+            event = AssetEvent(asset_id=asset.id)
+            event.source_aliases.append(alias)
+            ti.dag_run.consumed_asset_events.append(event)
+        session.commit()
+
+        with (
+            capture_orm_selects("asset") as asset_selects,
+            capture_orm_selects("asset_alias") as alias_selects,
+        ):
+            response = client.patch(
+                f"/execution/task-instances/{ti.id}/run",
+                json={
+                    "state": "running",
+                    "hostname": "h",
+                    "unixname": "u",
+                    "pid": 1,
+                    "start_date": "2024-09-30T12:00:00Z",
+                },
+            )
+
+        assert response.status_code == 200
+        events = response.json()["dag_run"]["consumed_asset_events"]
+        assert sorted(event["asset"]["name"] for event in events) == [
+            "upstream_0",
+            "upstream_1",
+            "upstream_2",
+        ]
+        assert [event["source_aliases"] for event in events] == [[{"name": "upstream_alias"}]] * 3
+        assert len(asset_selects) == 1
+        assert len(alias_selects) == 1
+
+    def test_ti_run_missing_dagrun_returns_404(self, client, session, create_task_instance):
+        """A missing DagRun must surface as a clean 404, not an internal 500."""
+        ti = create_task_instance(
+            task_id="test_ti_run_missing_dagrun",
+            state=State.QUEUED,
+            session=session,
+        )
+        session.commit()
+
+        # Patch only around the request so fixture setup above is untouched; force the DagRun
+        # lookup (the only scalars() call before the guard) to return None.
+        with mock.patch("sqlalchemy.orm.Session.scalars", autospec=True) as mock_scalars:
+            mock_scalars.return_value.unique.return_value.one_or_none.return_value = None
+            response = client.patch(
+                f"/execution/task-instances/{ti.id}/run",
+                json=self.RUN_PAYLOAD,
+            )
+
+        assert response.status_code == 404
+        assert response.json()["detail"] == {
+            "reason": "not_found",
+            "message": f"DagRun with dag_id={ti.dag_id} and run_id={ti.run_id} not found",
+        }
+
+    @pytest.mark.parametrize(
+        ("max_tries", "should_retry"),
+        [
+            pytest.param(0, False, id="max_retries=0"),
+            pytest.param(3, True, id="should_retry"),
+        ],
+    )
+    def test_ti_run_state_to_running(
+        self,
+        client,
+        session,
+        create_task_instance,
+        time_machine,
+        max_tries,
+        should_retry,
+    ):
+        """
+        Test that the Task Instance state is updated to running when the Task Instance is in a state where it can be
+        marked as running.
+        """
+        instant_str = "2024-09-30T12:00:00Z"
+        instant = timezone.parse(instant_str)
+        time_machine.move_to(instant, tick=False)
+
+        ti = create_task_instance(
+            task_id="test_ti_run_state_to_running",
+            state=State.QUEUED,
+            dagrun_state=DagRunState.RUNNING,
+            session=session,
+            start_date=instant,
+            dag_id=str(uuid4()),
+        )
+        ti.max_tries = max_tries
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/run",
+            json={
+                "state": "running",
+                "hostname": "random-hostname",
+                "unixname": "random-unixname",
+                "pid": 100,
+                "start_date": instant_str,
+            },
+        )
+
+        assert response.status_code == 200
+        result = response.json()
+        assert result == {
+            "dag_run": {
+                "dag_id": ti.dag_id,
+                "run_id": "test",
+                "clear_number": 0,
+                "logical_date": instant_str,
+                "data_interval_start": instant.subtract(days=1).to_iso8601_string(),
+                "data_interval_end": instant_str,
+                "run_after": instant_str,
+                "start_date": instant_str,
+                "state": "running",
+                "end_date": None,
+                "run_type": "manual",
+                "conf": {},
+                "triggering_user_name": None,
+                "consumed_asset_events": [],
+                "partition_key": None,
+                "partition_date": None,
+                "note": None,
+                "team_name": None,
+            },
+            "task_reschedule_count": 0,
+            "max_tries": max_tries,
+            "should_retry": should_retry,
+            "variables": [],
+            "connections": [],
+            "xcom_keys_to_clear": [],
+            "multi_team": False,
+        }
+        # upstream_map_indexes is now computed by Task SDK, not returned by the server in HEAD version
+        assert "upstream_map_indexes" not in result
+        # execution-scoped tokens do not trigger a token swap
+        assert "Refreshed-API-Token" not in response.headers
+
+        # Refresh the Task Instance from the database so that we can check the updated values
+        session.refresh(ti)
+        assert ti.state == State.RUNNING
+        assert ti.hostname == "random-hostname"
+        assert ti.unixname == "random-unixname"
+        assert ti.pid == 100
+
+        response1 = response.json()
+
+        # Test that if we make a second request (simulating a network glitch so the client issues a retry)
+        # that it is accepted and we get the same info back
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/run",
+            json={
+                "state": "running",
+                "hostname": "random-hostname",
+                "unixname": "random-unixname",
+                "pid": 100,
+                "start_date": instant_str,
+            },
+        )
+        assert response.status_code == 200
+        assert response.json() == response1
+
+        # But that for a different pid on the same host (etc) it fails
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/run",
+            json={
+                "state": "running",
+                "hostname": "random-hostname",
+                "unixname": "random-unixname",
+                "pid": 101,
+                "start_date": instant_str,
+            },
+        )
+        assert response.status_code == 409
+
+    def test_ti_run_state_includes_first_task_reschedule_start_date(
+        self,
+        client,
+        session,
+        create_task_instance,
+    ):
+        """Test that running a rescheduled Task Instance includes its first reschedule start date."""
+        instant_str = "2024-09-30T12:00:00Z"
+        instant = timezone.parse(instant_str)
+        first_reschedule_start_date = timezone.datetime(2024, 9, 30, 10)
+        second_reschedule_start_date = timezone.datetime(2024, 9, 30, 11)
+
+        ti = create_task_instance(
+            task_id="test_ti_run_state_includes_first_task_reschedule_start_date",
+            state=State.QUEUED,
+            dagrun_state=DagRunState.RUNNING,
+            session=session,
+            start_date=instant,
+            dag_id=str(uuid4()),
+        )
+        session.add_all(
+            [
+                TaskReschedule(
+                    ti_id=ti.id,
+                    start_date=second_reschedule_start_date,
+                    end_date=timezone.datetime(2024, 9, 30, 11, 1),
+                    reschedule_date=timezone.datetime(2024, 9, 30, 11, 2),
+                ),
+                TaskReschedule(
+                    ti_id=ti.id,
+                    start_date=first_reschedule_start_date,
+                    end_date=timezone.datetime(2024, 9, 30, 10, 1),
+                    reschedule_date=timezone.datetime(2024, 9, 30, 10, 2),
+                ),
+            ]
+        )
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/run",
+            json={
+                "state": "running",
+                "hostname": "random-hostname",
+                "unixname": "random-unixname",
+                "pid": 100,
+                "start_date": instant_str,
+            },
+        )
+
+        assert response.status_code == 200
+        result = response.json()
+        assert result["task_reschedule_count"] == 2
+        assert result["first_task_reschedule_start_date"] == "2024-09-30T10:00:00Z"
+
+    def test_ti_run_returns_execution_token(
+        self, client, exec_app, session, create_task_instance, time_machine
+    ):
+        """PATCH /run with a workload token should swap to an execution-scoped token."""
+        instant = timezone.parse("2024-10-31T12:00:00Z")
+        time_machine.move_to(instant, tick=False)
+
+        ti = create_task_instance(
+            task_id="test_exec_token",
+            state=State.QUEUED,
+            dagrun_state=DagRunState.RUNNING,
+            session=session,
+            start_date=instant,
+            dag_id=str(uuid4()),
+        )
+        session.commit()
+
+        mock_gen = mock.MagicMock(spec=JWTGenerator)
+        mock_gen.generate.return_value = "mock-execution-token"
+        lifespan.registry.register_value(JWTGenerator, mock_gen)
+
+        async def workload_token(request: Request) -> TIToken:
+            ti_id = UUID(request.path_params.get("task_instance_id", "00000000-0000-0000-0000-000000000000"))
+            return TIToken(id=ti_id, claims=TIClaims(scope="workload"))
+
+        exec_app.dependency_overrides[require_auth] = workload_token
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/run",
+            json={
+                "state": "running",
+                "hostname": "test-host",
+                "unixname": "test-user",
+                "pid": 100,
+                "start_date": "2024-10-31T12:00:00Z",
+            },
+        )
+
+        exec_app.dependency_overrides.pop(require_auth, None)
+
+        assert response.status_code == 200
+        assert "Refreshed-API-Token" in response.headers
+        assert response.headers["Refreshed-API-Token"] == "mock-execution-token"
+        mock_gen.generate.assert_called_once()
+        extras = mock_gen.generate.call_args.kwargs["extras"]
+        assert extras["scope"] == "execution"
+        assert extras["sub"] == str(ti.id)
+
+    def test_ti_run_returns_arg_bindings_for_stub_task(self, client, dag_maker):
+        """A stub task's TaskFlow arg spec is extracted from the serialized Dag and returned."""
+        with dag_maker("test_arg_bindings_dag", serialized=True):
+
+            @task.stub
+            def extract(): ...
+
+            @task.stub
+            def transform(country: str, extracted: dict, limit: int = 10): ...
+
+            transform("uk", extract())
+
+        dr = dag_maker.create_dagrun()
+        tis = {ti.task_id: ti for ti in dr.get_task_instances()}
+        for ti in tis.values():
+            ti.set_state(State.QUEUED)
+        dag_maker.session.flush()
+
+        response = client.patch(f"/execution/task-instances/{tis['transform'].id}/run", json=self.RUN_PAYLOAD)
+        assert response.status_code == 200
+        assert response.json()["arg_bindings"] == [
+            {"name": "country", "kind": "literal", "value_schema": {"type": "string"}, "value": "uk"},
+            {
+                "name": "extracted",
+                "kind": "xcom",
+                "value_schema": {"type": "object", "additionalProperties": True},
+                "task_id": "extract",
+            },
+            {
+                "name": "limit",
+                "kind": "literal",
+                "value_schema": {"type": "integer", "format": "int64"},
+                "value": 10,
+                "from_default": True,
+            },
+        ]
+
+        # An argless stub has no captured spec, so the field stays unset.
+        response = client.patch(f"/execution/task-instances/{tis['extract'].id}/run", json=self.RUN_PAYLOAD)
+        assert response.status_code == 200
+        assert "arg_bindings" not in response.json()
+
+    def test_ti_run_does_not_load_the_dag_for_a_regular_task(self, client, dag_maker, mocker):
+        """The row rules the task out, so starting it reads no serialized Dag -- the point of the column."""
+        with dag_maker("test_regular_task_arg_bindings", serialized=True):
+
+            @task
+            def transform(country: str): ...
+
+            transform("uk")
+
+        dr = dag_maker.create_dagrun()
+        (ti,) = dr.get_task_instances()
+        assert ti.is_stub is False
+        ti.set_state(State.QUEUED)
+        dag_maker.session.flush()
+        get_dag = mocker.patch.object(DBDagBag, "get_dag", autospec=True)
+
+        response = client.patch(f"/execution/task-instances/{ti.id}/run", json=self.RUN_PAYLOAD)
+
+        assert response.status_code == 200
+        assert "arg_bindings" not in response.json()
+        get_dag.assert_not_called()
+
+    def test_ti_run_treats_an_unset_is_stub_as_a_regular_task(self, client, dag_maker):
+        """A row written before the column existed carries null and keeps its pre-upgrade behavior."""
+        with dag_maker("test_unset_is_stub", serialized=True):
+
+            @task.stub
+            def transform(country: str): ...
+
+            transform("uk")
+
+        dr = dag_maker.create_dagrun()
+        (ti,) = dr.get_task_instances()
+        ti.set_state(State.QUEUED)
+        dag_maker.session.get(TaskInstance, ti.id).is_stub = None
+        dag_maker.session.commit()
+        assert dag_maker.session.scalar(select(TaskInstance.is_stub).where(TaskInstance.id == ti.id)) is None
+
+        response = client.patch(f"/execution/task-instances/{ti.id}/run", json=self.RUN_PAYLOAD)
+
+        assert response.status_code == 200
+        assert "arg_bindings" not in response.json()
+
+    @mock.patch(
+        "airflow.api_fastapi.execution_api.routes.task_instances.get_arg_bindings",
+        autospec=True,
+        return_value=[{"name": "country", "kind": "hologram", "value": "uk"}],
+    )
+    def test_ti_run_reports_invalid_arg_bindings_spec(self, _, client, dag_maker):
+        """A serialized spec this core version cannot validate fails with a structured error, not a bare 500."""
+        with dag_maker("test_invalid_arg_bindings_dag", serialized=True):
+
+            @task.stub
+            def transform(country: str): ...
+
+            transform("uk")
+
+        dr = dag_maker.create_dagrun()
+        (ti,) = dr.get_task_instances()
+        ti.set_state(State.QUEUED)
+        dag_maker.session.flush()
+
+        response = client.patch(f"/execution/task-instances/{ti.id}/run", json=self.RUN_PAYLOAD)
+
+        assert response.status_code == 500
+        assert response.json()["detail"]["reason"] == "invalid_arg_bindings"
+
+    def test_ti_run_returns_no_arg_bindings_for_mapped_stub(self, client, dag_maker):
+        """Mapped stubs keep the legacy ignored-args behavior until per-map-index delivery lands."""
+        with dag_maker("test_mapped_stub_ignored_args", serialized=True):
+
+            @task.stub
+            def transform(country: str): ...
+
+            transform.expand(country=["uk", "fr"])
+
+        dr = dag_maker.create_dagrun()
+        ti = next(t for t in dr.get_task_instances() if t.map_index == 0)
+        ti.set_state(State.QUEUED)
+        dag_maker.session.flush()
+
+        response = client.patch(f"/execution/task-instances/{ti.id}/run", json=self.RUN_PAYLOAD)
+        assert response.status_code == 200
+        assert "arg_bindings" not in response.json()
+
+    @pytest.mark.parametrize(
+        ("decorator", "expected"),
+        [
+            pytest.param(task.stub(execution_timeout=timedelta(seconds=90)), 90.0, id="stub-with-timeout"),
+            pytest.param(task.stub, None, id="stub-without-timeout"),
+            pytest.param(task.stub(execution_timeout=timedelta(0)), 0.0, id="stub-zero-timeout"),
+            pytest.param(
+                task.stub(execution_timeout=timedelta(seconds=-30)), -30.0, id="stub-negative-timeout"
+            ),
+            # A Python task's timeout stays with the task runner, which sends it to the supervisor,
+            # so the server resolves one only for a task whose definition it loads anyway.
+            pytest.param(task(execution_timeout=timedelta(seconds=10)), None, id="python-task"),
+        ],
+    )
+    def test_ti_run_returns_execution_timeout(self, client, dag_maker, decorator, expected):
+        with dag_maker("test_execution_timeout_dag", serialized=True):
+
+            @decorator
+            def sleeper(): ...
+
+            sleeper()
+
+        (ti,) = dag_maker.create_dagrun().get_task_instances()
+        ti.set_state(State.QUEUED)
+        dag_maker.session.flush()
+
+        response = client.patch(f"/execution/task-instances/{ti.id}/run", json=self.RUN_PAYLOAD)
+        assert response.status_code == 200
+        body = response.json()
+        assert body.get("execution_timeout") == expected
+        assert ("execution_timeout" in body) == (expected is not None)
+
+    def test_ti_run_returns_execution_timeout_for_mapped_stub(self, client, dag_maker):
+        with dag_maker("test_mapped_stub_execution_timeout", serialized=True):
+
+            @task.stub(execution_timeout=timedelta(seconds=90))
+            def transform(country: str): ...
+
+            transform.expand(country=["uk", "fr"])
+
+        dr = dag_maker.create_dagrun()
+        ti = next(t for t in dr.get_task_instances() if t.map_index == 0)
+        ti.set_state(State.QUEUED)
+        dag_maker.session.flush()
+
+        response = client.patch(f"/execution/task-instances/{ti.id}/run", json=self.RUN_PAYLOAD)
+        assert response.status_code == 200
+        assert response.json()["execution_timeout"] == 90.0
+
+    def test_arg_bindings_adapter_rejects_unknown_kind(self):
+        """The discriminated union refuses serialized specs with an unrecognised kind."""
+        from airflow.api_fastapi.execution_api.datamodels.task_arg_binding import get_arg_bindings_adapter
+
+        with pytest.raises(ValidationError, match="does not match any of the expected tags"):
+            get_arg_bindings_adapter().validate_python(
+                [{"name": "country", "kind": "template", "value": "x"}]
+            )
+
+    def test_arg_bindings_adapter_carries_value_schema_fragments_verbatim(self):
+        """The fragment is free-form JSON schema: every keyword the provider generated must
+        survive validation untouched -- a typed model would silently strip what it doesn't know."""
+        from airflow.api_fastapi.execution_api.datamodels.task_arg_binding import get_arg_bindings_adapter
+
+        fragment = {"anyOf": [{"type": "array", "items": {"type": "string"}}, {"type": "null"}]}
+        (binding,) = get_arg_bindings_adapter().validate_python(
+            [{"name": "tags", "kind": "literal", "value_schema": fragment, "value": ["a"]}]
+        )
+        assert binding.value_schema == fragment
+
+    def test_dynamic_task_mapping_with_parse_time_value(self, client, dag_maker):
+        """Test that dynamic task mapping works correctly with parse-time values."""
+        with dag_maker("test_dynamic_task_mapping_with_parse_time_value", serialized=True):
+
+            @task_group
+            def task_group_1(arg1):
+                @task
+                def group1_task_1(arg1):
+                    return {"a": arg1}
+
+                @task
+                def group1_task_2(arg2):
+                    return arg2
+
+                group1_task_2(group1_task_1(arg1))
+
+            @task
+            def task2():
+                return None
+
+            task_group_1.expand(arg1=[0, 1]) >> task2()
+
+        dr = dag_maker.create_dagrun()
+        for ti in dr.get_task_instances():
+            ti.set_state(State.QUEUED)
+        dag_maker.session.flush()
+
+        for ti in dr.get_task_instances():
+            response = client.patch(
+                f"/execution/task-instances/{ti.id}/run",
+                json={
+                    "state": "running",
+                    "hostname": "random-hostname",
+                    "unixname": "random-unixname",
+                    "pid": 100,
+                    "start_date": "2024-09-30T12:00:00Z",
+                },
+            )
+
+            assert response.status_code == 200
+
+    def test_nested_mapped_task_group(self, client, dag_maker):
+        """Test that nested mapped task groups work correctly."""
+        with dag_maker("test_nested_mapped_tg", serialized=True):
+
+            @task
+            def alter_input(inp: str) -> str:
+                return f"{inp}_Altered"
+
+            @task
+            def print_task(orig_input: str, altered_input: str) -> str:
+                return f"orig:{orig_input},altered:{altered_input}"
+
+            @task_group
+            def inner_task_group(orig_input: str) -> None:
+                altered_input = alter_input(orig_input)
+                print_task(orig_input, altered_input)
+
+            @task_group
+            def expandable_task_group(param: str) -> None:
+                inner_task_group(param)
+
+            expandable_task_group.expand(param=["One", "Two", "Three"])
+
+        dr = dag_maker.create_dagrun()
+
+        # Set all alter_input tasks to success so print_task can run
+        for ti in dr.get_task_instances():
+            if "alter_input" in ti.task_id and ti.map_index >= 0:
+                ti.state = State.SUCCESS
+            elif "print_task" in ti.task_id and ti.map_index >= 0:
+                ti.set_state(State.QUEUED)
+        dag_maker.session.flush()
+
+        # Get only the expanded print_task instances (not the template)
+        print_task_tis = [
+            ti for ti in dr.get_task_instances() if "print_task" in ti.task_id and ti.map_index >= 0
+        ]
+
+        for ti in print_task_tis:
+            response = client.patch(
+                f"/execution/task-instances/{ti.id}/run",
+                json={
+                    "state": "running",
+                    "hostname": "random-hostname",
+                    "unixname": "random-unixname",
+                    "pid": 100,
+                    "start_date": "2024-09-30T12:00:00Z",
+                },
+            )
+
+            assert response.status_code == 200
+
+    def test_dynamic_task_mapping_with_xcom(self, client: Client, dag_maker: DagMaker, session: Session):
+        """Test that dynamic task mapping works correctly with XCom values."""
+        from tests_common.test_utils.mapping import push_mapped_length
+
+        with dag_maker(session=session, serialized=True):
+
+            @task
+            def task_1():
+                return [0, 1]
+
+            @task_group
+            def tg(x, y):
+                @task
+                def task_2():
+                    pass
+
+                task_2()
+
+            @task
+            def task_3():
+                pass
+
+            tg.expand(x=task_1(), y=[1, 2, 3]) >> task_3()
+
+        dr = dag_maker.create_dagrun()
+
+        decision = dr.task_instance_scheduling_decisions(session=session)
+
+        # Simulate task_1 execution to produce the mapped length.
+        (ti_1,) = decision.schedulable_tis
+        ti_1.state = TaskInstanceState.SUCCESS
+        push_mapped_length(ti_1, [0, 1], session=session)
+        session.flush()
+
+        # Now task_2 in mapped tagk group is expanded.
+        decision = dr.task_instance_scheduling_decisions(session=session)
+        for ti in decision.schedulable_tis:
+            ti.state = TaskInstanceState.SUCCESS
+        session.flush()
+
+        decision = dr.task_instance_scheduling_decisions(session=session)
+        (task_3_ti,) = decision.schedulable_tis
+        task_3_ti.set_state(State.QUEUED)
+
+        response = client.patch(
+            f"/execution/task-instances/{task_3_ti.id}/run",
+            json={
+                "state": "running",
+                "hostname": "random-hostname",
+                "unixname": "random-unixname",
+                "pid": 100,
+                "start_date": "2024-09-30T12:00:00Z",
+            },
+        )
+        assert response.status_code == 200
+
+    def test_dynamic_task_mapping_with_all_success_trigger_rule(self, dag_maker: DagMaker, session: Session):
+        """Test that with ALL_SUCCESS trigger rule and skipped upstream, downstream should not run."""
+
+        with dag_maker(session=session, serialized=True):
+
+            @task
+            def task_1():
+                raise AirflowSkipException()
+
+            @task_group
+            def tg(x):
+                @task
+                def task_2():
+                    raise AirflowSkipException()
+
+                task_2()
+
+            @task(trigger_rule=TriggerRule.ALL_SUCCESS)
+            def task_3():
+                pass
+
+            @task
+            def task_4():
+                pass
+
+            tg.expand(x=task_1()) >> [task_3(), task_4()]
+
+        dr = dag_maker.create_dagrun()
+
+        decision = dr.task_instance_scheduling_decisions(session=session)
+
+        # Simulate task_1 skipped
+        (ti_1,) = decision.schedulable_tis
+        ti_1.state = TaskInstanceState.SKIPPED
+        session.flush()
+
+        # Now task_2 in mapped task group is not expanded and also skipped.
+        decision = dr.task_instance_scheduling_decisions(session=session)
+        for ti in decision.schedulable_tis:
+            ti.state = TaskInstanceState.SKIPPED
+        session.flush()
+
+        decision = dr.task_instance_scheduling_decisions(session=session)
+        assert decision.schedulable_tis == []
+
+    @pytest.mark.parametrize(
+        "trigger_rule",
+        [
+            TriggerRule.ALL_DONE,
+            TriggerRule.ALL_DONE_SETUP_SUCCESS,
+            TriggerRule.NONE_FAILED,
+            TriggerRule.ALL_SKIPPED,
+        ],
+    )
+    def test_dynamic_task_mapping_with_non_all_success_trigger_rule(
+        self, client: Client, dag_maker: DagMaker, session: Session, trigger_rule: TriggerRule
+    ):
+        """Test that with non-ALL_SUCCESS trigger rule, downstream task should still run."""
+
+        with dag_maker(session=session, serialized=True):
+
+            @task
+            def task_1():
+                raise AirflowSkipException()
+
+            @task_group
+            def tg(x):
+                @task
+                def task_2():
+                    raise AirflowSkipException()
+
+                task_2()
+
+            @task(trigger_rule=trigger_rule)
+            def task_3():
+                pass
+
+            @task
+            def task_4():
+                pass
+
+            tg.expand(x=task_1()) >> [task_3(), task_4()]
+
+        dr = dag_maker.create_dagrun()
+
+        decision = dr.task_instance_scheduling_decisions(session=session)
+
+        # Simulate task_1 skipped
+        (ti_1,) = decision.schedulable_tis
+        ti_1.state = TaskInstanceState.SKIPPED
+        session.flush()
+
+        # Now task_2 in mapped tagk group is not expanded and also skipped..
+        decision = dr.task_instance_scheduling_decisions(session=session)
+        for ti in decision.schedulable_tis:
+            ti.state = TaskInstanceState.SKIPPED
+        session.flush()
+
+        decision = dr.task_instance_scheduling_decisions(session=session)
+        # only task_3 is schedulable
+        (task_3_ti,) = decision.schedulable_tis
+        assert task_3_ti.task_id == "task_3"
+        task_3_ti.set_state(State.QUEUED)
+
+        response = client.patch(
+            f"/execution/task-instances/{task_3_ti.id}/run",
+            json={
+                "state": "running",
+                "hostname": "random-hostname",
+                "unixname": "random-unixname",
+                "pid": 100,
+                "start_date": "2024-09-30T12:00:00Z",
+            },
+        )
+        assert response.status_code == 200
+
+    def test_next_kwargs_still_encoded(self, client, session, create_task_instance, time_machine):
+        instant_str = "2024-09-30T12:00:00Z"
+        instant = timezone.parse(instant_str)
+        time_machine.move_to(instant, tick=False)
+
+        ti = create_task_instance(
+            task_id="test_next_kwargs_still_encoded",
+            state=State.QUEUED,
+            session=session,
+            start_date=instant,
+            dag_id=str(uuid4()),
+        )
+
+        ti.next_method = "execute_complete"
+        # explicitly use serde serialized value before assigning since we use JSON/JSONB now
+        # that this value comes serde serialized from the worker
+        expected_next_kwargs = {
+            "moment": {
+                "__classname__": "pendulum.datetime.DateTime",
+                "__version__": 2,
+                "__data__": {
+                    "timestamp": 1727697600.0,
+                    "tz": {
+                        "__classname__": "builtins.tuple",
+                        "__version__": 1,
+                        "__data__": ["UTC", "pendulum.tz.timezone.Timezone", 1, True],
+                    },
+                },
+            }
+        }
+        ti.next_kwargs = expected_next_kwargs
+
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/run",
+            json={
+                "state": "running",
+                "hostname": "random-hostname",
+                "unixname": "random-unixname",
+                "pid": 100,
+                "start_date": instant_str,
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "dag_run": mock.ANY,
+            "task_reschedule_count": 0,
+            "max_tries": 0,
+            "should_retry": False,
+            "variables": [],
+            "connections": [],
+            "xcom_keys_to_clear": [],
+            "multi_team": False,
+            "next_method": "execute_complete",
+            "next_kwargs": expected_next_kwargs,
+            "start_date": None,
+        }
+
+    @pytest.mark.parametrize("resume", [True, False])
+    def test_next_kwargs_determines_start_date_update(self, client, session, create_task_instance, resume):
+        dag_start_time_str = "2024-09-30T12:00:00Z"
+        dag_start_time = timezone.parse(dag_start_time_str)
+        orig_task_start_time = dag_start_time.add(seconds=5)
+
+        ti = create_task_instance(
+            task_id="test_next_kwargs_still_encoded",
+            state=State.QUEUED,
+            session=session,
+            start_date=orig_task_start_time,
+            dag_id=str(uuid4()),
+        )
+
+        ti.start_date = orig_task_start_time
+        ti.next_method = "execute_complete"
+
+        second_start_time = orig_task_start_time.add(seconds=30)
+        second_start_time_str = second_start_time.isoformat()
+
+        # explicitly serialize using serde before assigning since we use JSON/JSONB now
+        # this value comes serde serialized from the worker
+        if resume:
+            # expected format is now in serde serialized format
+            expected_next_kwargs = {
+                "moment": {
+                    "__classname__": "pendulum.datetime.DateTime",
+                    "__version__": 2,
+                    "__data__": {
+                        "timestamp": 1727697635.0,
+                        "tz": {
+                            "__classname__": "builtins.tuple",
+                            "__version__": 1,
+                            "__data__": ["UTC", "pendulum.tz.timezone.Timezone", 1, True],
+                        },
+                    },
+                }
+            }
+            ti.next_kwargs = expected_next_kwargs
+            expected_start_date = orig_task_start_time
+        else:
+            expected_start_date = second_start_time
+            expected_next_kwargs = None
+
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/run",
+            json={
+                "state": "running",
+                "hostname": "random-hostname",
+                "unixname": "random-unixname",
+                "pid": 100,
+                "start_date": second_start_time_str,
+            },
+        )
+        session.commit()
+
+        assert response.status_code == 200
+        result = response.json()
+        assert timezone.parse(result["start_date"]) == orig_task_start_time
+        result.pop("start_date")
+        assert result == {
+            "dag_run": mock.ANY,
+            "task_reschedule_count": 0,
+            "max_tries": 0,
+            "should_retry": False,
+            "variables": [],
+            "connections": [],
+            "xcom_keys_to_clear": [],
+            "multi_team": False,
+            "next_method": "execute_complete",
+            "next_kwargs": expected_next_kwargs,
+        }
+        session.expunge_all()
+        ti = session.get(TaskInstance, ti.id)
+        assert ti.start_date == expected_start_date
+
+    def test_ti_run_resume_returns_original_start_date_in_context(
+        self,
+        client,
+        session,
+        create_task_instance,
+    ):
+        original_start_date = timezone.parse("2024-09-30T12:00:05Z")
+        payload_start_date = timezone.parse("2024-09-30T12:00:35Z")
+
+        ti = create_task_instance(
+            task_id="test_ti_run_resume_returns_original_start_date_in_context",
+            state=State.QUEUED,
+            session=session,
+            start_date=original_start_date,
+            dag_id=str(uuid4()),
+        )
+        ti.start_date = original_start_date
+        ti.next_method = "execute_complete"
+        ti.next_kwargs = {
+            "moment": {
+                "__classname__": "pendulum.datetime.DateTime",
+                "__version__": 2,
+                "__data__": {
+                    "timestamp": 1727697605.0,
+                    "tz": {
+                        "__classname__": "builtins.tuple",
+                        "__version__": 1,
+                        "__data__": ["UTC", "pendulum.tz.timezone.Timezone", 1, True],
+                    },
+                },
+            }
+        }
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/run",
+            json={
+                "state": "running",
+                "hostname": "random-hostname",
+                "unixname": "random-unixname",
+                "pid": 100,
+                "start_date": payload_start_date.isoformat(),
+            },
+        )
+
+        assert response.status_code == 200
+        result = response.json()
+        assert result["start_date"] is not None
+        assert timezone.parse(result["start_date"]) == original_start_date
+
+        session.expunge_all()
+        ti = session.get(TaskInstance, ti.id)
+        assert ti is not None
+        assert ti.start_date == original_start_date
+
+    @pytest.mark.parametrize(
+        "initial_ti_state",
+        [s for s in TaskInstanceState if s not in (TaskInstanceState.QUEUED, TaskInstanceState.RESTARTING)],
+    )
+    def test_ti_run_state_conflict_if_not_queued(
+        self, client, session, create_task_instance, initial_ti_state
+    ):
+        """
+        Test that a 409 error is returned when the Task Instance is not in a state where it can be marked as
+        running. In this case, the Task Instance is first in NONE state so it cannot be marked as running.
+        """
+        ti = create_task_instance(
+            task_id="test_ti_run_state_conflict_if_not_queued",
+            state=initial_ti_state,
+        )
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/run",
+            json={
+                "state": "running",
+                "hostname": "random-hostname",
+                "unixname": "random-unixname",
+                "pid": 100,
+                "start_date": "2024-10-31T12:00:00Z",
+            },
+        )
+
+        assert response.status_code == 409
+        assert response.json() == {
+            "detail": {
+                "message": "TI was not in a state where it could be marked as running",
+                "previous_state": initial_ti_state,
+                "reason": "invalid_state",
+            }
+        }
+
+        assert session.scalar(select(TaskInstance.state).where(TaskInstance.id == ti.id)) == initial_ti_state
+
+    def test_xcom_not_cleared_for_deferral(self, client, session, create_task_instance, time_machine):
+        """
+        Test that the xcoms are not cleared when the Task Instance state is re-running after deferral.
+        """
+        instant_str = "2024-09-30T12:00:00Z"
+        instant = timezone.parse(instant_str)
+        time_machine.move_to(instant, tick=False)
+
+        ti = create_task_instance(
+            task_id="test_xcom_not_cleared_for_deferral",
+            state=State.RUNNING,
+            session=session,
+            start_date=instant,
+            dag_id=str(uuid4()),
+        )
+        session.commit()
+
+        # Move this task to deferred
+        payload = {
+            "state": "deferred",
+            "trigger_kwargs": {"key": "value", "moment": "2024-12-18T00:00:00Z"},
+            "trigger_timeout": "P1D",  # 1 day
+            "classpath": "my-classpath",
+            "next_method": "execute_callback",
+        }
+
+        response = client.patch(f"/execution/task-instances/{ti.id}/state", json=payload)
+        assert response.status_code == 204
+        assert response.text == ""
+        session.expire_all()
+
+        # Deferred -> Queued so that we can run it again
+        query = update(TaskInstance).where(TaskInstance.id == ti.id).values(state="queued")
+        session.execute(query)
+        session.commit()
+
+        # Lets stage a xcom push
+        ti.xcom_push(key="key", value="value")
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/run",
+            json={
+                "state": "running",
+                "hostname": "random-hostname",
+                "unixname": "random-unixname",
+                "pid": 100,
+                "start_date": instant_str,
+            },
+        )
+
+        assert response.status_code == 200
+        assert ti.xcom_pull(task_ids="test_xcom_not_cleared_for_deferral", key="key") == "value"
+
+    def test_ti_run_with_triggering_user_name(
+        self,
+        client,
+        session,
+        dag_maker,
+        time_machine,
+    ):
+        """
+        Test that the triggering_user_name field is correctly returned when it has a non-None value.
+        """
+        instant_str = "2024-09-30T12:00:00Z"
+        instant = timezone.parse(instant_str)
+        time_machine.move_to(instant, tick=False)
+
+        with dag_maker(dag_id=str(uuid4()), session=session):
+            EmptyOperator(task_id="test_ti_run_with_triggering_user_name")
+
+        # Create DagRun with triggering_user_name set to a specific value
+        dr = dag_maker.create_dagrun(
+            run_id="test",
+            logical_date=instant,
+            state=DagRunState.RUNNING,
+            start_date=instant,
+            triggering_user_name="test_user",
+        )
+
+        ti = dr.get_task_instance(task_id="test_ti_run_with_triggering_user_name")
+        ti.set_state(State.QUEUED)
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/run",
+            json={
+                "state": "running",
+                "hostname": "test-hostname",
+                "unixname": "test-unixname",
+                "pid": 12345,
+                "start_date": instant_str,
+            },
+        )
+
+        assert response.status_code == 200
+        json_response = response.json()
+
+        # Verify the dag_run is present
+        assert "dag_run" in json_response
+        dag_run = json_response["dag_run"]
+
+        # The triggering_user_name field should be present with the correct value
+        assert dag_run["triggering_user_name"] == "test_user"
+
+        # Verify other expected fields are still present
+        assert dag_run["dag_id"] == ti.dag_id
+        assert dag_run["run_id"] == "test"
+        assert dag_run["state"] == "running"
+
+    @pytest.mark.parametrize(
+        ("multi_team_enabled", "expected"),
+        [
+            pytest.param("False", False, id="multi-team-disabled"),
+            pytest.param("True", True, id="multi-team-enabled"),
+        ],
+    )
+    def test_ti_run_reports_multi_team(
+        self, client, session, create_task_instance, time_machine, multi_team_enabled, expected
+    ):
+        """The worker cannot read ``core.multi_team`` itself, so the run context carries it."""
+        instant_str = "2024-09-30T12:00:00Z"
+        instant = timezone.parse(instant_str)
+        time_machine.move_to(instant, tick=False)
+
+        ti = create_task_instance(
+            task_id="test_ti_run_reports_multi_team",
+            state=State.QUEUED,
+            dagrun_state=DagRunState.RUNNING,
+            session=session,
+            start_date=instant,
+            dag_id=str(uuid4()),
+        )
+        session.commit()
+
+        with conf_vars({("core", "multi_team"): multi_team_enabled}):
+            response = client.patch(
+                f"/execution/task-instances/{ti.id}/run",
+                json={
+                    "state": "running",
+                    "hostname": "random-hostname",
+                    "unixname": "random-unixname",
+                    "pid": 100,
+                    "start_date": instant_str,
+                },
+            )
+
+        assert response.status_code == 200
+        assert response.json()["multi_team"] is expected
+
+    @pytest.mark.parametrize(
+        ("multi_team_enabled", "expect_team"),
+        [
+            pytest.param("False", False, id="multi-team-disabled"),
+            pytest.param("True", True, id="multi-team-enabled"),
+        ],
+    )
+    def test_ti_run_populates_team_name(
+        self,
+        client,
+        session,
+        dag_maker,
+        time_machine,
+        multi_team_enabled,
+        expect_team,
+    ):
+        """``team_name`` is resolved from the DAG's bundle when multi-team is enabled."""
+        from airflow.models.dagbundle import DagBundleModel
+        from airflow.models.team import Team
+
+        instant = timezone.parse("2024-09-30T12:00:00Z")
+        time_machine.move_to(instant, tick=False)
+
+        dag_id = str(uuid4())
+        with dag_maker(dag_id=dag_id, session=session):
+            EmptyOperator(task_id="task")
+        dr = dag_maker.create_dagrun(
+            run_id="test", logical_date=instant, state=DagRunState.RUNNING, start_date=instant
+        )
+        ti = dr.get_task_instance(task_id="task")
+        ti.set_state(State.QUEUED)
+
+        bundle_name = f"bundle-{dag_id}"
+        team_name = f"team-{dag_id[:8]}"
+        bundle = DagBundleModel(name=bundle_name)
+        bundle.teams.append(Team(name=team_name))
+        session.add(bundle)
+        session.flush()
+        session.execute(update(DagModel).where(DagModel.dag_id == dag_id).values(bundle_name=bundle_name))
+        session.commit()
+
+        with conf_vars({("core", "multi_team"): multi_team_enabled}):
+            response = client.patch(
+                f"/execution/task-instances/{ti.id}/run",
+                json={
+                    "state": "running",
+                    "hostname": "h",
+                    "unixname": "u",
+                    "pid": 1,
+                    "start_date": "2024-09-30T12:00:00Z",
+                },
+            )
+
+        assert response.status_code == 200
+        assert response.json()["dag_run"]["team_name"] == (team_name if expect_team else None)
+
+    def test_ti_run_team_name_is_not_served_from_a_stale_cache(
+        self, client, session, dag_maker, time_machine
+    ):
+        """
+        ``ti_run`` must eager load the team rather than fall back to the cached resolver.
+
+        The fallback caches per dag_id for ``team_name_cache_ttl`` seconds, so a Dag whose team
+        was looked up before it moved bundles would keep reporting the old team to the worker.
+        """
+        from airflow.models.dag import clear_team_name_cache
+        from airflow.models.dagbundle import DagBundleModel
+        from airflow.models.team import Team
+
+        instant = timezone.parse("2024-09-30T12:00:00Z")
+        time_machine.move_to(instant, tick=False)
+
+        dag_id = str(uuid4())
+        with dag_maker(dag_id=dag_id, session=session):
+            EmptyOperator(task_id="task")
+        dr = dag_maker.create_dagrun(
+            run_id="test", logical_date=instant, state=DagRunState.RUNNING, start_date=instant
+        )
+        ti = dr.get_task_instance(task_id="task")
+        ti.set_state(State.QUEUED)
+
+        for suffix in ("old", "new"):
+            bundle = DagBundleModel(name=f"bundle-{suffix}-{dag_id}")
+            bundle.teams.append(Team(name=f"team-{suffix}-{dag_id[:8]}"))
+            session.add(bundle)
+        session.flush()
+        session.execute(
+            update(DagModel).where(DagModel.dag_id == dag_id).values(bundle_name=f"bundle-old-{dag_id}")
+        )
+        session.commit()
+
+        with conf_vars({("core", "multi_team"): "True"}):
+            clear_team_name_cache()
+            # Warm the cache with the old team, then move the Dag to the other bundle.
+            assert DagModel.get_team_name(dag_id, session=session) == f"team-old-{dag_id[:8]}"
+            session.execute(
+                update(DagModel).where(DagModel.dag_id == dag_id).values(bundle_name=f"bundle-new-{dag_id}")
+            )
+            session.commit()
+
+            response = client.patch(
+                f"/execution/task-instances/{ti.id}/run",
+                json={
+                    "state": "running",
+                    "hostname": "h",
+                    "unixname": "u",
+                    "pid": 1,
+                    "start_date": "2024-09-30T12:00:00Z",
+                },
+            )
+            clear_team_name_cache()
+
+        assert response.status_code == 200
+        assert response.json()["dag_run"]["team_name"] == f"team-new-{dag_id[:8]}"
+
+    def test_ti_run_creates_audit_log(self, client, session, create_task_instance, time_machine):
+        """Test that transitioning to RUNNING creates an audit log record."""
+        instant_str = "2024-09-30T12:00:00Z"
+        instant = timezone.parse(instant_str)
+        time_machine.move_to(instant, tick=False)
+
+        ti = create_task_instance(
+            task_id="test_ti_run_creates_audit_log",
+            state=State.QUEUED,
+            dagrun_state=DagRunState.RUNNING,
+            session=session,
+            start_date=instant,
+            dag_id=str(uuid4()),
+        )
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/run",
+            json={
+                "state": "running",
+                "hostname": "random-hostname",
+                "unixname": "random-unixname",
+                "pid": 100,
+                "start_date": instant_str,
+            },
+        )
+
+        assert response.status_code == 200
+
+        logs = session.scalars(select(Log).where(Log.dag_id == ti.dag_id)).all()
+        assert len(logs) == 1
+        assert logs[0].event == TaskInstanceState.RUNNING.value
+        assert logs[0].task_instance_id == ti.id
+        assert logs[0].task_id == ti.task_id
+        assert logs[0].dag_id == ti.dag_id
+        assert logs[0].run_id == ti.run_id
+        assert logs[0].map_index == ti.map_index
+        assert logs[0].try_number == ti.try_number
+        assert logs[0].logical_date == instant
+        assert logs[0].owner == ti.task.owner
+        assert logs[0].extra == '{"host_name": "random-hostname"}'
+
+    @pytest.mark.parametrize(
+        "scenario",
+        ["first_run", "retry", "deferral_resume"],
+    )
+    def test_ti_run_emits_queued_duration_metric(
+        self, client, session, create_task_instance, time_machine, scenario
+    ):
+        """task.queued_duration is emitted once per queue wait.
+
+        The scheduler refreshes queued_dttm every time it queues a task, so a retry and a
+        resume from deferral each waited for a worker slot of their own and must emit too. A
+        retry still carries the previous attempt's end_date on the row when ti_run is reached,
+        so this also asserts the emit does not depend on end_date being unset.
+        """
+        queued_at = timezone.parse("2024-09-30T12:00:00Z")
+        run_at = queued_at.add(seconds=42)
+
+        ti = create_task_instance(
+            task_id=f"test_ti_run_emits_queued_duration_metric_{scenario}",
+            state=State.QUEUED,
+            dagrun_state=DagRunState.RUNNING,
+            session=session,
+            start_date=queued_at,
+            dag_id=str(uuid4()),
+        )
+        ti.queued_dttm = queued_at
+        ti.queue = "default"
+        if scenario == "retry":
+            # A retried TI still has the previous attempt's end_date set on the row until
+            # ti_run clears it; the metric must fire regardless.
+            ti.end_date = queued_at.add(seconds=10)
+        elif scenario == "deferral_resume":
+            ti.next_method = "execute_complete"
+        session.commit()
+
+        # The metric has to stay sliceable the same way as its sibling task.scheduled_duration,
+        # which emit_state_change_metric sends as {**ti.stats_tags, "queue": ti.queue}. Deriving
+        # the expectation from that same expression makes the two drift apart only if this fails.
+        expected_tags = {**ti.stats_tags, "queue": ti.queue}
+        assert "run_type" in expected_tags
+
+        time_machine.move_to(run_at, tick=False)
+
+        with mock.patch(
+            "airflow.api_fastapi.execution_api.routes.task_instances.stats", autospec=True
+        ) as mock_stats:
+            response = client.patch(
+                f"/execution/task-instances/{ti.id}/run",
+                json={
+                    "state": "running",
+                    "hostname": "random-hostname",
+                    "unixname": "random-unixname",
+                    "pid": 100,
+                    "start_date": run_at.isoformat(),
+                },
+            )
+
+        assert response.status_code == 200
+        mock_stats.timing.assert_called_once_with(
+            "task.queued_duration",
+            run_at - queued_at,
+            tags=expected_tags,
+        )
+
+    @mock.patch(
+        "airflow.api_fastapi.execution_api.routes.task_instances.get_arg_bindings",
+        autospec=True,
+        return_value=[{"name": "country", "kind": "hologram", "value": "uk"}],
+    )
+    def test_ti_run_skips_queued_duration_metric_when_the_response_fails(
+        self, _, client, session, create_task_instance, time_machine
+    ):
+        """The SDK retries a 5xx, and the rollback leaves the TI in QUEUED for that retry to pick
+        up, so a sample sent before the response is settled counts one queue wait twice."""
+        queued_at = timezone.parse("2024-09-30T12:00:00Z")
+        run_at = queued_at.add(seconds=42)
+        time_machine.move_to(run_at, tick=False)
+
+        ti = create_task_instance(
+            task_id="test_ti_run_skips_queued_duration_metric_when_the_response_fails",
+            state=State.QUEUED,
+            dagrun_state=DagRunState.RUNNING,
+            session=session,
+            start_date=queued_at,
+            dag_id=str(uuid4()),
+        )
+        ti.queued_dttm = queued_at
+        ti.is_stub = True
+        session.commit()
+
+        with mock.patch(
+            "airflow.api_fastapi.execution_api.routes.task_instances.stats", autospec=True
+        ) as mock_stats:
+            response = client.patch(
+                f"/execution/task-instances/{ti.id}/run",
+                json={
+                    "state": "running",
+                    "hostname": "random-hostname",
+                    "unixname": "random-unixname",
+                    "pid": 100,
+                    "start_date": run_at.isoformat(),
+                },
+            )
+
+        assert response.status_code == 500
+        assert response.json()["detail"]["reason"] == "invalid_arg_bindings"
+        mock_stats.timing.assert_not_called()
+
+    def test_ti_run_skips_queued_duration_metric_without_queued_dttm(
+        self, client, session, create_task_instance, time_machine
+    ):
+        """queued_dttm is what the wait is measured from, so a row without one (a run that skips
+        the scheduler's queueing, e.g. dag.test()) has nothing to report."""
+        queued_at = timezone.parse("2024-09-30T12:00:00Z")
+        run_at = queued_at.add(seconds=42)
+        time_machine.move_to(run_at, tick=False)
+
+        ti = create_task_instance(
+            task_id="test_ti_run_skips_queued_duration_metric_without_queued_dttm",
+            state=State.QUEUED,
+            dagrun_state=DagRunState.RUNNING,
+            session=session,
+            start_date=queued_at,
+            dag_id=str(uuid4()),
+        )
+        ti.queued_dttm = None
+        session.commit()
+
+        with mock.patch(
+            "airflow.api_fastapi.execution_api.routes.task_instances.stats", autospec=True
+        ) as mock_stats:
+            response = client.patch(
+                f"/execution/task-instances/{ti.id}/run",
+                json={
+                    "state": "running",
+                    "hostname": "random-hostname",
+                    "unixname": "random-unixname",
+                    "pid": 100,
+                    "start_date": run_at.isoformat(),
+                },
+            )
+
+        assert response.status_code == 200
+        mock_stats.timing.assert_not_called()
+
+    def test_ti_run_skips_queued_duration_metric_on_duplicate_start(
+        self, client, session, create_task_instance, time_machine
+    ):
+        """A start request replayed by the same worker after a network glitch returns the same
+        200 without re-running the transition, so it must not double-count the queue wait."""
+        queued_at = timezone.parse("2024-09-30T12:00:00Z")
+        run_at = queued_at.add(seconds=42)
+        time_machine.move_to(run_at, tick=False)
+
+        ti = create_task_instance(
+            task_id="test_ti_run_skips_queued_duration_metric_on_duplicate_start",
+            state=State.RUNNING,
+            dagrun_state=DagRunState.RUNNING,
+            session=session,
+            start_date=queued_at,
+            dag_id=str(uuid4()),
+        )
+        ti.queued_dttm = queued_at
+        ti.hostname = "random-hostname"
+        ti.unixname = "random-unixname"
+        ti.pid = 100
+        session.commit()
+
+        with mock.patch(
+            "airflow.api_fastapi.execution_api.routes.task_instances.stats", autospec=True
+        ) as mock_stats:
+            response = client.patch(
+                f"/execution/task-instances/{ti.id}/run",
+                json={
+                    "state": "running",
+                    "hostname": "random-hostname",
+                    "unixname": "random-unixname",
+                    "pid": 100,
+                    "start_date": run_at.isoformat(),
+                },
+            )
+
+        assert response.status_code == 200
+        mock_stats.timing.assert_not_called()
+
+    def test_ti_run_queued_duration_metric_is_tagged_with_team_name(
+        self, client, session, dag_maker, time_machine
+    ):
+        """The team tag has to be pinned with multi-team on: with it off both the metric and any
+        expectation derived from stats_tags omit the key, so they would agree for the wrong reason.
+        """
+        from airflow.models.dagbundle import DagBundleModel
+        from airflow.models.team import Team
+
+        queued_at = timezone.parse("2024-09-30T12:00:00Z")
+        run_at = queued_at.add(seconds=42)
+        time_machine.move_to(queued_at, tick=False)
+
+        dag_id = str(uuid4())
+        with dag_maker(dag_id=dag_id, session=session):
+            EmptyOperator(task_id="task")
+        dr = dag_maker.create_dagrun(
+            run_id="test", logical_date=queued_at, state=DagRunState.RUNNING, start_date=queued_at
+        )
+        ti = dr.get_task_instance(task_id="task")
+        session.execute(
+            update(TaskInstance)
+            .where(TaskInstance.id == ti.id)
+            .values(state=State.QUEUED, queued_dttm=queued_at, queue="default")
+        )
+
+        bundle_name = f"bundle-{dag_id}"
+        team_name = f"team-{dag_id[:8]}"
+        bundle = DagBundleModel(name=bundle_name)
+        bundle.teams.append(Team(name=team_name))
+        session.add(bundle)
+        session.flush()
+        session.execute(update(DagModel).where(DagModel.dag_id == dag_id).values(bundle_name=bundle_name))
+        session.commit()
+
+        time_machine.move_to(run_at, tick=False)
+
+        with conf_vars({("core", "multi_team"): "True"}):
+            with mock.patch(
+                "airflow.api_fastapi.execution_api.routes.task_instances.stats", autospec=True
+            ) as mock_stats:
+                response = client.patch(
+                    f"/execution/task-instances/{ti.id}/run",
+                    json={
+                        "state": "running",
+                        "hostname": "random-hostname",
+                        "unixname": "random-unixname",
+                        "pid": 100,
+                        "start_date": run_at.isoformat(),
+                    },
+                )
+
+        assert response.status_code == 200
+        mock_stats.timing.assert_called_once()
+        assert mock_stats.timing.call_args.kwargs["tags"]["team_name"] == team_name
+
+    def test_ti_run_queued_duration_metric_carries_dag_tags(self, client, session, dag_maker, time_machine):
+        """With dag_tags_in_metrics on, stats_tags would lazy-load dag_model.tags per task start;
+        the select eager-loads them instead, so the tags have to survive that route."""
+        queued_at = timezone.parse("2024-09-30T12:00:00Z")
+        run_at = queued_at.add(seconds=42)
+        time_machine.move_to(queued_at, tick=False)
+
+        dag_id = str(uuid4())
+        with dag_maker(dag_id=dag_id, tags=["critical", "env:prod"], session=session):
+            EmptyOperator(task_id="task")
+        dr = dag_maker.create_dagrun(
+            run_id="test", logical_date=queued_at, state=DagRunState.RUNNING, start_date=queued_at
+        )
+        ti = dr.get_task_instance(task_id="task")
+        session.execute(
+            update(TaskInstance)
+            .where(TaskInstance.id == ti.id)
+            .values(state=State.QUEUED, queued_dttm=queued_at, queue="default")
+        )
+        session.commit()
+
+        time_machine.move_to(run_at, tick=False)
+
+        with conf_vars({("metrics", "dag_tags_in_metrics"): "True"}):
+            with mock.patch(
+                "airflow.api_fastapi.execution_api.routes.task_instances.stats", autospec=True
+            ) as mock_stats:
+                response = client.patch(
+                    f"/execution/task-instances/{ti.id}/run",
+                    json={
+                        "state": "running",
+                        "hostname": "random-hostname",
+                        "unixname": "random-unixname",
+                        "pid": 100,
+                        "start_date": run_at.isoformat(),
+                    },
+                )
+
+        assert response.status_code == 200
+        mock_stats.timing.assert_called_once()
+        tags = mock_stats.timing.call_args.kwargs["tags"]
+        assert (tags["critical"], tags["env"]) == ("", "prod")
+
+    def test_ti_run_emits_queued_duration_for_start_from_trigger(
+        self, client, session, dag_maker, time_machine
+    ):
+        """A start_from_trigger operator is deferred straight from SCHEDULED and only reaches the
+        queue once the trigger fires, so that resume is the one wait it ever has to report.
+        """
+        from airflow.sdk import BaseOperator
+        from airflow.triggers.base import StartTriggerArgs
+
+        class StartFromTriggerOperator(BaseOperator):
+            start_trigger_args = StartTriggerArgs(
+                trigger_cls="airflow.triggers.testing.SuccessTrigger",
+                trigger_kwargs={},
+                next_method="execute_complete",
+                timeout=None,
+            )
+            start_from_trigger = True
+
+            def execute_complete(self):
+                pass
+
+        queued_at = timezone.parse("2024-09-30T12:00:00Z")
+        run_at = queued_at.add(seconds=42)
+        time_machine.move_to(queued_at, tick=False)
+
+        with dag_maker(dag_id=str(uuid4()), session=session):
+            StartFromTriggerOperator(task_id="task")
+        dr = dag_maker.create_dagrun(run_id="test", logical_date=queued_at, state=DagRunState.RUNNING)
+
+        ti = dr.get_task_instance(task_id="task")
+        ti.task = dr.dag.get_task("task")
+        assert dr.schedule_tis((ti,), session=session) == 0
+        session.merge(ti)
+        session.commit()
+
+        # Read the row back rather than the in-memory TI: what ti_run sees is the persisted state,
+        # and the point of this test is that the deferral lands without the TI ever being queued.
+        state, next_method, queued_dttm = session.execute(
+            select(TaskInstance.state, TaskInstance.next_method, TaskInstance.queued_dttm).where(
+                TaskInstance.id == ti.id
+            )
+        ).one()
+        assert (state, next_method, queued_dttm) == (TaskInstanceState.DEFERRED, "execute_complete", None)
+
+        # The trigger fires and the scheduler queues it -- the first and only real queue wait.
+        session.execute(
+            update(TaskInstance)
+            .where(TaskInstance.id == ti.id)
+            .values(state=State.QUEUED, queued_dttm=queued_at, queue="default")
+        )
+        session.commit()
+
+        time_machine.move_to(run_at, tick=False)
+
+        with mock.patch(
+            "airflow.api_fastapi.execution_api.routes.task_instances.stats", autospec=True
+        ) as mock_stats:
+            response = client.patch(
+                f"/execution/task-instances/{ti.id}/run",
+                json={
+                    "state": "running",
+                    "hostname": "random-hostname",
+                    "unixname": "random-unixname",
+                    "pid": 100,
+                    "start_date": run_at.isoformat(),
+                },
+            )
+
+        assert response.status_code == 200
+        # Assert off the call rather than the in-memory TI, whose queue is stale after the
+        # raw update above.
+        mock_stats.timing.assert_called_once()
+        assert mock_stats.timing.call_args.args == ("task.queued_duration", run_at - queued_at)
+        assert mock_stats.timing.call_args.kwargs["tags"]["queue"] == "default"
+
+
+class TestTIUpdateState:
+    def test_loop_continues_while_earlier_body_branch_is_running(self, client, session, dag_maker):
+        @task_group
+        def body():
+            left = PythonOperator(task_id="left", python_callable=list)
+            right = PythonOperator(task_id="right", python_callable=list)
+            terminal = PythonOperator(
+                task_id="terminal", python_callable=list, trigger_rule=TriggerRule.ONE_SUCCESS
+            )
+            [left, right] >> terminal
+
+        with dag_maker(serialized=True, session=session):
+            loop = create_loop(body, max_iterations=2)
+        dr = dag_maker.create_dagrun()
+        dr.dag = dag_maker.serialized_dag
+        tis = {ti.task_id: ti for ti in dr.task_instances}
+        tis["body.left"].state = State.SUCCESS
+        right = tis["body.right"]
+        right.state = State.RUNNING
+        right_id = right.id
+        terminal = tis["body.terminal"]
+        gate = tis[loop.gate_task_id]
+        session.flush()
+        assert terminal in dr.task_instance_scheduling_decisions(session=session).schedulable_tis
+        terminal.state, terminal.start_date = State.RUNNING, DEFAULT_START_DATE
+        session.commit()
+        assert (
+            client.patch(
+                f"/execution/task-instances/{terminal.id}/state",
+                json={"state": "success", "end_date": DEFAULT_END_DATE.isoformat()},
+            ).status_code
+            == 204
+        )
+        session.expire_all()
+        assert gate in dr.task_instance_scheduling_decisions(session=session).schedulable_tis
+        gate.state, gate.start_date = State.RUNNING, DEFAULT_START_DATE
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{gate.id}/state",
+            json={"state": "success", "end_date": DEFAULT_END_DATE.isoformat(), "loop_decision": CONTINUE},
+        )
+
+        assert response.status_code == 204, response.text
+        session.expire_all()
+        assert session.get(TaskInstance, right_id).state == State.RUNNING
+        ready = dr.task_instance_scheduling_decisions(session=session).schedulable_tis
+        assert {(ti.task_id, ti.region_index) for ti in ready} == {("body.left", 2), ("body.right", 2)}
+
+    @pytest.fixture
+    def started_loop_successor(self, client, session, running_loop_gate):
+        gate = running_loop_gate
+        dr = gate.dag_run
+        response = client.patch(
+            f"/execution/task-instances/{gate.id}/state",
+            json={"state": "success", "end_date": DEFAULT_END_DATE.isoformat(), "loop_decision": CONTINUE},
+        )
+        assert response.status_code == 204
+        session.expire_all()
+        running = next(
+            ti
+            for ti in dr.get_task_instances(session=session)
+            if ti.task_id != gate.task_id and ti.region_index == 2
+        )
+        running.state = State.QUEUED
+        for ti in dr.get_task_instances(session=session):
+            if ti.task_id != gate.task_id and ti.region_index == 1:
+                ti.state = State.SUCCESS
+        session.commit()
+        running_id = running.id
+        response = client.patch(
+            f"/execution/task-instances/{running_id}/run",
+            json={
+                "state": "running",
+                "hostname": "archiving-worker",
+                "unixname": "airflow",
+                "pid": 123,
+                "start_date": DEFAULT_START_DATE.isoformat(),
+            },
+        )
+        assert response.status_code == 200, response.text
+        session.expire_all()
+        return gate, running_id
+
+    def test_loop_rewind_admits_the_gate_without_waiting_for_worker_acknowledgement(
+        self, client, session, started_loop_successor, dag_maker
+    ):
+        gate, running_id = started_loop_successor
+        dr = gate.dag_run
+        running = session.get(TaskInstance, running_id)
+
+        for _ in range(2):
+            clear_loop_task_instances([session.get(TaskInstance, gate.id)], downstream=False, session=session)
+            session.commit()
+            session.expire_all()
+            assert running.id == running_id
+            assert running.state == State.RESTARTING
+            assert running.working_set is True
+            gate = next(
+                ti
+                for ti in dr.get_task_instances(session=session)
+                if ti.task_id == gate.task_id and ti.region_index == gate.region_index
+            )
+            dr.dag = dag_maker.serialized_dag
+            decision = dr.task_instance_scheduling_decisions(session=session)
+            assert gate.id in {ti.id for ti in decision.schedulable_tis}
+            dr.update_state(session=session)
+            assert dr.state == DagRunState.RUNNING
+            session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{running_id}/state",
+            json={
+                "state": "server_terminated",
+                "end_date": DEFAULT_END_DATE.isoformat(),
+                "hostname": "archiving-worker",
+                "pid": 123,
+            },
+        )
+
+        assert response.status_code == 204, response.text
+        session.expire_all()
+        archived = session.get(TaskInstance, running_id)
+        assert (archived.working_set, archived.archived_reason) == (None, "superseded")
+        dr.dag = dag_maker.serialized_dag
+        decision = dr.task_instance_scheduling_decisions(session=session)
+        assert gate.id in {ti.id for ti in decision.schedulable_tis}
+        assert not any(ti.region_index == 2 for ti in dr.get_task_instances(session=session))
+
+    def test_restart_ack_locks_run_before_task(self, client, session, create_task_instance, mocker):
+        if session.bind.dialect.name == "sqlite":
+            pytest.skip("SQLite has no row locks")
+        ti = create_task_instance(state=State.QUEUED)
+        ti.region_index = 0
+        session.commit()
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/run",
+            json={
+                "state": "running",
+                "hostname": "worker",
+                "unixname": "airflow",
+                "pid": 123,
+                "start_date": DEFAULT_START_DATE.isoformat(),
+            },
+        )
+        assert response.status_code == 200, response.text
+        session.refresh(ti)
+        clear_task_instances([ti], session=session)
+        session.commit()
+        archiving_id = ti.id
+        dag_id, run_id = ti.dag_id, ti.run_id
+        ack_locked = Event()
+        clear_at_lock = Event()
+        execute = Session._execute_internal
+        bind = session.get_bind()
+
+        def coordinate(request_session, statement, *args, **kwargs):
+            locking = isinstance(statement, Select) and statement._for_update_arg is not None
+            run_lock = locking and any(
+                getattr(table, "name", None) == "dag_run" for table in statement.get_final_froms()
+            )
+            role = request_session.info.get("role")
+            if role == "clear" and run_lock:
+                clear_at_lock.set()
+            result = execute(request_session, statement, *args, **kwargs)
+            if role == "ack" and run_lock:
+                request_session.info["run_locked"] = True
+            elif role == "ack" and locking:
+                ack_locked.set()
+                assert request_session.info.get("run_locked")
+                assert clear_at_lock.wait(timeout=10)
+            return result
+
+        mocker.patch.object(Session, "_execute_internal", autospec=True, side_effect=coordinate)
+
+        def acknowledge():
+            with Session(bind=bind, info={"role": "ack"}) as other:
+                result = ti_update_state(
+                    task_instance_id=archiving_id,
+                    ti_patch_payload=TITerminalStatePayload(
+                        state="server_terminated", end_date=DEFAULT_END_DATE, hostname="worker", pid=123
+                    ),
+                    session=other,
+                    dag_bag=DBDagBag(),
+                )
+                other.commit()
+                return result.status_code
+
+        def clear_again():
+            assert ack_locked.wait(timeout=10)
+            with Session(bind=bind, info={"role": "clear"}) as other:
+                other.scalar(
+                    select(DagRun).where(DagRun.dag_id == dag_id, DagRun.run_id == run_id).with_for_update()
+                )
+                selected = other.scalar(
+                    select(TaskInstance).where(
+                        TaskInstance.dag_id == dag_id,
+                        TaskInstance.run_id == run_id,
+                        TaskInstance.working_set.is_(True),
+                    )
+                )
+                clear_task_instances([selected], session=other)
+                other.commit()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            ack = pool.submit(acknowledge)
+            repeated = pool.submit(clear_again)
+            assert ack.result(timeout=20) == 204
+            repeated.result(timeout=20)
+        session.expire_all()
+        assert session.get(TaskInstance, archiving_id).working_set is None
+
+    @conf_vars({("state_store", "clear_on_success"): "true"})
+    @pytest.mark.parametrize("mapped", [False, True])
+    @pytest.mark.parametrize(
+        ("decision", "state", "max_iterations", "conditional", "rejected", "passes"),
+        [
+            ("continue", State.SUCCESS, 3, False, False, [1, 2]),
+            ("stop", State.SUCCESS, 3, False, True, [1]),
+            (None, State.SUCCESS, 3, False, True, [1]),
+            ("continue", State.FAILED, 3, False, False, [1]),
+            ("continue", State.SKIPPED, 3, False, False, [1]),
+            ("stop", State.SUCCESS, 1, False, False, [1]),
+            ("continue", State.SUCCESS, 1, False, True, [1]),
+            ("stop", State.SUCCESS, 3, True, False, [1]),
+            ("stop", State.SUCCESS, 1, True, False, [1]),
+            ("continue", State.SUCCESS, 1, True, True, [1]),
+            (None, State.FAILED, 1, True, False, [1]),
+        ],
+    )
+    def test_loop_gate_completion_consumes_decision_atomically(
+        self,
+        client,
+        session,
+        dag_maker,
+        decision,
+        state,
+        max_iterations,
+        conditional,
+        mapped,
+        rejected,
+        passes,
+        mocker,
+    ):
+        backend = mocker.create_autospec(MetastoreBackend, instance=True)
+        mocker.patch(
+            "airflow.api_fastapi.execution_api.routes.task_instances.get_state_backend",
+            autospec=True,
+            return_value=backend,
+        )
+
+        @task_group
+        def body():
+            if mapped:
+                PythonOperator.partial(task_id="terminal", python_callable=list).expand(op_kwargs=[{}, {}])
+            else:
+                PythonOperator(task_id="terminal", python_callable=list)
+
+        with dag_maker(serialized=True, session=session):
+            loop = create_loop(
+                body, max_iterations=max_iterations, until=(lambda loop: True) if conditional else None
+            )
+        dr = dag_maker.create_dagrun()
+        gate = next(ti for ti in dr.task_instances if ti.task_id == loop.gate_task_id)
+        gate.state = State.RUNNING
+        gate.start_date = DEFAULT_START_DATE
+        session.commit()
+        payload = {"state": state, "end_date": DEFAULT_END_DATE.isoformat()}
+        if decision:
+            payload["loop_decision"] = {"stop": decision == "stop"}
+
+        response = client.patch(f"/execution/task-instances/{gate.id}/state", json=payload)
+
+        assert response.status_code == 204, response.text
+        assert backend.clear.call_count == (state == State.SUCCESS and not rejected)
+        session.expire_all()
+        assert gate.state == (State.FAILED if rejected else state)
+        current = dr.get_task_instances(session=session)
+        assert sorted(ti.region_index for ti in current if ti.task_id == gate.task_id) == passes
+        if mapped:
+            children = session.scalars(
+                select(DynamicRegion).where(DynamicRegion.parent_region_id == gate.region_id)
+            ).all()
+            assert sorted(region.parent_region_index for region in children) == passes
+            region_ids = {gate.region_id, *(region.id for region in children)}
+            assert all(ti.region_id in region_ids for ti in current)
+        else:
+            assert all(ti.region_id == gate.region_id for ti in current)
+        if not rejected:
+            duplicate = client.patch(f"/execution/task-instances/{gate.id}/state", json=payload)
+            assert duplicate.status_code == 200
+            assert (
+                sorted(
+                    ti.region_index
+                    for ti in dr.get_task_instances(session=session)
+                    if ti.task_id == gate.task_id
+                )
+                == passes
+            )
+        if mapped and passes == [1, 2]:
+            successor_region = next(region for region in children if region.parent_region_index == 2)
+            assert [ti.region_index for ti in current if ti.region_id == successor_region.id] == [-1]
+            dr.dag = dag_maker.serialized_dag
+
+            dr.task_instance_scheduling_decisions(session=session)
+
+            assert sorted(
+                ti.region_index
+                for ti in dr.get_task_instances(session=session)
+                if ti.region_id == successor_region.id
+            ) == [0, 1]
+
+    @pytest.fixture
+    def running_loop_gate(self, session, dag_maker):
+        @task_group
+        def body():
+            PythonOperator(task_id="terminal", python_callable=list)
+
+        with dag_maker(serialized=True, session=session):
+            loop = create_loop(body, max_iterations=3)
+        dr = dag_maker.create_dagrun()
+        gate = next(ti for ti in dr.task_instances if ti.task_id == loop.gate_task_id)
+        gate.state, gate.start_date = State.RUNNING, DEFAULT_START_DATE
+        session.commit()
+        return gate
+
+    def test_loop_gate_materialization_error_rolls_back_state_and_successor(
+        self, client, session, running_loop_gate, mocker
+    ):
+        gate = running_loop_gate
+        dr = gate.dag_run
+        original = DagRun._create_task_instances
+        observed = []
+
+        def fail_after_insert(*args, **kwargs):
+            original(*args, **kwargs)
+            with Session(bind=session.get_bind()) as observer:
+                observed.append(observer.get(TaskInstance, gate.id).state)
+                observed.append(
+                    observer.scalars(
+                        select(TaskInstance.region_index).where(
+                            TaskInstance.dag_id == dr.dag_id, TaskInstance.task_id == gate.task_id
+                        )
+                    ).all()
+                )
+            raise StaleDataError("injected materialization failure")
+
+        mocker.patch.object(DagRun, "_create_task_instances", autospec=True, side_effect=fail_after_insert)
+        response = client.patch(
+            f"/execution/task-instances/{gate.id}/state",
+            json={"state": "success", "end_date": DEFAULT_END_DATE.isoformat(), "loop_decision": CONTINUE},
+        )
+
+        assert response.status_code == 500
+        session.expire_all()
+        assert observed == [State.RUNNING, [1]]
+        assert gate.state == State.RUNNING
+        assert len(dr.get_task_instances(session=session)) == 2
+
+    @pytest.mark.parametrize(
+        ("max_tries", "expected_state"),
+        [(0, State.FAILED), (1, State.UP_FOR_RETRY)],
+    )
+    def test_loop_gate_with_invalid_decision_leaves_running_in_same_request(
+        self, client, session, running_loop_gate, max_tries, expected_state
+    ):
+        gate = running_loop_gate
+        dr = gate.dag_run
+        gate_id = gate.id
+        gate.max_tries = max_tries
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{gate.id}/state",
+            json={"state": "success", "end_date": DEFAULT_END_DATE.isoformat()},
+        )
+
+        assert response.status_code == 204
+        session.expire_all()
+        current = dr.get_task_instances(session=session)
+        assert sorted(ti.state for ti in current if ti.task_id == gate.task_id) == [expected_state]
+        assert len(current) == 2
+        assert "requires a decision" in session.get(TaskInstance, gate_id).retry_reason
+
+    @pytest.mark.backend("mysql", "postgres")
+    def test_concurrent_loop_gate_completions_create_one_successor(self, session, running_loop_gate):
+        gate = running_loop_gate
+        dr = gate.dag_run
+        gate_id = gate.id
+        bind = session.get_bind()
+        barrier = Barrier(2)
+
+        def complete():
+            with Session(bind=bind) as request_session:
+                barrier.wait(timeout=10)
+                result = ti_update_state(
+                    task_instance_id=gate_id,
+                    ti_patch_payload=TISuccessStatePayload(
+                        state="success",
+                        end_date=DEFAULT_END_DATE,
+                        loop_decision=LoopDecisionPayload(stop=False),
+                    ),
+                    session=request_session,
+                    dag_bag=DBDagBag(),
+                )
+                return result.status_code if result is not None else 204
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(complete) for _ in range(2)]
+            assert sorted(future.result(timeout=20) for future in futures) == [200, 204]
+        session.expire_all()
+        assert gate.state == State.SUCCESS
+        assert sorted(
+            ti.region_index for ti in dr.get_task_instances(session=session) if ti.task_id == gate.task_id
+        ) == [1, 2]
+
+    def test_loop_gate_completion_uses_its_pinned_limit(self, client, session, running_loop_gate, dag_maker):
+        gate = running_loop_gate
+        original_version = gate.dag_version_id
+
+        @task_group
+        def body():
+            PythonOperator(task_id="terminal", python_callable=list)
+
+        with dag_maker(serialized=True, session=session):
+            create_loop(body, max_iterations=1)
+
+        response = client.patch(
+            f"/execution/task-instances/{gate.id}/state",
+            json={"state": "success", "end_date": DEFAULT_END_DATE.isoformat(), "loop_decision": CONTINUE},
+        )
+
+        assert response.status_code == 204, response.text
+        session.expire_all()
+        successors = [ti for ti in gate.dag_run.get_task_instances(session=session) if ti.region_index == 2]
+        assert len(successors) == 2
+        assert all(ti.dag_version_id == original_version for ti in successors)
+
+    @pytest.mark.parametrize("state", ["success", "failed"])
+    def test_loop_gate_missing_from_its_pinned_version_fails(
+        self, client, session, running_loop_gate, dag_maker, state
+    ):
+        gate = running_loop_gate
+
+        def renamed_gate(loop):
+            return True
+
+        @task_group
+        def body():
+            PythonOperator(task_id="terminal", python_callable=list)
+
+        with dag_maker(serialized=True, session=session):
+            create_loop(body, max_iterations=3, until=renamed_gate)
+        gate.dag_version_id = DagVersion.get_latest_version(gate.dag_id, session=session).id
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{gate.id}/state",
+            json={"state": state, "end_date": DEFAULT_END_DATE.isoformat()},
+        )
+
+        assert response.status_code == 204, response.text
+        session.expire_all()
+        assert gate.state == State.FAILED
+        assert [ti.region_index for ti in gate.dag_run.get_task_instances(session=session)] == [1, 1]
+
+    def test_loop_gate_state_update_error_rolls_back_next_pass(
+        self, client, session, running_loop_gate, mocker
+    ):
+        gate = running_loop_gate
+        mocker.patch.object(
+            task_instances_route,
+            "_create_ti_state_update_query_and_update_state",
+            autospec=True,
+            side_effect=StaleDataError("injected state update failure"),
+        )
+
+        response = client.patch(
+            f"/execution/task-instances/{gate.id}/state",
+            json={"state": "success", "end_date": DEFAULT_END_DATE.isoformat(), "loop_decision": CONTINUE},
+        )
+
+        assert response.status_code == 500
+        session.expire_all()
+        assert gate.state == State.RUNNING
+        assert len(gate.dag_run.get_task_instances(session=session)) == 2
+
+    @pytest.mark.parametrize("state", ["success", "failed"])
+    def test_non_loop_operator_named_loop_gate_completes_normally(
+        self, client, session, create_task_instance, state
+    ):
+        ti = create_task_instance(task_id="user_gate", start_date=DEFAULT_START_DATE, state=State.RUNNING)
+        ti.operator = LOOP_GATE_OPERATOR
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/state",
+            json={"state": state, "end_date": DEFAULT_END_DATE.isoformat()},
+        )
+
+        assert response.status_code == 204
+        session.expire_all()
+        assert ti.state == state
+
+    def test_loop_gate_inner_insert_error_is_not_swallowed(self, client, session, running_loop_gate, mocker):
+        gate = running_loop_gate
+        bulk_insert = mocker.patch.object(
+            Session,
+            "bulk_insert_mappings",
+            autospec=True,
+            side_effect=StaleDataError("injected insert error"),
+        )
+
+        response = client.patch(
+            f"/execution/task-instances/{gate.id}/state",
+            json={"state": "success", "end_date": DEFAULT_END_DATE.isoformat(), "loop_decision": CONTINUE},
+        )
+
+        assert response.status_code == 500
+        bulk_insert.assert_called_once()
+        session.expire_all()
+        assert gate.state == State.RUNNING
+        assert len(gate.dag_run.get_task_instances(session=session)) == 2
+
+    @pytest.mark.parametrize("state", [State.SUCCESS, State.FAILED, State.SKIPPED])
+    def test_rerun_gate_preserves_existing_later_pass_and_reason(
+        self, client, session, running_loop_gate, state
+    ):
+        gate = running_loop_gate
+        response = client.patch(
+            f"/execution/task-instances/{gate.id}/state",
+            json={
+                "state": "success",
+                "end_date": DEFAULT_END_DATE.isoformat(),
+                "loop_decision": {"stop": False, "reason": "first"},
+            },
+        )
+        assert response.status_code == 204
+        session.refresh(gate)
+        successor_ids = {
+            ti.id for ti in gate.dag_run.get_task_instances(session=session) if ti.region_index == 2
+        }
+        archived_id = gate.id
+        dag_run = gate.dag_run
+        clear_task_instances([gate], session=session)
+        session.expire_all()
+        gate = session.scalar(
+            select(TaskInstance).where(
+                TaskInstance.dag_id == dag_run.dag_id,
+                TaskInstance.run_id == dag_run.run_id,
+                TaskInstance.task_id == gate.task_id,
+                TaskInstance.region_index == 1,
+                TaskInstance.working_set.is_(True),
+            )
+        )
+        assert gate.id != archived_id
+        gate.state = State.RUNNING
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{gate.id}/state",
+            json={
+                "state": state,
+                "end_date": DEFAULT_END_DATE.isoformat(),
+                "loop_decision": {"stop": True, "reason": "second"},
+            },
+        )
+
+        assert response.status_code == 204, response.text
+        session.expire_all()
+        assert gate.state == state
+        assert {
+            ti.id for ti in gate.dag_run.get_task_instances(session=session) if ti.region_index == 2
+        } == successor_ids
+        assert _stored_loop_decision_reasons(session, archived_id) == ["first"]
+        assert _stored_loop_decision_reasons(session, gate.id) == []
+
+    @pytest.mark.parametrize(
+        ("payload", "expected"),
+        [
+            ({"state": "success", "loop_decision": {"stop": False, "reason": "score 0.7"}}, ["score 0.7"]),
+            ({"state": "failed", "loop_decision": {"stop": False, "reason": "score 0.8"}}, ["score 0.8"]),
+            ({"state": "success", "loop_decision": {"stop": False}}, []),
+            ({"state": "success", "loop_decision": {"stop": False, "reason": ""}}, []),
+        ],
+        ids=["success", "failed-with-decision", "no-reason", "empty-reason"],
+    )
+    def test_loop_gate_records_the_reason_of_its_decision(
+        self, client, session, running_loop_gate, payload, expected
+    ):
+        gate = running_loop_gate
+
+        response = client.patch(
+            f"/execution/task-instances/{gate.id}/state",
+            json={**payload, "end_date": DEFAULT_END_DATE.isoformat()},
+        )
+
+        assert response.status_code == 204, response.text
+        session.expire_all()
+        assert _stored_loop_decision_reasons(session, gate.id) == expected
+
+    def test_loop_gate_rejects_a_reason_over_the_byte_limit(self, client, session, running_loop_gate):
+        gate = running_loop_gate
+
+        response = client.patch(
+            f"/execution/task-instances/{gate.id}/state",
+            json={
+                "state": "success",
+                "end_date": DEFAULT_END_DATE.isoformat(),
+                "loop_decision": {"stop": False, "reason": "é" * 257},
+            },
+        )
+
+        assert response.status_code == 422
+        session.expire_all()
+        assert gate.state == State.RUNNING
+
+    @pytest.mark.parametrize(
+        ("interruption", "expected_state", "expected_status"),
+        [("clear", State.RESTARTING, 409), ("failed", State.FAILED, 409)],
+    )
+    def test_delayed_retry_report_preserves_external_state(
+        self, client, session, create_task_instance, interruption, expected_state, expected_status
+    ):
+        ti = create_task_instance(state=State.RUNNING, start_date=DEFAULT_START_DATE, session=session)
+        session.commit()
+        old_id = ti.id
+
+        if interruption == "clear":
+            clear_task_instances([ti], session=session)
+        else:
+            ti.set_state(State.FAILED, session=session)
+        session.commit()
+        expected_id = ti.id
+        expected_end_date = ti.end_date
+
+        response = client.patch(
+            f"/execution/task-instances/{old_id}/state",
+            json={"state": State.UP_FOR_RETRY, "end_date": DEFAULT_END_DATE.isoformat()},
+        )
+
+        assert response.status_code == expected_status
+        session.refresh(ti)
+        assert ti.id == expected_id
+        assert ti.state == expected_state
+        assert ti.end_date == expected_end_date
+        if interruption == "clear":
+            assert ti.id == old_id
+
+    @pytest.mark.parametrize("state", [State.SUCCESS, State.FAILED, State.RUNNING])
+    def test_stopped_report_preserves_server_state(self, client, session, create_task_instance, state):
+        ti = create_task_instance(task_id="stopped_preserves_state", state=state)
+        ti.hostname = "worker"
+        ti.pid = 123
+        session.commit()
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/state",
+            json={
+                "state": "server_terminated",
+                "end_date": DEFAULT_END_DATE.isoformat(),
+                "hostname": "worker",
+                "pid": 123,
+            },
+        )
+        assert response.status_code == (409 if state == State.RUNNING else 204)
+        session.refresh(ti)
+        assert ti.state == state
+
+    @pytest.mark.parametrize(
+        ("region_index", "locks_run"),
+        [(-1, False), (0, True)],
+    )
+    def test_stopped_report_locks_dag_run_only_for_regional_task(
+        self, client, session, create_task_instance, mocker, region_index, locks_run
+    ):
+        ti = create_task_instance(task_id="stopped_lock", state=State.SUCCESS)
+        ti.hostname = "worker"
+        ti.pid = 123
+        ti.region_index = region_index
+        session.commit()
+        execute = Session.execute
+        locked_tables = []
+
+        def record_locks(request_session, statement, *args, **kwargs):
+            if isinstance(statement, Select) and statement._for_update_arg is not None:
+                locked_tables.extend(getattr(table, "name", None) for table in statement.get_final_froms())
+            return execute(request_session, statement, *args, **kwargs)
+
+        mocker.patch.object(Session, "execute", autospec=True, side_effect=record_locks)
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/state",
+            json={
+                "state": "server_terminated",
+                "end_date": DEFAULT_END_DATE.isoformat(),
+                "hostname": "worker",
+                "pid": 123,
+            },
+        )
+
+        assert response.status_code == 204
+        assert ("dag_run" in locked_tables) == locks_run
+
+    @pytest.mark.parametrize("matching_worker", [True, False])
+    @pytest.mark.parametrize("missing_definition", [None, "dag", "task"])
+    @pytest.mark.parametrize("max_tries", [0, 7])
+    def test_stopped_worker_completes_restart_once(
+        self, client, session, create_task_instance, mocker, matching_worker, missing_definition, max_tries
+    ):
+        ti = create_task_instance(
+            task_id="stopped_restart",
+            state=State.RESTARTING,
+            start_date=DEFAULT_START_DATE,
+            default_args={"retries": 2},
+        )
+        ti.hostname = "original"
+        ti.pid = 123
+        ti.try_number = 3
+        ti.max_tries = max_tries
+        old_id = ti.id
+        session.commit()
+        payload = {
+            "state": "server_terminated",
+            "end_date": DEFAULT_END_DATE.isoformat(),
+            "hostname": "original" if matching_worker else "duplicate",
+            "pid": 123,
+        }
+
+        if missing_definition == "dag":
+            mocker.patch("airflow.models.dagbag.DBDagBag.get_dag_for_run", autospec=True, return_value=None)
+        elif missing_definition == "task":
+            mocker.patch(
+                "airflow.serialization.definitions.dag.SerializedDAG.get_task",
+                autospec=True,
+                side_effect=TaskNotFound("Task was removed"),
+            )
+
+        response = client.patch(f"/execution/task-instances/{old_id}/state", json=payload)
+
+        assert response.status_code == (204 if matching_worker else 409)
+        session.expunge_all()
+        current = session.scalar(select(TaskInstance).where(TaskInstance.task_id == "stopped_restart"))
+        if not matching_worker:
+            assert (current.id, current.try_number, current.state) == (old_id, 3, State.RESTARTING)
+            return
+        assert current.id != old_id
+        assert current.try_number == 4
+        expected_max_tries = max(max_tries, 3) if missing_definition else 5
+        assert current.max_tries == expected_max_tries
+        assert current.state is None
+        history = session.scalar(
+            select(TaskInstance)
+            .where(TaskInstance.working_set.is_(None))
+            .where(TaskInstance.id == old_id)
+            .execution_options(include_all_attempts=True)
+        )
+        assert history.try_number == 3
+        assert history.end_date == DEFAULT_END_DATE
+        new_id = current.id
+        response = client.patch(f"/execution/task-instances/{old_id}/state", json=payload)
+        assert response.status_code == 204
+        session.refresh(current)
+        assert (current.id, current.try_number, current.state) == (new_id, 4, None)
+        assert current.max_tries == expected_max_tries
+        assert session.scalars(
+            select(TaskInstance)
+            .where(TaskInstance.working_set.is_(None))
+            .where(TaskInstance.id == old_id)
+            .execution_options(include_all_attempts=True)
+        ).all() == [history]
+
+    @pytest.mark.parametrize("first_report", ["api", "executor"])
+    @pytest.mark.parametrize("executor_state", [State.SUCCESS, State.FAILED])
+    @pytest.mark.parametrize(
+        ("definition", "lookup_error", "expectation"),
+        [
+            pytest.param("available", None, nullcontext(), id="available"),
+            pytest.param("missing_dag", None, nullcontext(), id="missing_dag"),
+            pytest.param("missing_task", TaskNotFound("Task was removed"), nullcontext(), id="missing_task"),
+            pytest.param(
+                "broken_task",
+                RuntimeError("lookup failed"),
+                pytest.raises(RuntimeError, match="lookup failed"),
+                id="broken_task",
+            ),
+        ],
+    )
+    def test_restart_reports_handle_definition_lookup_in_either_order(
+        self,
+        client,
+        session,
+        create_task_instance,
+        mocker,
+        first_report,
+        executor_state,
+        definition,
+        lookup_error,
+        expectation,
+    ):
+        ti = create_task_instance(
+            task_id="restart_reports",
+            state=State.RESTARTING,
+            start_date=DEFAULT_START_DATE,
+            default_args={"retries": 2},
+        )
+        ti.hostname, ti.pid = "worker", 123
+        ti.try_number, ti.max_tries = 3, 0
+        old_id = ti.id
+        session.commit()
+        if definition == "missing_dag":
+            mocker.patch.object(DBDagBag, "get_dag_for_run", autospec=True, return_value=None)
+        elif lookup_error is not None:
+            mocker.patch(
+                "airflow.serialization.definitions.dag.SerializedDAG.get_task",
+                autospec=True,
+                side_effect=lookup_error,
+            )
+        executor = MockExecutor(do_update=False)
+        executor_key = executor.get_task_key(ti)
+        reports = ["api", "executor"] if first_report == "api" else ["executor", "api"]
+        replacement_id = None
+
+        for report in reports * 2:
+            with expectation:
+                if report == "api":
+                    response = client.patch(
+                        f"/execution/task-instances/{old_id}/state",
+                        json={
+                            "state": "server_terminated",
+                            "end_date": DEFAULT_END_DATE.isoformat(),
+                            "hostname": "worker",
+                            "pid": 123,
+                        },
+                    )
+                    assert response.status_code == 204
+                else:
+                    executor.event_buffer[executor_key] = executor_state, None
+                    SchedulerJobRunner.process_executor_events(executor, None, DBDagBag(), session)
+                    session.commit()
+            session.expunge_all()
+            current = session.scalar(select(TaskInstance).where(TaskInstance.task_id == "restart_reports"))
+            if definition == "broken_task":
+                assert (current.id, current.try_number, current.state, current.max_tries) == (
+                    old_id,
+                    3,
+                    State.RESTARTING,
+                    0,
+                )
+                assert (
+                    session.scalar(
+                        select(TaskInstance)
+                        .where(TaskInstance.working_set.is_(None))
+                        .where(TaskInstance.task_id == "restart_reports")
+                        .execution_options(include_all_attempts=True)
+                    )
+                    is None
+                )
+                return
+            assert current.id != old_id
+            if replacement_id is None:
+                replacement_id = current.id
+            assert (current.id, current.try_number, current.state) == (replacement_id, 4, None)
+            assert current.max_tries == (5 if definition == "available" else 3)
+            history = session.scalars(
+                select(TaskInstance)
+                .where(TaskInstance.working_set.is_(None))
+                .where(TaskInstance.task_id == "restart_reports")
+                .execution_options(include_all_attempts=True)
+            ).one()
+            assert (history.id, history.try_number, history.state) == (old_id, 3, State.FAILED)
+
+    def setup_method(self):
+        clear_db_assets()
+        clear_db_logs()
+        clear_db_runs()
+
+    def teardown_method(self):
+        clear_db_assets()
+        clear_db_logs()
+        clear_db_runs()
+
+    @pytest.mark.parametrize(
+        ("state", "end_date", "expected_state"),
+        [
+            (State.SUCCESS, DEFAULT_END_DATE, State.SUCCESS),
+            (State.FAILED, DEFAULT_END_DATE, State.FAILED),
+            (State.SKIPPED, DEFAULT_END_DATE, State.SKIPPED),
+        ],
+    )
+    def test_ti_update_state_to_terminal(
+        self, client, session, create_task_instance, state, end_date, expected_state
+    ):
+        ti = create_task_instance(
+            task_id="test_ti_update_state_to_terminal",
+            start_date=DEFAULT_START_DATE,
+            state=State.RUNNING,
+        )
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/state",
+            json={
+                "state": state,
+                "end_date": end_date.isoformat(),
+            },
+        )
+
+        assert response.status_code == 204
+        assert response.text == ""
+
+        session.expire_all()
+
+        ti = session.get(TaskInstance, ti.id)
+        assert ti.state == expected_state
+        assert ti.end_date == end_date
+
+    @pytest.mark.parametrize(
+        ("payload", "expected_event"),
+        [
+            pytest.param(
+                {"state": State.SUCCESS, "end_date": DEFAULT_END_DATE.isoformat()},
+                State.SUCCESS,
+                id="success",
+            ),
+            pytest.param(
+                {"state": State.FAILED, "end_date": DEFAULT_END_DATE.isoformat()},
+                State.FAILED,
+                id="failed",
+            ),
+            pytest.param(
+                {"state": State.SKIPPED, "end_date": DEFAULT_END_DATE.isoformat()},
+                State.SKIPPED,
+                id="skipped",
+            ),
+            pytest.param(
+                {"state": State.UP_FOR_RETRY, "end_date": DEFAULT_END_DATE.isoformat()},
+                TaskInstanceState.UP_FOR_RETRY.value,
+                id="up_for_retry",
+            ),
+            pytest.param(
+                {
+                    "state": "deferred",
+                    "trigger_kwargs": {"key": "value", "moment": "2026-02-18T00:00:00Z"},
+                    "trigger_timeout": "P1D",
+                    "classpath": "my-classpath",
+                    "next_method": "execute_callback",
+                },
+                TaskInstanceState.DEFERRED.value,
+                id="deferred",
+            ),
+            pytest.param(
+                {
+                    "state": "up_for_reschedule",
+                    "reschedule_date": "2026-02-18T11:03:00+00:00",
+                    "end_date": DEFAULT_END_DATE.isoformat(),
+                },
+                TaskInstanceState.UP_FOR_RESCHEDULE.value,
+                id="up_for_reschedule",
+            ),
+        ],
+    )
+    def test_ti_update_state_creates_audit_log(
+        self, client, session, create_task_instance, payload, expected_event
+    ):
+        """Test that state transition creates an audit log record."""
+        ti = create_task_instance(
+            task_id="test_ti_update_state_creates_audit_log",
+            start_date=DEFAULT_START_DATE,
+            state=State.RUNNING,
+            hostname="random-hostname",
+        )
+        session.commit()
+
+        emitting_id = ti.id
+        response = client.patch(
+            f"/execution/task-instances/{emitting_id}/state",
+            json=payload,
+        )
+
+        assert response.status_code == 204
+
+        logs = session.scalars(select(Log).where(Log.dag_id == ti.dag_id)).all()
+        assert len(logs) == 1
+        assert logs[0].event == expected_event
+        assert logs[0].task_instance_id == emitting_id
+        assert logs[0].task_id == ti.task_id
+        assert logs[0].dag_id == ti.dag_id
+        assert logs[0].run_id == ti.run_id
+        assert logs[0].map_index == ti.map_index
+        assert logs[0].try_number == ti.try_number
+        assert logs[0].logical_date == ti.dag_run.logical_date
+        assert logs[0].owner == ti.task.owner
+        assert logs[0].extra == '{"host_name": "random-hostname"}'
+
+    @pytest.mark.parametrize(
+        ("state", "end_date", "expected_state", "rendered_map_index"),
+        [
+            (State.SUCCESS, DEFAULT_END_DATE, State.SUCCESS, DEFAULT_RENDERED_MAP_INDEX),
+            (State.FAILED, DEFAULT_END_DATE, State.FAILED, DEFAULT_RENDERED_MAP_INDEX),
+            (State.SKIPPED, DEFAULT_END_DATE, State.SKIPPED, DEFAULT_RENDERED_MAP_INDEX),
+        ],
+    )
+    def test_ti_update_state_to_terminal_with_rendered_map_index(
+        self, client, session, create_task_instance, state, end_date, expected_state, rendered_map_index
+    ):
+        ti = create_task_instance(
+            task_id="test_ti_update_state_to_terminal_with_rendered_map_index",
+            start_date=DEFAULT_START_DATE,
+            state=State.RUNNING,
+        )
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/state",
+            json={"state": state, "end_date": end_date.isoformat(), "rendered_map_index": rendered_map_index},
+        )
+
+        assert response.status_code == 204
+        assert response.text == ""
+
+        session.expire_all()
+
+        ti = session.get(TaskInstance, ti.id)
+        assert ti.state == expected_state
+        assert ti.end_date == end_date
+        assert ti.rendered_map_index == rendered_map_index
+
+    @pytest.mark.parametrize(
+        "task_outlets",
+        [
+            pytest.param([{"name": "my-task", "uri": "s3://bucket/my-task", "type": "Asset"}], id="asset"),
+            pytest.param([{"name": "my-task", "type": "AssetNameRef"}], id="name-ref"),
+            pytest.param([{"uri": "s3://bucket/my-task", "type": "AssetUriRef"}], id="uri-ref"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("outlet_events", "expected_extra"),
+        [
+            pytest.param([], {}, id="default"),
+            pytest.param(
+                [
+                    {
+                        "dest_asset_key": {"name": "my-task", "uri": "s3://bucket/my-task"},
+                        "extra": {"foo": 1},
+                    },
+                    {
+                        "dest_asset_key": {"name": "my-task-2", "uri": "s3://bucket/my-task-2"},
+                        "extra": {"foo": 2},
+                    },
+                ],
+                {"foo": 1},
+                id="extra",
+            ),
+        ],
+    )
+    def test_ti_update_state_to_success_with_asset_events(
+        self, client, session, create_task_instance, task_outlets, outlet_events, expected_extra
+    ):
+        asset = AssetModel(
+            id=1,
+            name="my-task",
+            uri="s3://bucket/my-task",
+            group="asset",
+            extra={},
+        )
+        asset_active = AssetActive.for_asset(asset)
+        session.add_all([asset, asset_active])
+
+        ti = create_task_instance(
+            task_id="test_ti_update_state_to_success_with_asset_events",
+            start_date=DEFAULT_START_DATE,
+            state=State.RUNNING,
+        )
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/state",
+            json={
+                "state": "success",
+                "end_date": DEFAULT_END_DATE.isoformat(),
+                "task_outlets": task_outlets,
+                "outlet_events": outlet_events,
+            },
+        )
+
+        assert response.status_code == 204
+        assert response.text == ""
+        session.expire_all()
+
+        event = session.scalars(select(AssetEvent)).all()
+        assert len(event) == 1
+        assert event[0].asset == AssetModel(name="my-task", uri="s3://bucket/my-task", extra={})
+        assert event[0].extra == expected_extra
+
+    def test_ti_update_state_to_success_runs_deferred_asset_listener_callbacks(
+        self, client, session, create_task_instance, listener_manager
+    ):
+        """The success endpoint runs the deferred asset listener callbacks after committing."""
+        asset_listener.clear()
+        listener_manager(asset_listener)
+
+        asset = AssetModel(id=1, name="my-task", uri="s3://bucket/my-task", group="asset", extra={})
+        session.add_all([asset, AssetActive.for_asset(asset)])
+
+        ti = create_task_instance(
+            task_id="test_ti_update_state_to_success_runs_deferred_asset_listener_callbacks",
+            start_date=DEFAULT_START_DATE,
+            state=State.RUNNING,
+        )
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/state",
+            json={
+                "state": "success",
+                "end_date": DEFAULT_END_DATE.isoformat(),
+                "task_outlets": [{"name": "my-task", "uri": "s3://bucket/my-task", "type": "Asset"}],
+                "outlet_events": [],
+            },
+        )
+
+        assert response.status_code == 204
+
+        # Notifications are deferred during registration and run by the endpoint after the
+        # TI state is committed (and the task_instance row lock released).
+        assert len(asset_listener.changed) == 1
+        assert asset_listener.changed[0].uri == "s3://bucket/my-task"
+        assert len(asset_listener.emitted) == 1
+
+    def test_ti_update_state_to_success_rolls_back_partial_asset_registration(
+        self, client, session, create_task_instance
+    ):
+        """A failure partway through asset registration rolls back the partial writes.
+
+        The endpoint's exception handler marks the TI failed and commits; the explicit rollback
+        ensures an asset event flushed before the failure is not committed alongside it.
+        """
+        asset = AssetModel(id=1, name="my-task", uri="s3://bucket/my-task", group="asset", extra={})
+        session.add_all([asset, AssetActive.for_asset(asset)])
+
+        ti = create_task_instance(
+            task_id="test_ti_update_state_to_success_rolls_back_partial_asset_registration",
+            start_date=DEFAULT_START_DATE,
+            state=State.RUNNING,
+        )
+        session.commit()
+
+        def _partial_then_fail(ti, task_outlets, outlet_events, *, session):
+            # Simulate a half-way registration: an asset event is flushed, then registration
+            # fails before the endpoint commits.
+            session.add(AssetEvent(asset_id=asset.id))
+            session.flush()
+            raise RuntimeError("boom partway through outlets")
+
+        with mock.patch.object(TaskInstance, "register_asset_changes_in_db", side_effect=_partial_then_fail):
+            response = client.patch(
+                f"/execution/task-instances/{ti.id}/state",
+                json={
+                    "state": "success",
+                    "end_date": DEFAULT_END_DATE.isoformat(),
+                    "task_outlets": [{"name": "my-task", "uri": "s3://bucket/my-task", "type": "Asset"}],
+                    "outlet_events": [],
+                },
+            )
+
+        assert response.status_code == 204
+        session.expire_all()
+        # The partially-written asset event was rolled back, and the TI is marked failed.
+        assert session.scalars(select(AssetEvent)).all() == []
+        assert session.get(TaskInstance, ti.id).state == State.FAILED
+
+    @pytest.mark.parametrize(
+        ("outlet_events", "expected_extra"),
+        [
+            pytest.param([], None, id="default"),
+            pytest.param(
+                [
+                    {
+                        "dest_asset_key": {"name": "my-task", "uri": "s3://bucket/my-task"},
+                        "source_alias_name": "simple1",
+                        "extra": {"foo": 1},
+                    },
+                    {
+                        "dest_asset_key": {"name": "my-task-2", "uri": "s3://bucket/my-task-2"},
+                        "extra": {"foo": 2},
+                    },
+                    {
+                        "dest_asset_key": {"name": "my-task-2", "uri": "s3://bucket/my-task-2"},
+                        "source_alias_name": "simple2",
+                        "extra": {"foo": 3},
+                    },
+                ],
+                {"foo": 1},
+                id="extra",
+            ),
+        ],
+    )
+    def test_ti_update_state_to_success_with_asset_alias_events(
+        self, client, session, create_task_instance, outlet_events, expected_extra
+    ):
+        asset = AssetModel(
+            id=1,
+            name="my-task",
+            uri="s3://bucket/my-task",
+            group="asset",
+            extra={},
+        )
+        asset_active = AssetActive.for_asset(asset)
+        session.add_all([asset, asset_active])
+
+        _create_asset_aliases(session, num=2)
+
+        ti = create_task_instance(
+            task_id="test_ti_update_state_to_success_with_asset_events",
+            start_date=DEFAULT_START_DATE,
+            state=State.RUNNING,
+        )
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/state",
+            json={
+                "state": "success",
+                "end_date": DEFAULT_END_DATE.isoformat(),
+                "task_outlets": [{"name": "simple1", "type": "AssetAlias"}],
+                "outlet_events": outlet_events,
+            },
+        )
+
+        assert response.status_code == 204
+        assert response.text == ""
+        session.expire_all()
+
+        events = session.scalars(select(AssetEvent)).all()
+        if expected_extra is None:
+            assert events == []
+        else:
+            assert len(events) == 1
+            assert events[0].asset == AssetModel(name="my-task", uri="s3://bucket/my-task", extra={})
+            assert events[0].extra == expected_extra
+
+    @pytest.mark.parametrize(
+        ("partition_key", "expected_status"),
+        [
+            pytest.param("a" * 250, 204, id="at_limit_accepted"),
+            pytest.param("a" * 251, 422, id="over_limit_rejected"),
+            pytest.param("", 422, id="empty_rejected"),
+            pytest.param("   ", 422, id="whitespace_rejected"),
+        ],
+    )
+    def test_ti_update_state_to_success_outlet_event_partition_key_validation(
+        self, client, session, create_task_instance, partition_key, expected_status
+    ):
+        """Outlet event partition_key content is validated server-side; invalid keys return 422."""
+        ti = create_task_instance(
+            task_id="test_outlet_event_partition_key_validation",
+            start_date=DEFAULT_START_DATE,
+            state=State.RUNNING,
+        )
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/state",
+            json={
+                "state": "success",
+                "end_date": DEFAULT_END_DATE.isoformat(),
+                "task_outlets": [],
+                "outlet_events": [
+                    {
+                        "dest_asset_key": {"name": "my-asset", "uri": "s3://bucket/my-asset"},
+                        "extra": {},
+                        "partition_key": partition_key,
+                    }
+                ],
+            },
+        )
+        assert response.status_code == expected_status
+        if expected_status == 422:
+            detail = response.json()["detail"]
+            assert detail["reason"] == "invalid_partition_key"
+
+    def test_ti_update_state_not_found(self, client, session):
+        """
+        Test that a 404 error is returned when the Task Instance does not exist.
+        """
+        task_instance_id = UUID("0182e924-0f1e-77e6-ab50-e977118bc139")
+
+        # Pre-condition: the Task Instance does not exist
+        assert session.get(TaskInstance, task_instance_id) is None
+
+        payload = {"state": "success", "end_date": "2024-10-31T12:30:00Z"}
+
+        response = client.patch(f"/execution/task-instances/{task_instance_id}/state", json=payload)
+        assert response.status_code == 404
+        assert response.json()["detail"] == {
+            "reason": "not_found",
+            "message": "Task Instance not found",
+        }
+
+    def test_ti_update_state_running_errors(self, client, session, create_task_instance, time_machine):
+        """
+        Test that a 422 error is returned when the Task Instance state is RUNNING in the payload.
+
+        Task should be set to Running state via the /execution/task-instances/{task_instance_id}/run endpoint.
+        """
+        ti = create_task_instance(
+            task_id="test_ti_update_state_running_errors",
+            state=State.QUEUED,
+            session=session,
+            start_date=DEFAULT_START_DATE,
+        )
+
+        session.commit()
+
+        response = client.patch(f"/execution/task-instances/{ti.id}/state", json={"state": "running"})
+
+        assert response.status_code == 422
+
+    def test_ti_update_state_database_error(self, client, session, create_task_instance):
+        """
+        Test that a database error is handled correctly when updating the Task Instance state.
+        """
+        ti = create_task_instance(
+            task_id="test_ti_update_state_database_error",
+            state=State.RUNNING,
+        )
+        session.commit()
+        payload = {
+            "state": "success",
+            "end_date": "2024-10-31T12:00:00Z",
+        }
+
+        execute = Session.execute
+
+        def fail_ti_update(db_session, statement, *args, **kwargs):
+            if getattr(statement, "is_update", False) and statement.table.name == "task_instance":
+                raise SQLAlchemyError("Database error")
+            return execute(db_session, statement, *args, **kwargs)
+
+        with mock.patch(
+            "airflow.api_fastapi.common.db.common.Session.execute",
+            autospec=True,
+            side_effect=fail_ti_update,
+        ):
+            response = client.patch(f"/execution/task-instances/{ti.id}/state", json=payload)
+            assert response.status_code == 500
+            detail = response.json()["detail"]
+            assert isinstance(detail, dict)
+            assert detail.get("reason") == "Database error"
+
+    @pytest.mark.parametrize(
+        ("pgcode", "expected_status", "expected_state"),
+        [
+            pytest.param("40P01", 500, State.RUNNING, id="deadlock-is-retryable"),
+            pytest.param("55P03", 204, State.FAILED, id="other-operational-error-fails-ti"),
+            pytest.param("psycopg3", 500, State.RUNNING, id="psycopg3-deadlock-is-retryable"),
+        ],
+    )
+    def test_ti_update_state_deadlock_returns_5xx_instead_of_failing(
+        self, client, session, create_task_instance, mocker, pgcode, expected_status, expected_state
+    ):
+        ti = create_task_instance(
+            task_id="test_ti_update_state_deadlock_returns_5xx_instead_of_failing",
+            state=State.RUNNING,
+        )
+        session.commit()
+        if pgcode == "psycopg3":
+            errors = pytest.importorskip(
+                "psycopg.errors", reason="Test only runs when psycopg v3 is installed."
+            )
+            orig = errors.DeadlockDetected("deadlock detected")
+        else:
+            orig = mock.Mock(sqlstate=None, pgcode=pgcode, args=("db error",))
+        mocker.patch.object(
+            task_instances_route,
+            "_create_ti_state_update_query_and_update_state",
+            autospec=True,
+            side_effect=OperationalError("statement", {}, orig),
+        )
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/state",
+            json={"state": "success", "end_date": DEFAULT_END_DATE.isoformat()},
+        )
+
+        assert response.status_code == expected_status
+        session.expire_all()
+        assert session.get(TaskInstance, ti.id).state == expected_state
+
+    def test_ti_run_database_error(self, client, session, create_task_instance):
+        """
+        Test that a database error is handled correctly when starting the Task Instance.
+        """
+        ti = create_task_instance(
+            task_id="test_ti_run_database_error",
+            state=State.QUEUED,
+            dagrun_state=DagRunState.RUNNING,
+            session=session,
+            dag_id=str(uuid4()),
+        )
+        session.commit()
+
+        payload = {
+            "state": "running",
+            "hostname": "hostname",
+            "unixname": "unixname",
+            "pid": 123,
+            "start_date": "2024-10-31T12:00:00Z",
+        }
+
+        with mock.patch(
+            "airflow.api_fastapi.common.db.common.Session.execute",
+            side_effect=[
+                mock.Mock(
+                    one=mock.Mock(
+                        return_value=SimpleNamespace(
+                            state="queued",
+                            dag_id="dag",
+                            run_id="run",
+                            task_id="task",
+                            region_index=-1,
+                            try_number=1,
+                            max_tries=0,
+                            start_date=None,
+                            queue="default",
+                            queued_dttm=timezone.utcnow(),
+                            next_method=None,
+                            hostname=None,
+                            unixname=None,
+                            pid=None,
+                            next_kwargs=None,
+                            logical_date=timezone.utcnow(),
+                            owners="test_owner",
+                        )
+                    )
+                ),
+                SQLAlchemyError("Database error"),
+            ],
+        ):
+            response = client.patch(f"/execution/task-instances/{ti.id}/run", json=payload)
+
+        assert response.status_code == 500
+        detail = response.json()["detail"]
+        assert isinstance(detail, dict)
+        assert detail.get("reason") == "Database error"
+
+    @pytest.mark.parametrize("queues_enabled", [False, True])
+    def test_ti_update_state_to_deferred(
+        self, client, session, create_task_instance, time_machine, queues_enabled: bool
+    ):
+        """
+        Test that tests if the transition to deferred state is handled correctly.
+        """
+        with conf_vars({("triggerer", "queues_enabled"): str(queues_enabled)}):
+            ti = create_task_instance(
+                task_id="test_ti_update_state_to_deferred",
+                state=State.RUNNING,
+                session=session,
+            )
+            session.commit()
+
+            instant = timezone.datetime(2024, 11, 22)
+            time_machine.move_to(instant, tick=False)
+
+            payload = {
+                "state": "deferred",
+                # expected format is now in serde serialized format
+                "trigger_kwargs": {
+                    "key": "value",
+                    "moment": {
+                        "__classname__": "datetime.datetime",
+                        "__version__": 2,
+                        "__data__": {
+                            "timestamp": 1734480001.0,
+                            "tz": {
+                                "__classname__": "builtins.tuple",
+                                "__version__": 1,
+                                "__data__": ["UTC", "pendulum.tz.timezone.Timezone", 1, True],
+                            },
+                        },
+                    },
+                },
+                "trigger_timeout": "P1D",  # 1 day
+                "queue": "default" if queues_enabled else None,
+                "classpath": "my-classpath",
+                "next_method": "execute_callback",
+                # expected format is now in serde serialized format
+                "next_kwargs": {
+                    "foo": {
+                        "__classname__": "datetime.datetime",
+                        "__version__": 2,
+                        "__data__": {
+                            "timestamp": 1734480000.0,
+                            "tz": {
+                                "__classname__": "builtins.tuple",
+                                "__version__": 1,
+                                "__data__": ["UTC", "pendulum.tz.timezone.Timezone", 1, True],
+                            },
+                        },
+                    },
+                    "bar": "abc",
+                },
+            }
+
+            response = client.patch(f"/execution/task-instances/{ti.id}/state", json=payload)
+
+            assert response.status_code == 204
+            assert response.text == ""
+
+            session.expire_all()
+
+            tis = session.scalars(select(TaskInstance)).all()
+            assert len(tis) == 1
+
+            assert tis[0].state == TaskInstanceState.DEFERRED
+            assert tis[0].next_method == "execute_callback"
+
+            assert tis[0].next_kwargs == {
+                "foo": {
+                    "__classname__": "datetime.datetime",
+                    "__version__": 2,
+                    "__data__": {
+                        "timestamp": 1734480000.0,
+                        "tz": {
+                            "__classname__": "builtins.tuple",
+                            "__version__": 1,
+                            "__data__": ["UTC", "pendulum.tz.timezone.Timezone", 1, True],
+                        },
+                    },
+                },
+                "bar": "abc",
+            }
+            assert tis[0].trigger_timeout == timezone.make_aware(
+                datetime(2024, 11, 23), timezone=timezone.utc
+            )
+
+            t = session.scalars(select(Trigger)).all()
+            assert len(t) == 1
+            assert t[0].created_date == instant
+            assert t[0].classpath == "my-classpath"
+            assert t[0].kwargs == {
+                "key": "value",
+                "moment": datetime(2024, 12, 18, 00, 00, 1, tzinfo=timezone.utc),
+            }
+            if queues_enabled:
+                assert t[0].queue == "default"
+            else:
+                assert t[0].queue is None
+            assert (t[0].dag_id, t[0].owner_ref) == (ti.dag_id, {"ti_id": str(ti.id)})
+
+    @staticmethod
+    def _defer_ti_in_team_bundle(client, session, create_task_instance):
+        """Map the TI's Dag to a bundle/team, then defer it via the Execution API."""
+        from airflow.models.dagbundle import DagBundleModel
+        from airflow.models.team import Team
+
+        ti = create_task_instance(
+            task_id="test_ti_deferred_team",
+            state=State.RUNNING,
+            session=session,
+        )
+
+        bundle_name = "bundle_deferred_team_test"
+        team_name = "team_deferred_test"
+        bundle = session.get(DagBundleModel, bundle_name) or DagBundleModel(name=bundle_name)
+        team = session.get(Team, team_name) or Team(name=team_name)
+        if team not in bundle.teams:
+            bundle.teams.append(team)
+        session.add(bundle)
+        session.flush()
+        session.execute(update(DagModel).where(DagModel.dag_id == ti.dag_id).values(bundle_name=bundle_name))
+        session.commit()
+
+        payload = {
+            "state": "deferred",
+            "trigger_kwargs": {"key": "value"},
+            "classpath": "my-classpath",
+            "next_method": "execute_callback",
+        }
+        response = client.patch(f"/execution/task-instances/{ti.id}/state", json=payload)
+        assert response.status_code == 204
+        return team_name
+
+    @conf_vars({("core", "multi_team"): "True"})
+    def test_ti_update_state_to_deferred_populates_trigger_team_name(
+        self, client, session, create_task_instance, time_machine
+    ):
+        """Trigger created on deferral gets team_name from the TI's bundle."""
+        from airflow.models.trigger import Trigger
+
+        time_machine.move_to(timezone.datetime(2024, 11, 22), tick=False)
+
+        team_name = self._defer_ti_in_team_bundle(client, session, create_task_instance)
+
+        session.expire_all()
+        trigger = session.scalars(select(Trigger)).one()
+        assert trigger.team_name == team_name
+
+    @conf_vars({("core", "multi_team"): "False"})
+    def test_ti_update_state_to_deferred_skips_trigger_team_name_when_multi_team_disabled(
+        self, client, session, create_task_instance, time_machine
+    ):
+        """When multi_team is disabled, the trigger team_name stays NULL."""
+        from airflow.models.trigger import Trigger
+
+        time_machine.move_to(timezone.datetime(2024, 11, 22), tick=False)
+
+        self._defer_ti_in_team_bundle(client, session, create_task_instance)
+
+        session.expire_all()
+        trigger = session.scalars(select(Trigger)).one()
+        assert trigger.team_name is None
+
+    def test_ti_update_state_to_reschedule(self, client, session, create_task_instance, time_machine):
+        """
+        Test that tests if the transition to reschedule state is handled correctly.
+        """
+        instant = timezone.datetime(2024, 10, 30)
+        time_machine.move_to(instant, tick=False)
+
+        ti = create_task_instance(
+            task_id="test_ti_update_state_to_reschedule",
+            state=State.RUNNING,
+            session=session,
+        )
+        ti.start_date = instant
+        session.commit()
+
+        payload = {
+            "state": "up_for_reschedule",
+            "reschedule_date": "2024-10-31T11:03:00+00:00",
+            "end_date": DEFAULT_END_DATE.isoformat(),
+        }
+
+        response = client.patch(f"/execution/task-instances/{ti.id}/state", json=payload)
+
+        assert response.status_code == 204
+        assert response.text == ""
+
+        session.expire_all()
+
+        tis = session.scalars(select(TaskInstance)).all()
+        assert len(tis) == 1
+        assert tis[0].state == TaskInstanceState.UP_FOR_RESCHEDULE
+        assert tis[0].next_method is None
+        assert tis[0].next_kwargs is None
+        assert tis[0].duration == 129600
+
+        trs = session.scalars(select(TaskReschedule)).all()
+        assert len(trs) == 1
+        assert trs[0].task_instance.dag_id == "dag"
+        assert trs[0].task_instance.task_id == "test_ti_update_state_to_reschedule"
+        assert trs[0].task_instance.run_id == "test"
+        assert trs[0].ti_id == tis[0].id
+        assert trs[0].start_date == instant
+        assert trs[0].end_date == DEFAULT_END_DATE
+        assert trs[0].reschedule_date == timezone.parse("2024-10-31T11:03:00+00:00")
+        assert trs[0].task_instance.map_index == -1
+        assert trs[0].duration == 129600
+
+    @pytest.mark.backend("mysql")
+    def test_ti_update_state_reschedule_mysql_limit(
+        self, client, session, create_task_instance, time_machine
+    ):
+        """Test that the reschedule date is validated against MySQL's TIMESTAMP limit."""
+        instant = timezone.datetime(2024, 10, 30)
+        time_machine.move_to(instant, tick=False)
+
+        ti = create_task_instance(
+            task_id="test_ti_update_state_reschedule_mysql_limit",
+            state=State.RUNNING,
+            session=session,
+        )
+        ti.start_date = instant
+        session.commit()
+
+        # Date beyond MySQL's TIMESTAMP limit (2038-01-19 03:14:07)
+        future_date = timezone.datetime(2038, 1, 19, 3, 14, 8)
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/state",
+            json={
+                "state": TaskInstanceState.UP_FOR_RESCHEDULE,
+                "reschedule_date": future_date.isoformat(),
+                "end_date": DEFAULT_END_DATE.isoformat(),
+            },
+        )
+
+        assert response.status_code == 204
+        assert response.text == ""
+
+        session.expire_all()
+
+        ti = session.get(TaskInstance, ti.id)
+        assert ti.state == State.FAILED
+
+    # DataError handling: an oversized field the DB rejects must surface as 422 (not an opaque 500
+    # or a silent mark-FAILED). Only MySQL/Postgres enforce varchar limits; SQLite ignores them.
+    @pytest.mark.backend("mysql", "postgres")
+    def test_ti_run_oversized_field_returns_422(self, client, session, create_task_instance):
+        """ti_run: a DataError on the running-state UPDATE surfaces as 422, not 500."""
+        ti = create_task_instance(
+            task_id="test_ti_run_dataerror",
+            state=State.QUEUED,
+            dagrun_state=DagRunState.RUNNING,
+            session=session,
+            dag_id=str(uuid4()),
+        )
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/run",
+            json={
+                "state": "running",
+                "hostname": "h" * 1100,  # > hostname varchar(1000)
+                "unixname": "u",
+                "pid": 1,
+                "start_date": "2024-09-30T12:00:00Z",
+            },
+        )
+        assert response.status_code == 422
+        assert response.json()["detail"]["reason"] == "Value rejected by database"
+
+    @pytest.mark.backend("mysql", "postgres")
+    def test_ti_update_state_oversized_field_returns_422(self, client, session, create_task_instance):
+        """ti_update_state: a DataError on the state UPDATE surfaces as 422, not 500."""
+        ti = create_task_instance(
+            task_id="test_ti_update_dataerror",
+            state=State.RUNNING,
+            dagrun_state=DagRunState.RUNNING,
+            session=session,
+            dag_id=str(uuid4()),
+        )
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/state",
+            json={
+                "state": "up_for_retry",
+                "end_date": "2024-09-30T12:00:00Z",
+                "rendered_map_index": "x" * 300,  # > rendered_map_index varchar(250)
+            },
+        )
+        assert response.status_code == 422
+        assert response.json()["detail"]["reason"] == "Value rejected by database"
+
+    @pytest.mark.backend("mysql", "postgres")
+    def test_ti_update_state_dataerror_does_not_silently_fail(self, client, session, create_task_instance):
+        """A DataError raised while building the state update must not silently mark the TI FAILED."""
+        ti = create_task_instance(
+            task_id="test_ti_defer_dataerror",
+            state=State.RUNNING,
+            dagrun_state=DagRunState.RUNNING,
+            session=session,
+            dag_id=str(uuid4()),
+        )
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/state",
+            json={
+                "state": "deferred",
+                "classpath": "c" * 1100,  # > trigger.classpath varchar(1000)
+                "next_method": "execute_complete",
+                "trigger_kwargs": {},
+                "next_kwargs": {},
+            },
+        )
+        assert response.status_code == 422
+        assert response.json()["detail"]["reason"] == "Value rejected by database"
+
+        # The bare `except Exception` would have marked this FAILED behind the worker's back.
+        session.expire_all()
+        assert session.get(TaskInstance, ti.id).state == State.RUNNING
+
+    def test_ti_update_state_handle_retry(self, client, session, create_task_instance):
+        ti = create_task_instance(
+            task_id="test_ti_update_state_to_retry",
+            state=State.RUNNING,
+        )
+        ti.try_number = 3
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/state",
+            json={
+                "state": State.UP_FOR_RETRY,
+                "end_date": DEFAULT_END_DATE.isoformat(),
+            },
+        )
+
+        assert response.status_code == 204
+        assert response.text == ""
+
+        ti = session.scalar(
+            select(TaskInstance).filter_by(task_id=ti.task_id, run_id=ti.run_id, dag_id=ti.dag_id)
+        )
+        # ti = session.get(TaskInstance, ti.id)
+        assert ti.state == State.UP_FOR_RETRY
+        assert ti.next_method is None
+        assert ti.next_kwargs is None
+
+        tih = session.scalars(
+            select(TaskInstance)
+            .where(TaskInstance.working_set.is_(None))
+            .where(TaskInstance.task_id == ti.task_id, TaskInstance.run_id == ti.run_id)
+            .execution_options(include_all_attempts=True)
+        ).one()
+        assert tih.id
+        assert tih.id != ti.id
+        assert tih.try_number == 3
+        assert ti.try_number == 4
+
+    def test_retry_helper_failure_keeps_failed_attempt_current(self, client, session, create_task_instance):
+        ti = create_task_instance(task_id="retry_helper_failure", state=State.RUNNING)
+        attempt_id = ti.id
+        session.commit()
+
+        with mock.patch(
+            "airflow.api_fastapi.execution_api.routes.task_instances._create_ti_state_update_query_and_update_state",
+            autospec=True,
+            side_effect=RuntimeError("state update failed"),
+        ):
+            response = client.patch(
+                f"/execution/task-instances/{attempt_id}/state",
+                json={"state": State.UP_FOR_RETRY, "end_date": DEFAULT_END_DATE.isoformat()},
+            )
+
+        assert response.status_code == 204
+        session.expire_all()
+        attempts = session.scalars(
+            select(TaskInstance).where(TaskInstance.task_id == "retry_helper_failure")
+        ).all()
+        assert len(attempts) == 1
+        assert attempts[0].id == attempt_id
+        assert attempts[0].state == State.FAILED
+        assert attempts[0].working_set is True
+
+    @pytest.mark.parametrize("replacement_state", [State.UP_FOR_RETRY, State.RUNNING])
+    @pytest.mark.parametrize("reported_state", [State.UP_FOR_RETRY, State.FAILED])
+    def test_retired_attempt_report_does_not_change_replacement(
+        self, client, session, create_task_instance, replacement_state, reported_state
+    ):
+        ti = create_task_instance(task_id="retired_attempt_report", state=State.RUNNING)
+        ti.try_number = 3
+        old_id = ti.id
+        session.commit()
+        payload = {"state": State.UP_FOR_RETRY, "end_date": DEFAULT_END_DATE.isoformat()}
+        assert client.patch(f"/execution/task-instances/{old_id}/state", json=payload).status_code == 204
+        session.expunge_all()
+        replacement = session.scalar(
+            select(TaskInstance).where(TaskInstance.task_id == "retired_attempt_report")
+        )
+        replacement.state = replacement_state
+        replacement.external_executor_id = "replacement-worker"
+        replacement_id = replacement.id
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{old_id}/state", json={**payload, "state": reported_state}
+        )
+
+        assert response.status_code == 410
+        session.refresh(replacement)
+        assert (
+            replacement.id,
+            replacement.try_number,
+            replacement.state,
+            replacement.external_executor_id,
+        ) == (
+            replacement_id,
+            4,
+            replacement_state,
+            "replacement-worker",
+        )
+        history = session.scalars(
+            select(TaskInstance)
+            .where(TaskInstance.working_set.is_(None))
+            .where(TaskInstance.task_id == "retired_attempt_report")
+            .execution_options(include_all_attempts=True)
+        ).all()
+        assert [(attempt.id, attempt.try_number) for attempt in history] == [(old_id, 3)]
+
+    def test_ti_update_state_retry_with_policy_overrides(self, client, session, create_task_instance):
+        """Test that retry_delay_seconds and retry_reason from a RetryPolicy are stored on the TI."""
+        ti = create_task_instance(
+            task_id="test_retry_policy_override",
+            state=State.RUNNING,
+        )
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/state",
+            json={
+                "state": State.UP_FOR_RETRY,
+                "end_date": DEFAULT_END_DATE.isoformat(),
+                "retry_delay_seconds": 42.5,
+                "retry_reason": "Rate limit: backing off",
+            },
+        )
+
+        assert response.status_code == 204
+
+        ti = session.scalar(
+            select(TaskInstance).filter_by(task_id=ti.task_id, run_id=ti.run_id, dag_id=ti.dag_id)
+        )
+        assert ti.state == State.UP_FOR_RETRY
+        assert ti.retry_delay_override == 42.5
+        assert ti.retry_reason == "Rate limit: backing off"
+        assert ti.retry_at == DEFAULT_END_DATE + timedelta(seconds=42.5)
+
+    def test_ti_update_state_retry_policy_overrides_persisted_in_history(
+        self, client, session, create_task_instance
+    ):
+        """The archived attempt keeps its retry policy and rendered-index values."""
+        ti = create_task_instance(
+            task_id="test_retry_policy_override_history",
+            state=State.RUNNING,
+        )
+        ti.start_date = DEFAULT_START_DATE
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/state",
+            json={
+                "state": State.UP_FOR_RETRY,
+                "end_date": DEFAULT_END_DATE.isoformat(),
+                "rendered_map_index": DEFAULT_RENDERED_MAP_INDEX,
+                "retry_delay_seconds": 42.5,
+                "retry_reason": "Rate limit: backing off",
+            },
+        )
+
+        assert response.status_code == 204
+
+        session.expire_all()
+        tih = session.scalars(
+            select(TaskInstance)
+            .where(TaskInstance.working_set.is_(None))
+            .where(
+                TaskInstance.dag_id == ti.dag_id,
+                TaskInstance.task_id == ti.task_id,
+                TaskInstance.run_id == ti.run_id,
+            )
+            .execution_options(include_all_attempts=True)
+        ).one()
+        assert tih.retry_delay_override == 42.5
+        assert tih.retry_reason == "Rate limit: backing off"
+        assert tih.end_date == DEFAULT_END_DATE
+        assert tih.duration == (DEFAULT_END_DATE - DEFAULT_START_DATE).total_seconds()
+        assert tih.rendered_map_index == DEFAULT_RENDERED_MAP_INDEX
+
+    def test_ti_update_state_retry_clears_rendered_map_index_in_history(
+        self, client, session, create_task_instance
+    ):
+        """An explicit ``rendered_map_index: null`` must clear the value archived to history too.
+
+        The worker sends ``rendered_map_index`` on every retry, even when this try never
+        (re-)computed it (e.g. it failed before rendering). That must null out the archived
+        row along with the live one, not leave the history row snapshotting a stale value
+        left over from an earlier try.
+        """
+        ti = create_task_instance(
+            task_id="test_retry_clears_rendered_map_index_history",
+            state=State.RUNNING,
+        )
+        ti.start_date = DEFAULT_START_DATE
+        ti._rendered_map_index = DEFAULT_RENDERED_MAP_INDEX
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/state",
+            json={
+                "state": State.UP_FOR_RETRY,
+                "end_date": DEFAULT_END_DATE.isoformat(),
+                "rendered_map_index": None,
+            },
+        )
+
+        assert response.status_code == 204
+
+        session.expire_all()
+        ti = session.scalars(
+            select(TaskInstance).filter_by(task_id=ti.task_id, run_id=ti.run_id, dag_id=ti.dag_id)
+        ).one()
+        assert ti.rendered_map_index is None
+
+        tih = session.scalars(
+            select(TaskInstance)
+            .where(TaskInstance.working_set.is_(None))
+            .where(
+                TaskInstance.dag_id == ti.dag_id,
+                TaskInstance.task_id == ti.task_id,
+                TaskInstance.run_id == ti.run_id,
+            )
+            .execution_options(include_all_attempts=True)
+        ).one()
+        assert tih.rendered_map_index is None
+
+    def test_ti_update_state_retry_without_policy_overrides(self, client, session, create_task_instance):
+        """Without retry policy fields, the columns remain NULL."""
+        ti = create_task_instance(
+            task_id="test_retry_no_policy",
+            state=State.RUNNING,
+        )
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/state",
+            json={
+                "state": State.UP_FOR_RETRY,
+                "end_date": DEFAULT_END_DATE.isoformat(),
+            },
+        )
+
+        assert response.status_code == 204
+
+        ti = session.scalar(
+            select(TaskInstance).filter_by(task_id=ti.task_id, run_id=ti.run_id, dag_id=ti.dag_id)
+        )
+        assert ti.state == State.UP_FOR_RETRY
+        assert ti.retry_delay_override is None
+        assert ti.retry_reason is None
+
+        tih = session.scalars(
+            select(TaskInstance)
+            .where(TaskInstance.working_set.is_(None))
+            .where(
+                TaskInstance.dag_id == ti.dag_id,
+                TaskInstance.task_id == ti.task_id,
+                TaskInstance.run_id == ti.run_id,
+            )
+            .execution_options(include_all_attempts=True)
+        ).one()
+        assert tih.retry_delay_override is None
+        assert tih.retry_reason is None
+
+    def test_ti_run_clears_retry_policy_overrides(self, client, session, create_task_instance):
+        """When a task enters RUNNING, retry policy overrides from the previous attempt are cleared."""
+        ti = create_task_instance(
+            task_id="test_retry_cleared_on_run",
+            state=State.QUEUED,
+        )
+        # Simulate having retry overrides from a previous attempt
+        ti.retry_delay_override = 60.0
+        ti.retry_reason = "previous attempt rate limit"
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/run",
+            json={
+                "state": "running",
+                "hostname": "test-host",
+                "unixname": "test-user",
+                "pid": 12345,
+                "start_date": DEFAULT_END_DATE.isoformat(),
+            },
+        )
+
+        assert response.status_code == 200
+
+        session.expire_all()
+        ti = session.scalar(
+            select(TaskInstance).filter_by(task_id=ti.task_id, run_id=ti.run_id, dag_id=ti.dag_id)
+        )
+        assert ti.state == State.RUNNING
+        assert ti.retry_delay_override is None
+        assert ti.retry_reason is None
+
+    @pytest.mark.parametrize(
+        "target_state",
+        [
+            State.UP_FOR_RETRY,
+            TerminalTIState.FAILED,
+            TerminalTIState.SUCCESS,
+        ],
+    )
+    def test_ti_update_state_clears_deferred_fields(
+        self, client, session, create_task_instance, target_state
+    ):
+        """Test that next_method and next_kwargs are cleared when transitioning to terminal/retry states."""
+        ti = create_task_instance(
+            task_id="test_ti_update_state_clears_deferred_fields",
+            state=State.RUNNING,
+        )
+        # Simulate a task that resumed from deferred state with next_method/next_kwargs set
+        ti.next_method = "execute_complete"
+        ti.next_kwargs = {"event": "test_event", "data": "test_data"}
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/state",
+            json={
+                "state": target_state,
+                "end_date": DEFAULT_END_DATE.isoformat(),
+            },
+        )
+
+        assert response.status_code == 204
+
+        if target_state == State.UP_FOR_RETRY:
+            # Retry creates a new TI ID, so we need to fetch by unique key
+            ti = session.scalar(
+                select(TaskInstance).filter_by(task_id=ti.task_id, run_id=ti.run_id, dag_id=ti.dag_id)
+            )
+        else:
+            session.expire_all()
+            ti = session.get(TaskInstance, ti.id)
+
+        assert ti.state == target_state
+        assert ti.next_method is None
+        assert ti.next_kwargs is None
+
+    def test_ti_update_state_to_failed_table_check(self, client, session, create_task_instance):
+        # we just want to fail in this test, no need to retry
+        ti = create_task_instance(
+            task_id="test_ti_update_state_to_failed_table_check",
+            state=State.RUNNING,
+        )
+        ti.start_date = DEFAULT_START_DATE
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/state",
+            json={
+                "state": TerminalTIState.FAILED,
+                "end_date": DEFAULT_END_DATE.isoformat(),
+            },
+        )
+
+        assert response.status_code == 204
+        assert response.text == ""
+
+        session.expire_all()
+
+        ti = session.get(TaskInstance, ti.id)
+        assert ti.state == State.FAILED
+        assert ti.next_method is None
+        assert ti.next_kwargs is None
+        assert ti.duration == 3600.00
+
+    def test_ti_update_state_to_failed_persists_retry_reason(self, client, session, create_task_instance):
+        ti = create_task_instance(
+            task_id="test_ti_update_state_to_failed_persists_retry_reason",
+            state=State.RUNNING,
+        )
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/state",
+            json={
+                "state": TerminalTIState.FAILED,
+                "end_date": DEFAULT_END_DATE.isoformat(),
+                "retry_reason": "auth error, do not retry",
+            },
+        )
+
+        assert response.status_code == 204
+
+        session.expire_all()
+        ti = session.get(TaskInstance, ti.id)
+        assert ti.state == State.FAILED
+        assert ti.retry_reason == "auth error, do not retry"
+
+    def test_ti_update_state_to_failed_truncates_retry_reason(self, client, session, create_task_instance):
+        ti = create_task_instance(
+            task_id="test_ti_update_state_to_failed_truncates_retry_reason",
+            state=State.RUNNING,
+        )
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/state",
+            json={
+                "state": TerminalTIState.FAILED,
+                "end_date": DEFAULT_END_DATE.isoformat(),
+                "retry_reason": "x" * 600,
+            },
+        )
+
+        assert response.status_code == 204
+
+        session.expire_all()
+        ti = session.get(TaskInstance, ti.id)
+        assert ti.retry_reason == "x" * 500
+
+    def test_ti_update_state_to_failed_without_retry_reason(self, client, session, create_task_instance):
+        ti = create_task_instance(
+            task_id="test_ti_update_state_to_failed_without_retry_reason",
+            state=State.RUNNING,
+        )
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/state",
+            json={
+                "state": TerminalTIState.FAILED,
+                "end_date": DEFAULT_END_DATE.isoformat(),
+            },
+        )
+
+        assert response.status_code == 204
+
+        session.expire_all()
+        ti = session.get(TaskInstance, ti.id)
+        assert ti.retry_reason is None
+
+    def test_ti_update_state_not_running(self, client, session, create_task_instance):
+        """Test that a 409 error is returned when attempting to update a TI that is not in RUNNING state."""
+        ti = create_task_instance(
+            task_id="test_ti_update_state_not_running",
+            state=State.SUCCESS,
+            session=session,
+            start_date=DEFAULT_START_DATE,
+        )
+        session.commit()
+
+        payload = {
+            "state": "failed",
+            "end_date": DEFAULT_END_DATE.isoformat(),
+        }
+
+        response = client.patch(f"/execution/task-instances/{ti.id}/state", json=payload)
+        assert response.status_code == 409
+        assert response.json()["detail"] == {
+            "reason": "invalid_state",
+            "message": "TI was not in the running state so it cannot be updated",
+            "previous_state": State.SUCCESS,
+        }
+
+        # Verify the task instance state hasn't changed
+        session.refresh(ti)
+        assert ti.state == State.SUCCESS
+
+    def test_ti_update_state_same_state_is_idempotent(self, client, session, create_task_instance):
+        """Test that setting a TI to its current state is treated as an idempotent no-op."""
+        ti = create_task_instance(
+            task_id="test_ti_update_state_same_state_is_idempotent",
+            state=State.SUCCESS,
+            session=session,
+            start_date=DEFAULT_START_DATE,
+        )
+        ti.end_date = DEFAULT_END_DATE
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/state",
+            json={
+                "state": "success",
+                "end_date": timezone.parse("2024-10-31T13:00:00Z").isoformat(),
+            },
+        )
+        assert response.status_code == 200
+        assert response.content == b""
+
+        session.refresh(ti)
+        assert ti.state == State.SUCCESS
+        assert ti.end_date == DEFAULT_END_DATE
+
+    def test_ti_update_state_terminal_state_mismatch_returns_conflict(
+        self, client, session, create_task_instance
+    ):
+        """A completed TI cannot be updated to a different state."""
+        ti = create_task_instance(
+            task_id="test_ti_update_state_terminal_state_mismatch_returns_conflict",
+            state=State.SUCCESS,
+            session=session,
+            start_date=DEFAULT_START_DATE,
+        )
+        ti.end_date = DEFAULT_END_DATE
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/state",
+            json={
+                "state": "failed",
+                "end_date": timezone.parse("2024-10-31T13:00:00Z").isoformat(),
+            },
+        )
+        assert response.status_code == 409
+        assert response.json()["detail"] == {
+            "reason": "invalid_state",
+            "message": "TI was not in the running state so it cannot be updated",
+            "previous_state": State.SUCCESS,
+        }
+
+        session.refresh(ti)
+        assert ti.state == State.SUCCESS
+        assert ti.end_date == DEFAULT_END_DATE
+
+    def test_ti_update_state_to_failed_without_fail_fast(self, client, session, dag_maker):
+        """Test that SerializedDAG is NOT loaded when fail_fast=False (default)."""
+        with dag_maker(dag_id="test_dag_no_fail_fast", serialized=True):
+            EmptyOperator(task_id="task1")
+            EmptyOperator(task_id="task2")
+
+        dr = dag_maker.create_dagrun()
+        ti = dr.get_task_instance(task_id="task1", session=session)
+        ti.state = State.RUNNING
+        ti.start_date = DEFAULT_START_DATE
+        session.commit()
+        session.refresh(ti)
+
+        with mock.patch("airflow.models.dagbag.DBDagBag.get_dag_for_run", autospec=True) as mock_get_dag:
+            response = client.patch(
+                f"/execution/task-instances/{ti.id}/state",
+                json={
+                    "state": TerminalTIState.FAILED,
+                    "end_date": DEFAULT_END_DATE.isoformat(),
+                },
+            )
+
+            assert response.status_code == 204
+            # Verify SerializedDAG was NOT loaded (memory optimization)
+            mock_get_dag.assert_not_called()
+
+        session.expire_all()
+        ti = session.get(TaskInstance, ti.id)
+        assert ti.state == State.FAILED
+
+    def test_ti_update_state_to_failed_with_fail_fast(self, client, session, dag_maker):
+        """Test that SerializedDAG IS loaded and other tasks stopped when fail_fast=True."""
+        with dag_maker(dag_id="test_dag_with_fail_fast", fail_fast=True, serialized=True):
+            EmptyOperator(task_id="task1")
+            EmptyOperator(task_id="task2")
+
+        dr = dag_maker.create_dagrun()
+        ti1 = dr.get_task_instance(task_id="task1", session=session)
+        ti1.state = State.RUNNING
+        ti1.start_date = DEFAULT_START_DATE
+
+        ti2 = dr.get_task_instance(task_id="task2", session=session)
+        ti2.state = State.QUEUED
+        session.commit()
+        session.refresh(ti1)
+        session.refresh(ti2)
+
+        with mock.patch(
+            "airflow.api_fastapi.execution_api.routes.task_instances._stop_remaining_tasks", autospec=True
+        ) as mock_stop:
+            response = client.patch(
+                f"/execution/task-instances/{ti1.id}/state",
+                json={
+                    "state": TerminalTIState.FAILED,
+                    "end_date": DEFAULT_END_DATE.isoformat(),
+                },
+            )
+
+            assert response.status_code == 204
+            mock_stop.assert_called_once()
+
+        session.expire_all()
+        ti1 = session.get(TaskInstance, ti1.id)
+        assert ti1.state == State.FAILED
+
+    def test_ti_update_state_reschedule_mysql_limit_triggers_fail_fast(
+        self, client, session, dag_maker, time_machine
+    ):
+        """
+        When a reschedule date exceeds MySQL's TIMESTAMP limit and the DAG has fail_fast=True,
+        sibling tasks must still be stopped. The MySQL-limit branch routes through a different
+        FAILED transition than the regular fail path -- both must honor fail_fast.
+        """
+        instant = timezone.datetime(2024, 10, 30)
+        time_machine.move_to(instant, tick=False)
+
+        with dag_maker(dag_id="test_dag_with_fail_fast_mysql_reschedule", fail_fast=True, serialized=True):
+            EmptyOperator(task_id="task1")
+            EmptyOperator(task_id="task2")
+
+        dr = dag_maker.create_dagrun()
+        ti1 = dr.get_task_instance(task_id="task1", session=session)
+        ti1.state = State.RUNNING
+        ti1.start_date = instant
+
+        ti2 = dr.get_task_instance(task_id="task2", session=session)
+        ti2.state = State.QUEUED
+        session.commit()
+        session.refresh(ti1)
+        session.refresh(ti2)
+
+        # Date beyond MySQL's TIMESTAMP limit (2038-01-19 03:14:07).
+        future_date = timezone.datetime(2038, 1, 19, 3, 14, 8)
+
+        with (
+            mock.patch(
+                "airflow.api_fastapi.execution_api.routes.task_instances.get_dialect_name",
+                return_value="mysql",
+            ),
+            mock.patch(
+                "airflow.api_fastapi.execution_api.routes.task_instances._stop_remaining_tasks",
+                autospec=True,
+            ) as mock_stop,
+        ):
+            response = client.patch(
+                f"/execution/task-instances/{ti1.id}/state",
+                json={
+                    "state": TaskInstanceState.UP_FOR_RESCHEDULE,
+                    "reschedule_date": future_date.isoformat(),
+                    "end_date": DEFAULT_END_DATE.isoformat(),
+                },
+            )
+
+            assert response.status_code == 204
+            mock_stop.assert_called_once()
+
+        session.expire_all()
+        ti1 = session.get(TaskInstance, ti1.id)
+        assert ti1.state == State.FAILED
+
+    @pytest.mark.db_test
+    @conf_vars({("state_store", "clear_on_success"): "True"})
+    @pytest.mark.parametrize("regional", [False, True])
+    def test_ti_update_state_to_success_clears_task_state(
+        self, client, session, create_task_instance, regional
+    ):
+        """When clear_on_success=True, task_state rows are deleted after TI transitions to SUCCESS."""
+        ti = create_task_instance(
+            task_id="test_clear_on_success",
+            start_date=DEFAULT_START_DATE,
+            state=State.RUNNING,
+        )
+        if regional:
+            region = DynamicRegion.get_or_create(
+                dag_id=ti.dag_id, run_id=ti.run_id, node_id="loop", session=session
+            )
+            session.add(region)
+            session.flush()
+            ti.region_id = region.id
+            ti.region_index = 2
+        session.commit()
+
+        backend = MetastoreBackend()
+        scope = TaskScope(
+            dag_id=ti.dag_id,
+            run_id=ti.run_id,
+            task_id=ti.task_id,
+            map_index=ti.region_index,
+            region_id=ti.region_id,
+        )
+        backend.set(scope, "job_id", "app_1234", session=session)
+        backend.set(scope, "checkpoint", "step_3", session=session)
+        session.commit()
+
+        assert session.scalars(
+            select(TaskStateStoreModel).where(TaskStateStoreModel.task_id == ti.task_id)
+        ).all()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/state",
+            json={"state": "success", "end_date": DEFAULT_END_DATE.isoformat()},
+        )
+
+        assert response.status_code == 204
+        session.expire_all()
+        assert not session.scalars(
+            select(TaskStateStoreModel).where(TaskStateStoreModel.task_id == ti.task_id)
+        ).all()
+
+    @pytest.mark.db_test
+    @conf_vars({("state_store", "clear_on_success"): "True"})
+    def test_ti_update_state_to_failed_does_not_clear_task_state(self, client, session, create_task_instance):
+        """Task state rows are preserved when a TI transitions to FAILED."""
+        ti = create_task_instance(
+            task_id="test_no_clear_on_failed",
+            start_date=DEFAULT_START_DATE,
+            state=State.RUNNING,
+        )
+        session.commit()
+
+        backend = MetastoreBackend()
+        scope = TaskScope(dag_id=ti.dag_id, run_id=ti.run_id, task_id=ti.task_id, map_index=ti.map_index)
+        backend.set(scope, "job_id", "app_1234", session=session)
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/state",
+            json={"state": "failed", "end_date": DEFAULT_END_DATE.isoformat()},
+        )
+
+        assert response.status_code == 204
+        session.expire_all()
+        assert session.scalars(
+            select(TaskStateStoreModel).where(TaskStateStoreModel.task_id == ti.task_id)
+        ).all()
+
+    @pytest.mark.db_test
+    @conf_vars({("state_store", "clear_on_success"): "False"})
+    def test_ti_update_state_to_success_skips_clear_when_config_disabled(
+        self, client, session, create_task_instance
+    ):
+        """Task state rows are preserved on SUCCESS when clear_on_success=False."""
+        ti = create_task_instance(
+            task_id="test_clear_disabled",
+            start_date=DEFAULT_START_DATE,
+            state=State.RUNNING,
+        )
+        session.commit()
+
+        backend = MetastoreBackend()
+        scope = TaskScope(dag_id=ti.dag_id, run_id=ti.run_id, task_id=ti.task_id, map_index=ti.map_index)
+        backend.set(scope, "job_id", "app_1234", session=session)
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/state",
+            json={"state": "success", "end_date": DEFAULT_END_DATE.isoformat()},
+        )
+
+        assert response.status_code == 204
+        session.expire_all()
+        assert session.scalars(
+            select(TaskStateStoreModel).where(TaskStateStoreModel.task_id == ti.task_id)
+        ).all()
+
+    def test_ti_update_state_to_success_records_the_external_clear_target(
+        self, client, session, create_task_instance
+    ):
+        ti = create_task_instance(task_id="mark", start_date=DEFAULT_START_DATE, state=State.RUNNING)
+        session.commit()
+        target = {
+            "dag_id": "child",
+            "task_id": "wait",
+            "logical_date": "2026-10-01T00:00:00Z",
+            "recursion_depth": 3,
+        }
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/state",
+            json={
+                "state": "success",
+                "end_date": DEFAULT_END_DATE.isoformat(),
+                "external_clear_target": target,
+            },
+        )
+
+        assert response.status_code == 204
+        session.expire_all()
+        stored = session.scalars(
+            select(XComModelV2.value).where(
+                XComModelV2.task_instance_id == ti.id, XComModelV2.key == EXTERNAL_CLEAR_TARGET_XCOM_KEY
+            )
+        ).one()
+        assert XComModel.deserialize_value_primitives(SimpleNamespace(value=stored)) == target
+
+    def test_ti_update_state_to_success_rejects_a_naive_external_clear_target_date(
+        self, client, session, create_task_instance
+    ):
+        ti = create_task_instance(task_id="mark", start_date=DEFAULT_START_DATE, state=State.RUNNING)
+        session.commit()
+        target = {
+            "dag_id": "child",
+            "task_id": "wait",
+            "logical_date": "2026-10-01T00:00:00",
+            "recursion_depth": 1,
+        }
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/state",
+            json={
+                "state": "success",
+                "end_date": DEFAULT_END_DATE.isoformat(),
+                "external_clear_target": target,
+            },
+        )
+
+        assert response.status_code == 422
+        session.expire_all()
+        assert session.get(TaskInstance, ti.id).state == State.RUNNING
+
+
+class TestTISkipDownstream:
+    def test_skip_downstream_selects_consumer_loop_pass(self, client, session, dag_maker):
+        @task_group
+        def body():
+            EmptyOperator(task_id="branch") >> EmptyOperator(task_id="target")
+
+        with dag_maker(serialized=True) as dag:
+            create_loop(body, max_iterations=3)
+        dr = dag_maker.create_dagrun()
+        region = DynamicRegion.get_or_create(
+            dag_id=dr.dag_id, run_id=dr.run_id, node_id="body", session=session
+        )
+        session.add(region)
+        session.flush()
+        tis = {ti.task_id: ti for ti in dr.task_instances}
+        caller, target = tis["body.branch"], tis["body.target"]
+        caller.region_id, caller.region_index = region.id, 2
+        target.region_id, target.region_index = region.id, 2
+        previous = TaskInstance(
+            task=dag.get_task(target.task_id), run_id=dr.run_id, dag_version_id=target.dag_version_id
+        )
+        previous.region_id, previous.region_index = region.id, 1
+        session.add(previous)
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{caller.id}/skip-downstream", json={"tasks": [[target.task_id, -1]]}
+        )
+
+        assert response.status_code == 204
+        session.expire_all()
+        assert target.state == State.SKIPPED
+        assert previous.state is None
+
+    @pytest.mark.parametrize("tasks", [["body.target"], [["body.target", -1]]])
+    def test_skip_downstream_from_outside_loop_skips_every_live_pass(self, client, session, dag_maker, tasks):
+        @task_group
+        def body():
+            EmptyOperator(task_id="target")
+
+        with dag_maker(serialized=True) as dag:
+            EmptyOperator(task_id="branch") >> create_loop(body, max_iterations=3)
+        dr = dag_maker.create_dagrun()
+        region = DynamicRegion.get_or_create(
+            dag_id=dr.dag_id, run_id=dr.run_id, node_id="body", session=session
+        )
+        session.add(region)
+        session.flush()
+        tis = {ti.task_id: ti for ti in dr.task_instances}
+        caller, target = tis["branch"], tis["body.target"]
+        other_pass = TaskInstance(
+            task=dag.get_task(target.task_id), run_id=dr.run_id, dag_version_id=target.dag_version_id
+        )
+        other_pass.region_id, other_pass.region_index = region.id, 2
+        session.add(other_pass)
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{caller.id}/skip-downstream", json={"tasks": tasks}
+        )
+
+        assert response.status_code == 204
+        session.expire_all()
+        assert target.state == State.SKIPPED
+        assert other_pass.state == State.SKIPPED
+
+    def setup_method(self):
+        clear_db_runs()
+
+    def teardown_method(self):
+        clear_db_runs()
+
+    def test_ti_skip_downstream_asks_once_which_tasks_have_regions(self, client, session, dag_maker):
+        with dag_maker("skip_downstream_many", session=session):
+            head = EmptyOperator(task_id="head")
+            for index in range(6):
+                head >> EmptyOperator(task_id=f"t{index}")
+        dr = dag_maker.create_dagrun(run_id="run")
+        head_ti = dr.get_task_instance("head")
+        head_ti.set_state(State.SUCCESS)
+        session.commit()
+
+        with capture_orm_selects("task_instance") as statements:
+            response = client.patch(
+                f"/execution/task-instances/{head_ti.id}/skip-downstream",
+                json={"tasks": [f"t{index}" for index in range(6)]},
+            )
+
+        assert response.status_code == 204
+        region_lookups = [sql for sql in statements if "region_id !=" in sql]
+        assert len(region_lookups) == 1
+
+    def test_ti_skip_downstream_with_hundreds_of_targets_uses_constant_queries(
+        self, client, session, dag_maker
+    ):
+        with dag_maker("skip_downstream_hundreds", session=session):
+            head = EmptyOperator(task_id="head")
+            for index in range(520):
+                head >> EmptyOperator(task_id=f"t{index}")
+        dr = dag_maker.create_dagrun(run_id="run")
+        head_ti = dr.get_task_instance("head")
+        head_ti.set_state(State.SUCCESS)
+        session.commit()
+
+        with capture_orm_selects("task_instance") as statements:
+            response = client.patch(
+                f"/execution/task-instances/{head_ti.id}/skip-downstream",
+                json={"tasks": [f"t{index}" for index in range(520)]},
+            )
+
+        assert response.status_code == 204
+        assert len(statements) <= 6
+        session.expire_all()
+        assert {ti.state for ti in dr.get_task_instances() if ti.task_id != "head"} == {State.SKIPPED}
+
+    @pytest.mark.parametrize("_json", (({"tasks": ["t1"]}), ({"tasks": [("t1", -1)]})))
+    def test_ti_skip_downstream(self, client, session, create_task_instance, dag_maker, _json):
+        with dag_maker("skip_downstream_dag", session=session):
+            t0 = EmptyOperator(task_id="t0")
+            t1 = EmptyOperator(task_id="t1")
+            t0 >> t1
+        dr = dag_maker.create_dagrun(run_id="run")
+
+        ti0 = dr.get_task_instance("t0")
+        ti0.set_state(State.SUCCESS)
+
+        response = client.patch(
+            f"/execution/task-instances/{ti0.id}/skip-downstream",
+            json=_json,
+        )
+        ti1 = dr.get_task_instance("t1")
+
+        assert response.status_code == 204
+        assert ti1.state == State.SKIPPED
+
+    @pytest.mark.parametrize(
+        ("tasks", "expected_skipped"),
+        [
+            pytest.param(["mapped"], {0, 1, 2}, id="task-id-skips-all-map-indexes"),
+            pytest.param([("mapped", 1)], {1}, id="ti-key-skips-one-map-index"),
+        ],
+    )
+    def test_ti_skip_downstream_expanded_mapped_task(
+        self, client, session, dag_maker, tasks, expected_skipped
+    ):
+        """A bare task_id skips an already expanded mapped task, not only map_index -1."""
+        with dag_maker("skip_downstream_mapped_dag", session=session):
+
+            @task
+            def mapped(x):
+                return x
+
+            EmptyOperator(task_id="t0") >> mapped.expand(x=[1, 2, 3])
+        dr = dag_maker.create_dagrun(run_id="run")
+        ti0 = dr.get_task_instance("t0")
+        ti0.set_state(State.SUCCESS)
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti0.id}/skip-downstream",
+            json={"tasks": tasks},
+        )
+
+        assert response.status_code == 204
+        session.expire_all()
+        states = {
+            ti.map_index: ti.state
+            for ti in session.scalars(select(TaskInstance).where(TaskInstance.task_id == "mapped"))
+        }
+        assert {i for i, state in states.items() if state == State.SKIPPED} == expected_skipped
+        assert set(states) == {0, 1, 2}
+
+
+class TestTISkipDownstreamRaceCondition:
+    """Regression tests for #59378: state guard in ti_skip_downstream()."""
+
+    def setup_method(self):
+        clear_db_runs()
+
+    def teardown_method(self):
+        clear_db_runs()
+
+    @pytest.mark.parametrize(
+        "initial_state",
+        [
+            State.RUNNING,
+            State.SUCCESS,
+            State.FAILED,
+        ],
+    )
+    def test_skip_downstream_does_not_overwrite_terminal_or_running_ti(
+        self, client, session, dag_maker, initial_state
+    ):
+        with dag_maker(f"skip_race_dag_{initial_state}", session=session):
+            branch = EmptyOperator(task_id="branch")
+            downstream = EmptyOperator(task_id="downstream")
+            branch >> downstream
+        dr = dag_maker.create_dagrun(run_id="run")
+
+        ti_branch = dr.get_task_instance("branch")
+        ti_branch.set_state(State.SUCCESS)
+
+        ti_downstream = dr.get_task_instance("downstream")
+        ti_downstream.set_state(initial_state)
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti_branch.id}/skip-downstream",
+            json={"tasks": ["downstream"]},
+        )
+        assert response.status_code == 204
+
+        session.expire_all()
+        ti_downstream = dr.get_task_instance("downstream")
+        assert ti_downstream.state == initial_state
+
+    def test_skip_downstream_does_skip_queued_ti(self, client, session, dag_maker):
+        with dag_maker("skip_race_dag_queued", session=session):
+            branch = EmptyOperator(task_id="branch")
+            downstream = EmptyOperator(task_id="downstream")
+            branch >> downstream
+        dr = dag_maker.create_dagrun(run_id="run")
+
+        ti_branch = dr.get_task_instance("branch")
+        ti_branch.set_state(State.SUCCESS)
+
+        ti_downstream = dr.get_task_instance("downstream")
+        ti_downstream.set_state(TaskInstanceState.QUEUED)
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti_branch.id}/skip-downstream",
+            json={"tasks": ["downstream"]},
+        )
+        assert response.status_code == 204
+
+        session.expire_all()
+        ti_downstream = dr.get_task_instance("downstream")
+        assert ti_downstream.state == State.SKIPPED
+
+    def test_skip_downstream_still_skips_none_state_ti(self, client, session, dag_maker):
+        with dag_maker("skip_race_dag_normal", session=session):
+            branch = EmptyOperator(task_id="branch")
+            downstream = EmptyOperator(task_id="downstream")
+            branch >> downstream
+        dr = dag_maker.create_dagrun(run_id="run")
+
+        ti_branch = dr.get_task_instance("branch")
+        ti_branch.set_state(State.SUCCESS)
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti_branch.id}/skip-downstream",
+            json={"tasks": ["downstream"]},
+        )
+        assert response.status_code == 204
+
+        session.expire_all()
+        ti_downstream = dr.get_task_instance("downstream")
+        assert ti_downstream.state == State.SKIPPED
+
+
+class TestTIHealthEndpoint:
+    def setup_method(self):
+        clear_db_runs()
+
+    def teardown_method(self):
+        clear_db_runs()
+
+    @pytest.mark.parametrize(
+        ("hostname", "pid", "expected_status_code", "expected_detail"),
+        [
+            # Case: Successful heartbeat
+            ("random-hostname", 1789, 204, None),
+            # Case: Conflict due to hostname mismatch
+            (
+                "wrong-hostname",
+                1789,
+                409,
+                {
+                    "reason": "running_elsewhere",
+                    "message": "TI is already running elsewhere",
+                    "current_hostname": "random-hostname",
+                    "current_pid": 1789,
+                },
+            ),
+            # Case: Conflict due to pid mismatch
+            (
+                "random-hostname",
+                1054,
+                409,
+                {
+                    "reason": "running_elsewhere",
+                    "message": "TI is already running elsewhere",
+                    "current_hostname": "random-hostname",
+                    "current_pid": 1789,
+                },
+            ),
+        ],
+    )
+    def test_ti_heartbeat(
+        self,
+        client,
+        session,
+        create_task_instance,
+        hostname,
+        pid,
+        expected_status_code,
+        expected_detail,
+        time_machine,
+    ):
+        """Test the TI heartbeat endpoint for various scenarios including conflicts."""
+        time_now = timezone.parse("2024-10-31T12:00:00Z")
+
+        # Freeze time to a specific time
+        time_machine.move_to(time_now, tick=False)
+
+        ti = create_task_instance(
+            task_id="test_ti_heartbeat",
+            state=State.RUNNING,
+            hostname="random-hostname",
+            pid=1789,
+            session=session,
+        )
+        session.commit()
+        task_instance_id = ti.id
+
+        # Pre-condition: TI heartbeat is NONE
+        assert ti.last_heartbeat_at is None
+
+        response = client.put(
+            f"/execution/task-instances/{task_instance_id}/heartbeat",
+            json={"hostname": hostname, "pid": pid},
+        )
+
+        assert response.status_code == expected_status_code
+
+        if expected_status_code == 204:
+            # If successful, ensure last_heartbeat_at is updated
+            session.refresh(ti)
+            assert ti.last_heartbeat_at == time_now
+            assert response.text == ""
+        else:
+            # If there's an error, check the error detail
+            assert response.json()["detail"] == expected_detail
+
+    def test_ti_heartbeat_non_existent_task(self, client, session, create_task_instance):
+        """Test that a 404 error is returned when the Task Instance does not exist."""
+        task_instance_id = UUID("0182e924-0f1e-77e6-ab50-e977118bc139")
+
+        # Pre-condition: the Task Instance does not exist
+        assert session.get(TaskInstance, task_instance_id) is None
+
+        response = client.put(
+            f"/execution/task-instances/{task_instance_id}/heartbeat",
+            json={"hostname": "random-hostname", "pid": 1547},
+        )
+
+        assert response.status_code == 404
+        assert response.json()["detail"] == {
+            "reason": "not_found",
+            "message": "Task Instance not found",
+        }
+
+    def test_ti_heartbeat_cleared_task_returns_410(self, client, session, create_task_instance):
+        """Test that a 410 error is returned when a TI was cleared and moved to TIH."""
+        ti = create_task_instance(
+            task_id="test_ti_heartbeat_cleared",
+            state=State.RUNNING,
+            hostname="random-hostname",
+            pid=1547,
+            session=session,
+        )
+        session.commit()
+        old_ti_id = ti.id
+
+        # Simulate task being cleared: this archives the current try to TIH
+        # and assigns a new UUID to the TI, mirroring prepare_db_for_next_try().
+        ti.prepare_db_for_next_try(session)
+        session.commit()
+
+        assert session.get(TaskInstance, old_ti_id) is not None
+        tih = session.scalar(
+            select(TaskInstance)
+            .where(TaskInstance.working_set.is_(None))
+            .where(TaskInstance.id == old_ti_id)
+            .execution_options(include_all_attempts=True)
+        )
+        assert tih is not None
+
+        response = client.put(
+            f"/execution/task-instances/{old_ti_id}/heartbeat",
+            json={"hostname": "random-hostname", "pid": 1547},
+        )
+
+        assert response.status_code == 410
+        assert response.json()["detail"] == {
+            "reason": "not_found",
+            "message": "Task Instance not found, it may have been moved to the Task Instance History table",
+        }
+
+    @pytest.mark.parametrize(
+        "ti_state",
+        [State.SUCCESS, State.FAILED],
+    )
+    def test_ti_heartbeat_when_task_not_running(self, client, session, create_task_instance, ti_state):
+        """Test that a 409 error is returned when the Task Instance is not in RUNNING state."""
+        ti = create_task_instance(
+            task_id="test_ti_heartbeat_when_task_not_running",
+            state=ti_state,
+            hostname="random-hostname",
+            pid=1547,
+            session=session,
+        )
+        session.commit()
+        task_instance_id = ti.id
+
+        response = client.put(
+            f"/execution/task-instances/{task_instance_id}/heartbeat",
+            json={"hostname": "random-hostname", "pid": 1547},
+        )
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == {
+            "reason": "not_running",
+            "message": "TI is no longer in the running state and task should terminate",
+            "current_state": ti_state,
+        }
+
+    def test_ti_heartbeat_update(self, client, session, create_task_instance, time_machine):
+        """Test that the Task Instance heartbeat is updated when the Task Instance is running."""
+        # Set initial time for the test
+        time_now = timezone.parse("2024-10-31T12:00:00Z")
+        time_machine.move_to(time_now, tick=False)
+
+        ti = create_task_instance(
+            task_id="test_ti_heartbeat_update",
+            state=State.RUNNING,
+            hostname="random-hostname",
+            pid=1547,
+            last_heartbeat_at=time_now,
+            session=session,
+        )
+        session.commit()
+        task_instance_id = ti.id
+
+        # Pre-condition: TI heartbeat is set
+        assert ti.last_heartbeat_at == time_now, "Initial last_heartbeat_at should match time_now"
+
+        # Move time forward by 10 minutes
+        new_time = time_now.add(minutes=10)
+        time_machine.move_to(new_time, tick=False)
+
+        response = client.put(
+            f"/execution/task-instances/{task_instance_id}/heartbeat",
+            json={"hostname": "random-hostname", "pid": 1547},
+        )
+
+        assert response.status_code == 204
+
+        # If successful, ensure last_heartbeat_at is updated
+        session.refresh(ti)
+        assert ti.last_heartbeat_at == time_now.add(minutes=10)
+
+    def test_ti_heartbeat_fast_path_skips_fallback(
+        self, client, session, create_task_instance, monkeypatch, time_machine
+    ):
+        """When the fast-path UPDATE succeeds, the fallback path does not run."""
+        time_now = timezone.parse("2024-10-31T12:00:00Z")
+        time_machine.move_to(time_now, tick=False)
+
+        ti = create_task_instance(
+            task_id="test_ti_heartbeat_fast_path_skips_fallback",
+            state=State.RUNNING,
+            hostname="random-hostname",
+            pid=1547,
+            last_heartbeat_at=time_now,
+            session=session,
+        )
+        session.commit()
+
+        new_time = time_now.add(minutes=10)
+        time_machine.move_to(new_time, tick=False)
+
+        original_execute = Session.execute
+        task_instance_updates = []
+        for_update_selects = []
+
+        def counting_execute(session_obj, statement, *args, **kwargs):
+            if _is_task_instance_update(statement):
+                task_instance_updates.append(statement)
+            if _is_select_for_update(statement):
+                for_update_selects.append(statement)
+            return original_execute(session_obj, statement, *args, **kwargs)
+
+        monkeypatch.setattr(Session, "execute", counting_execute)
+
+        response = client.put(
+            f"/execution/task-instances/{ti.id}/heartbeat",
+            json={"hostname": "random-hostname", "pid": 1547},
+        )
+
+        assert response.status_code == 204
+        assert len(task_instance_updates) == 1
+        assert _where_column_keys(task_instance_updates[0]) == {"id", "state", "hostname", "pid"}
+        assert len(for_update_selects) == 0
+        session.refresh(ti)
+        assert ti.last_heartbeat_at == new_time
+
+    def test_ti_heartbeat_fallback_updates_on_fast_path_miss(
+        self, client, session, create_task_instance, monkeypatch, time_machine
+    ):
+        """When the fast-path UPDATE returns rowcount=0 the fallback path should
+        still update last_heartbeat_at."""
+        time_now = timezone.parse("2024-10-31T12:00:00Z")
+        time_machine.move_to(time_now, tick=False)
+
+        ti = create_task_instance(
+            task_id="test_ti_heartbeat_fallback_updates_on_fast_path_miss",
+            state=State.RUNNING,
+            hostname="random-hostname",
+            pid=1547,
+            last_heartbeat_at=time_now,
+            session=session,
+        )
+        session.commit()
+
+        new_time = time_now.add(minutes=10)
+        time_machine.move_to(new_time, tick=False)
+
+        original_execute = AsyncSession.execute
+        fast_path_intercepted = False
+
+        async def execute_with_fast_path_miss(session_obj, statement, *args, **kwargs):
+            nonlocal fast_path_intercepted
+            if (
+                not fast_path_intercepted
+                and getattr(statement, "is_update", False)
+                and statement.table.name == TaskInstance.__table__.name
+            ):
+                fast_path_intercepted = True
+                return mock.MagicMock(rowcount=0)
+            return await original_execute(session_obj, statement, *args, **kwargs)
+
+        monkeypatch.setattr(AsyncSession, "execute", execute_with_fast_path_miss)
+
+        response = client.put(
+            f"/execution/task-instances/{ti.id}/heartbeat",
+            json={"hostname": "random-hostname", "pid": 1547},
+        )
+
+        assert response.status_code == 204
+        assert fast_path_intercepted
+        session.refresh(ti)
+        assert ti.last_heartbeat_at == new_time
+
+    def test_ti_heartbeat_fallback_updates_on_unknown_fast_path_rowcount(
+        self, client, session, create_task_instance, monkeypatch, time_machine
+    ):
+        """A truthy-but-unknown rowcount must not be treated as fast-path success."""
+        time_now = timezone.parse("2024-10-31T12:00:00Z")
+        time_machine.move_to(time_now, tick=False)
+
+        ti = create_task_instance(
+            task_id="test_ti_heartbeat_fallback_updates_on_unknown_fast_path_rowcount",
+            state=State.RUNNING,
+            hostname="random-hostname",
+            pid=1547,
+            last_heartbeat_at=time_now,
+            session=session,
+        )
+        session.commit()
+
+        new_time = time_now.add(minutes=10)
+        time_machine.move_to(new_time, tick=False)
+
+        original_execute = AsyncSession.execute
+        fast_path_intercepted = False
+
+        async def execute_with_unknown_fast_path_rowcount(session_obj, statement, *args, **kwargs):
+            nonlocal fast_path_intercepted
+            if (
+                not fast_path_intercepted
+                and getattr(statement, "is_update", False)
+                and statement.table.name == TaskInstance.__table__.name
+            ):
+                fast_path_intercepted = True
+                return mock.MagicMock(rowcount=-1)
+            return await original_execute(session_obj, statement, *args, **kwargs)
+
+        monkeypatch.setattr(AsyncSession, "execute", execute_with_unknown_fast_path_rowcount)
+
+        response = client.put(
+            f"/execution/task-instances/{ti.id}/heartbeat",
+            json={"hostname": "random-hostname", "pid": 1547},
+        )
+
+        assert response.status_code == 204
+        assert fast_path_intercepted
+        session.refresh(ti)
+        assert ti.last_heartbeat_at == new_time
+
+    def test_ti_heartbeat_commit_failure_surfaces_error(
+        self, client, session, create_task_instance, monkeypatch
+    ):
+        """A commit failure must reach the worker as an error, never a silent 204.
+
+        ``AsyncSessionDep`` is function-scoped, so the yield-dependency commit runs
+        *before* the response is sent -- mirroring the sync ``SessionDep``. Were it
+        request-scoped (the FastAPI default for ``yield`` dependencies), the 204 would
+        be sent before the commit, so a commit failure (e.g. an asyncpg /
+        transaction-mode PgBouncer drop) would roll back *after* the worker already
+        saw success. Regression guard for the parity goal of this route conversion.
+        """
+        ti = create_task_instance(
+            task_id="test_ti_heartbeat_commit_failure",
+            state=State.RUNNING,
+            hostname="random-hostname",
+            pid=1789,
+            session=session,
+        )
+        session.commit()
+
+        async def failing_commit(self):
+            raise SQLAlchemyError("simulated commit failure (connection dropped)")
+
+        monkeypatch.setattr(AsyncSession, "commit", failing_commit)
+        # The default TestClient re-raises server exceptions, and it does so for *both*
+        # dependency scopes; the worker-visible status (500 vs a silent 204) is what
+        # tells them apart, so observe the response the worker would actually receive.
+        monkeypatch.setattr(client._transport, "raise_server_exceptions", False)
+
+        response = client.put(
+            f"/execution/task-instances/{ti.id}/heartbeat",
+            json={"hostname": "random-hostname", "pid": 1789},
+        )
+
+        # Function scope -> commit fails before the response -> 500. Request scope -> 204.
+        assert response.status_code == 500
+        # The transaction rolled back, so the heartbeat was not persisted.
+        session.refresh(ti)
+        assert ti.last_heartbeat_at is None
+
+
+class TestTIPutRTIF:
+    def setup_method(self):
+        clear_db_runs()
+        clear_rendered_ti_fields()
+
+    def teardown_method(self):
+        clear_db_runs()
+        clear_rendered_ti_fields()
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            # string value
+            {"field1": "string_value", "field2": "another_string"},
+            # dictionary value
+            {"field1": {"nested_key": "nested_value"}},
+            # string lists value
+            {"field1": ["123"], "field2": ["a", "b", "c"]},
+            # list of JSON values
+            {"field1": [1, "string", 3.14, True, None, {"nested": "dict"}]},
+            # nested dictionary with mixed types in lists
+            {
+                "field1": {"nested_dict": {"key1": 123, "key2": "value"}},
+                "field2": [3.14, {"sub_key": "sub_value"}, [1, 2]],
+            },
+        ],
+    )
+    def test_ti_put_rtif_success(self, client, session, create_task_instance, payload):
+        ti = create_task_instance(
+            task_id="test_ti_put_rtif_success",
+            state=State.RUNNING,
+            session=session,
+        )
+        session.commit()
+        response = client.put(f"/execution/task-instances/{ti.id}/rtif", json=payload)
+        assert response.status_code == 201
+        assert response.json() == {"message": "Rendered task instance fields successfully set"}
+
+        session.expire_all()
+
+        rtifs = session.scalars(select(RenderedTaskInstanceFields)).all()
+        assert len(rtifs) == 1
+
+        assert rtifs[0].task_instance_id == ti.id
+        assert rtifs[0].rendered_fields == payload
+
+    def test_ti_put_rtif_missing_ti(self, client, session, create_task_instance):
+        create_task_instance(
+            task_id="test_ti_put_rtif_missing_ti",
+            state=State.RUNNING,
+            session=session,
+        )
+        session.commit()
+
+        payload = {"field1": "rendered_value1", "field2": "rendered_value2"}
+
+        random_id = uuid6.uuid7()
+        response = client.put(f"/execution/task-instances/{random_id}/rtif", json=payload)
+        assert response.status_code == 404
+        assert response.json()["detail"] == {
+            "reason": "not_found",
+            "message": "Task Instance not found",
+        }
+
+    def test_ti_put_rtif_archived_ti_returns_410(self, client, session, create_task_instance):
+        ti = create_task_instance(
+            task_id="test_ti_put_rtif_archived",
+            state=State.RUNNING,
+            session=session,
+        )
+        session.commit()
+        old_ti_id = ti.id
+
+        # Archive the current try to TIH and assign a new UUID, mirroring prepare_db_for_next_try().
+        ti.prepare_db_for_next_try(session)
+        session.commit()
+
+        assert session.get(TaskInstance, old_ti_id) is not None
+
+        response = client.put(
+            f"/execution/task-instances/{old_ti_id}/rtif",
+            json={"field1": "rendered_value1"},
+        )
+
+        assert response.status_code == 410
+        assert response.json()["detail"] == {
+            "reason": "not_found",
+            "message": "Task Instance not found, it may have been moved to the Task Instance History table",
+        }
+        assert (
+            session.scalar(
+                select(RenderedTaskInstanceFields.id).where(
+                    RenderedTaskInstanceFields.task_instance_id == old_ti_id
+                )
+            )
+            is None
+        )
+
+
+class TestPreviousDagRun:
+    def setup_method(self):
+        clear_db_runs()
+
+    def teardown_method(self):
+        clear_db_runs()
+
+    def test_ti_previous_dag_run(self, client, session, create_task_instance, dag_maker):
+        """Test that the previous dag run is returned correctly for a task instance."""
+        ti = create_task_instance(
+            task_id="test_ti_previous_dag_run",
+            dag_id="test_dag",
+            logical_date=timezone.datetime(2025, 1, 19),
+            state=State.RUNNING,
+            start_date=timezone.datetime(2024, 1, 17),
+            session=session,
+        )
+        session.commit()
+
+        # Create 2 DagRuns for the same DAG to verify that the correct DagRun (last) is returned
+        dr1 = dag_maker.create_dagrun(
+            run_id="test_run_id_1",
+            logical_date=timezone.datetime(2025, 1, 17),
+            run_type="scheduled",
+            state=State.SUCCESS,
+            session=session,
+        )
+        dr1.end_date = timezone.datetime(2025, 1, 17, 1, 0, 0)
+
+        dr2 = dag_maker.create_dagrun(
+            run_id="test_run_id_2",
+            logical_date=timezone.datetime(2025, 1, 18),
+            run_type="scheduled",
+            state=State.SUCCESS,
+            session=session,
+        )
+
+        dr2.end_date = timezone.datetime(2025, 1, 18, 1, 0, 0)
+
+        session.commit()
+
+        response = client.get(f"/execution/task-instances/{ti.id}/previous-successful-dagrun")
+        assert response.status_code == 200
+        assert response.json() == {
+            "data_interval_start": "2025-01-18T00:00:00Z",
+            "data_interval_end": "2025-01-19T00:00:00Z",
+            "start_date": "2024-01-17T00:00:00Z",
+            "end_date": "2025-01-18T01:00:00Z",
+        }
+
+    def test_ti_previous_dag_run_not_found(self, client, session):
+        ti_id = UUID("0182e924-0f1e-77e6-ab50-e977118bc139")
+
+        assert session.get(TaskInstance, ti_id) is None
+
+        response = client.get(f"/execution/task-instances/{ti_id}/previous-successful-dagrun")
+        assert response.status_code == 200
+        assert response.json() == {
+            "data_interval_start": None,
+            "data_interval_end": None,
+            "start_date": None,
+            "end_date": None,
+        }
+
+    def test_ti_with_none_as_logical_date(self, client, session, create_task_instance, dag_maker):
+        ti = create_task_instance(
+            task_id="test_ti_with_none_as_logical_date",
+            dag_id="test_dag",
+            logical_date=None,
+            state=State.RUNNING,
+            start_date=timezone.datetime(2024, 1, 17),
+            session=session,
+        )
+        session.commit()
+
+        assert ti.logical_date is None
+
+        dr1 = dag_maker.create_dagrun(
+            run_id="test_ti_with_none_as_logical_date",
+            logical_date=timezone.datetime(2025, 1, 17),
+            run_type="scheduled",
+            state=State.SUCCESS,
+            session=session,
+        )
+        dr1.end_date = timezone.datetime(2025, 1, 17, 1, 0, 0)
+
+        session.commit()
+
+        response = client.get(f"/execution/task-instances/{ti.id}/previous-successful-dagrun")
+        assert response.status_code == 200
+        assert response.json() == {
+            "data_interval_start": None,
+            "data_interval_end": None,
+            "start_date": None,
+            "end_date": None,
+        }
+
+
+class TestGetRescheduleStartDate:
+    def test_get_start_date(self, client, session, create_task_instance):
+        ti = create_task_instance(
+            task_id="test_ti_update_state_reschedule_mysql_limit",
+            state=State.RUNNING,
+            start_date=timezone.datetime(2024, 1, 1),
+            session=session,
+        )
+        tr = TaskReschedule(
+            ti_id=ti.id,
+            start_date=timezone.datetime(2024, 1, 1),
+            end_date=timezone.datetime(2024, 1, 1, 1),
+            reschedule_date=timezone.datetime(2024, 1, 1, 2),
+        )
+        session.add(tr)
+        session.commit()
+
+        response = client.get(f"/execution/task-reschedules/{ti.id}/start_date")
+        assert response.status_code == 200
+        assert response.json() == "2024-01-01T00:00:00Z"
+
+    def test_get_start_date_returns_earliest_not_first_inserted(self, client, session, create_task_instance):
+        ti = create_task_instance(
+            task_id="test_get_start_date_returns_earliest_not_first_inserted",
+            state=State.RUNNING,
+            start_date=timezone.datetime(2024, 1, 1),
+            session=session,
+        )
+        # Insert the later reschedule first so that ordering by id and by start_date disagree
+        for start_date in (timezone.datetime(2024, 1, 2), timezone.datetime(2024, 1, 1)):
+            session.add(
+                TaskReschedule(
+                    ti_id=ti.id,
+                    start_date=start_date,
+                    end_date=start_date + timedelta(hours=1),
+                    reschedule_date=start_date + timedelta(hours=2),
+                )
+            )
+            session.flush()
+        session.commit()
+
+        response = client.get(f"/execution/task-reschedules/{ti.id}/start_date")
+        assert response.status_code == 200
+        assert response.json() == "2024-01-01T00:00:00Z"
+
+    def test_get_start_date_not_found(self, client):
+        ti_id = "0182e924-0f1e-77e6-ab50-e977118bc139"
+        response = client.get(f"/execution/task-reschedules/{ti_id}/start_date")
+        assert response.json() is None
+
+
+class TestGetCount:
+    def setup_method(self):
+        clear_db_runs()
+
+    def teardown_method(self):
+        clear_db_runs()
+
+    def test_get_count_basic(self, client, session, create_task_instance):
+        create_task_instance(task_id="test_task", state=State.SUCCESS)
+        session.commit()
+
+        response = client.get("/execution/task-instances/count", params={"dag_id": "dag"})
+        assert response.status_code == 200
+        assert response.json() == 1
+
+    def test_get_count_with_task_ids(self, client, session, create_task_instance):
+        for i in range(3):
+            create_task_instance(
+                task_id=f"task{i}",
+                state=State.SUCCESS,
+                dag_id="test_get_count_with_task_ids",
+                run_id=f"test_run_id{i}",
+            )
+        session.commit()
+
+        response = client.get(
+            "/execution/task-instances/count",
+            params={"dag_id": "test_get_count_with_task_ids", "task_ids": ["task1", "task2"]},
+        )
+        assert response.status_code == 200
+        assert response.json() == 2
+
+    def test_get_count_with_states(self, client, session, dag_maker):
+        """Test counting tasks in specific states."""
+        with dag_maker("test_get_count_with_states"):
+            EmptyOperator(task_id="task1")
+            EmptyOperator(task_id="task2")
+            EmptyOperator(task_id="task3")
+
+        dr = dag_maker.create_dagrun()
+
+        tis = dr.get_task_instances()
+
+        # Set different states for the task instances
+        for ti, state in zip(tis, [State.SUCCESS, State.FAILED, State.SKIPPED]):
+            ti.state = state
+            session.merge(ti)
+        session.commit()
+
+        response = client.get(
+            "/execution/task-instances/count",
+            params={"dag_id": "test_get_count_with_states", "states": [State.SUCCESS, State.FAILED]},
+        )
+        assert response.status_code == 200
+        assert response.json() == 2
+
+    def test_get_count_with_logical_dates(self, client, session, dag_maker):
+        with dag_maker("test_get_count_with_logical_dates"):
+            EmptyOperator(task_id="task1")
+
+        date1 = timezone.datetime(2025, 1, 1)
+        date2 = timezone.datetime(2025, 1, 2)
+
+        dag_maker.create_dagrun(run_id="test_run_id1", logical_date=date1)
+        dag_maker.create_dagrun(run_id="test_run_id2", logical_date=date2)
+
+        session.commit()
+
+        response = client.get(
+            "/execution/task-instances/count",
+            params={
+                "dag_id": "test_get_count_with_logical_dates",
+                "logical_dates": [date1.isoformat(), date2.isoformat()],
+            },
+        )
+        assert response.status_code == 200
+        assert response.json() == 2
+
+    def test_get_count_with_run_ids(self, client, session, dag_maker):
+        with dag_maker("test_get_count_with_run_ids"):
+            EmptyOperator(task_id="task1")
+
+        dag_maker.create_dagrun(run_id="run1", logical_date=timezone.datetime(2025, 1, 1))
+        dag_maker.create_dagrun(run_id="run2", logical_date=timezone.datetime(2025, 1, 2))
+
+        session.commit()
+
+        response = client.get(
+            "/execution/task-instances/count",
+            params={"dag_id": "test_get_count_with_run_ids", "run_ids": ["run1", "run2"]},
+        )
+        assert response.status_code == 200
+        assert response.json() == 2
+
+    def test_get_count_with_task_group(self, client, session, dag_maker):
+        with dag_maker(dag_id="test_dag", serialized=True):
+            with TaskGroup("group1"):
+                EmptyOperator(task_id="task1")
+                EmptyOperator(task_id="task2")
+
+            with TaskGroup("group2"):
+                EmptyOperator(task_id="task3")
+
+        dag_maker.create_dagrun(session=session)
+        session.commit()
+
+        response = client.get(
+            "/execution/task-instances/count",
+            params={"dag_id": "test_dag", "task_group_id": "group1"},
+        )
+        assert response.status_code == 200
+        assert response.json() == 2
+
+    def test_get_count_task_group_not_found(self, client, session, dag_maker):
+        with dag_maker(dag_id="test_get_count_task_group_not_found", serialized=True):
+            with TaskGroup("group1"):
+                EmptyOperator(task_id="task1")
+        dag_maker.create_dagrun(session=session)
+
+        response = client.get(
+            "/execution/task-instances/count",
+            params={"dag_id": "test_get_count_task_group_not_found", "task_group_id": "non_existent_group"},
+        )
+        assert response.status_code == 404
+        assert response.json()["detail"] == {
+            "reason": "not_found",
+            "message": "Task group non_existent_group not found in DAG test_get_count_task_group_not_found",
+        }
+
+    def test_get_count_dag_not_found(self, client, session):
+        response = client.get(
+            "/execution/task-instances/count",
+            params={"dag_id": "non_existent_dag", "task_group_id": "group1"},
+        )
+        assert response.status_code == 404
+        assert response.json()["detail"] == {
+            "reason": "not_found",
+            "message": "The Dag with ID: `non_existent_dag` was not found",
+        }
+
+    def test_get_count_with_none_state(self, client, session, create_task_instance):
+        create_task_instance(task_id="task1", dag_id="get_count_with_none", state=None)
+        session.commit()
+
+        response = client.get(
+            "/execution/task-instances/count",
+            params={"dag_id": "get_count_with_none", "states": ["null"]},
+        )
+        assert response.status_code == 200
+        assert response.json() == 1
+
+    def test_get_count_with_mixed_states(self, client, session, create_task_instance):
+        create_task_instance(task_id="task1", state=State.SUCCESS, run_id="runid1", dag_id="mixed_states")
+        create_task_instance(task_id="task2", state=None, run_id="runid2", dag_id="mixed_states")
+        session.commit()
+
+        response = client.get(
+            "/execution/task-instances/count",
+            params={"dag_id": "mixed_states", "states": [State.SUCCESS, "null"]},
+        )
+        assert response.status_code == 200
+        assert response.json() == 2
+
+    def test_get_count_with_map_index_less_than_zero(self, client, session, create_task_instance):
+        create_task_instance(task_id="task1", state=State.SUCCESS, run_id="runid1", dag_id="map_index_test")
+        session.commit()
+
+        response = client.get(
+            "/execution/task-instances/count",
+            params={"dag_id": "map_index_test", "states": [State.SUCCESS], "map_index": -1},
+        )
+        assert response.status_code == 200
+        assert response.json() == 1
+
+    def test_get_count_with_multiple_tasks_and_map_index_less_than_zero(
+        self, dag_maker, client, session, create_task_instance
+    ):
+        with dag_maker("test_get_count_with_multiple_tasks_and_map_index_less_than_zero"):
+            EmptyOperator(task_id="task1")
+            EmptyOperator(task_id="task2")
+            EmptyOperator(task_id="task3")
+
+        dr = dag_maker.create_dagrun()
+
+        tis = dr.get_task_instances()
+
+        # Set different states for the task instances
+        for ti, state in zip(tis, [State.SUCCESS, State.FAILED, State.SKIPPED]):
+            ti.state = state
+            session.merge(ti)
+        session.commit()
+
+        response = client.get(
+            "/execution/task-instances/count",
+            params={
+                "dag_id": "test_get_count_with_multiple_tasks_and_map_index_less_than_zero",
+                "map_index": -1,
+            },
+        )
+        assert response.status_code == 200
+        assert response.json() == 3
+
+    @pytest.mark.parametrize(
+        ("map_index", "dynamic_task_args", "expected_count"),
+        (
+            pytest.param(None, [1, 2, 3], 4, id="use-default-map-index"),
+            pytest.param(-1, [1, 2, 3], 1, id="map-index-(-1)"),
+            pytest.param(0, [1, 2, 3], 1, id="map-index-0"),
+            pytest.param(1, [1, 2, 3], 1, id="map-index-1"),
+            pytest.param(2, [1, 2, 3], 1, id="map-index-2"),
+        ),
+    )
+    def test_get_count_for_dynamic_task_mapping(
+        self, dag_maker, client, session, map_index, dynamic_task_args, expected_count
+    ):
+        """
+        case 1: map_index is None, it should fetch all the tasks
+        other cases: when map index is provided, it should return the count of tasks that falls under the map index
+        """
+        with dag_maker(session=session) as dag:
+            EmptyOperator(task_id="op1")
+
+            @dag.task()
+            def add_one(x):
+                return [x + 1]
+
+            add_one.expand(x=dynamic_task_args)
+
+        dr = dag_maker.create_dagrun()
+
+        tis = dr.get_task_instances()
+
+        for ti in tis:
+            ti.state = State.SUCCESS
+            session.merge(ti)
+        session.commit()
+
+        map_index = {} if map_index is None else {"map_index": map_index}
+
+        response = client.get(
+            "/execution/task-instances/count",
+            params={"dag_id": dr.dag_id, "run_ids": [dr.run_id], **map_index},
+        )
+        assert response.status_code == 200
+        assert response.json() == expected_count
+
+    @pytest.mark.parametrize(
+        ("map_index", "dynamic_task_args", "task_ids", "task_group_name", "expected_count"),
+        (
+            pytest.param(None, [1, 2, 3], None, None, 5, id="use-default-map-index-None"),
+            pytest.param(0, [1, 2, 3], None, None, 1, id="with-map-index-0-no-task-group"),
+            pytest.param(-1, [1, 2, 3], ["task1"], None, 1, id="with-task-ids-and-map-index-(-1)"),
+            pytest.param(None, [1, 2, 3], None, "group1", 4, id="with-task-group-id-and-map-index-None"),
+            pytest.param(0, [1, 2, 3], None, "group1", 1, id="with-task-group-id-and-map-index-0"),
+            pytest.param(-1, [1, 2, 3], None, "group1", 1, id="with-task-group-id-and-map-index-(-1)"),
+        ),
+    )
+    def test_get_count_mix_of_task_and_task_group_dynamic_task_mapping(
+        self,
+        dag_maker,
+        client,
+        session,
+        map_index,
+        dynamic_task_args,
+        task_ids,
+        task_group_name,
+        expected_count,
+    ):
+        """
+        case 1: map_index is None, task_ids is None, task_group_name is None, it should fetch all the tasks
+        case 2: when map index -1 and provided task_ids, it should return the count of task_ids
+        case 3: when map index is None and provided task_group_id, it should return the count of tasks under the task group
+        case 4: when map index is 0 and provided task_group_id, it should return the count of tasks under the task group that falls map index =0
+        case 5: when map index is -1 and provided task_group_id, it should return the count of tasks under the task group that falls map index =-1 i.e this task is not mapped
+        """
+
+        with dag_maker(session=session, serialized=True) as dag:
+            EmptyOperator(task_id="task1")
+
+            with TaskGroup("group1"):
+
+                @dag.task()
+                def add_one(x):
+                    return [x + 1]
+
+                add_one.expand(x=dynamic_task_args)
+
+                EmptyOperator(task_id="task2")
+
+        dr = dag_maker.create_dagrun(session=session)
+
+        session.commit()
+        params = {}
+
+        if task_ids:
+            params["task_ids"] = task_ids
+        if task_group_name:
+            params["task_group_id"] = task_group_name
+        if map_index is not None:
+            params["map_index"] = map_index
+
+        response = client.get(
+            "/execution/task-instances/count",
+            params={"dag_id": dr.dag_id, "run_ids": [dr.run_id], **params},
+        )
+        assert response.status_code == 200
+        assert response.json() == expected_count
+
+
+class TestGetPreviousTI:
+    def setup_method(self):
+        clear_db_runs()
+
+    def teardown_method(self):
+        clear_db_runs()
+
+    def test_get_previous_ti_basic(self, client, session, create_task_instance):
+        """Test basic get_previous_ti without filters."""
+        # Create TIs with different logical dates
+        create_task_instance(
+            task_id="test_task",
+            state=State.SUCCESS,
+            logical_date=timezone.datetime(2025, 1, 1),
+            run_id="run1",
+        )
+        create_task_instance(
+            task_id="test_task",
+            state=State.SUCCESS,
+            logical_date=timezone.datetime(2025, 1, 2),
+            run_id="run2",
+        )
+        session.commit()
+
+        response = client.get(
+            "/execution/task-instances/previous/dag/test_task",
+            params={
+                "logical_date": "2025-01-02T00:00:00Z",
+            },
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["task_id"] == "test_task"
+        assert data["dag_id"] == "dag"
+        assert data["run_id"] == "run1"
+        assert data["state"] == State.SUCCESS
+
+    def test_get_previous_ti_reports_no_region_for_a_task_outside_any_region(
+        self, client, session, create_task_instance
+    ):
+        create_task_instance(
+            task_id="test_task",
+            state=State.SUCCESS,
+            logical_date=timezone.datetime(2025, 1, 1),
+            run_id="run1",
+        )
+        create_task_instance(
+            task_id="test_task",
+            state=State.SUCCESS,
+            logical_date=timezone.datetime(2025, 1, 2),
+            run_id="run2",
+        )
+        session.commit()
+
+        response = client.get(
+            "/execution/task-instances/previous/dag/test_task",
+            params={"logical_date": "2025-01-02T00:00:00Z"},
+        )
+
+        assert "region_id" not in response.json()
+        assert "region_index" not in response.json()
+
+    def test_get_previous_ti_with_state_filter(self, client, session, create_task_instance):
+        """Test get_previous_ti with state filter."""
+        # Create TIs with different states
+        create_task_instance(
+            task_id="test_task",
+            state=State.FAILED,
+            logical_date=timezone.datetime(2025, 1, 1),
+            run_id="run1",
+        )
+        create_task_instance(
+            task_id="test_task",
+            state=State.SUCCESS,
+            logical_date=timezone.datetime(2025, 1, 2),
+            run_id="run2",
+        )
+        create_task_instance(
+            task_id="test_task",
+            state=State.FAILED,
+            logical_date=timezone.datetime(2025, 1, 3),
+            run_id="run3",
+        )
+        session.commit()
+
+        # Query for previous successful TI before 2025-01-03
+        response = client.get(
+            "/execution/task-instances/previous/dag/test_task",
+            params={
+                "logical_date": "2025-01-03T00:00:00Z",
+                "state": State.SUCCESS,
+            },
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["task_id"] == "test_task"
+        assert data["run_id"] == "run2"
+        assert data["state"] == State.SUCCESS
+
+    def test_get_previous_ti_with_map_index_filter(self, client, session, create_task_instance):
+        """Test get_previous_ti with map_index filter for mapped tasks."""
+        # Create TIs with different map_index values
+        # map_index=0 in run1
+        create_task_instance(
+            task_id="test_task",
+            state=State.SUCCESS,
+            logical_date=timezone.datetime(2025, 1, 1),
+            run_id="run1",
+            map_index=0,
+        )
+        # map_index=1 in run1_alt (different logical date to avoid constraint)
+        create_task_instance(
+            task_id="test_task",
+            state=State.SUCCESS,
+            logical_date=timezone.datetime(2025, 1, 1, 12, 0, 0),
+            run_id="run1_alt",
+            map_index=1,
+        )
+        # map_index=0 in run2
+        create_task_instance(
+            task_id="test_task",
+            state=State.SUCCESS,
+            logical_date=timezone.datetime(2025, 1, 2),
+            run_id="run2",
+            map_index=0,
+        )
+        session.commit()
+
+        # Query for previous TI with map_index=0 before 2025-01-02
+        response = client.get(
+            "/execution/task-instances/previous/dag/test_task",
+            params={
+                "logical_date": "2025-01-02T00:00:00Z",
+                "map_index": 0,
+            },
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["run_id"] == "run1"
+        assert data["map_index"] == 0
+
+    def test_get_previous_ti_not_found(self, client, session):
+        """Test get_previous_ti when no previous TI exists."""
+        response = client.get(
+            "/execution/task-instances/previous/dag/test_task",
+        )
+        assert response.status_code == 200
+        assert response.json() is None
+
+    def test_get_previous_ti_returns_most_recent(self, client, session, create_task_instance):
+        """Test that get_previous_ti returns the most recent matching TI."""
+        # Create multiple TIs
+        for i in range(5):
+            create_task_instance(
+                task_id="test_task",
+                state=State.SUCCESS,
+                logical_date=timezone.datetime(2025, 1, i + 1),
+                run_id=f"run{i + 1}",
+            )
+        session.commit()
+
+        # Query for TI before 2025-01-05
+        response = client.get(
+            "/execution/task-instances/previous/dag/test_task",
+            params={
+                "logical_date": "2025-01-05T00:00:00Z",
+            },
+        )
+        assert response.status_code == 200
+        data = response.json()
+        # Should return the most recent one (2025-01-04)
+        assert data["run_id"] == "run4"
+
+    def test_get_previous_ti_with_all_filters(self, client, session, create_task_instance):
+        """Test get_previous_ti with all filters combined."""
+        # Create TIs with different states and map_index values
+        create_task_instance(
+            task_id="test_task",
+            state=State.SUCCESS,
+            logical_date=timezone.datetime(2025, 1, 1),
+            run_id="target_run_1",
+            map_index=0,
+        )
+        create_task_instance(
+            task_id="test_task",
+            state=State.FAILED,
+            logical_date=timezone.datetime(2025, 1, 2),
+            run_id="target_run_2",
+            map_index=0,
+        )
+        create_task_instance(
+            task_id="test_task",
+            state=State.SUCCESS,
+            logical_date=timezone.datetime(2025, 1, 3),
+            run_id="target_run_3",
+            map_index=1,
+        )
+        session.commit()
+
+        # Query for previous successful TI before 2025-01-03 with map_index=0
+        response = client.get(
+            "/execution/task-instances/previous/dag/test_task",
+            params={
+                "logical_date": "2025-01-03T00:00:00Z",
+                "state": State.SUCCESS,
+                "map_index": 0,
+            },
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["run_id"] == "target_run_1"
+        assert data["state"] == State.SUCCESS
+
+    def test_get_previous_ti_query_is_bounded(self, client, session, create_task_instance):
+        """The single-row previous-TI lookup must ask the DB for one row, join ``dag_run`` once,
+        and surface the eager-loaded ``logical_date`` in the response."""
+        for i in range(5):
+            create_task_instance(
+                task_id="test_task",
+                state=State.SUCCESS,
+                logical_date=timezone.datetime(2025, 1, i + 1),
+                run_id=f"run{i + 1}",
+            )
+        session.commit()
+
+        with (
+            capture_orm_selects("task_instance") as statements,
+            assert_queries_count(1),
+        ):
+            response = client.get(
+                "/execution/task-instances/previous/dag/test_task",
+                params={"logical_date": "2025-01-05T00:00:00Z"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["run_id"] == "run4"
+        assert data["logical_date"] == "2025-01-04T00:00:00Z"
+        assert statements, "expected the endpoint to query the task_instance table"
+        for sql in statements:
+            assert re.search(r"\bLIMIT 1\b", sql), f"previous-TI lookup is not bounded to one row: {sql}"
+            dag_run_join_count = len(re.findall(r"JOIN dag_run(\s|$)", sql))
+            assert dag_run_join_count == 1, (
+                f"previous-TI query joins dag_run {dag_run_join_count} times, expected once: {sql}"
+            )
+
+
+class TestGetTaskStates:
+    def setup_method(self):
+        clear_db_runs()
+
+    def teardown_method(self):
+        clear_db_runs()
+
+    def test_get_task_states_basic(self, client, session, create_task_instance):
+        create_task_instance(task_id="test_task", state=State.SUCCESS)
+        session.commit()
+
+        response = client.get("/execution/task-instances/states", params={"dag_id": "dag"})
+        assert response.status_code == 200
+        assert response.json() == {"task_states": {"test": {"test_task": "success"}}}
+
+    def test_get_task_states_group_id_basic(self, client, dag_maker, session):
+        with dag_maker(dag_id="test_dag", serialized=True):
+            with TaskGroup("group1"):
+                EmptyOperator(task_id="task1")
+
+        dag_maker.create_dagrun(session=session)
+        session.commit()
+
+        response = client.get(
+            "/execution/task-instances/states",
+            params={"dag_id": "test_dag", "task_group_id": "group1"},
+        )
+        assert response.status_code == 200
+        assert response.json() == {
+            "task_states": {
+                "test": {
+                    "group1.task1": None,
+                },
+            },
+        }
+
+    def test_get_task_states_with_task_group_id_and_task_id(self, client, session, dag_maker):
+        with dag_maker("test_get_task_group_states_with_multiple_task_tasks", serialized=True):
+            with TaskGroup("group1"):
+                EmptyOperator(task_id="task1")
+            EmptyOperator(task_id="task2")
+
+        dr = dag_maker.create_dagrun()
+
+        tis = dr.get_task_instances()
+
+        # Set different states for the task instances
+        for ti, state in zip(tis, [State.SUCCESS, State.FAILED]):
+            ti.state = state
+            session.merge(ti)
+        session.commit()
+
+        response = client.get(
+            "/execution/task-instances/states",
+            params={
+                "dag_id": "test_get_task_group_states_with_multiple_task_tasks",
+                "task_group_id": "group1",
+                "task_ids": ["task2"],
+            },
+        )
+        assert response.status_code == 200
+        assert response.json() == {
+            "task_states": {
+                "test": {
+                    "group1.task1": "success",
+                    "task2": "failed",
+                },
+            },
+        }
+
+    def test_get_task_group_states_with_multiple_task(self, client, session, dag_maker):
+        with dag_maker("test_get_task_group_states_with_multiple_task_tasks", serialized=True):
+            with TaskGroup("group1"):
+                EmptyOperator(task_id="task1")
+                EmptyOperator(task_id="task2")
+                EmptyOperator(task_id="task3")
+
+        dr = dag_maker.create_dagrun()
+
+        tis = dr.get_task_instances()
+
+        # Set different states for the task instances
+        for ti, state in zip(tis, [State.SUCCESS, State.FAILED, State.SKIPPED]):
+            ti.state = state
+            session.merge(ti)
+        session.commit()
+
+        response = client.get(
+            "/execution/task-instances/states",
+            params={
+                "dag_id": "test_get_task_group_states_with_multiple_task_tasks",
+                "task_group_id": "group1",
+            },
+        )
+        assert response.status_code == 200
+        assert response.json() == {
+            "task_states": {
+                "test": {
+                    "group1.task1": "success",
+                    "group1.task2": "failed",
+                    "group1.task3": "skipped",
+                },
+            },
+        }
+
+    def test_get_task_group_states_with_logical_dates(self, client, session, dag_maker):
+        with dag_maker("test_get_task_group_states_with_logical_dates", serialized=True):
+            with TaskGroup("group1"):
+                EmptyOperator(task_id="task1")
+
+        date1 = timezone.datetime(2025, 1, 1)
+        date2 = timezone.datetime(2025, 1, 2)
+
+        dag_maker.create_dagrun(run_id="test_run_id1", logical_date=date1)
+        dag_maker.create_dagrun(run_id="test_run_id2", logical_date=date2)
+
+        session.commit()
+
+        response = client.get(
+            "/execution/task-instances/states",
+            params={
+                "dag_id": "test_get_task_group_states_with_logical_dates",
+                "logical_dates": [date1.isoformat(), date2.isoformat()],
+                "task_group_id": "group1",
+            },
+        )
+        assert response.status_code == 200
+        assert response.json() == {
+            "task_states": {
+                "test_run_id1": {
+                    "group1.task1": None,
+                },
+                "test_run_id2": {
+                    "group1.task1": None,
+                },
+            },
+        }
+
+    def test_get_task_group_states_with_run_ids(self, client, session, dag_maker):
+        with dag_maker("test_get_task_group_states_with_run_ids", serialized=True):
+            with TaskGroup("group1"):
+                EmptyOperator(task_id="task1")
+
+        dag_maker.create_dagrun(run_id="run1", logical_date=timezone.datetime(2025, 1, 1))
+        dag_maker.create_dagrun(run_id="run2", logical_date=timezone.datetime(2025, 1, 2))
+
+        session.commit()
+
+        response = client.get(
+            "/execution/task-instances/states",
+            params={
+                "dag_id": "test_get_task_group_states_with_run_ids",
+                "run_ids": ["run1", "run2"],
+                "task_group_id": "group1",
+            },
+        )
+        assert response.status_code == 200
+        assert response.json() == {
+            "task_states": {
+                "run1": {
+                    "group1.task1": None,
+                },
+                "run2": {
+                    "group1.task1": None,
+                },
+            },
+        }
+
+    def test_get_task_states_task_group_not_found(self, client, session, dag_maker):
+        with dag_maker(dag_id="test_get_task_states_task_group_not_found", serialized=True):
+            with TaskGroup("group1"):
+                EmptyOperator(task_id="task1")
+        dag_maker.create_dagrun(session=session)
+
+        response = client.get(
+            "/execution/task-instances/states",
+            params={
+                "dag_id": "test_get_task_states_task_group_not_found",
+                "task_group_id": "non_existent_group",
+            },
+        )
+        assert response.status_code == 404
+        assert response.json()["detail"] == {
+            "reason": "not_found",
+            "message": "Task group non_existent_group not found in DAG test_get_task_states_task_group_not_found",
+        }
+
+    def test_get_task_states_dag_not_found(self, client, session):
+        response = client.get(
+            "/execution/task-instances/states",
+            params={"dag_id": "non_existent_dag", "task_group_id": "group1"},
+        )
+        assert response.status_code == 404
+        assert response.json()["detail"] == {
+            "reason": "not_found",
+            "message": "The Dag with ID: `non_existent_dag` was not found",
+        }
+
+    @pytest.mark.parametrize(
+        ("map_index", "dynamic_task_args", "states", "expected"),
+        (
+            pytest.param(
+                None,
+                [1, 2, 3],
+                {"-1": State.SUCCESS, "0": State.SUCCESS, "1": State.SUCCESS, "2": State.SUCCESS},
+                {"task1": "success", "add_one_0": "success", "add_one_1": "success", "add_one_2": "success"},
+                id="with-default-map-index-None",
+            ),
+            pytest.param(
+                0,
+                [1, 2, 3],
+                {"-1": State.SUCCESS, "0": State.FAILED, "1": State.SUCCESS, "2": State.SUCCESS},
+                {"add_one_0": "failed"},
+                id="with-map-index-0",
+            ),
+            pytest.param(
+                1,
+                [1, 2, 3],
+                {"-1": State.SUCCESS, "0": State.SUCCESS, "1": State.FAILED, "2": State.SUCCESS},
+                {"add_one_1": "failed"},
+                id="with-map-index-1",
+            ),
+        ),
+    )
+    def test_get_task_states_for_dynamic_task_mapping(
+        self, dag_maker, client, session, map_index, dynamic_task_args, states, expected
+    ):
+        """
+        case 1: map_index is None, it should fetch all the tasks
+        other cases: when map index is provided, it should return the count of tasks that falls under the map index
+        """
+        with dag_maker(session=session, serialized=True) as dag:
+            EmptyOperator(task_id="task1")
+
+            @dag.task()
+            def add_one(x):
+                return [x + 1]
+
+            add_one.expand(x=dynamic_task_args)
+
+        dr = dag_maker.create_dagrun()
+
+        tis = dr.get_task_instances()
+        for ti in tis:
+            ti.state = states.get(str(ti.map_index))
+            session.merge(ti)
+        session.commit()
+
+        map_index = {} if map_index is None else {"map_index": map_index}
+
+        response = client.get("/execution/task-instances/states", params={"dag_id": dr.dag_id, **map_index})
+        assert response.status_code == 200
+        assert response.json() == {"task_states": {dr.run_id: expected}}
+
+    @pytest.mark.parametrize(
+        ("map_index", "dynamic_task_args", "task_ids", "task_group_name", "states", "expected"),
+        (
+            pytest.param(
+                None,
+                [1, 2, 3],
+                None,
+                None,
+                {"-1": State.SUCCESS, "0": State.SUCCESS, "1": State.SUCCESS, "2": State.SUCCESS},
+                {
+                    "group1.add_one_0": "success",
+                    "group1.add_one_1": "success",
+                    "group1.add_one_2": "success",
+                    "group1.task2": "success",
+                    "task1": "success",
+                },
+                id="with-default-map-index-None",
+            ),
+            pytest.param(
+                0,
+                [1, 2, 3],
+                None,
+                None,
+                {"-1": State.SUCCESS, "0": State.FAILED, "1": State.SUCCESS, "2": State.SUCCESS},
+                {"group1.add_one_0": "failed"},
+                id="with-map-index-0-no-task-group",
+            ),
+            pytest.param(
+                -1,
+                [1, 2, 3],
+                ["task1"],
+                None,
+                {"-1": State.SUCCESS, "0": State.SUCCESS, "1": State.SUCCESS, "2": State.SUCCESS},
+                {"task1": "success"},
+                id="with-task-ids-map-index-(-1)",
+            ),
+            pytest.param(
+                None,
+                [1, 2, 3],
+                None,
+                "group1",
+                {"-1": State.SUCCESS, "0": State.SUCCESS, "1": State.SUCCESS, "2": State.SUCCESS},
+                {
+                    "group1.task2": "success",
+                    "group1.add_one_0": "success",
+                    "group1.add_one_1": "success",
+                    "group1.add_one_2": "success",
+                },
+                id="with-task-group-id-and-map-index-None",
+            ),
+            pytest.param(
+                0,
+                [1, 2, 3],
+                None,
+                "group1",
+                {"-1": State.SUCCESS, "0": State.FAILED, "1": State.SUCCESS, "2": State.SUCCESS},
+                {"group1.add_one_0": "failed"},
+                id="with-task-group-id-and-map-index-0",
+            ),
+            pytest.param(
+                -1,
+                [1, 2, 3],
+                ["task1"],
+                "group1",
+                {"-1": State.SUCCESS, "0": State.SUCCESS, "1": State.SUCCESS, "2": State.SUCCESS},
+                {"task1": "success", "group1.task2": "success"},
+                id="with-task-id-and-task-group-map-index-(-1)",
+            ),
+        ),
+    )
+    def test_get_task_states_mix_of_task_and_task_group_dynamic_task_mapping(
+        self,
+        dag_maker,
+        client,
+        session,
+        map_index,
+        dynamic_task_args,
+        task_ids,
+        task_group_name,
+        states,
+        expected,
+    ):
+        """
+        case1: map_index is None, task_ids is None, task_group_name is None, it should fetch all the task states
+        case2: when map index -1 and provided task_ids, it should return the task states of task_ids
+        case3: when map index is None and provided task_group_id, it should return the task states of tasks under the task group and normal task states under task group
+        case4: when map index is 0 and provided task_group_id, it should return the task states of tasks under the task group that falls under map index = 0
+        case5: when map index is -1 and provided both task_id and task_group_id, it should return the task states of tasks under the task group that falls under map index = -1 and normal task_ids states
+        """
+
+        with dag_maker(session=session, serialized=True) as dag:
+            EmptyOperator(task_id="task1")
+
+            with TaskGroup("group1"):
+
+                @dag.task()
+                def add_one(x):
+                    return [x + 1]
+
+                add_one.expand(x=dynamic_task_args)
+
+                EmptyOperator(task_id="task2")
+
+        dr = dag_maker.create_dagrun(session=session)
+
+        tis = dr.get_task_instances()
+        for ti in tis:
+            ti.state = states.get(str(ti.map_index))
+            session.merge(ti)
+        session.commit()
+        params = {}
+
+        if task_ids:
+            params["task_ids"] = task_ids
+        if task_group_name:
+            params["task_group_id"] = task_group_name
+        if map_index is not None:
+            params["map_index"] = map_index
+
+        response = client.get("/execution/task-instances/states", params={"dag_id": dr.dag_id, **params})
+        assert response.status_code == 200
+        assert response.json() == {"task_states": {dr.run_id: expected}}
+
+
+class TestGetTaskInstanceBreadcrumbs:
+    def setup_method(self):
+        clear_db_runs()
+
+    def teardown_method(self):
+        clear_db_runs()
+
+    @pytest.fixture(autouse=True)
+    def dag_run(self, dag_maker, session):
+        with dag_maker(session=session):
+            for name in TaskInstanceState._member_names_:
+                EmptyOperator(task_id=name)
+        return dag_maker.create_dagrun(state="running")
+
+    @pytest.fixture(autouse=True)
+    def task_instances(self, dag_run, session):
+        tis = {ti.task_id: ti for ti in dag_run.task_instances}
+        for name, value in TaskInstanceState._member_map_.items():
+            tis[name].state = value
+        session.commit()
+        return tis
+
+    def test_get_breadcrumbs(self, client, dag_run):
+        response = client.get(
+            "/execution/task-instances/breadcrumbs",
+            params={"dag_id": dag_run.dag_id, "run_id": dag_run.run_id},
+        )
+        assert response.status_code == 200
+        assert response.json() == {  # Should find tis with terminal states.
+            "breadcrumbs": [
+                {
+                    "duration": None,
+                    "map_index": -1,
+                    "operator": "EmptyOperator",
+                    "state": "failed",
+                    "task_id": "FAILED",
+                },
+                {
+                    "duration": None,
+                    "map_index": -1,
+                    "operator": "EmptyOperator",
+                    "state": "removed",
+                    "task_id": "REMOVED",
+                },
+                {
+                    "duration": None,
+                    "map_index": -1,
+                    "operator": "EmptyOperator",
+                    "state": "skipped",
+                    "task_id": "SKIPPED",
+                },
+                {
+                    "duration": None,
+                    "map_index": -1,
+                    "operator": "EmptyOperator",
+                    "state": "success",
+                    "task_id": "SUCCESS",
+                },
+                {
+                    "duration": None,
+                    "map_index": -1,
+                    "operator": "EmptyOperator",
+                    "state": "upstream_failed",
+                    "task_id": "UPSTREAM_FAILED",
+                },
+            ]
+        }
+
+
+class TestInvactiveInletsAndOutlets:
+    @pytest.mark.parametrize(
+        "logical_date",
+        [
+            datetime(2025, 6, 6, tzinfo=timezone.utc),
+            None,
+        ],
+    )
+    def test_ti_inactive_inlets_and_outlets(self, logical_date, client, dag_maker):
+        """Test the inactive assets in inlets and outlets can be found."""
+        with dag_maker("test_inlets_and_outlets"):
+            EmptyOperator(
+                task_id="task1",
+                inlets=[Asset(name="inlet-name"), Asset(name="inlet-name", uri="but-different-uri")],
+                outlets=[
+                    Asset(name="outlet-name", uri="uri"),
+                    Asset(name="outlet-name", uri="second-different-uri"),
+                ],
+            )
+
+        dr = dag_maker.create_dagrun(logical_date=logical_date)
+
+        task1_ti = dr.get_task_instance("task1")
+        response = client.get(f"/execution/task-instances/{task1_ti.id}/validate-inlets-and-outlets")
+        assert response.status_code == 200
+        inactive_assets = response.json()["inactive_assets"]
+        expected_inactive_assets = (
+            {
+                "name": "inlet-name",
+                "type": "Asset",
+                "uri": "but-different-uri",
+            },
+            {
+                "name": "outlet-name",
+                "type": "Asset",
+                "uri": "second-different-uri",
+            },
+        )
+        for asset in expected_inactive_assets:
+            assert asset in inactive_assets
+
+    @pytest.mark.parametrize(
+        "logical_date",
+        [
+            datetime(2025, 6, 6, tzinfo=timezone.utc),
+            None,
+        ],
+    )
+    def test_ti_inactive_inlets_and_outlets_without_inactive_assets(self, logical_date, client, dag_maker):
+        """Test the task without inactive assets in its inlets or outlets returns empty list."""
+        with dag_maker("test_inlets_and_outlets_inactive"):
+            EmptyOperator(
+                task_id="inactive_task1",
+                inlets=[Asset(name="inlet-name")],
+                outlets=[Asset(name="outlet-name", uri="uri")],
+            )
+
+        dr = dag_maker.create_dagrun(logical_date=logical_date)
+
+        task1_ti = dr.get_task_instance("inactive_task1")
+        response = client.get(f"/execution/task-instances/{task1_ti.id}/validate-inlets-and-outlets")
+        assert response.status_code == 200
+        assert response.json() == {"inactive_assets": []}
+
+    def test_ti_run_with_null_conf(self, client, session, create_task_instance):
+        """Test that task instances can start when dag_run.conf is NULL."""
+        ti = create_task_instance(
+            task_id="test_ti_run_with_null_conf",
+            state=State.QUEUED,
+            dagrun_state=DagRunState.RUNNING,
+            session=session,
+        )
+        # Set conf to NULL to simulate Airflow 2.x upgrade or offline migration
+        ti.dag_run.conf = None
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/run",
+            json={
+                "state": "running",
+                "pid": 100,
+                "hostname": "test-hostname",
+                "unixname": "test-user",
+                "start_date": timezone.utcnow().isoformat(),
+            },
+        )
+
+        assert response.status_code == 200, f"Response: {response.text}"
+        context = response.json()
+        assert context["dag_run"]["conf"] is None
+
+
+class TestTIPatchRenderedMapIndex:
+    def setup_method(self):
+        clear_db_runs()
+
+    def teardown_method(self):
+        clear_db_runs()
+
+    def test_ti_patch_rendered_map_index(self, client, session, create_task_instance):
+        """Test updating rendered_map_index for a task instance."""
+        ti = create_task_instance(
+            task_id="test_ti_patch_rendered_map_index",
+            state=State.RUNNING,
+            session=session,
+        )
+        session.commit()
+
+        rendered_map_index = "custom_label_123"
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/rendered-map-index",
+            json=rendered_map_index,
+        )
+
+        assert response.status_code == 204
+        assert response.text == ""
+
+        session.expire_all()
+        ti = session.get(TaskInstance, ti.id)
+        assert ti.rendered_map_index == rendered_map_index
+
+    def test_ti_patch_rendered_map_index_not_found(self, client, session):
+        """Test 404 error when task instance does not exist."""
+        fake_id = str(uuid4())
+        response = client.patch(
+            f"/execution/task-instances/{fake_id}/rendered-map-index",
+            json="test",
+        )
+
+        assert response.status_code == 404
+
+    def test_ti_patch_rendered_map_index_empty_string(self, client, session, create_task_instance):
+        """Test that empty string is accepted (clears the rendered_map_index)."""
+        ti = create_task_instance(
+            task_id="test_ti_patch_rendered_map_index_empty",
+            state=State.RUNNING,
+            session=session,
+        )
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/rendered-map-index",
+            json="",
+        )
+
+        assert response.status_code == 422
+
+
+class TestTIDagRunNoteUpdate:
+    def setup_method(self):
+        clear_db_runs()
+
+    def teardown_method(self):
+        clear_db_runs()
+
+    def test_create_dag_run_note(self, client, session, create_task_instance):
+        ti = create_task_instance(
+            task_id="test_create_dag_run_note",
+            state=State.RUNNING,
+            session=session,
+        )
+        ti_id = ti.id
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti_id}/dag-run-note",
+            json={"note": "Created from task runtime"},
+        )
+
+        assert response.status_code == 204
+        assert response.text == ""
+
+        session.expire_all()
+        dag_run = session.get(TaskInstance, ti_id).dag_run
+        assert dag_run.note == "Created from task runtime"
+        assert dag_run.dag_run_note.user_id is None
+
+    def test_runtime_update_of_user_note_becomes_unattributed(self, client, session, create_task_instance):
+        """Runtime rewrites the content, so the previous author is not carried over."""
+        ti = create_task_instance(
+            task_id="test_update_dag_run_note",
+            state=State.RUNNING,
+            session=session,
+        )
+        ti.dag_run.note = ("Created from UI", "user_id")
+        ti_id = ti.id
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti_id}/dag-run-note",
+            json={"note": "Updated from task runtime"},
+        )
+
+        assert response.status_code == 204
+        assert response.text == ""
+
+        session.expire_all()
+        dag_run = session.get(TaskInstance, ti_id).dag_run
+        assert dag_run.note == "Updated from task runtime"
+        assert dag_run.dag_run_note.user_id is None
+
+    def test_clear_dag_run_note(self, client, session, create_task_instance):
+        ti = create_task_instance(
+            task_id="test_clear_dag_run_note",
+            state=State.RUNNING,
+            session=session,
+        )
+        ti.dag_run.note = ("Will be cleared", "user_id")
+        ti_id = ti.id
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti_id}/dag-run-note",
+            json={"note": ""},
+        )
+
+        assert response.status_code == 204
+        assert response.text == ""
+
+        session.expire_all()
+        dag_run = session.get(TaskInstance, ti_id).dag_run
+        # Clearing removes the note row entirely, same as the UI/public API path.
+        assert dag_run.note is None
+        assert dag_run.dag_run_note is None
+
+    def test_null_note_leaves_existing_dag_run_note_unchanged(self, client, session, create_task_instance):
+        ti = create_task_instance(
+            task_id="test_null_note_leaves_existing_dag_run_note_unchanged",
+            state=State.RUNNING,
+            session=session,
+        )
+        ti.dag_run.note = ("Keep existing note", "user_id")
+        ti_id = ti.id
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti_id}/dag-run-note",
+            json={"note": None},
+        )
+
+        assert response.status_code == 204
+        assert response.text == ""
+
+        session.expire_all()
+        dag_run = session.get(TaskInstance, ti_id).dag_run
+        assert dag_run.note == "Keep existing note"
+        assert dag_run.dag_run_note.user_id == "user_id"
+
+    def test_update_dag_run_note_task_instance_not_found(self, client, session):
+        response = client.patch(
+            f"/execution/task-instances/{uuid4()}/dag-run-note",
+            json={"note": "Does not matter"},
+        )
+
+        assert response.status_code == 404
+
+    def test_update_dag_run_note_rejects_too_long_note(self, client, session, create_task_instance):
+        ti = create_task_instance(
+            task_id="test_update_dag_run_note_rejects_too_long_note",
+            state=State.RUNNING,
+            session=session,
+        )
+        ti_id = ti.id
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti_id}/dag-run-note",
+            json={"note": "x" * 1001},
+        )
+
+        assert response.status_code == 422
+
+
+@pytest.mark.usefixtures("_use_real_jwt_bearer")
+class TestTokenTypeValidation:
+    """Test token scope enforcement (workload vs execution)."""
+
+    def _register_scoped_validator(self, ti_id, scope):
+        """Register a JWTValidator mock returning claims with the given scope."""
+        validator = mock.AsyncMock(spec=JWTValidator)
+        claims = {"sub": str(ti_id), "exp": 9999999999, "iat": 1000000000, "nbf": 1000000000}
+        if scope is not None:
+            claims["scope"] = scope
+        validator.avalidated_claims.side_effect = lambda cred, validators: claims
+        lifespan.registry.register_value(JWTValidator, validator)
+
+    def test_workload_scope_rejected_on_heartbeat_endpoint(self, client, session, create_task_instance):
+        """Workload scoped tokens should be rejected on /heartbeat."""
+        ti = create_task_instance(task_id="test_ti_run_heartbeat", state=State.RUNNING)
+        session.commit()
+
+        self._register_scoped_validator(ti.id, "workload")
+
+        payload = {"hostname": "test-host", "pid": 100}
+        resp = client.put(f"/execution/task-instances/{ti.id}/heartbeat", json=payload)
+        assert resp.status_code == 403
+        assert "Token type 'workload' not allowed" in resp.json()["detail"]
+
+    def test_workload_scope_rejected_on_state_endpoint(self, client, session, create_task_instance):
+        """Workload scoped tokens should be rejected on PATCH /state."""
+        ti = create_task_instance(task_id="test_workload_state", state=State.RUNNING)
+        session.commit()
+
+        self._register_scoped_validator(ti.id, "workload")
+
+        payload = {"state": "success", "end_date": "2024-10-31T13:00:00Z"}
+        resp = client.patch(f"/execution/task-instances/{ti.id}/state", json=payload)
+        assert resp.status_code == 403
+        assert "Token type 'workload' not allowed" in resp.json()["detail"]
+
+    def test_workload_scope_rejected_on_connections_endpoint(self, client, session, create_task_instance):
+        """Workload scoped tokens should be rejected on GET /connections (different router)."""
+        ti = create_task_instance(task_id="test_workload_conn", state=State.RUNNING)
+        session.commit()
+
+        self._register_scoped_validator(ti.id, "workload")
+
+        resp = client.get("/execution/connections/test_conn")
+        assert resp.status_code == 403
+        assert "Token type 'workload' not allowed" in resp.json()["detail"]
+
+    def test_execution_scope_accepted_on_all_endpoints(self, client, session, create_task_instance):
+        """Execution scoped tokens should be accepted on all endpoints."""
+        ti = create_task_instance(task_id="test_ti_star", state=State.RUNNING)
+        session.commit()
+
+        self._register_scoped_validator(ti.id, "execution")
+
+        payload = {"state": "success", "end_date": "2024-10-31T13:00:00Z"}
+        resp = client.patch(f"/execution/task-instances/{ti.id}/state", json=payload)
+        assert resp.status_code in [200, 204]
+
+    def test_invalid_scope_value_rejected(self, client, session, create_task_instance):
+        """Tokens with unrecognized scope values should be rejected."""
+        ti = create_task_instance(task_id="test_invalid_scope", state=State.QUEUED)
+        session.commit()
+
+        self._register_scoped_validator(ti.id, "bogus:scope")
+
+        payload = {
+            "state": "running",
+            "hostname": "test-host",
+            "unixname": "test-user",
+            "pid": 100,
+            "start_date": "2024-10-31T12:00:00Z",
+        }
+
+        resp = client.patch(f"/execution/task-instances/{ti.id}/run", json=payload)
+        assert resp.status_code == 403
+        assert "Invalid auth token" in resp.json()["detail"]
+
+    def test_workload_scope_accepted_on_run_endpoint(
+        self, client, session, create_task_instance, time_machine
+    ):
+        """Workload scoped tokens should be accepted on the /run endpoint."""
+        instant = timezone.parse("2024-10-31T12:00:00Z")
+        time_machine.move_to(instant, tick=False)
+
+        ti = create_task_instance(
+            task_id="test_workload_run",
+            state=State.QUEUED,
+            dagrun_state=DagRunState.RUNNING,
+            session=session,
+            start_date=instant,
+            dag_id=str(uuid4()),
+        )
+        session.commit()
+
+        self._register_scoped_validator(ti.id, "workload")
+
+        resp = client.patch(
+            f"/execution/task-instances/{ti.id}/run",
+            json={
+                "state": "running",
+                "hostname": "test-host",
+                "unixname": "test-user",
+                "pid": 100,
+                "start_date": "2024-10-31T12:00:00Z",
+            },
+        )
+        assert resp.status_code == 200
+
+    def test_no_scope_defaults_to_execution(self, client, session, create_task_instance):
+        """Tokens without scope claim should default to 'execution'."""
+        ti = create_task_instance(task_id="test_no_scope", state=State.RUNNING)
+        session.commit()
+
+        self._register_scoped_validator(ti.id, None)
+
+        payload = {"state": "success", "end_date": "2024-10-31T13:00:00Z"}
+        resp = client.patch(f"/execution/task-instances/{ti.id}/state", json=payload)
+        assert resp.status_code in [200, 204]
+
+
+class TestEmitTaskSpan:
+    """Tests for the _emit_task_span function in the execution API task-instance route."""
+
+    @pytest.fixture(autouse=True)
+    def sdk_tracer_provider(self):
+        self.resolver = mock.create_autospec(TaskCoordinateResolver, instance=True)
+        self.exporter = InMemorySpanExporter()
+        provider = TracerProvider(id_generator=OverrideableRandomIdGenerator())
+        provider.add_span_processor(SimpleSpanProcessor(self.exporter))
+        test_tracer = provider.get_tracer("test")
+        with mock.patch("airflow.api_fastapi.execution_api.routes.task_instances.tracer", test_tracer):
+            yield
+
+    def _make_carriers(self):
+        """Return a (dr_carrier, ti_carrier) pair built with a real SDK provider."""
+        p = TracerProvider()
+        t = p.get_tracer("setup")
+        dr_span = t.start_span("dr")
+        dr_ctx = otel_trace.set_span_in_context(dr_span)
+        dr_carrier: dict = {}
+        TraceContextTextMapPropagator().inject(dr_carrier, context=dr_ctx)
+        ti_span = t.start_span("ti", context=dr_ctx)
+        ti_ctx = otel_trace.set_span_in_context(ti_span)
+        ti_carrier: dict = {}
+        TraceContextTextMapPropagator().inject(ti_carrier, context=ti_ctx)
+        return dr_carrier, ti_carrier
+
+    def test_retry_span_identifies_finished_attempt(self, client, session, create_task_instance):
+        ti = create_task_instance(task_id="retry_span", state=State.RUNNING)
+        ti.dag_run.context_carrier, ti.context_carrier = self._make_carriers()
+        ti.try_number = 3
+        retiring_id = ti.id
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{retiring_id}/state",
+            json={"state": State.UP_FOR_RETRY, "end_date": DEFAULT_END_DATE.isoformat()},
+        )
+
+        assert response.status_code == 204
+        span = next(span for span in self.exporter.get_finished_spans() if span.name == "task_run.retry_span")
+        assert span.attributes["airflow.task_instance.id"] == str(retiring_id)
+        assert span.attributes["airflow.task_instance.try_number"] == 3
+        assert "airflow.task_instance.region_id" not in span.attributes
+        assert "airflow.task_instance.region_index" not in span.attributes
+
+    def test_loop_span_keeps_public_index_and_exact_region(self, client, session, loop_reader_tis):
+        ti, _ = loop_reader_tis
+        ti.state = State.RUNNING
+        ti.dag_run.context_carrier, ti.context_carrier = self._make_carriers()
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti.id}/state",
+            json={"state": "success", "end_date": DEFAULT_END_DATE.isoformat()},
+        )
+
+        assert response.status_code == 204, response.text
+        span = next(span for span in self.exporter.get_finished_spans() if "body.task" in span.name)
+        assert span.name == "task_run.body.task"
+        assert span.attributes["airflow.task_instance.map_index"] == -1
+        assert span.attributes["airflow.task_instance.region_id"] == str(ti.region_id)
+        assert span.attributes["airflow.task_instance.region_index"] == 2
+
+    def _make_ti(self, task_id="my_task", map_index=-1, queued_dttm=None, start_date=None):
+        dr_carrier, ti_carrier = self._make_carriers()
+        ti = mock.MagicMock()
+        ti.id = UUID("0182e924-0f1e-77e6-ab50-e977118bc139")
+        ti.dag_id = "test_dag"
+        ti.task_id = task_id
+        ti.run_id = "test_run"
+        ti.try_number = 1
+        ti.region_id = UUID(int=0)
+        ti.region_index = map_index
+        self.resolver.public_map_index.return_value = map_index
+        ti.queued_dttm = queued_dttm
+        ti.start_date = start_date or DEFAULT_START_DATE
+        ti.dag_run.context_carrier = dr_carrier
+        ti.context_carrier = ti_carrier
+        return ti
+
+    def test_emit_task_span_success_sets_ok_status(self):
+        _emit_task_span(self._make_ti(), TaskInstanceState.SUCCESS, resolver=self.resolver)
+
+        spans = self.exporter.get_finished_spans()
+        assert len(spans) == 1
+        assert spans[0].status.status_code == StatusCode.OK
+
+    def test_emit_task_span_failed_sets_error_status(self):
+        _emit_task_span(self._make_ti(), TaskInstanceState.FAILED, resolver=self.resolver)
+
+        spans = self.exporter.get_finished_spans()
+        assert len(spans) == 1
+        assert spans[0].status.status_code == StatusCode.ERROR
+
+    def test_emit_task_span_sets_attributes(self):
+        ti = self._make_ti(task_id="my_task", map_index=2)
+        _emit_task_span(ti, TaskInstanceState.SUCCESS, resolver=self.resolver)
+
+        attrs = self.exporter.get_finished_spans()[0].attributes
+        assert attrs["airflow.dag_id"] == "test_dag"
+        assert attrs["airflow.task_id"] == "my_task"
+        assert attrs["airflow.dag_run.run_id"] == "test_run"
+        assert attrs["airflow.task_instance.try_number"] == 1
+        assert attrs["airflow.task_instance.map_index"] == 2
+        assert attrs["airflow.task_instance.state"] == TaskInstanceState.SUCCESS
+        # The OTEL SDK only accepts str/bytes/int/float/bool attribute values,
+        # so the UUID must be stringified before being set on the span.
+        assert attrs["airflow.task_instance.id"] == str(ti.id)
+        assert isinstance(attrs["airflow.task_instance.id"], str)
+
+    def test_emit_task_span_name_unmapped(self):
+        _emit_task_span(
+            self._make_ti(task_id="my_task", map_index=-1), TaskInstanceState.SUCCESS, resolver=self.resolver
+        )
+        assert self.exporter.get_finished_spans()[0].name == "task_run.my_task"
+
+    def test_emit_task_span_name_mapped(self):
+        _emit_task_span(
+            self._make_ti(task_id="my_task", map_index=3), TaskInstanceState.SUCCESS, resolver=self.resolver
+        )
+        assert self.exporter.get_finished_spans()[0].name == "task_run.my_task[3]"
+
+    def test_emit_task_span_start_time_uses_queued_dttm(self):
+        queued_dttm = timezone.parse("2024-01-01T10:00:00Z")
+        start_date = timezone.parse("2024-01-01T10:05:00Z")
+        ti = self._make_ti(queued_dttm=queued_dttm, start_date=start_date)
+        _emit_task_span(ti, TaskInstanceState.SUCCESS, resolver=self.resolver)
+
+        assert self.exporter.get_finished_spans()[0].start_time == int(queued_dttm.timestamp() * 1e9)
+
+    def test_emit_task_span_start_time_falls_back_to_start_date(self):
+        start_date = timezone.parse("2024-01-01T10:05:00Z")
+        ti = self._make_ti(queued_dttm=None, start_date=start_date)
+        _emit_task_span(ti, TaskInstanceState.SUCCESS, resolver=self.resolver)
+
+        assert self.exporter.get_finished_spans()[0].start_time == int(start_date.timestamp() * 1e9)
+
+    def test_emit_task_span_skips_if_no_ti_carrier(self):
+        ti = mock.MagicMock()
+        ti.dag_run.context_carrier = {
+            "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+        }
+        ti.context_carrier = None
+
+        _emit_task_span(ti, TaskInstanceState.SUCCESS, resolver=self.resolver)
+        assert len(self.exporter.get_finished_spans()) == 0
+
+    def test_emit_task_span_skips_if_no_dagrun_carrier(self):
+        ti = mock.MagicMock()
+        ti.dag_run.context_carrier = None
+        ti.context_carrier = {"traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"}
+
+        _emit_task_span(ti, TaskInstanceState.SUCCESS, resolver=self.resolver)
+        assert len(self.exporter.get_finished_spans()) == 0
+
+    @pytest.mark.parametrize(
+        ("trace_flag", "expected_spans"),
+        [
+            pytest.param("01", 1, id="sampled-carrier-emits"),
+            pytest.param("00", 0, id="unsampled-carrier-skips"),
+        ],
+    )
+    def test_emit_task_span_honors_dagrun_carrier_sampling(self, trace_flag, expected_spans):
+        """A SAMPLED dag_run carrier (flag 01) emits the task span; an unsampled one (flag 00) is head-sampled out."""
+        ti = self._make_ti()
+        ti.dag_run.context_carrier = {
+            "traceparent": f"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-{trace_flag}"
+        }
+        _emit_task_span(ti, TaskInstanceState.SUCCESS, resolver=self.resolver)
+        assert len(self.exporter.get_finished_spans()) == expected_spans

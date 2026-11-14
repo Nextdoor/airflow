@@ -20,71 +20,81 @@ import platform
 import shutil
 import subprocess
 import sys
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from click import Context
-
-from airflow_breeze.commands.ci_image_commands import ci_image
-from airflow_breeze.commands.production_image_commands import prod_image
-from airflow_breeze.commands.testing_commands import testing
-from airflow_breeze.configure_rich_click import click
-from airflow_breeze.utils.click_utils import BreezeGroup
-from airflow_breeze.utils.common_options import (
+from airflow_breeze.commands.common_options import (
+    option_all_integration,
     option_answer,
+    option_auth_manager,
     option_backend,
+    option_builder,
+    option_custom_db_url,
     option_db_reset,
+    option_docker_host,
     option_dry_run,
     option_forward_credentials,
     option_github_repository,
-    option_integration,
     option_max_time,
-    option_mssql_version,
     option_mysql_version,
     option_postgres_version,
+    option_project_name,
     option_python,
+    option_standalone_dag_processor,
+    option_use_uv,
     option_verbose,
 )
+from airflow_breeze.configure_rich_click import click
+from airflow_breeze.utils.click_utils import BreezeGroup
 from airflow_breeze.utils.confirm import Answer, user_confirm
-from airflow_breeze.utils.console import get_console
-from airflow_breeze.utils.path_utils import BUILD_CACHE_DIR
+from airflow_breeze.utils.console import console_print
+from airflow_breeze.utils.docker_command_utils import (
+    remove_docker_networks,
+    remove_docker_volumes,
+    remove_stale_worktree_containers,
+)
+from airflow_breeze.utils.path_utils import AIRFLOW_HOME_PATH, BUILD_CACHE_PATH
+from airflow_breeze.utils.provider_dependencies import generate_provider_dependencies_if_needed
 from airflow_breeze.utils.run_utils import run_command
 from airflow_breeze.utils.shared_options import get_dry_run
 
+if TYPE_CHECKING:
+    from click import Context
+
 
 def print_deprecated(deprecated_command: str, command_to_use: str):
-    get_console().print("[yellow]" + ("#" * 80) + "\n")
-    get_console().print(f"[yellow]The command '{deprecated_command}' is deprecated!\n")
-    get_console().print(f"Use 'breeze {command_to_use}' instead\n")
-    get_console().print("[yellow]" + ("#" * 80) + "\n")
+    console_print("\n[warning]" + ("#" * 80) + "\n")
+    console_print(f"[warning]The command '{deprecated_command}' is deprecated!\n")
+    console_print(f"Use 'breeze {command_to_use}' instead\n")
+    console_print("[warning]" + ("#" * 80) + "\n")
+
+
+def print_removed(deprecated_command: str, non_breeze_command_to_use: str, installation_notes: str | None):
+    console_print("\n[warning]" + ("#" * 80) + "\n")
+    console_print(f"[warning]The command '{deprecated_command}' is removed!\n")
+    console_print(f"Use '{non_breeze_command_to_use}' instead.\n")
+    if installation_notes:
+        console_print(installation_notes)
+    console_print("[warning]" + ("#" * 80) + "\n")
 
 
 class MainGroupWithAliases(BreezeGroup):
     def get_command(self, ctx: Context, cmd_name: str):
-        # Aliases for important commands moved to sub-commands
-        from airflow_breeze.commands.setup_commands import setup
-
+        # Aliases for important commands moved to sub-commands or deprecated commands
         rv = click.Group.get_command(self, ctx, cmd_name)
         if rv is not None:
             return rv
-        if cmd_name == "build-image":
-            print_deprecated("build-image", "ci-image build")
-            return ci_image.get_command(ctx, "build")
-        if cmd_name == "build-prod-image":
-            print_deprecated("build-prod-image", "prod-image build")
-            return prod_image.get_command(ctx, "build")
-        if cmd_name == "tests":
-            print_deprecated("tests", "testing tests")
-            return testing.get_command(ctx, "tests")
-        if cmd_name == "config":
-            print_deprecated("config", "setup config")
-            return setup.get_command(ctx, "config")
-        if cmd_name == "setup-autocomplete":
-            print_deprecated("setup-autocomplete", "setup autocomplete")
-            return setup.get_command(ctx, "autocomplete")
-        if cmd_name == "version":
+        if cmd_name == "static-checks":
             # version alias does not need to be deprecated. It's ok to keep it also at top level
             # even if it is not displayed in help
-            return setup.get_command(ctx, "version")
+            print_removed(
+                "static-checks",
+                "prek",
+                "\nYou can install prek with:\n"
+                "\n[special]uv tool install prek[/]\n\n"
+                "Followed by (in airflow repo):\n\n"
+                "[special]prek install -f[/]\n",
+            )
+            sys.exit(1)
         return None
 
 
@@ -93,25 +103,33 @@ class MainGroupWithAliases(BreezeGroup):
     invoke_without_command=True,
     context_settings={"help_option_names": ["-h", "--help"]},
 )
-@option_python
-@option_backend
-@option_postgres_version
-@option_mysql_version
-@option_mssql_version
-@option_integration
-@option_forward_credentials
-@option_db_reset
-@option_max_time
-@option_github_repository
-@option_verbose
-@option_dry_run
 @option_answer
+@option_auth_manager
+@option_backend
+@option_custom_db_url
+@option_builder
+@option_db_reset
+@option_docker_host
+@option_dry_run
+@option_forward_credentials
+@option_github_repository
+@option_all_integration
+@option_max_time
+@option_mysql_version
+@option_postgres_version
+@option_python
+@option_project_name
+@option_standalone_dag_processor
+@option_use_uv
+@option_verbose
 @click.pass_context
 def main(ctx: click.Context, **kwargs: dict[str, Any]):
     from airflow_breeze.commands.developer_commands import shell
 
     check_for_rosetta_environment()
     check_for_python_emulation()
+    if not any(argument in {"-h", "--help"} for argument in sys.argv[1:]):
+        generate_provider_dependencies_if_needed()
 
     if not ctx.invoked_subcommand:
         ctx.forward(shell, extra_args={})
@@ -122,30 +140,30 @@ def check_for_python_emulation():
         system_machine = subprocess.check_output(["uname", "-m"], text=True).strip()
         python_machine = platform.uname().machine
         if system_machine != python_machine:
-            from airflow_breeze.utils.console import get_console
-
-            get_console().print(
+            console_print(
                 f"\n\n[error]Your Python architecture is {python_machine} and "
                 f"system architecture is {system_machine}[/]"
             )
-            get_console().print(
-                "[warning]This is very bad and your Python is 10x slower as it is emulated[/]"
-            )
-            get_console().print(
+            console_print("[warning]This is very bad and your Python is 10x slower as it is emulated[/]")
+            console_print(
                 "[warning]You likely installed your Python wrongly and you should "
                 "remove it and reinstall from scratch[/]\n"
             )
             from inputimeout import TimeoutOccurred, inputimeout
 
-            user_status = inputimeout(
-                prompt="Are you REALLY sure you want to continue? (answer with y otherwise we exit in 20s)\n",
-                timeout=20,
-            )
-            if user_status.upper() not in ["Y", "YES"]:
+            try:
+                user_status = inputimeout(
+                    prompt="Are you REALLY sure you want to continue? "
+                    "(answer with y otherwise we exit in 20s)\n",
+                    timeout=20,
+                )
+                if user_status.upper() not in ["Y", "YES"]:
+                    sys.exit(1)
+            except TimeoutOccurred:
+                console_print("\nNo answer, exiting...")
                 sys.exit(1)
-    except TimeoutOccurred:
-        get_console().print("\nNo answer, exiting...")
-        sys.exit(1)
+    except FileNotFoundError:
+        pass
     except subprocess.CalledProcessError:
         pass
     except PermissionError:
@@ -165,15 +183,11 @@ def check_for_rosetta_environment():
             stderr=subprocess.DEVNULL,
         ).strip()
         if runs_in_rosetta == "1":
-            from airflow_breeze.utils.console import get_console
-
-            get_console().print(
+            console_print(
                 "\n\n[error]You are starting breeze in `rosetta 2` emulated environment on Mac[/]\n"
             )
-            get_console().print(
-                "[warning]This is very bad and your Python is 10x slower as it is emulated[/]\n"
-            )
-            get_console().print(
+            console_print("[warning]This is very bad and your Python is 10x slower as it is emulated[/]\n")
+            console_print(
                 "You have emulated Python interpreter (Intel rather than ARM). You should check:\n\n"
                 '  * Your IDE (PyCharm/VSCode/Intellij): the "About" window should show `aarch64` '
                 'not `x86_64` in "Runtime version".\n'
@@ -192,7 +206,7 @@ def check_for_rosetta_environment():
             if user_status.upper() not in ["Y", "YES"]:
                 sys.exit(1)
     except TimeoutOccurred:
-        get_console().print("\nNo answer, exiting...")
+        console_print("\nNo answer, exiting...")
         sys.exit(1)
     except subprocess.CalledProcessError:
         pass
@@ -202,7 +216,7 @@ def check_for_rosetta_environment():
 
 @main.command(
     name="cleanup",
-    help="Cleans the cache of parameters, docker cache and optionally built CI/PROD images.",
+    help="Cleans caches, deleted-worktree containers, unused Breeze volumes and optionally CI/PROD images.",
 )
 @click.option(
     "--all",
@@ -214,12 +228,12 @@ def check_for_rosetta_environment():
 @option_answer
 def cleanup(all: bool):
     if all:
-        get_console().print(
+        console_print(
             "\n[info]Removing cache of parameters, clean up docker cache "
             "and remove locally downloaded images[/]"
         )
     else:
-        get_console().print("[info]Removing cache of parameters, and cleans up docker cache[/]")
+        console_print("[info]Removing cache of parameters, and cleans up docker cache[/]")
     if all:
         docker_images_command_to_execute = [
             "docker",
@@ -232,10 +246,10 @@ def cleanup(all: bool):
         command_result = run_command(docker_images_command_to_execute, text=True, capture_output=True)
         images = command_result.stdout.splitlines() if command_result and command_result.stdout else []
         if images:
-            get_console().print("[info]Removing images:[/]")
+            console_print("[info]Removing images:[/]")
             for image in images:
-                get_console().print(f"[info] * {image}[/]")
-            get_console().print()
+                console_print(f"[info] * {image}[/]")
+            console_print()
             docker_rmi_command_to_execute = [
                 "docker",
                 "rmi",
@@ -248,21 +262,72 @@ def cleanup(all: bool):
             elif given_answer == Answer.QUIT:
                 sys.exit(0)
         else:
-            get_console().print("[info]No locally downloaded images to remove[/]\n")
-    get_console().print("Pruning docker images")
-    given_answer = user_confirm("Are you sure with the removal?")
+            console_print("[info]No locally downloaded images to remove[/]\n")
+    given_answer = user_confirm("Remove containers, including running ones, belonging to deleted worktrees?")
     if given_answer == Answer.YES:
-        system_prune_command_to_execute = ["docker", "system", "prune"]
+        remove_stale_worktree_containers()
+    elif given_answer == Answer.QUIT:
+        sys.exit(0)
+    console_print("Removing networks created by breeze")
+    given_answer = user_confirm("Are you sure with the removal of docker networks created by breeze?")
+    if given_answer == Answer.YES:
+        remove_docker_networks()
+    console_print("Pruning docker images")
+    given_answer = user_confirm("Are you sure with the removal of docker images?")
+    if given_answer == Answer.YES:
+        system_prune_command_to_execute = ["docker", "system", "prune", "-f"]
         run_command(
             system_prune_command_to_execute,
             check=False,
         )
     elif given_answer == Answer.QUIT:
         sys.exit(0)
-    get_console().print(f"Removing build cache dir ${BUILD_CACHE_DIR}")
+    console_print("Removing unused volumes created by breeze across all projects")
+    given_answer = user_confirm("Are you sure with the removal of unused docker volumes created by breeze?")
+    if given_answer == Answer.YES:
+        remove_docker_volumes()
+    elif given_answer == Answer.QUIT:
+        sys.exit(0)
+    console_print(f"Removing build cache dir {BUILD_CACHE_PATH}")
     given_answer = user_confirm("Are you sure with the removal?")
     if given_answer == Answer.YES:
         if not get_dry_run():
-            shutil.rmtree(BUILD_CACHE_DIR, ignore_errors=True)
+            shutil.rmtree(BUILD_CACHE_PATH, ignore_errors=True)
+    console_print("Uninstalling airflow and removing configuration")
+    given_answer = user_confirm("Are you sure with the uninstall / remove?")
+    if given_answer == Answer.YES:
+        if not get_dry_run():
+            shutil.rmtree(AIRFLOW_HOME_PATH, ignore_errors=True)
+            AIRFLOW_HOME_PATH.mkdir(exist_ok=True, parents=True)
+            run_command(["uv", "pip", "uninstall", "apache-airflow"], check=False)
+    elif given_answer == Answer.QUIT:
+        sys.exit(0)
+
+    to_be_excluded_from_deletion = (
+        # dirs
+        ".idea/",  # Pycharm config
+        ".vscode/",  # VSCode config
+        ".venv/",
+        "files/",
+        "logs/",
+        # files
+        ".bash_history",
+        ".bash_aliases",
+    )
+
+    console_print(
+        "Removing build file and git untracked files. This also removes files ignored in .gitignore.\n"
+        f"The following files will not be removed: `{to_be_excluded_from_deletion}`."
+    )
+    given_answer = user_confirm("Are you sure with the removal of build files?")
+    if given_answer == Answer.YES:
+        system_prune_command_to_execute = ["git", "clean", "-fdx"]
+        for excluded_object in to_be_excluded_from_deletion:
+            system_prune_command_to_execute.extend(["-e", excluded_object])
+
+        run_command(
+            system_prune_command_to_execute,
+            check=False,
+        )
     elif given_answer == Answer.QUIT:
         sys.exit(0)

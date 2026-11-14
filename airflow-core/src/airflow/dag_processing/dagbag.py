@@ -1,0 +1,716 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+import contextlib
+import os
+import sys
+import textwrap
+import warnings
+from collections.abc import Iterator
+from datetime import timedelta
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
+
+import structlog
+from tabulate import tabulate
+
+from airflow import settings
+from airflow._shared.timezones import timezone
+from airflow.configuration import conf
+from airflow.dag_processing.bundles.local import LocalDagBundle
+from airflow.dag_processing.importer_routing import get_claiming_importer, is_coordinator_importer
+from airflow.exceptions import (
+    AirflowClusterPolicyError,
+    AirflowClusterPolicySkipDag,
+    AirflowClusterPolicyViolation,
+    AirflowDagDuplicatedIdException,
+    AirflowException,
+    UnknownExecutorException,
+)
+from airflow.executors.executor_loader import ExecutorLoader
+from airflow.listeners.listener import get_listener_manager
+from airflow.models.pool import Pool
+from airflow.sdk.exceptions import AirflowDagCycleException, TaskGroupCycleDeprecationWarning
+from airflow.sdk.importers import DagImportError, get_importer_registry
+from airflow.serialization.definitions.dag import SerializedDAG
+from airflow.serialization.definitions.notset import NOTSET, ArgNotSet, is_arg_set
+from airflow.serialization.serialized_objects import DagSerialization, LazyDeserializedDAG
+from airflow.utils.file import find_enclosing_file
+from airflow.utils.log.logging_mixin import LoggingMixin
+from airflow.utils.session import NEW_SESSION, provide_session
+
+LangSDKSerializedDAG = SerializedDAG
+"""A native Dag that a Lang-SDK runtime parsed, as a Dag bag holds it."""
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
+
+    from airflow import DAG
+    from airflow.models.dagwarning import DagWarning
+    from airflow.sdk.importers import AbstractDagImporter, DagDefinition, DagImportWarning, DagSourceCode
+
+    BaggedDAG: TypeAlias = DAG | LangSDKSerializedDAG
+    """A Dag a Dag bag holds: a Python Dag, or a native Dag from a Lang-SDK runtime."""
+
+
+class FileLoadStat(NamedTuple):
+    """
+    Information about single file.
+
+    :param file: Loaded file.
+    :param duration: Time spent on process file.
+    :param dag_num: Total number of DAGs loaded in this file.
+    :param task_num: Total number of Tasks loaded in this file.
+    :param dags: DAGs names loaded in this file.
+    :param warning_num: Total number of warnings captured from processing this file.
+    :param bundle_path: The bundle path from DagBag, if any.
+    :param bundle_name: The bundle name from DagBag, if any.
+    """
+
+    file: str
+    duration: timedelta
+    dag_num: int
+    task_num: int
+    dags: str
+    warning_num: int
+    bundle_path: Path | None
+    bundle_name: str | None
+
+
+def _executor_exists(executor_name: str, team_name: str | None) -> bool:
+    """Check if executor exists, with global fallback for teams."""
+    try:
+        # First pass check for team-specific executor or a global executor (i.e. team_name=None)
+        ExecutorLoader.lookup_executor_name_by_str(executor_name, team_name=team_name, validate_teams=False)
+        return True
+    except UnknownExecutorException:
+        if team_name:
+            # If we had a team_name but didn't find an executor, check if there is a global executor that
+            # satisfies the request.
+            try:
+                ExecutorLoader.lookup_executor_name_by_str(
+                    executor_name, team_name=None, validate_teams=False
+                )
+                return True
+            except UnknownExecutorException:
+                pass
+    return False
+
+
+def _get_bundle_team_name(bundle_name: str | None) -> str | None:
+    """Return the team that owns *bundle_name* when multi-team is on, else ``None``."""
+    if not conf.getboolean("core", "multi_team") or not bundle_name:
+        return None
+    from airflow.dag_processing.bundles.manager import DagBundlesManager
+
+    return DagBundlesManager()._bundle_config[bundle_name].team_name
+
+
+def _validate_executor_fields(dag: DAG | SerializedDAG, bundle_name: str | None = None) -> None:
+    """Validate that executors specified in tasks are available and owned by the same team as the dag bundle."""
+    import logging
+
+    log = logging.getLogger(__name__)
+
+    dag_team_name = _get_bundle_team_name(bundle_name)
+    if dag_team_name:
+        log.debug("Found team '%s' for DAG '%s' via bundle '%s'", dag_team_name, dag.dag_id, bundle_name)
+
+    for task in dag.tasks:
+        if not task.executor:
+            continue
+
+        if not _executor_exists(task.executor, dag_team_name):
+            if dag_team_name:
+                raise UnknownExecutorException(
+                    f"Task '{task.task_id}' specifies executor '{task.executor}', which is not available "
+                    f"for team '{dag_team_name}' (the team associated with DAG '{dag.dag_id}') or as a global executor. "
+                    f"Make sure '{task.executor}' is configured for team '{dag_team_name}' or globally in your "
+                    "[core] executor configuration, or update the task's executor to use one of the "
+                    f"configured executors for team '{dag_team_name}' or available global executors."
+                )
+            raise UnknownExecutorException(
+                f"Task '{task.task_id}' specifies executor '{task.executor}', which is not available. "
+                "Make sure it is listed in your [core] executor configuration, or update the task's "
+                "executor to use one of the configured executors."
+            )
+
+
+def _assign_default_team_pools(
+    dag: DAG,
+    bundle_name: str | None = None,
+) -> None:
+    """Assign the default team pool to tasks that do not explicitly specify a pool."""
+    if not (dag_team_name := _get_bundle_team_name(bundle_name)):
+        return
+
+    for task in dag.tasks:
+        if task.pool == Pool.DEFAULT_POOL_NAME:
+            task.pool = Pool.get_default_team_pool_name(dag_team_name)
+
+
+class DagBag(LoggingMixin):
+    """
+    A dagbag is a collection of dags, parsed out of a folder tree and has high level configuration settings.
+
+    Some possible setting are database to use as a backend and what executor
+    to use to fire off tasks. This makes it easier to run distinct environments
+    for say production and development, tests, or for different teams or security
+    profiles. What would have been system level settings are now dagbag level so
+    that one system can run multiple, independent settings sets.
+
+    :param dag_folder: the folder to scan to find DAGs
+    :param safe_mode: when ``False``, scans all python modules for dags.
+        When ``True`` uses heuristics (files containing ``DAG`` and ``airflow`` strings)
+        to filter python modules to scan for dags.
+    :param load_op_links: Should the extra operator link be loaded via plugins when
+        de-serializing the DAG? This flag is set to False in Scheduler so that Extra Operator links
+        are not loaded to not run User code in Scheduler.
+    :param collect_dags: when True, collects dags during class initialization.
+    :param known_pools: If not none, then generate warnings if a Task attempts to use an unknown pool.
+    :param parse_lang_sdk_files: when ``True``, parses each file a coordinator's Dag importer claims with
+        the coordinator's runtime and bags its Dags as ``SerializedDAG`` objects. When ``False``, such a
+        file is an import error.
+    """
+
+    def __init__(
+        self,
+        dag_folder: str | Path | None = None,  # todo AIP-66: rename this to path
+        safe_mode: bool | ArgNotSet = NOTSET,
+        load_op_links: bool = True,
+        collect_dags: bool = True,
+        known_pools: set[str] | None = None,
+        bundle_path: Path | None = None,
+        bundle_name: str | None = None,
+        parse_lang_sdk_files: bool = False,
+    ):
+        super().__init__()
+        self.bundle_path = bundle_path
+        self.bundle_name = bundle_name
+        self.parse_lang_sdk_files = parse_lang_sdk_files
+
+        dag_folder = dag_folder or settings.DAGS_FOLDER
+        self.dag_folder = dag_folder
+        self.dags: dict[str, BaggedDAG] = {}
+        # The freshness token of each definition when we last imported it, keyed by its fileloc
+        self.file_last_changed: dict[str, str] = {}
+        # Store import errors with relative file paths as keys (relative to bundle_path)
+        self.import_errors: dict[str, str] = {}
+        self.captured_warnings: dict[str, tuple[str, ...]] = {}
+        self._import_warnings: dict[str, list[DagImportWarning]] = {}
+        self.task_group_cycle_warnings: dict[str, str] = {}
+        # The source code of each definition that produced Dags, keyed by its fileloc
+        self.dag_source_codes: dict[str, DagSourceCode] = {}
+        # Only used by SchedulerJob to compare the dag_hash to identify change in DAGs
+        self.dags_hash: dict[str, str] = {}
+
+        self.known_pools = known_pools
+        self._importer_registry = get_importer_registry(bundle_name)
+        # Importers only read the bundle's name and path, so a bag built without a bundle
+        # hands them its Dag folder instead.
+        self._bundle = LocalDagBundle(
+            name=bundle_name or "dags-folder", path=os.fspath(bundle_path or dag_folder)
+        )
+
+        self.dagbag_import_error_tracebacks = conf.getboolean("core", "dagbag_import_error_tracebacks")
+        self.dagbag_import_error_traceback_depth = conf.getint("core", "dagbag_import_error_traceback_depth")
+        if collect_dags:
+            self.collect_dags(
+                dag_folder=dag_folder,
+                safe_mode=(
+                    safe_mode if is_arg_set(safe_mode) else conf.getboolean("core", "DAG_DISCOVERY_SAFE_MODE")
+                ),
+            )
+        # Should the extra operator link be loaded via plugins?
+        # This flag is set to False in Scheduler so that Extra Operator links are not loaded
+        self.load_op_links = load_op_links
+
+    def size(self) -> int:
+        """:return: the amount of dags contained in this dagbag"""
+        return len(self.dags)
+
+    @property
+    def dag_ids(self) -> list[str]:
+        """
+        Get DAG ids.
+
+        :return: a list of DAG IDs in this bag
+        """
+        return list(self.dags)
+
+    @provide_session
+    def get_dag(self, dag_id, *, session: Session = NEW_SESSION):
+        """
+        Get the DAG out of the dictionary, and refreshes it if expired.
+
+        :param dag_id: DAG ID
+        """
+        # Avoid circular import
+        from airflow.models.dag import DagModel
+
+        dag = self.dags.get(dag_id)
+
+        # If DAG Model is absent, we can't check last_expired property. Is the DAG not yet synchronized?
+        if (orm_dag := DagModel.get_current(dag_id, session=session)) is None:
+            return dag
+
+        is_expired = (
+            orm_dag.last_expired and dag and dag.last_loaded and dag.last_loaded < orm_dag.last_expired
+        )
+        if is_expired:
+            # Remove associated dags so we can re-add them.
+            self.dags.pop(dag_id, None)
+        if dag is None or is_expired:
+            # Reprocess source file.
+            found_dags = self.process_file(filepath=orm_dag.fileloc, only_if_updated=False)
+
+            # If the source file no longer exports `dag_id`, delete it from self.dags
+            if found_dags and dag_id in [found_dag.dag_id for found_dag in found_dags]:
+                return self.dags[dag_id]
+            self.dags.pop(dag_id, None)
+        return self.dags.get(dag_id)
+
+    def process_file(self, filepath, only_if_updated=True, safe_mode=True):
+        """Process a Dag file, or a Dag definition nested in one, and return found Dags."""
+        if filepath is None or os.path.isdir(filepath):
+            return []
+        return [
+            dag
+            for importer, definition in self._find_definitions(Path(filepath), safe_mode=safe_mode)
+            for dag in self._process_definition(importer, definition, only_if_updated=only_if_updated)
+        ]
+
+    def _find_definitions(
+        self, path: Path, *, safe_mode: bool
+    ) -> Iterator[tuple[AbstractDagImporter, DagDefinition]]:
+        """
+        Discover the Dag definitions at ``path`` with the importer that should import each.
+
+        ``path`` may be a directory, a file, or a definition nested in a file (a zip member);
+        discovery is scoped to the directory or the enclosing file, and narrowed to the
+        definition itself in the nested case. Discovery errors are recorded as import errors.
+        """
+        scope = path if path.is_dir() else find_enclosing_file(path)
+        if scope is None:
+            return
+        scoped_bundle = LocalDagBundle(name=self._bundle.name, path=os.fspath(scope))
+        for importer, item in self._importer_registry.list_dag_definitions(
+            scoped_bundle, safe_mode=safe_mode
+        ):
+            if isinstance(item, DagImportError):
+                self._record_import_error(item, root=scope)
+            elif scope == path or Path(repr(item)) == path:
+                yield importer, item
+
+    def _process_definition(
+        self, importer: AbstractDagImporter, definition: DagDefinition, *, only_if_updated: bool
+    ) -> list[BaggedDAG]:
+        """Import a Dag definition and bag the Dags it defines."""
+        fileloc = repr(definition)
+        freshness_token = definition.freshness_token
+        if only_if_updated and self.file_last_changed.get(fileloc) == freshness_token:
+            return []
+
+        self.captured_warnings.pop(fileloc, None)
+        self._import_warnings.pop(fileloc, None)
+        # Keyed by dag_id, not fileloc: a bundle can embed several Dags' own source under one
+        # fileloc, so a stale entry is found by which dag_ids this fileloc previously bagged.
+        for dag_id, dag in list(self.dags.items()):
+            if dag.fileloc == fileloc:
+                self.dag_source_codes.pop(dag_id, None)
+        bagged_dags: list[BaggedDAG]
+        if self.parse_lang_sdk_files and is_coordinator_importer(importer):
+            bagged_dags = list(self._import_lang_sdk_definition(definition))
+        else:
+            bagged_dags = list(self._import_sdk_definition(importer, definition))
+
+        self.file_last_changed[fileloc] = freshness_token
+        for dag in bagged_dags:
+            try:
+                self.dag_source_codes[dag.dag_id] = importer.get_source_code(definition, dag.dag_id)
+            except Exception:
+                self.log.exception("Failed to read source code of %s", fileloc)
+        return bagged_dags
+
+    def _import_sdk_definition(self, importer: AbstractDagImporter, definition: DagDefinition) -> list[DAG]:
+        """Import a definition with its Dag importer, and bag the Dags after the Python Dag checks."""
+        fileloc = repr(definition)
+        result = importer.import_definition(definition, self._bundle)
+
+        for error in result.errors:
+            self._record_import_error(error, root=self._bundle.path)
+
+        if result.warnings:
+            self._import_warnings[fileloc] = result.warnings
+            self.captured_warnings[fileloc] = tuple(
+                f"{w.source_reference}:{w.line_number}: {w.warning_type}: {w.message}"
+                for w in result.warnings
+            )
+            # Re-emit warnings so they can be handled by Python's warning system
+            for w in result.warnings:
+                warnings.warn_explicit(
+                    message=w.message,
+                    category=UserWarning,
+                    filename=w.source_reference,
+                    lineno=w.line_number or 0,
+                )
+
+        bagged_dags = []
+        for dag in result.dags:
+            try:
+                # Importers are not required to set these, and ``DAG.fileloc`` otherwise
+                # defaults to the file that constructed the Dag (the importer's own module).
+                dag.fileloc = fileloc
+                dag.relative_fileloc = self._get_relative_fileloc(fileloc)
+                dag.bundle_name = self.bundle_name
+                dag.validate()
+                _validate_executor_fields(dag, self.bundle_name)
+                _assign_default_team_pools(dag, self.bundle_name)
+                self.bag_dag(dag=dag)
+                bagged_dags.append(dag)
+            except AirflowClusterPolicySkipDag:
+                self.log.debug("DAG %s skipped by cluster policy", dag.dag_id)
+            except Exception as e:
+                self.log.exception("Error bagging DAG from %s", fileloc)
+                self.import_errors[self._get_relative_fileloc(fileloc)] = f"{type(e).__name__}: {e}"
+        return bagged_dags
+
+    def _import_lang_sdk_definition(self, definition: DagDefinition) -> list[LangSDKSerializedDAG]:
+        """
+        Parse a coordinator-claimed file with its runtime, as the Dag processor does, and bag its Dags.
+
+        The runtime path already validated each Dag and applied the multi-team rules, so a Dag is only
+        checked for a duplicate id. There is no API client, so each request of the runtime that needs one
+        gets an error.
+        """
+        # circular: lang_sdk_processor imports this module
+        from airflow.dag_processing.lang_sdk_processor import LangSDKDagFileProcessorProcess
+
+        fileloc = repr(definition)
+        relative_loc = definition.get_relative_loc(self._bundle.path)
+        parsing_result = LangSDKDagFileProcessorProcess.run(
+            path=fileloc,
+            bundle_path=self._bundle.path,
+            bundle_name=self._bundle.name,
+            dag_file_rel_path=relative_loc,
+            logger=structlog.get_logger(logger_name=__name__),
+        )
+        if import_errors := parsing_result.import_errors:
+            # They all belong to this file, which holds a single import error.
+            message = "\n".join(m if k == relative_loc else f"{k}: {m}" for k, m in import_errors.items())
+            self._record_import_error(
+                DagImportError(source_reference=fileloc, message=message), root=self._bundle.path
+            )
+
+        bagged_dags = []
+        for serialized in parsing_result.serialized_dags:
+            try:
+                dag = DagSerialization.from_dict(serialized.data)
+                dag.fileloc = fileloc
+                dag.relative_fileloc = self._get_relative_fileloc(fileloc)
+                dag.bundle_name = self.bundle_name
+                self._add_to_bag(dag)
+                bagged_dags.append(dag)
+            except Exception as e:
+                self.log.exception("Error bagging DAG from %s", fileloc)
+                self.import_errors[self._get_relative_fileloc(fileloc)] = f"{type(e).__name__}: {e}"
+        return bagged_dags
+
+    def _record_import_error(self, error: DagImportError, *, root: Path) -> None:
+        # Importers report a source either absolutely or relative to the bundle they were given.
+        fileloc = self._get_relative_fileloc(os.fspath(root / error.source_reference))
+        self.import_errors[fileloc] = error.stacktrace or error.message
+        self.log.error("Error loading DAG from %s: %s", fileloc, error.message)
+
+    @property
+    def parsed_definitions(self) -> list[str]:
+        """Locations of the Dag definitions imported into this bag, relative to the bundle."""
+        return [self._get_relative_fileloc(fileloc) for fileloc in self.file_last_changed]
+
+    @property
+    def dag_warnings(self) -> set[DagWarning]:
+        """Get the set of DagWarnings for the bagged dags."""
+        from airflow.models.dagwarning import DagWarning, DagWarningType
+
+        dag_warnings: set[DagWarning] = {
+            DagWarning(dag_id, DagWarningType.TASK_GROUP_CYCLE, message)
+            for dag_id, message in self.task_group_cycle_warnings.items()
+            if dag_id in self.dags
+        }
+        for dag in self.dags.values():
+            for import_warning in self._import_warnings.get(dag.fileloc, ()):
+                # Only importer-namespaced types (``yaml:deprecated_field``) are Dag warnings;
+                # Python warning categories stay in ``captured_warnings``.
+                with contextlib.suppress(ValueError):
+                    dag_warnings.add(
+                        DagWarning(dag.dag_id, import_warning.warning_type, import_warning.message)
+                    )
+
+        # None means this feature is not enabled. Empty set means we don't know about any pools at all!
+        if self.known_pools is None:
+            return dag_warnings
+
+        for dag in self.dags.values():
+            nonexistent_pools = {task.pool for task in dag.tasks} - self.known_pools
+            if nonexistent_pools:
+                dag_warnings.add(
+                    DagWarning(
+                        dag.dag_id,
+                        DagWarningType.NONEXISTENT_POOL,
+                        f"Dag '{dag.dag_id}' references non-existent pools: {sorted(nonexistent_pools)!r}",
+                    )
+                )
+        return dag_warnings
+
+    def _get_relative_fileloc(self, filepath: str) -> str:
+        """
+        Get the relative file location for a given filepath.
+
+        :param filepath: Absolute path to the file
+        :return: Relative path from bundle_path, or original filepath if not under bundle_path
+        """
+        if self.bundle_path:
+            with contextlib.suppress(ValueError):
+                return str(Path(filepath).relative_to(self.bundle_path))
+        return filepath
+
+    def bag_dag(self, dag: DAG):
+        """
+        Add the DAG into the bag.
+
+        :raises: AirflowDagCycleException if a cycle is detected.
+        :raises: AirflowDagDuplicatedIdException if this dag already exists in the bag.
+        """
+        task_group_cycle_warning = None
+        with warnings.catch_warnings(record=True) as captured_warnings:
+            # DeprecationWarning is ignored by default outside __main__, which would hide it here too.
+            warnings.simplefilter("always", TaskGroupCycleDeprecationWarning)
+            dag.check_cycle()
+        for captured in captured_warnings:
+            if issubclass(captured.category, TaskGroupCycleDeprecationWarning):
+                task_group_cycle_warning = str(captured.message)
+            warnings.warn_explicit(
+                message=captured.message,
+                category=captured.category,
+                filename=captured.filename,
+                lineno=captured.lineno,
+                source=captured.source,
+            )
+        dag.resolve_template_files()
+        dag.last_loaded = timezone.utcnow()
+
+        try:
+            settings.dag_policy(dag)
+
+            for task in dag.tasks:
+                if getattr(task, "end_from_trigger", False) and get_listener_manager().has_listeners:
+                    raise AirflowException(
+                        "Listeners are not supported with end_from_trigger=True for deferrable operators. "
+                        "Task %s in DAG %s has end_from_trigger=True with listeners from plugins. "
+                        "Set end_from_trigger=False to use listeners.",
+                        task.task_id,
+                        dag.dag_id,
+                    )
+
+                settings.task_policy(task)
+        except (AirflowClusterPolicyViolation, AirflowClusterPolicySkipDag):
+            raise
+        except Exception as e:
+            self.log.exception(e)
+            raise AirflowClusterPolicyError(e)
+        self._add_to_bag(dag)
+        # Only once bagged: a rejected duplicate must not touch the warning of the Dag it lost to.
+        if task_group_cycle_warning is None:
+            self.task_group_cycle_warnings.pop(dag.dag_id, None)
+        else:
+            self.task_group_cycle_warnings[dag.dag_id] = task_group_cycle_warning
+
+    def _add_to_bag(self, dag: BaggedDAG) -> None:
+        """
+        Add *dag* to the bag, unless another file already defines its id.
+
+        :raises: AirflowDagDuplicatedIdException if this dag already exists in the bag.
+        """
+        try:
+            prev_dag = self.dags.get(dag.dag_id)
+            if prev_dag and prev_dag.fileloc != dag.fileloc:
+                raise AirflowDagDuplicatedIdException(
+                    dag_id=dag.dag_id,
+                    incoming=dag.fileloc,
+                    existing=self.dags[dag.dag_id].fileloc,
+                )
+            self.dags[dag.dag_id] = dag
+            self.log.debug("Loaded DAG %s", dag)
+        except (AirflowDagCycleException, AirflowDagDuplicatedIdException):
+            # There was an error in bagging the dag. Remove it from the list of dags
+            self.log.exception("Exception bagging dag: %s", dag.dag_id)
+            raise
+
+    def collect_dags(
+        self,
+        dag_folder: str | Path | None = None,
+        only_if_updated: bool = True,
+        safe_mode: bool = conf.getboolean("core", "DAG_DISCOVERY_SAFE_MODE"),
+    ):
+        """
+        Look for python modules in a given path, import them, and add them to the dagbag collection.
+
+        Note that if a ``.airflowignore`` file is found while processing
+        the directory, it will behave much like a ``.gitignore``,
+        ignoring files that match any of the patterns specified
+        in the file.
+
+        **Note**: The patterns in ``.airflowignore`` are interpreted as either
+        un-anchored regexes or gitignore-like glob expressions, depending on
+        the ``DAG_IGNORE_FILE_SYNTAX`` configuration parameter.
+        """
+        self.log.info("Filling up the DagBag from %s", dag_folder)
+        dag_folder = dag_folder or self.dag_folder
+        # Used to store stats around DagBag processing
+        stats = []
+
+        for importer, definition in self._find_definitions(Path(dag_folder), safe_mode=safe_mode):
+            fileloc = repr(definition)
+            try:
+                file_parse_start_dttm = timezone.utcnow()
+                found_dags = self._process_definition(importer, definition, only_if_updated=only_if_updated)
+
+                file_parse_end_dttm = timezone.utcnow()
+                try:
+                    relative_file = Path(fileloc).relative_to(Path(self.dag_folder)).as_posix()
+                except ValueError:
+                    # fileloc is not under dag_folder (e.g., example DAGs from a different location)
+                    relative_file = Path(fileloc).as_posix()
+                stats.append(
+                    FileLoadStat(
+                        file=relative_file,
+                        duration=file_parse_end_dttm - file_parse_start_dttm,
+                        dag_num=len(found_dags),
+                        task_num=sum(len(dag.tasks) for dag in found_dags),
+                        dags=str([dag.dag_id for dag in found_dags]),
+                        warning_num=len(self.captured_warnings.get(fileloc, [])),
+                        bundle_path=self.bundle_path,
+                        bundle_name=self.bundle_name,
+                    )
+                )
+            except Exception as e:
+                self.log.exception(e)
+
+        self.dagbag_stats = sorted(stats, key=lambda x: x.duration, reverse=True)
+
+    def dagbag_report(self):
+        """Print a report around DagBag loading stats."""
+        stats = self.dagbag_stats
+        dag_folder = self.dag_folder
+        duration = sum((o.duration for o in stats), timedelta()).total_seconds()
+        dag_num = sum(o.dag_num for o in stats)
+        task_num = sum(o.task_num for o in stats)
+        table = tabulate(stats, headers="keys")
+
+        report = textwrap.dedent(
+            f"""\n
+        -------------------------------------------------------------------
+        DagBag loading stats for {dag_folder}
+        -------------------------------------------------------------------
+        Number of DAGs: {dag_num}
+        Total task number: {task_num}
+        DagBag parsing time: {duration}\n{table}
+        """
+        )
+        return report
+
+
+class BundleDagBag(DagBag):
+    """
+    Bundle-aware DagBag that permanently modifies sys.path.
+
+    This class adds the bundle_path to sys.path permanently to allow DAG files
+    to import modules from their bundle directory. No cleanup is performed.
+
+    WARNING: Only use for one-off usages like CLI commands. Using this in long-running
+    processes will cause sys.path to accumulate entries.
+
+    Same parameters as DagBag, but bundle_path is required and examples are not loaded.
+    """
+
+    def __init__(self, *args, bundle_path: Path | None = None, **kwargs):
+        if not bundle_path:
+            raise ValueError("bundle_path is required for BundleDagBag")
+
+        if str(bundle_path) not in sys.path:
+            sys.path.append(str(bundle_path))
+
+        kwargs["bundle_path"] = bundle_path
+        super().__init__(*args, **kwargs)
+
+
+@provide_session
+def sync_bag_to_db(
+    dagbag: DagBag,
+    bundle_name: str,
+    bundle_version: str | None,
+    *,
+    version_data: dict[str, Any] | None = None,
+    session: Session = NEW_SESSION,
+) -> None:
+    """
+    Save attributes about list of DAG to the DB.
+
+    Files that a Lang-SDK runtime parses are left out, with their Dags and import errors: the Dag
+    processor stores those.
+    """
+    from airflow.dag_processing.collection import update_dag_parsing_results_in_db
+
+    def is_parsed_by_runtime(rel_path: str) -> bool:
+        return get_claiming_importer(Path(dagbag.bundle_path or "", rel_path), bundle_name) is not None
+
+    import_errors = {
+        (bundle_name, rel_path): error
+        for rel_path, error in dagbag.import_errors.items()
+        if not is_parsed_by_runtime(rel_path)
+    }
+
+    # Build the set of all files that were parsed and include files with import errors
+    # in case they are not in parsed_definitions
+    files_parsed = set(import_errors)
+    if dagbag.bundle_path:
+        for rel_path in dagbag.parsed_definitions:
+            if is_parsed_by_runtime(rel_path):
+                continue
+            files_parsed.add((bundle_name, rel_path))
+            # A definition nested in an archive also clears the archive's own discovery errors.
+            if enclosing_file := find_enclosing_file(Path(dagbag.bundle_path, rel_path)):
+                files_parsed.add((bundle_name, dagbag._get_relative_fileloc(os.fspath(enclosing_file))))
+
+    update_dag_parsing_results_in_db(
+        bundle_name,
+        bundle_version,
+        [
+            LazyDeserializedDAG.from_dag(dag)
+            for dag in dagbag.dags.values()
+            if not isinstance(dag, LangSDKSerializedDAG)
+        ],
+        import_errors,
+        None,  # file parsing duration is not well defined when parsing multiple files / multiple DAGs.
+        dagbag.dag_warnings,
+        session=session,
+        version_data=version_data,
+        files_parsed=files_parsed,
+        dag_source_codes=dagbag.dag_source_codes,
+    )

@@ -1,0 +1,866 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+import json
+from unittest.mock import patch
+
+import pytest
+from sqlalchemy import select
+
+from airflow import models, settings
+from airflow.cli import cli_parser
+from airflow.cli.commands import team_command
+from airflow.models import Connection, Pool, Variable
+from airflow.models.dagbundle import DagBundleModel
+from airflow.models.team import Team, dag_bundle_team_association_table
+from airflow.settings import Session
+
+from tests_common.test_utils.config import conf_vars
+from tests_common.test_utils.db import (
+    clear_db_connections,
+    clear_db_dag_bundles,
+    clear_db_pools,
+    clear_db_teams,
+    clear_db_variables,
+)
+
+pytestmark = pytest.mark.db_test
+
+
+class TestCliTeams:
+    @classmethod
+    def _cleanup(cls):
+        clear_db_connections(add_default_connections_back=False)
+        clear_db_variables()
+        clear_db_pools()
+        clear_db_dag_bundles()
+        clear_db_teams()
+
+    @classmethod
+    def setup_class(cls):
+        cls.dagbag = models.DagBag()
+        cls.parser = cli_parser.get_parser()
+        settings.configure_orm()
+        cls.session = Session
+        cls._cleanup()
+
+    def teardown_method(self):
+        """Called after each test method."""
+        self._cleanup()
+
+    def test_team_create_success(self, stdout_capture):
+        """Test successful team creation."""
+        with stdout_capture as stdout:
+            team_command.team_create(self.parser.parse_args(["teams", "create", "test-team"]))
+
+        # Verify team was created in database
+        team = self.session.scalar(select(Team).where(Team.name == "test-team"))
+        assert team is not None
+        assert team.name == "test-team"
+
+        # Verify output message
+        output = stdout.getvalue()
+        assert "Team 'test-team' created successfully" in output
+        assert str(team.name) in output
+
+    def test_team_create_creates_default_pool(self, stdout_capture):
+        """Test that creating a team also creates its default pool."""
+        with conf_vars(
+            {
+                ("core", "multi_team"): "True",
+                ("core", "default_pool_task_slot_count"): "111",
+            }
+        ):
+            with stdout_capture:
+                team_command.team_create(self.parser.parse_args(["teams", "create", "team-a"]))
+
+        pool = self.session.scalar(select(Pool).where(Pool.pool == Pool.get_default_team_pool_name("team-a")))
+
+        assert pool is not None
+        assert pool.team_name == "team-a"
+        assert pool.slots == 111
+        assert pool.include_deferred is False
+        assert pool.description == "Default pool for team 'team-a'"
+
+    def test_team_create_empty_name(self):
+        """Test team creation with empty name."""
+        with pytest.raises(SystemExit, match="Team name cannot be empty"):
+            team_command.team_create(self.parser.parse_args(["teams", "create", ""]))
+
+    def test_team_create_invalid_name(self):
+        with pytest.raises(SystemExit, match="Invalid team name"):
+            team_command.team_create(self.parser.parse_args(["teams", "create", "test with space"]))
+
+    @pytest.mark.parametrize(
+        "bad_name",
+        [
+            pytest.param("Data-Eng", id="upper-case"),
+            pytest.param("team__x", id="consecutive-underscores"),
+            pytest.param("team_a___prod", id="spans-the-separator"),
+        ],
+    )
+    def test_team_create_rejects_a_name_the_secrets_namespace_cannot_hold(self, bad_name):
+        with pytest.raises(SystemExit, match="Invalid team name"):
+            team_command.team_create(self.parser.parse_args(["teams", "create", bad_name]))
+
+        assert self.session.scalar(select(Team).where(Team.name == bad_name)) is None
+
+    def test_team_create_allows_a_single_underscore(self):
+        team_command.team_create(self.parser.parse_args(["teams", "create", "team_a"]))
+
+        assert self.session.scalar(select(Team).where(Team.name == "team_a")) is not None
+
+    def test_team_delete_accepts_a_name_the_current_rule_rejects(self):
+        """A team stored before the rule tightened still has to be removable."""
+        self.session.add(Team(name="Data-Eng"))
+        self.session.commit()
+
+        team_command.team_delete(self.parser.parse_args(["teams", "delete", "Data-Eng", "--yes"]))
+
+        assert self.session.scalar(select(Team).where(Team.name == "Data-Eng")) is None
+
+    def test_team_create_whitespace_name(self):
+        """Test team creation with whitespace-only name."""
+        with pytest.raises(SystemExit, match="Team name cannot be empty"):
+            team_command.team_create(self.parser.parse_args(["teams", "create", "   "]))
+
+    def test_team_create_duplicate_name(self):
+        """Test team creation with duplicate name."""
+        # Create first team
+        team_command.team_create(self.parser.parse_args(["teams", "create", "duplicate-team"]))
+
+        # Try to create team with same name
+        with pytest.raises(SystemExit, match="Team with name 'duplicate-team' already exists"):
+            team_command.team_create(self.parser.parse_args(["teams", "create", "duplicate-team"]))
+
+    @pytest.mark.parametrize(
+        ("output", "expected"),
+        [
+            ("json", "[]"),
+            ("yaml", "[]"),
+            ("table", "No data found"),
+            ("plain", "No data found"),
+        ],
+    )
+    def test_team_list_empty(self, stdout_capture, output, expected):
+        with stdout_capture as stdout:
+            team_command.team_list(self.parser.parse_args(["teams", "list", "--output", output]))
+
+        assert stdout.getvalue().strip() == expected
+
+    def test_team_list_with_teams(self, stdout_capture):
+        """Test listing teams when teams exist."""
+        # Create test teams
+        team_command.team_create(self.parser.parse_args(["teams", "create", "team-alpha"]))
+        team_command.team_create(self.parser.parse_args(["teams", "create", "team-beta"]))
+
+        with stdout_capture as stdout:
+            team_command.team_list(self.parser.parse_args(["teams", "list"]))
+
+        output = stdout.getvalue()
+        assert "team-alpha" in output
+        assert "team-beta" in output
+
+    def test_team_list_with_output_format(self):
+        """Test listing teams with different output formats."""
+        # Create a test team
+        team_command.team_create(self.parser.parse_args(["teams", "create", "format-test"]))
+
+        # Test different output formats
+        team_command.team_list(self.parser.parse_args(["teams", "list", "--output", "json"]))
+        team_command.team_list(self.parser.parse_args(["teams", "list", "--output", "yaml"]))
+        team_command.team_list(self.parser.parse_args(["teams", "list", "--output", "plain"]))
+
+    def test_team_delete_success(self, stdout_capture):
+        """Test successful team deletion."""
+        with conf_vars({("core", "multi_team"): "True"}):
+            # Create team first
+            team_command.team_create(self.parser.parse_args(["teams", "create", "delete-me"]))
+
+            # Verify team exists
+            team = self.session.scalar(select(Team).where(Team.name == "delete-me"))
+            assert team is not None
+
+            # Delete team with --yes flag
+            with stdout_capture as stdout:
+                team_command.team_delete(self.parser.parse_args(["teams", "delete", "delete-me", "--yes"]))
+
+            # Verify team was deleted
+            team = self.session.scalar(select(Team).where(Team.name == "delete-me"))
+            assert team is None
+
+            # Verify default pool was deleted
+            assert (
+                self.session.scalar(
+                    select(Pool).where(Pool.pool == Pool.get_default_team_pool_name("delete-me"))
+                )
+                is None
+            )
+
+        # Verify output message
+        output = stdout.getvalue()
+        assert "Team 'delete-me' deleted successfully" in output
+
+    def test_team_delete_nonexistent(self):
+        """Test deleting a team that doesn't exist."""
+        with pytest.raises(SystemExit, match="Team 'nonexistent' does not exist"):
+            team_command.team_delete(self.parser.parse_args(["teams", "delete", "nonexistent", "--yes"]))
+
+    def test_team_delete_empty_name(self):
+        """Test deleting team with empty name."""
+        with pytest.raises(SystemExit, match="Team name cannot be empty"):
+            team_command.team_delete(self.parser.parse_args(["teams", "delete", "", "--yes"]))
+
+    def test_team_delete_with_dag_bundle_association(self):
+        """Test deleting team that has DAG bundle associations."""
+        # Create team
+        team_command.team_create(self.parser.parse_args(["teams", "create", "bundle-team"]))
+        team = self.session.scalar(select(Team).where(Team.name == "bundle-team"))
+
+        # Create a DAG bundle first
+        dag_bundle = DagBundleModel(name="test-bundle")
+        self.session.add(dag_bundle)
+        self.session.commit()
+
+        # Create a DAG bundle association
+        self.session.execute(
+            dag_bundle_team_association_table.insert().values(
+                dag_bundle_name="test-bundle", team_name=team.name
+            )
+        )
+        self.session.commit()
+
+        # Try to delete team
+        with pytest.raises(
+            SystemExit,
+            match="Cannot delete team 'bundle-team' because it is associated with: 1 DAG bundle\\(s\\)",
+        ):
+            team_command.team_delete(self.parser.parse_args(["teams", "delete", "bundle-team", "--yes"]))
+
+    def test_team_delete_with_connection_association(self):
+        """Test deleting team that has connection associations."""
+        # Create team
+        team_command.team_create(self.parser.parse_args(["teams", "create", "conn-team"]))
+        team = self.session.scalar(select(Team).where(Team.name == "conn-team"))
+
+        # Create connection associated with team
+        conn = Connection(conn_id="test-conn", conn_type="http", team_name=team.name)
+        self.session.add(conn)
+        self.session.commit()
+
+        # Try to delete team
+        with pytest.raises(
+            SystemExit,
+            match="Cannot delete team 'conn-team' because it is associated with: 1 connection\\(s\\)",
+        ):
+            team_command.team_delete(self.parser.parse_args(["teams", "delete", "conn-team", "--yes"]))
+
+    def test_team_delete_with_variable_association(self):
+        """Test deleting team that has variable associations."""
+        # Create team
+        team_command.team_create(self.parser.parse_args(["teams", "create", "var-team"]))
+        team = self.session.scalar(select(Team).where(Team.name == "var-team"))
+
+        # Create variable associated with team
+        var = Variable(key="test-var", val="test-value", team_name=team.name)
+        self.session.add(var)
+        self.session.commit()
+
+        # Try to delete team
+        with pytest.raises(
+            SystemExit, match="Cannot delete team 'var-team' because it is associated with: 1 variable\\(s\\)"
+        ):
+            team_command.team_delete(self.parser.parse_args(["teams", "delete", "var-team", "--yes"]))
+
+    def test_team_delete_with_pool_association(self):
+        """Test deleting team that has pool associations."""
+        # Create team
+        team_command.team_create(self.parser.parse_args(["teams", "create", "pool-team"]))
+        team = self.session.scalar(select(Team).where(Team.name == "pool-team"))
+
+        # Create pool associated with team
+        pool = Pool(
+            pool="test-pool", slots=5, description="Test pool", include_deferred=False, team_name=team.name
+        )
+        self.session.add(pool)
+        self.session.commit()
+
+        # Try to delete team
+        with pytest.raises(
+            SystemExit, match="Cannot delete team 'pool-team' because it is associated with: 1 pool\\(s\\)"
+        ):
+            team_command.team_delete(self.parser.parse_args(["teams", "delete", "pool-team", "--yes"]))
+
+    def test_team_delete_with_multiple_associations(self):
+        """Test deleting team that has multiple types of associations."""
+        # Create team
+        team_command.team_create(self.parser.parse_args(["teams", "create", "multi-team"]))
+        team = self.session.scalar(select(Team).where(Team.name == "multi-team"))
+
+        # Create a DAG bundle first
+        dag_bundle = DagBundleModel(name="multi-bundle")
+        self.session.add(dag_bundle)
+        self.session.commit()
+
+        # Create multiple associations
+        conn = Connection(conn_id="multi-conn", conn_type="http", team_name=team.name)
+        var = Variable(key="multi-var", val="value", team_name=team.name)
+        pool = Pool(
+            pool="multi-pool", slots=3, description="Multi pool", include_deferred=False, team_name=team.name
+        )
+
+        self.session.add_all([conn, var, pool])
+        self.session.execute(
+            dag_bundle_team_association_table.insert().values(
+                dag_bundle_name="multi-bundle", team_name=team.name
+            )
+        )
+        self.session.commit()
+
+        # Try to delete team
+        with pytest.raises(SystemExit) as exc_info:
+            team_command.team_delete(self.parser.parse_args(["teams", "delete", "multi-team", "--yes"]))
+
+        error_msg = str(exc_info.value)
+        assert "Cannot delete team 'multi-team' because it is associated with:" in error_msg
+        assert "1 DAG bundle(s)" in error_msg
+        assert "1 connection(s)" in error_msg
+        assert "1 variable(s)" in error_msg
+        assert "1 pool(s)" in error_msg
+
+    @patch("builtins.input", return_value="Y")
+    def test_team_delete_with_confirmation_yes(self, mock_input, stdout_capture):
+        """Test team deletion with user confirmation (Yes)."""
+        # Create team
+        team_command.team_create(self.parser.parse_args(["teams", "create", "confirm-yes"]))
+
+        # Delete without --yes flag (should prompt for confirmation)
+        with stdout_capture as stdout:
+            team_command.team_delete(self.parser.parse_args(["teams", "delete", "confirm-yes"]))
+
+        # Verify team was deleted
+        team = self.session.scalar(select(Team).where(Team.name == "confirm-yes"))
+        assert team is None
+
+        output = stdout.getvalue()
+        assert "Team 'confirm-yes' deleted successfully" in output
+
+    @patch("builtins.input", return_value="N")
+    def test_team_delete_with_confirmation_no(self, mock_input, stdout_capture):
+        """Test team deletion with user confirmation (No)."""
+        # Create team
+        team_command.team_create(self.parser.parse_args(["teams", "create", "confirm-no"]))
+
+        # Delete without --yes flag (should prompt for confirmation)
+        with stdout_capture as stdout:
+            team_command.team_delete(self.parser.parse_args(["teams", "delete", "confirm-no"]))
+
+        # Verify team was NOT deleted
+        team = self.session.scalar(select(Team).where(Team.name == "confirm-no"))
+        assert team is not None
+
+        output = stdout.getvalue()
+        assert "Team deletion cancelled" in output
+
+    @patch("builtins.input", return_value="invalid")
+    def test_team_delete_with_confirmation_invalid(self, mock_input, stdout_capture):
+        """Test team deletion with invalid confirmation input."""
+        # Create team
+        team_command.team_create(self.parser.parse_args(["teams", "create", "confirm-invalid"]))
+
+        # Delete without --yes flag (should prompt for confirmation)
+        with stdout_capture as stdout:
+            team_command.team_delete(self.parser.parse_args(["teams", "delete", "confirm-invalid"]))
+
+        # Verify team was NOT deleted (invalid input treated as No)
+        team = self.session.scalar(select(Team).where(Team.name == "confirm-invalid"))
+        assert team is not None
+
+        output = stdout.getvalue()
+        assert "Team deletion cancelled" in output
+
+    def test_team_operations_integration(self):
+        """Test integration of create, list, and delete operations."""
+        # Start with empty state
+        teams = self.session.scalars(select(Team)).all()
+        assert len(teams) == 0
+
+        # Create multiple teams
+        team_command.team_create(self.parser.parse_args(["teams", "create", "integration-1"]))
+        team_command.team_create(self.parser.parse_args(["teams", "create", "integration-2"]))
+        team_command.team_create(self.parser.parse_args(["teams", "create", "integration-3"]))
+
+        # Verify all teams exist
+        teams = self.session.scalars(select(Team)).all()
+        assert len(teams) == 3
+        team_names = [team.name for team in teams]
+        assert "integration-1" in team_names
+        assert "integration-2" in team_names
+        assert "integration-3" in team_names
+
+        # Delete one team
+        team_command.team_delete(self.parser.parse_args(["teams", "delete", "integration-2", "--yes"]))
+
+        # Verify correct team was deleted
+        teams = self.session.scalars(select(Team)).all()
+        assert len(teams) == 2
+        team_names = [team.name for team in teams]
+        assert "integration-1" in team_names
+        assert "integration-2" not in team_names
+        assert "integration-3" in team_names
+
+    @pytest.mark.parametrize(
+        "bad_name",
+        [
+            pytest.param("a", id="too-short"),
+            pytest.param("Team1", id="upper-case"),
+            pytest.param("team__x", id="consecutive-underscores"),
+            pytest.param("team1\n", id="trailing-newline"),
+        ],
+    )
+    def test_team_sync_rejects_an_invalid_bundle_team_name(self, bad_name):
+        """``teams sync`` is a second creation path, so it holds names to the same rule.
+
+        Unlike ``teams create`` this path does not strip its input, so a trailing newline
+        reaches the pattern -- which is why the check is ``re.fullmatch`` against an unanchored
+        pattern rather than ``re.match`` against a ``$``-anchored one.
+        """
+        bundle_config = [
+            {
+                "name": "bundleone",
+                "classpath": "airflow.dag_processing.bundles.local.LocalDagBundle",
+                "kwargs": {"path": "/dev/null", "refresh_interval": 0},
+                "team_name": bad_name,
+            },
+        ]
+
+        with conf_vars(
+            {
+                ("core", "multi_team"): "True",
+                ("dag_processor", "dag_bundle_config_list"): json.dumps(bundle_config),
+            }
+        ):
+            with pytest.raises(SystemExit, match="Invalid team name"):
+                team_command.team_sync(self.parser.parse_args(["teams", "sync"]))
+
+        assert self.session.scalars(select(Team)).all() == []
+
+    def test_team_sync_rejects_an_invalid_name_already_stored(self):
+        """``teams sync`` shipped with no validation, so stored names can already break the rule."""
+        self.session.add(Team(name="Data-Eng"))
+        self.session.commit()
+
+        bundle_config = [
+            {
+                "name": "bundleone",
+                "classpath": "airflow.dag_processing.bundles.local.LocalDagBundle",
+                "kwargs": {"path": "/dev/null", "refresh_interval": 0},
+                "team_name": "team1",
+            },
+        ]
+
+        with conf_vars(
+            {
+                ("core", "multi_team"): "True",
+                ("dag_processor", "dag_bundle_config_list"): json.dumps(bundle_config),
+            }
+        ):
+            with pytest.raises(SystemExit, match="Data-Eng"):
+                team_command.team_sync(self.parser.parse_args(["teams", "sync"]))
+
+        assert self.session.scalar(select(Team).where(Team.name == "team1")) is None
+
+    def test_team_sync(self):
+        bundle_config = [
+            {
+                "name": "bundleone",
+                "classpath": "airflow.dag_processing.bundles.local.LocalDagBundle",
+                "kwargs": {"path": "/dev/null", "refresh_interval": 0},
+                "team_name": "team1",
+            },
+            {
+                "name": "bundletwo",
+                "classpath": "airflow.dag_processing.bundles.local.LocalDagBundle",
+                "kwargs": {"path": "/dev/null", "refresh_interval": 300},
+                "team_name": "team2",
+            },
+            {
+                "name": "bundlethree",
+                "classpath": "airflow.dag_processing.bundles.local.LocalDagBundle",
+                "kwargs": {"path": "/dev/null", "refresh_interval": 300},
+            },
+        ]
+
+        teams = self.session.scalars(select(Team)).all()
+        assert len(teams) == 0
+
+        with conf_vars(
+            {
+                ("core", "multi_team"): "True",
+                ("dag_processor", "dag_bundle_config_list"): json.dumps(bundle_config),
+            }
+        ):
+            team_command.team_sync(self.parser.parse_args(["teams", "sync"]))
+
+        teams = self.session.scalars(select(Team)).all()
+        assert len(teams) == 2
+
+        team_names = {team.name for team in teams}
+        assert team_names == {"team1", "team2"}
+
+        team1_pool = self.session.scalar(
+            select(Pool).where(Pool.pool == Pool.get_default_team_pool_name("team1"))
+        )
+        team2_pool = self.session.scalar(
+            select(Pool).where(Pool.pool == Pool.get_default_team_pool_name("team2"))
+        )
+
+        assert team1_pool is not None
+        assert team1_pool.team_name == "team1"
+
+        assert team2_pool is not None
+        assert team2_pool.team_name == "team2"
+
+    def test_team_sync_creates_missing_default_pool(self):
+        bundle_config = [
+            {
+                "name": "bundleone",
+                "classpath": "airflow.dag_processing.bundles.local.LocalDagBundle",
+                "kwargs": {"path": "/dev/null", "refresh_interval": 0},
+                "team_name": "team1",
+            },
+        ]
+
+        # Simulate an existing team created before automatic default pools existed.
+        self.session.add(Team(name="team1"))
+        self.session.commit()
+
+        assert (
+            self.session.scalar(select(Pool).where(Pool.pool == Pool.get_default_team_pool_name("team1")))
+            is None
+        )
+
+        with conf_vars(
+            {
+                ("core", "multi_team"): "True",
+                ("dag_processor", "dag_bundle_config_list"): json.dumps(bundle_config),
+            }
+        ):
+            team_command.team_sync(self.parser.parse_args(["teams", "sync"]))
+
+        pool = self.session.scalar(select(Pool).where(Pool.pool == Pool.get_default_team_pool_name("team1")))
+
+        assert pool is not None
+        assert pool.team_name == "team1"
+
+    def test_team_verify_multi_team_disabled(self, stdout_capture):
+        with conf_vars({("core", "multi_team"): "False"}):
+            with stdout_capture as stdout:
+                team_command.team_verify(self.parser.parse_args(["teams", "verify"]))
+
+        assert "Multi-team is not enabled." in stdout.getvalue()
+
+    def test_team_verify_success(self, stdout_capture):
+        bundle_config = [
+            {
+                "name": "bundleone",
+                "classpath": "airflow.dag_processing.bundles.local.LocalDagBundle",
+                "kwargs": {"path": "/dev/null", "refresh_interval": 0},
+                "team_name": "team1",
+            },
+        ]
+
+        with conf_vars(
+            {
+                ("core", "multi_team"): "True",
+                ("dag_processor", "dag_bundle_config_list"): json.dumps(bundle_config),
+            }
+        ):
+            team_command.team_sync(self.parser.parse_args(["teams", "sync"]))
+
+            with stdout_capture as stdout:
+                team_command.team_verify(self.parser.parse_args(["teams", "verify"]))
+
+        assert "Verification succeeded." in stdout.getvalue()
+
+    def test_team_sync_dry_run_reports_changes_without_writing(self, stdout_capture):
+        bundle_config = [
+            {
+                "name": "bundleone",
+                "classpath": "airflow.dag_processing.bundles.local.LocalDagBundle",
+                "kwargs": {"path": "/dev/null", "refresh_interval": 0},
+                "team_name": "team1",
+            },
+            {
+                "name": "bundletwo",
+                "classpath": "airflow.dag_processing.bundles.local.LocalDagBundle",
+                "kwargs": {"path": "/dev/null", "refresh_interval": 300},
+                "team_name": "team2",
+            },
+        ]
+
+        with conf_vars(
+            {
+                ("core", "multi_team"): "True",
+                ("dag_processor", "dag_bundle_config_list"): json.dumps(bundle_config),
+            }
+        ):
+            with stdout_capture as stdout:
+                team_command.team_sync(self.parser.parse_args(["teams", "sync", "--dry-run"]))
+
+        output = stdout.getvalue()
+
+        assert "Teams to add:" in output
+        assert "team1" in output
+        assert "team2" in output
+        assert "Default team pools to add:" in output
+        assert Pool.get_default_team_pool_name("team1") in output
+        assert Pool.get_default_team_pool_name("team2") in output
+
+        assert self.session.scalars(select(Team)).all() == []
+        assert (
+            self.session.scalar(select(Pool).where(Pool.pool == Pool.get_default_team_pool_name("team1")))
+            is None
+        )
+        assert (
+            self.session.scalar(select(Pool).where(Pool.pool == Pool.get_default_team_pool_name("team2")))
+            is None
+        )
+
+    def test_team_sync_dry_run_reports_missing_default_pool_without_writing(self, stdout_capture):
+        bundle_config = [
+            {
+                "name": "bundleone",
+                "classpath": "airflow.dag_processing.bundles.local.LocalDagBundle",
+                "kwargs": {"path": "/dev/null", "refresh_interval": 0},
+                "team_name": "team1",
+            },
+        ]
+
+        self.session.add(Team(name="team1"))
+        self.session.commit()
+
+        with conf_vars(
+            {
+                ("core", "multi_team"): "True",
+                ("dag_processor", "dag_bundle_config_list"): json.dumps(bundle_config),
+            }
+        ):
+            with stdout_capture as stdout:
+                team_command.team_sync(self.parser.parse_args(["teams", "sync", "--dry-run"]))
+
+        output = stdout.getvalue()
+
+        assert "Teams to add:" not in output
+        assert "Default team pools to add:" in output
+        assert Pool.get_default_team_pool_name("team1") in output
+
+        assert self.session.scalar(select(Team).where(Team.name == "team1")) is not None
+        assert (
+            self.session.scalar(select(Pool).where(Pool.pool == Pool.get_default_team_pool_name("team1")))
+            is None
+        )
+
+    def test_team_sync_dry_run_reports_no_changes(self, stdout_capture):
+        bundle_config = [
+            {
+                "name": "bundleone",
+                "classpath": "airflow.dag_processing.bundles.local.LocalDagBundle",
+                "kwargs": {"path": "/dev/null", "refresh_interval": 0},
+                "team_name": "team1",
+            },
+        ]
+
+        self.session.add(Team(name="team1"))
+        self.session.commit()
+
+        self.session.add(
+            Pool(
+                pool=Pool.get_default_team_pool_name("team1"),
+                slots=128,
+                description="Default pool",
+                include_deferred=False,
+                team_name="team1",
+            )
+        )
+        self.session.commit()
+
+        with conf_vars(
+            {
+                ("core", "multi_team"): "True",
+                ("dag_processor", "dag_bundle_config_list"): json.dumps(bundle_config),
+            }
+        ):
+            with stdout_capture as stdout:
+                team_command.team_sync(self.parser.parse_args(["teams", "sync", "--dry-run"]))
+
+        assert "No changes to sync." in stdout.getvalue()
+
+    def test_team_verify_missing_default_pool(self):
+        self.session.add(Team(name="team1"))
+        self.session.commit()
+
+        with conf_vars({("core", "multi_team"): "True"}):
+            with pytest.raises(SystemExit):
+                team_command.team_verify(self.parser.parse_args(["teams", "verify"]))
+
+    def test_team_verify_unknown_bundle_team(self, stdout_capture):
+        bundle_config = [
+            {
+                "name": "bundleone",
+                "classpath": "airflow.dag_processing.bundles.local.LocalDagBundle",
+                "kwargs": {"path": "/dev/null", "refresh_interval": 0},
+                "team_name": "missing-team",
+            },
+        ]
+
+        with conf_vars(
+            {
+                ("core", "multi_team"): "True",
+                ("dag_processor", "dag_bundle_config_list"): json.dumps(bundle_config),
+            }
+        ):
+            with stdout_capture as stdout:
+                with pytest.raises(SystemExit):
+                    team_command.team_verify(self.parser.parse_args(["teams", "verify"]))
+
+        assert "references unknown team 'missing-team'" in stdout.getvalue()
+
+    def test_team_inspect(self, stdout_capture):
+        """Test inspecting a team with associated resources."""
+        self.session.add_all([Team(name="team1"), Team(name="team2")])
+        self.session.commit()
+
+        self.session.add_all(
+            [
+                DagBundleModel(name="bundle1"),
+                DagBundleModel(name="bundle2"),
+            ]
+        )
+        self.session.commit()
+
+        self.session.execute(
+            dag_bundle_team_association_table.insert(),
+            [
+                {"dag_bundle_name": "bundle1", "team_name": "team1"},
+                {"dag_bundle_name": "bundle2", "team_name": "team2"},
+            ],
+        )
+
+        self.session.add_all(
+            [
+                Pool(
+                    pool=Pool.get_default_team_pool_name("team1"),
+                    slots=128,
+                    description="Default pool",
+                    include_deferred=False,
+                    team_name="team1",
+                ),
+                Connection(conn_id="conn1", conn_type="http", team_name="team1"),
+                Variable(key="var1", val="value", team_name="team1"),
+                Pool(
+                    pool="pool1",
+                    slots=5,
+                    description="Additional pool",
+                    include_deferred=False,
+                    team_name="team1",
+                ),
+                Pool(
+                    pool=Pool.get_default_team_pool_name("team2"),
+                    slots=128,
+                    description="Default pool",
+                    include_deferred=False,
+                    team_name="team2",
+                ),
+                Connection(conn_id="conn2", conn_type="http", team_name="team2"),
+                Variable(key="var2", val="value", team_name="team2"),
+                Pool(
+                    pool="pool2",
+                    slots=5,
+                    description="Additional pool",
+                    include_deferred=False,
+                    team_name="team2",
+                ),
+            ]
+        )
+        self.session.commit()
+
+        with conf_vars({("core", "multi_team"): "True"}):
+            with stdout_capture as stdout:
+                team_command.team_inspect(
+                    self.parser.parse_args(["teams", "inspect", "team1", "--output", "json"])
+                )
+
+        assert json.loads(stdout.getvalue()) == [
+            {
+                "name": "team1",
+                "dag_bundles": ["bundle1"],
+                "pools": [
+                    Pool.get_default_team_pool_name("team1"),
+                    "pool1",
+                ],
+                "connections": ["conn1"],
+                "variables": ["var1"],
+            }
+        ]
+
+    def test_team_inspect_empty_team(self, stdout_capture):
+        """Test inspecting a team with no associated resources."""
+        self.session.add(Team(name="team1"))
+        self.session.commit()
+
+        self.session.add(
+            Pool(
+                pool=Pool.get_default_team_pool_name("team1"),
+                slots=128,
+                description="Default pool",
+                include_deferred=False,
+                team_name="team1",
+            )
+        )
+
+        self.session.commit()
+        with conf_vars({("core", "multi_team"): "True"}):
+            with stdout_capture as stdout:
+                team_command.team_inspect(
+                    self.parser.parse_args(["teams", "inspect", "team1", "--output", "json"])
+                )
+
+        assert json.loads(stdout.getvalue()) == [
+            {
+                "name": "team1",
+                "dag_bundles": [],
+                "pools": [Pool.get_default_team_pool_name("team1")],
+                "connections": [],
+                "variables": [],
+            }
+        ]
+
+    def test_team_inspect_nonexistent_team(self):
+        """Test inspecting a team that does not exist."""  #
+        with conf_vars({("core", "multi_team"): "True"}):
+            with pytest.raises(SystemExit, match="Team 'team1' does not exist"):
+                team_command.team_inspect(self.parser.parse_args(["teams", "inspect", "team1"]))
+
+    def test_team_inspect_multi_team_disabled(self, stdout_capture):
+        with conf_vars({("core", "multi_team"): "False"}):
+            with stdout_capture as stdout:
+                team_command.team_inspect(self.parser.parse_args(["teams", "inspect", "team1"]))
+
+        assert "Multi-team is not enabled." in stdout.getvalue()

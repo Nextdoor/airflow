@@ -21,6 +21,7 @@ from unittest import mock
 
 import pytest
 
+from airflow_breeze.global_constants import ALLOWED_PYTHON_MAJOR_MINOR_VERSIONS
 from airflow_breeze.utils.cache import (
     check_if_cache_exists,
     check_if_values_allowed,
@@ -32,12 +33,11 @@ AIRFLOW_SOURCES = Path(__file__).parents[3].resolve()
 
 
 @pytest.mark.parametrize(
-    "parameter, value, result, exception",
+    ("parameter", "value", "result", "exception"),
     [
-        ("backend", "mysql", (True, ["sqlite", "mysql", "postgres", "mssql"]), None),
-        ("backend", "xxx", (False, ["sqlite", "mysql", "postgres", "mssql"]), None),
-        ("python_major_minor_version", "3.8", (True, ["3.7", "3.8", "3.9", "3.10"]), None),
-        ("python_major_minor_version", "3.5", (False, ["3.7", "3.8", "3.9", "3.10"]), None),
+        ("backend", "mysql", (True, ["sqlite", "mysql", "postgres", "none", "custom"]), None),
+        ("backend", "xxx", (False, ["sqlite", "mysql", "postgres", "none", "custom"]), None),
+        ("python_major_minor_version", "3.11", (True, ALLOWED_PYTHON_MAJOR_MINOR_VERSIONS), None),
         ("missing", "value", None, AttributeError),
     ],
 )
@@ -66,7 +66,7 @@ def test_check_if_cache_exists(path):
 def test_read_from_cache_file(param):
     param_value = read_from_cache_file(param.upper())
     if param_value is None:
-        assert None is param_value
+        assert param_value is None
     else:
         allowed, param_list = check_if_values_allowed(param, param_value)
         if allowed:

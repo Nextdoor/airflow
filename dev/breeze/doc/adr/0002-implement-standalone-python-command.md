@@ -39,7 +39,7 @@ Accepted
 
 ## Context
 
-The [Breeze](https://github.com/apache/airflow/blob/main/BREEZE.rst) is
+The [Breeze](https://github.com/apache/airflow/blob/main/dev/breeze/doc/README.rst) is
 a command line development environment for Apache Airflow that makes
 it easy to setup Airflow development and test environment easily
 (< 10 minutes is the goal) and enable contributors to run any subset
@@ -104,8 +104,8 @@ SLOC    Directory         SLOC-by-Language (Sorted)
 6314    chart             python=6218,sh=96
 3665    top_dir           sh=2896,python=769
 3102    dev               python=2938,sh=164
-1723    kubernetes_tests  python=1723
-280     docker_tests      python=280
+1723    kubernetes-tests  python=1723
+280     docker-tests      python=280
 140     metastore_browser python=140
 109     clients           sh=109
 28      images              sh=28
@@ -138,9 +138,9 @@ There are a few properties of Breeze/CI scripts that should be maintained though
   run a command and get everything done with the least number of prerequisites
 
 * The prerequisites for Breeze and CI are:
-   * Python 3.7+ (Python 3.7 end of life is Jun 2023)
-   * Docker (TBD which minimum version supported)
-   * Docker Compose (TBD which minimum version supported)
+   * Python 3.10+ (Python 3.10 end of life is October 2025)
+   * Docker (23.0+)
+   * Docker Compose (2.16.0+)
    * No other tools and CLI commands should be needed
    * The python requirements should be automatically installed when missing in a "Breeze" venv and updated
      automatically when needed. The number of Python dependencies needed to run Breeze and CI scripts

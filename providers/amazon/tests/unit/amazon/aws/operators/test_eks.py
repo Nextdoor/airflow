@@ -1,0 +1,1740 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+import runpy
+from contextlib import AbstractContextManager, nullcontext
+from typing import Any, TypedDict
+from unittest import mock
+
+import pytest
+from botocore.exceptions import ClientError
+from botocore.waiter import Waiter
+
+from airflow.exceptions import AirflowException, AirflowProviderDeprecationWarning
+from airflow.providers.amazon.aws.hooks.eks import ClusterStates, EksHook
+from airflow.providers.amazon.aws.operators import eks
+from airflow.providers.amazon.aws.operators.eks import (
+    EksCreateClusterOperator,
+    EksCreateFargateProfileOperator,
+    EksCreateNodegroupOperator,
+    EksDeleteClusterOperator,
+    EksDeleteFargateProfileOperator,
+    EksDeleteNodegroupOperator,
+    EksPodExecOperator,
+    EksPodOperator,
+)
+from airflow.providers.amazon.aws.triggers.eks import (
+    EksCreateFargateProfileTrigger,
+    EksCreateNodegroupTrigger,
+    EksDeleteFargateProfileTrigger,
+    EksDeleteNodegroupTrigger,
+    EksPodTrigger,
+)
+from airflow.providers.cncf.kubernetes.utils.pod_manager import OnFinishAction
+from airflow.providers.common.compat.sdk import AirflowOptionalProviderFeatureException, TaskDeferred
+
+from unit.amazon.aws.utils.eks_test_constants import (
+    NODEROLE_ARN,
+    POD_EXECUTION_ROLE_ARN,
+    RESOURCES_VPC_CONFIG,
+    ROLE_ARN,
+    SELECTORS,
+    SUBNET_IDS,
+    TASK_ID,
+)
+from unit.amazon.aws.utils.eks_test_utils import convert_keys
+from unit.amazon.aws.utils.test_deferral import expect_deferral_warning
+from unit.amazon.aws.utils.test_template_fields import validate_template_fields
+from unit.amazon.aws.utils.test_waiter import assert_expected_waiter_type
+
+CLUSTER_NAME = "cluster1"
+NODEGROUP_NAME = "nodegroup1"
+FARGATE_PROFILE_NAME = "fargate_profile1"
+DESCRIBE_CLUSTER_RESULT = f'{{"cluster": "{CLUSTER_NAME}"}}'
+DESCRIBE_NODEGROUP_RESULT = f'{{"nodegroup": "{NODEGROUP_NAME}"}}'
+EMPTY_CLUSTER = '{"cluster": {}}'
+EMPTY_NODEGROUP = '{"nodegroup": {}}'
+NAME_LIST = ["foo", "bar", "baz", "qux"]
+CREATE_CLUSTER_KWARGS = {"version": "1.22"}
+CREATE_FARGATE_PROFILE_KWARGS = {"tags": {"hello": "world"}}
+CREATE_NODEGROUP_KWARGS = {
+    "capacityType": "ON_DEMAND",
+    "instanceTypes": "t4g.large",
+}
+
+RESOURCE_IN_USE_ERROR = ClientError(
+    error_response={"Error": {"Code": "ResourceInUseException", "Message": "update in progress"}},
+    operation_name="DeleteCluster",
+)
+RESOURCE_NOT_FOUND_ERROR = ClientError(
+    error_response={"Error": {"Code": "ResourceNotFoundException", "Message": "not found"}},
+    operation_name="DeleteCluster",
+)
+
+
+class ClusterParams(TypedDict):
+    cluster_name: str
+    cluster_role_arn: str
+    resources_vpc_config: dict[Any, Any]
+
+
+class NodeGroupParams(TypedDict):
+    nodegroup_name: str
+    nodegroup_role_arn: str
+
+
+class BaseFargateProfileParams(TypedDict):
+    fargate_profile_name: str
+    fargate_pod_execution_role_arn: str
+    fargate_selectors: list[Any]
+
+
+class CreateFargateProfileParams(TypedDict):
+    cluster_name: str
+    pod_execution_role_arn: str
+    selectors: list[Any]
+    fargate_profile_name: str
+
+
+class CreateNodegroupParams(TypedDict):
+    cluster_name: str
+    nodegroup_name: str
+    nodegroup_subnets: list[str]
+    nodegroup_role_arn: str
+
+
+class TestEksCreateClusterOperator:
+    def setup_method(self) -> None:
+        # Parameters which are needed to create a cluster.
+        self.create_cluster_params = ClusterParams(
+            cluster_name=CLUSTER_NAME,
+            cluster_role_arn=ROLE_ARN[1],
+            resources_vpc_config=RESOURCES_VPC_CONFIG[1],
+        )
+        self.nodegroup_setup()
+        self.fargate_profile_setup()
+
+    def nodegroup_setup(self) -> None:
+        # Parameters which are added to the cluster parameters
+        # when creating both the cluster and nodegroup together.
+        self.base_nodegroup_params = NodeGroupParams(
+            nodegroup_name=NODEGROUP_NAME,
+            nodegroup_role_arn=NODEROLE_ARN[1],
+        )
+
+        # Parameters expected to be passed in the CreateNodegroup hook call.
+        self.create_nodegroup_params = dict(
+            **self.base_nodegroup_params,
+            cluster_name=CLUSTER_NAME,
+            subnets=SUBNET_IDS,
+        )
+
+        self.create_cluster_operator_with_nodegroup = EksCreateClusterOperator(
+            task_id=TASK_ID,
+            **self.create_cluster_params,
+            **self.base_nodegroup_params,
+        )
+
+    def fargate_profile_setup(self) -> None:
+        # Parameters which are added to the cluster parameters
+        # when creating both the cluster and Fargate profile together.
+        self.base_fargate_profile_params = BaseFargateProfileParams(
+            fargate_profile_name=FARGATE_PROFILE_NAME,
+            fargate_pod_execution_role_arn=POD_EXECUTION_ROLE_ARN[1],
+            fargate_selectors=SELECTORS[1],
+        )
+
+        # Parameters expected to be passed in the CreateFargateProfile hook call.
+        self.create_fargate_profile_params = dict(
+            **self.base_fargate_profile_params,
+            cluster_name=CLUSTER_NAME,
+        )
+
+        self.create_cluster_operator_with_fargate_profile = EksCreateClusterOperator(
+            task_id=TASK_ID,
+            **self.create_cluster_params,
+            **self.base_fargate_profile_params,
+            compute="fargate",
+        )
+
+    @pytest.mark.parametrize(
+        "create_cluster_kwargs",
+        [
+            pytest.param(None, id="without cluster kwargs"),
+            pytest.param(CREATE_CLUSTER_KWARGS, id="with cluster kwargs"),
+        ],
+    )
+    @mock.patch.object(EksHook, "create_cluster")
+    @mock.patch.object(EksHook, "create_nodegroup")
+    def test_execute_create_cluster(self, mock_create_nodegroup, mock_create_cluster, create_cluster_kwargs):
+        op_kwargs = {**self.create_cluster_params, "compute": None}
+        if create_cluster_kwargs:
+            op_kwargs["create_cluster_kwargs"] = create_cluster_kwargs
+            parameters = {**self.create_cluster_params, **create_cluster_kwargs}
+        else:
+            assert "create_cluster_kwargs" not in op_kwargs
+            parameters = self.create_cluster_params
+
+        operator = EksCreateClusterOperator(task_id=TASK_ID, **op_kwargs)
+        operator.execute({})
+        mock_create_cluster.assert_called_with(**convert_keys(parameters))
+        mock_create_nodegroup.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "create_cluster_kwargs",
+        [
+            pytest.param(None, id="without cluster kwargs"),
+            pytest.param(CREATE_CLUSTER_KWARGS, id="with cluster kwargs"),
+        ],
+    )
+    @mock.patch.object(Waiter, "wait")
+    @mock.patch.object(EksHook, "create_cluster")
+    @mock.patch.object(EksHook, "create_nodegroup")
+    def test_execute_create_cluster_with_wait(
+        self, mock_create_nodegroup, mock_create_cluster, mock_waiter, create_cluster_kwargs
+    ):
+        op_kwargs = {**self.create_cluster_params, "compute": None}
+        if create_cluster_kwargs:
+            op_kwargs["create_cluster_kwargs"] = create_cluster_kwargs
+            parameters = {**self.create_cluster_params, **create_cluster_kwargs}
+        else:
+            assert "create_cluster_kwargs" not in op_kwargs
+            parameters = self.create_cluster_params
+
+        operator = EksCreateClusterOperator(task_id=TASK_ID, **op_kwargs, wait_for_completion=True)
+        operator.execute({})
+        mock_create_cluster.assert_called_with(**convert_keys(parameters))
+        mock_create_nodegroup.assert_not_called()
+        mock_waiter.assert_called_once_with(
+            mock.ANY,
+            name=CLUSTER_NAME,
+            WaiterConfig={"Delay": mock.ANY, "MaxAttempts": mock.ANY},
+        )
+        assert_expected_waiter_type(mock_waiter, "ClusterActive")
+
+    @mock.patch.object(Waiter, "wait")
+    @mock.patch.object(EksHook, "get_cluster_state")
+    @mock.patch.object(EksHook, "create_cluster")
+    @mock.patch.object(EksHook, "create_nodegroup")
+    def test_execute_when_called_with_nodegroup_creates_both(
+        self, mock_create_nodegroup, mock_create_cluster, mock_cluster_state, mock_waiter
+    ):
+        mock_cluster_state.return_value = ClusterStates.ACTIVE
+
+        self.create_cluster_operator_with_nodegroup.execute({})
+
+        mock_create_cluster.assert_called_once_with(**convert_keys(self.create_cluster_params))
+        mock_create_nodegroup.assert_called_once_with(**convert_keys(self.create_nodegroup_params))
+        mock_waiter.assert_called_once_with(
+            mock.ANY,
+            name=CLUSTER_NAME,
+            WaiterConfig={"Delay": mock.ANY, "MaxAttempts": mock.ANY},
+        )
+        assert_expected_waiter_type(mock_waiter, "ClusterActive")
+
+    @mock.patch.object(Waiter, "wait")
+    @mock.patch.object(EksHook, "get_cluster_state")
+    @mock.patch.object(EksHook, "create_cluster")
+    @mock.patch.object(EksHook, "create_nodegroup")
+    def test_execute_with_wait_when_called_with_nodegroup_creates_both(
+        self, mock_create_nodegroup, mock_create_cluster, mock_cluster_state, mock_waiter
+    ):
+        mock_cluster_state.return_value = ClusterStates.ACTIVE
+        self.create_cluster_operator_with_nodegroup.wait_for_completion = True
+
+        self.create_cluster_operator_with_nodegroup.execute({})
+
+        mock_create_cluster.assert_called_once_with(**convert_keys(self.create_cluster_params))
+        mock_create_nodegroup.assert_called_once_with(**convert_keys(self.create_nodegroup_params))
+        # Calls waiter once for the cluster and once for the nodegroup.
+        assert mock_waiter.call_count == 2
+        mock_waiter.assert_called_with(
+            mock.ANY,
+            clusterName=CLUSTER_NAME,
+            nodegroupName=NODEGROUP_NAME,
+            WaiterConfig={"MaxAttempts": mock.ANY},
+        )
+        assert_expected_waiter_type(mock_waiter, "NodegroupActive")
+
+    @mock.patch.object(Waiter, "wait")
+    @mock.patch.object(EksHook, "get_cluster_state")
+    @mock.patch.object(EksHook, "create_cluster")
+    @mock.patch.object(EksHook, "create_fargate_profile")
+    def test_execute_when_called_with_fargate_creates_both(
+        self, mock_create_fargate_profile, mock_create_cluster, mock_cluster_state, mock_waiter
+    ):
+        mock_cluster_state.return_value = ClusterStates.ACTIVE
+
+        self.create_cluster_operator_with_fargate_profile.execute({})
+
+        mock_create_cluster.assert_called_once_with(**convert_keys(self.create_cluster_params))
+        mock_create_fargate_profile.assert_called_once_with(
+            **convert_keys(self.create_fargate_profile_params)
+        )
+        mock_waiter.assert_called_once_with(
+            mock.ANY,
+            name=CLUSTER_NAME,
+            WaiterConfig={"Delay": mock.ANY, "MaxAttempts": mock.ANY},
+        )
+        assert_expected_waiter_type(mock_waiter, "ClusterActive")
+
+    @mock.patch.object(Waiter, "wait")
+    @mock.patch.object(EksHook, "get_cluster_state")
+    @mock.patch.object(EksHook, "create_cluster")
+    @mock.patch.object(EksHook, "create_fargate_profile")
+    def test_execute_with_wait_when_called_with_fargate_creates_both(
+        self, mock_create_fargate_profile, mock_create_cluster, mock_cluster_state, mock_waiter
+    ):
+        mock_cluster_state.return_value = ClusterStates.ACTIVE
+        self.create_cluster_operator_with_fargate_profile.wait_for_completion = True
+
+        self.create_cluster_operator_with_fargate_profile.execute({})
+
+        mock_create_cluster.assert_called_once_with(**convert_keys(self.create_cluster_params))
+        mock_create_fargate_profile.assert_called_once_with(
+            **convert_keys(self.create_fargate_profile_params)
+        )
+        # Calls waiter once for the cluster and once for the nodegroup.
+        assert mock_waiter.call_count == 2
+        mock_waiter.assert_called_with(
+            mock.ANY,
+            clusterName=CLUSTER_NAME,
+            fargateProfileName=FARGATE_PROFILE_NAME,
+            WaiterConfig={"MaxAttempts": mock.ANY},
+        )
+        assert_expected_waiter_type(mock_waiter, "FargateProfileActive")
+
+    def test_invalid_compute_value(self):
+        invalid_compute = EksCreateClusterOperator(
+            task_id=TASK_ID,
+            **self.create_cluster_params,
+            compute="infinite",
+        )
+
+        with pytest.raises(ValueError, match="Provided compute type is not supported."):
+            invalid_compute.execute({})
+
+    def test_nodegroup_compute_missing_nodegroup_role_arn(self):
+        missing_nodegroup_role_arn = EksCreateClusterOperator(
+            task_id=TASK_ID,
+            **self.create_cluster_params,
+            compute="nodegroup",
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="Creating an Amazon EKS managed node groups requires nodegroup_role_arn to be passed in.",
+        ):
+            missing_nodegroup_role_arn.execute({})
+
+    def test_fargate_compute_missing_fargate_pod_execution_role_arn(self):
+        missing_fargate_pod_execution_role_arn = EksCreateClusterOperator(
+            task_id=TASK_ID,
+            **self.create_cluster_params,
+            compute="fargate",
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="Creating an AWS Fargate profiles requires fargate_pod_execution_role_arn to be passed in.",
+        ):
+            missing_fargate_pod_execution_role_arn.execute({})
+
+    def test_init_with_region(self):
+        with pytest.warns(AirflowProviderDeprecationWarning) as m:
+            m.operator = EksCreateClusterOperator(
+                task_id=TASK_ID,
+                **self.create_cluster_params,
+                compute=None,
+                region="us-east-2",
+            )
+        assert m.operator.region_name == "us-east-2"
+
+    @mock.patch.object(EksHook, "create_cluster")
+    def test_eks_create_cluster_short_circuit_early(self, mock_create_cluster, caplog):
+        mock_create_cluster.return_value = None
+        eks_create_cluster_operator = EksCreateClusterOperator(
+            task_id=TASK_ID,
+            **self.create_cluster_params,
+            compute=None,
+            wait_for_completion=False,
+            deferrable=False,
+        )
+        eks_create_cluster_operator.execute({})
+        assert len(caplog.records) == 0
+
+    @pytest.mark.parametrize("wait_for_completion", [True, False], ids=["wait", "no_wait"])
+    @mock.patch.object(EksHook, "create_cluster")
+    def test_eks_create_cluster_with_deferrable(self, mock_create_cluster, caplog, wait_for_completion):
+        mock_create_cluster.return_value = None
+
+        eks_create_cluster_operator = EksCreateClusterOperator(
+            task_id=TASK_ID,
+            **self.create_cluster_params,
+            compute=None,
+            wait_for_completion=wait_for_completion,
+            deferrable=True,
+        )
+        with (
+            expect_deferral_warning(deferrable=True, wait_for_completion=wait_for_completion),
+            pytest.raises(TaskDeferred),
+        ):
+            eks_create_cluster_operator.execute({})
+        assert "Waiting for EKS Cluster to provision. This will take some time." in caplog.messages
+
+    @pytest.mark.parametrize(
+        ("compute", "trigger_class"),
+        [
+            pytest.param("nodegroup", EksCreateNodegroupTrigger, id="nodegroup"),
+            pytest.param("fargate", EksCreateFargateProfileTrigger, id="fargate"),
+        ],
+    )
+    @pytest.mark.parametrize("wait_for_completion", [True, False], ids=["wait", "no_wait"])
+    @mock.patch("airflow.providers.amazon.aws.operators.eks._create_compute", autospec=True)
+    def test_deferrable_create_cluster_next_defers_for_compute(
+        self, mock_create_compute, wait_for_completion, compute, trigger_class
+    ):
+        operator = EksCreateClusterOperator(
+            task_id=TASK_ID,
+            **self.create_cluster_params,
+            compute=compute,
+            wait_for_completion=wait_for_completion,
+            deferrable=True,
+        )
+        with (
+            expect_deferral_warning(deferrable=True, wait_for_completion=wait_for_completion),
+            pytest.raises(TaskDeferred) as exc,
+        ):
+            operator.deferrable_create_cluster_next({}, event={"status": "success"})
+
+        assert isinstance(exc.value.trigger, trigger_class)
+        assert mock_create_compute.call_args.kwargs["wait_for_completion"] is False
+
+    def test_template_fields(self):
+        op = EksCreateClusterOperator(
+            task_id=TASK_ID, **self.create_cluster_params, compute="fargate", region_name="us-east-1"
+        )
+
+        validate_template_fields(op)
+
+
+class TestEksCreateFargateProfileOperator:
+    def setup_method(self) -> None:
+        self.create_fargate_profile_params = CreateFargateProfileParams(
+            cluster_name=CLUSTER_NAME,
+            pod_execution_role_arn=POD_EXECUTION_ROLE_ARN[1],
+            selectors=SELECTORS[1],
+            fargate_profile_name=FARGATE_PROFILE_NAME,
+        )
+
+    @pytest.mark.parametrize(
+        "create_fargate_profile_kwargs",
+        [
+            pytest.param(None, id="without fargate profile kwargs"),
+            pytest.param(CREATE_FARGATE_PROFILE_KWARGS, id="with fargate profile kwargs"),
+        ],
+    )
+    @mock.patch.object(Waiter, "wait")
+    @mock.patch.object(EksHook, "create_fargate_profile")
+    def test_execute_when_fargate_profile_does_not_already_exist(
+        self, mock_create_fargate_profile, mock_waiter, create_fargate_profile_kwargs
+    ):
+        op_kwargs = {**self.create_fargate_profile_params}
+        if create_fargate_profile_kwargs:
+            op_kwargs["create_fargate_profile_kwargs"] = create_fargate_profile_kwargs
+            parameters = {**self.create_fargate_profile_params, **create_fargate_profile_kwargs}
+        else:
+            assert "create_fargate_profile_kwargs" not in op_kwargs
+            parameters = self.create_fargate_profile_params
+
+        operator = EksCreateFargateProfileOperator(task_id=TASK_ID, **op_kwargs)
+        operator.execute({})
+        mock_create_fargate_profile.assert_called_with(**convert_keys(parameters))
+        mock_waiter.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "create_fargate_profile_kwargs",
+        [
+            pytest.param(None, id="without fargate profile kwargs"),
+            pytest.param(CREATE_FARGATE_PROFILE_KWARGS, id="with fargate profile kwargs"),
+        ],
+    )
+    @mock.patch.object(Waiter, "wait")
+    @mock.patch.object(EksHook, "create_fargate_profile")
+    def test_execute_with_wait_when_fargate_profile_does_not_already_exist(
+        self, mock_create_fargate_profile, mock_waiter, create_fargate_profile_kwargs
+    ):
+        op_kwargs = {**self.create_fargate_profile_params}
+        if create_fargate_profile_kwargs:
+            op_kwargs["create_fargate_profile_kwargs"] = create_fargate_profile_kwargs
+            parameters = {**self.create_fargate_profile_params, **create_fargate_profile_kwargs}
+        else:
+            assert "create_fargate_profile_kwargs" not in op_kwargs
+            parameters = self.create_fargate_profile_params
+
+        operator = EksCreateFargateProfileOperator(task_id=TASK_ID, **op_kwargs, wait_for_completion=True)
+        operator.execute({})
+        mock_create_fargate_profile.assert_called_with(**convert_keys(parameters))
+        mock_waiter.assert_called_with(
+            mock.ANY,
+            clusterName=CLUSTER_NAME,
+            fargateProfileName=FARGATE_PROFILE_NAME,
+            WaiterConfig={"MaxAttempts": mock.ANY},
+        )
+        assert_expected_waiter_type(mock_waiter, "FargateProfileActive")
+
+    @pytest.mark.parametrize("wait_for_completion", [True, False], ids=["wait", "no_wait"])
+    @mock.patch.object(Waiter, "wait")
+    @mock.patch.object(EksHook, "create_fargate_profile")
+    def test_create_fargate_profile_deferrable(self, _, mock_waiter, wait_for_completion):
+        op_kwargs = {**self.create_fargate_profile_params}
+        operator = EksCreateFargateProfileOperator(
+            task_id=TASK_ID,
+            **op_kwargs,
+            wait_for_completion=wait_for_completion,
+            deferrable=True,
+        )
+        with (
+            expect_deferral_warning(deferrable=True, wait_for_completion=wait_for_completion),
+            pytest.raises(TaskDeferred) as exc,
+        ):
+            operator.execute({})
+        mock_waiter.assert_not_called()
+        assert isinstance(exc.value.trigger, EksCreateFargateProfileTrigger), (
+            "Trigger is not a EksCreateFargateProfileTrigger"
+        )
+
+    def test_template_fields(self):
+        op = EksCreateFargateProfileOperator(task_id=TASK_ID, **self.create_fargate_profile_params)
+
+        validate_template_fields(op)
+
+    def test_init_with_region(self):
+        with pytest.warns(AirflowProviderDeprecationWarning) as m:
+            m.operator = EksCreateFargateProfileOperator(
+                task_id=TASK_ID,
+                **self.create_fargate_profile_params,
+                region="us-east-2",
+            )
+        assert m.operator.region_name == "us-east-2"
+
+
+class TestEksCreateNodegroupOperator:
+    def setup_method(self) -> None:
+        self.create_nodegroup_params = CreateNodegroupParams(
+            cluster_name=CLUSTER_NAME,
+            nodegroup_name=NODEGROUP_NAME,
+            nodegroup_subnets=SUBNET_IDS,
+            nodegroup_role_arn=NODEROLE_ARN[1],
+        )
+
+    @pytest.mark.parametrize(
+        "create_nodegroup_kwargs",
+        [
+            pytest.param(None, id="without nodegroup kwargs"),
+            pytest.param(CREATE_NODEGROUP_KWARGS, id="with nodegroup kwargs"),
+        ],
+    )
+    @mock.patch.object(Waiter, "wait")
+    @mock.patch.object(EksHook, "create_nodegroup")
+    def test_execute_when_nodegroup_does_not_already_exist(
+        self, mock_create_nodegroup, mock_waiter, create_nodegroup_kwargs
+    ):
+        op_kwargs = {**self.create_nodegroup_params}
+        if create_nodegroup_kwargs:
+            op_kwargs["create_nodegroup_kwargs"] = create_nodegroup_kwargs
+            parameters = {**self.create_nodegroup_params, **create_nodegroup_kwargs}
+        else:
+            assert "create_nodegroup_kwargs" not in op_kwargs
+            parameters = self.create_nodegroup_params
+
+        operator = EksCreateNodegroupOperator(task_id=TASK_ID, **op_kwargs)
+        operator.execute({})
+        mock_create_nodegroup.assert_called_with(**convert_keys(parameters))
+        mock_waiter.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "create_nodegroup_kwargs",
+        [
+            pytest.param(None, id="without nodegroup kwargs"),
+            pytest.param(CREATE_NODEGROUP_KWARGS, id="with nodegroup kwargs"),
+        ],
+    )
+    @mock.patch.object(Waiter, "wait")
+    @mock.patch.object(EksHook, "create_nodegroup")
+    def test_execute_with_wait_when_nodegroup_does_not_already_exist(
+        self, mock_create_nodegroup, mock_waiter, create_nodegroup_kwargs
+    ):
+        op_kwargs = {**self.create_nodegroup_params}
+        if create_nodegroup_kwargs:
+            op_kwargs["create_nodegroup_kwargs"] = create_nodegroup_kwargs
+            parameters = {**self.create_nodegroup_params, **create_nodegroup_kwargs}
+        else:
+            assert "create_nodegroup_kwargs" not in op_kwargs
+            parameters = self.create_nodegroup_params
+
+        operator = EksCreateNodegroupOperator(task_id=TASK_ID, **op_kwargs, wait_for_completion=True)
+        operator.execute({})
+        mock_create_nodegroup.assert_called_with(**convert_keys(parameters))
+        mock_waiter.assert_called_with(
+            mock.ANY,
+            clusterName=CLUSTER_NAME,
+            nodegroupName=NODEGROUP_NAME,
+            WaiterConfig={"MaxAttempts": mock.ANY},
+        )
+        assert_expected_waiter_type(mock_waiter, "NodegroupActive")
+
+    @pytest.mark.parametrize("wait_for_completion", [True, False], ids=["wait", "no_wait"])
+    @mock.patch.object(Waiter, "wait")
+    @mock.patch.object(EksHook, "create_nodegroup")
+    def test_create_nodegroup_deferrable(self, mock_create_nodegroup, mock_waiter, wait_for_completion):
+        mock_create_nodegroup.return_value = True
+        op_kwargs = {**self.create_nodegroup_params}
+        operator = EksCreateNodegroupOperator(
+            task_id=TASK_ID,
+            **op_kwargs,
+            wait_for_completion=wait_for_completion,
+            deferrable=True,
+        )
+        assert operator.wait_for_completion is wait_for_completion
+        with (
+            expect_deferral_warning(deferrable=True, wait_for_completion=wait_for_completion),
+            pytest.raises(TaskDeferred) as exc,
+        ):
+            operator.execute({})
+        assert isinstance(exc.value.trigger, EksCreateNodegroupTrigger)
+        mock_waiter.assert_not_called()
+
+    def test_template_fields(self):
+        op_kwargs = {**self.create_nodegroup_params}
+        op = EksCreateNodegroupOperator(task_id=TASK_ID, **op_kwargs)
+
+        validate_template_fields(op)
+
+    def test_init_with_region(self):
+        op_kwargs = {**self.create_nodegroup_params}
+
+        with pytest.warns(AirflowProviderDeprecationWarning) as m:
+            m.operator = EksCreateNodegroupOperator(
+                task_id=TASK_ID,
+                **op_kwargs,
+                region="us-east-2",
+            )
+        assert m.operator.region_name == "us-east-2"
+
+    @mock.patch.object(EksHook, "delete_nodegroup")
+    @mock.patch("airflow.providers.amazon.aws.operators.eks.wait")
+    @mock.patch.object(EksHook, "create_nodegroup")
+    def test_nodegroup_cleanup_on_waiter_auth_failure(
+        self,
+        mock_create_nodegroup,
+        mock_waiter,
+        mock_delete_nodegroup,
+    ):
+        # Airflow currently wraps waiter errors with AirflowException, but the code intentionally supports both.
+        waiter_error = AirflowException("Nodegroup creation failed: Waiter NodegroupActive failed")
+        mock_waiter.side_effect = waiter_error
+
+        operator = EksCreateNodegroupOperator(
+            task_id=TASK_ID,
+            cluster_name=CLUSTER_NAME,
+            nodegroup_name=NODEGROUP_NAME,
+            nodegroup_subnets=SUBNET_IDS,
+            nodegroup_role_arn=NODEROLE_ARN[1],
+            wait_for_completion=True,
+            delete_nodegroup_on_failure=True,
+        )
+
+        with pytest.raises(AirflowException):
+            operator.execute({})
+
+        # Nodegroup creation happened.
+        mock_create_nodegroup.assert_called_once()
+
+        # Cleanup attempted.
+        mock_delete_nodegroup.assert_called_once_with(
+            clusterName=CLUSTER_NAME,
+            nodegroupName=NODEGROUP_NAME,
+        )
+
+    @mock.patch("time.sleep", return_value=None)
+    @mock.patch.object(EksHook, "delete_nodegroup")
+    @mock.patch("airflow.providers.amazon.aws.operators.eks.wait")
+    @mock.patch.object(EksHook, "create_nodegroup")
+    def test_nodegroup_cleanup_retries_on_resource_in_use(
+        self,
+        mock_create_nodegroup,
+        mock_waiter,
+        mock_delete_nodegroup,
+        mock_sleep,
+    ):
+        mock_waiter.side_effect = AirflowException("Nodegroup creation failed: Waiter NodegroupActive failed")
+        # A freshly-failed nodegroup may still be settling, so the cleanup delete rides out
+        # transient ResourceInUseException before succeeding.
+        mock_delete_nodegroup.side_effect = [RESOURCE_IN_USE_ERROR, RESOURCE_IN_USE_ERROR, None]
+
+        operator = EksCreateNodegroupOperator(
+            task_id=TASK_ID,
+            cluster_name=CLUSTER_NAME,
+            nodegroup_name=NODEGROUP_NAME,
+            nodegroup_subnets=SUBNET_IDS,
+            nodegroup_role_arn=NODEROLE_ARN[1],
+            wait_for_completion=True,
+            delete_nodegroup_on_failure=True,
+        )
+
+        # The original creation error is still raised once cleanup eventually succeeds.
+        with pytest.raises(AirflowException, match="Nodegroup creation failed"):
+            operator.execute({})
+
+        assert mock_delete_nodegroup.call_count == 3
+        mock_delete_nodegroup.assert_called_with(clusterName=CLUSTER_NAME, nodegroupName=NODEGROUP_NAME)
+
+    @mock.patch.object(EksHook, "delete_nodegroup")
+    @mock.patch("airflow.providers.amazon.aws.operators.eks.wait")
+    @mock.patch.object(EksHook, "create_nodegroup")
+    def test_nodegroup_cleanup_failure_does_not_mask_original_error(
+        self,
+        mock_create_nodegroup,
+        mock_waiter,
+        mock_delete_nodegroup,
+    ):
+        # Airflow currently wraps waiter errors with AirflowException, but the code intentionally supports both.
+        waiter_error = AirflowException("Nodegroup creation failed: Waiter NodegroupActive failed")
+
+        cleanup_error = ClientError(
+            error_response={
+                "Error": {
+                    "Code": "UnauthorizedOperation",
+                    "Message": "You are not authorized to perform this operation",
+                }
+            },
+            operation_name="DeleteNodegroup",
+        )
+
+        mock_waiter.side_effect = waiter_error
+        mock_delete_nodegroup.side_effect = cleanup_error
+
+        operator = EksCreateNodegroupOperator(
+            task_id=TASK_ID,
+            cluster_name=CLUSTER_NAME,
+            nodegroup_name=NODEGROUP_NAME,
+            nodegroup_subnets=SUBNET_IDS,
+            nodegroup_role_arn=NODEROLE_ARN[1],
+            wait_for_completion=True,
+            delete_nodegroup_on_failure=True,
+        )
+
+        with pytest.raises(AirflowException) as exc:
+            operator.execute({})
+
+        # Original error preserved.
+        assert isinstance(exc.value, AirflowException)
+        assert "Nodegroup creation failed" in str(exc.value)
+
+        # Nodegroup creation happened.
+        mock_create_nodegroup.assert_called_once()
+
+        # Cleanup attempted.
+        mock_delete_nodegroup.assert_called_once_with(
+            clusterName=CLUSTER_NAME,
+            nodegroupName=NODEGROUP_NAME,
+        )
+
+
+class TestEksDeleteClusterOperator:
+    def setup_method(self) -> None:
+        self.cluster_name: str = CLUSTER_NAME
+
+        self.delete_cluster_operator = EksDeleteClusterOperator(
+            task_id=TASK_ID, cluster_name=self.cluster_name
+        )
+
+    @mock.patch.object(Waiter, "wait")
+    @mock.patch.object(EksHook, "list_nodegroups")
+    @mock.patch.object(EksHook, "delete_cluster")
+    def test_existing_cluster_not_in_use(self, mock_delete_cluster, mock_list_nodegroups, mock_waiter):
+        mock_list_nodegroups.return_value = []
+        self.delete_cluster_operator.execute({})
+        mock_delete_cluster.assert_called_once_with(name=self.cluster_name)
+        mock_waiter.assert_not_called()
+
+    @mock.patch.object(Waiter, "wait")
+    @mock.patch.object(EksHook, "list_nodegroups")
+    @mock.patch.object(EksHook, "delete_cluster")
+    def test_existing_cluster_not_in_use_with_wait(
+        self, mock_delete_cluster, mock_list_nodegroups, mock_waiter
+    ):
+        mock_list_nodegroups.return_value = []
+        self.delete_cluster_operator.wait_for_completion = True
+
+        self.delete_cluster_operator.execute({})
+
+        mock_list_nodegroups.assert_not_called()
+        mock_delete_cluster.assert_called_once_with(name=self.cluster_name)
+        mock_waiter.assert_called_with(
+            mock.ANY,
+            name=CLUSTER_NAME,
+            WaiterConfig={"Delay": 30, "MaxAttempts": 40},
+        )
+        assert_expected_waiter_type(mock_waiter, "ClusterDeleted")
+
+    @pytest.mark.parametrize("wait_for_completion", [True, False], ids=["wait", "no_wait"])
+    def test_eks_delete_cluster_operator_with_deferrable(self, wait_for_completion):
+        self.delete_cluster_operator.deferrable = True
+        self.delete_cluster_operator.wait_for_completion = wait_for_completion
+        with (
+            expect_deferral_warning(deferrable=True, wait_for_completion=wait_for_completion),
+            pytest.raises(TaskDeferred),
+        ):
+            self.delete_cluster_operator.execute({})
+
+    @pytest.mark.parametrize("status", ["deleted", "success"])
+    def test_execute_complete_when_trigger_yields_deleted(self, caplog, status):
+        # EksDeleteClusterTrigger reports a deleted cluster with status "deleted".
+        # Also accept "success" for forward-compat with the usual event.
+        self.delete_cluster_operator.execute_complete(context={}, event={"status": status})
+        assert "Cluster deleted successfully." in caplog.messages
+
+    @mock.patch("time.sleep", return_value=None)
+    @mock.patch.object(Waiter, "wait")
+    @mock.patch.object(EksHook, "list_nodegroups")
+    @mock.patch.object(EksHook, "delete_cluster")
+    def test_delete_cluster_retries_on_resource_in_use(
+        self, mock_delete_cluster, mock_list_nodegroups, mock_waiter, mock_sleep
+    ):
+        mock_list_nodegroups.return_value = []
+        mock_delete_cluster.side_effect = [RESOURCE_IN_USE_ERROR, RESOURCE_IN_USE_ERROR, None]
+
+        self.delete_cluster_operator.execute({})
+
+        assert mock_delete_cluster.call_count == 3
+        mock_delete_cluster.assert_called_with(name=self.cluster_name)
+
+    @mock.patch.object(Waiter, "wait")
+    @mock.patch.object(EksHook, "delete_cluster")
+    def test_delete_cluster_with_waiter_config(self, mock_delete_cluster, mock_waiter):
+        op = EksDeleteClusterOperator(
+            task_id=TASK_ID,
+            cluster_name=CLUSTER_NAME,
+            wait_for_completion=True,
+            waiter_delay=15,
+            waiter_max_attempts=10,
+        )
+        op.execute({})
+        mock_delete_cluster.assert_called_once_with(name=CLUSTER_NAME)
+        mock_waiter.assert_called_with(
+            mock.ANY,
+            name=CLUSTER_NAME,
+            WaiterConfig={"Delay": 15, "MaxAttempts": 10},
+        )
+        assert_expected_waiter_type(mock_waiter, "ClusterDeleted")
+
+    @mock.patch.object(Waiter, "wait")
+    @mock.patch.object(EksHook, "get_waiter")
+    @mock.patch.object(EksHook, "list_fargate_profiles")
+    @mock.patch.object(EksHook, "list_nodegroups")
+    @mock.patch.object(EksHook, "delete_fargate_profile")
+    @mock.patch.object(EksHook, "delete_nodegroup")
+    @mock.patch.object(EksHook, "delete_cluster")
+    def test_force_delete_compute_with_waiter_config(
+        self,
+        mock_delete_cluster,
+        mock_delete_nodegroup,
+        mock_delete_fargate_profile,
+        mock_list_nodegroups,
+        mock_list_fargate_profiles,
+        mock_get_waiter,
+        mock_waiter,
+    ):
+        mock_list_nodegroups.return_value = [NODEGROUP_NAME]
+        mock_list_fargate_profiles.return_value = [FARGATE_PROFILE_NAME]
+        expected_config = {"Delay": 15, "MaxAttempts": 10}
+
+        op = EksDeleteClusterOperator(
+            task_id=TASK_ID,
+            cluster_name=CLUSTER_NAME,
+            force_delete_compute=True,
+            wait_for_completion=True,
+            waiter_delay=15,
+            waiter_max_attempts=10,
+        )
+
+        op.execute({})
+
+        mock_get_waiter.assert_called_once_with("all_nodegroups_deleted")
+        mock_get_waiter.return_value.wait.assert_called_once_with(
+            clusterName=CLUSTER_NAME,
+            WaiterConfig=expected_config,
+        )
+        assert mock_waiter.call_args_list == [
+            mock.call(
+                mock.ANY,
+                clusterName=CLUSTER_NAME,
+                fargateProfileName=FARGATE_PROFILE_NAME,
+                WaiterConfig=expected_config,
+            ),
+            mock.call(mock.ANY, name=CLUSTER_NAME, WaiterConfig=expected_config),
+        ]
+
+    @mock.patch("time.sleep", return_value=None)
+    @mock.patch.object(EksHook, "get_waiter")
+    @mock.patch.object(EksHook, "list_nodegroups")
+    @mock.patch.object(EksHook, "delete_nodegroup")
+    def test_delete_any_nodegroups_retries_on_resource_in_use(
+        self, mock_delete_nodegroup, mock_list_nodegroups, mock_get_waiter, mock_sleep
+    ):
+        mock_list_nodegroups.return_value = ["ng1"]
+        mock_delete_nodegroup.side_effect = [RESOURCE_IN_USE_ERROR, RESOURCE_IN_USE_ERROR, None]
+
+        self.delete_cluster_operator.delete_any_nodegroups()
+
+        assert mock_delete_nodegroup.call_count == 3
+        mock_delete_nodegroup.assert_called_with(clusterName=self.cluster_name, nodegroupName="ng1")
+
+    @mock.patch("time.sleep", return_value=None)
+    @mock.patch.object(Waiter, "wait")
+    @mock.patch.object(EksHook, "list_fargate_profiles")
+    @mock.patch.object(EksHook, "delete_fargate_profile")
+    def test_delete_any_fargate_profiles_retries_on_resource_in_use(
+        self, mock_delete_fargate_profile, mock_list_fargate_profiles, mock_waiter, mock_sleep
+    ):
+        mock_list_fargate_profiles.return_value = ["fp1"]
+        mock_delete_fargate_profile.side_effect = [RESOURCE_IN_USE_ERROR, RESOURCE_IN_USE_ERROR, None]
+
+        self.delete_cluster_operator.delete_any_fargate_profiles()
+
+        assert mock_delete_fargate_profile.call_count == 3
+        mock_delete_fargate_profile.assert_called_with(
+            clusterName=self.cluster_name, fargateProfileName="fp1"
+        )
+
+    def test_template_fields(self):
+        validate_template_fields(self.delete_cluster_operator)
+
+    def test_init_with_region(self):
+        with pytest.warns(AirflowProviderDeprecationWarning) as m:
+            m.operator = EksDeleteClusterOperator(
+                task_id=TASK_ID, cluster_name=self.cluster_name, region="us-east-2"
+            )
+        assert m.operator.region_name == "us-east-2"
+
+
+class TestEksDeleteNodegroupOperator:
+    def setup_method(self) -> None:
+        self.cluster_name: str = CLUSTER_NAME
+        self.nodegroup_name: str = NODEGROUP_NAME
+
+        self.delete_nodegroup_operator = EksDeleteNodegroupOperator(
+            task_id=TASK_ID, cluster_name=self.cluster_name, nodegroup_name=self.nodegroup_name
+        )
+
+    @mock.patch.object(Waiter, "wait")
+    @mock.patch.object(EksHook, "delete_nodegroup")
+    def test_existing_nodegroup(self, mock_delete_nodegroup, mock_waiter):
+        self.delete_nodegroup_operator.execute({})
+
+        mock_delete_nodegroup.assert_called_once_with(
+            clusterName=self.cluster_name, nodegroupName=self.nodegroup_name
+        )
+        mock_waiter.assert_not_called()
+
+    @mock.patch.object(Waiter, "wait")
+    @mock.patch.object(EksHook, "delete_nodegroup")
+    def test_existing_nodegroup_with_wait(self, mock_delete_nodegroup, mock_waiter):
+        self.delete_nodegroup_operator.wait_for_completion = True
+
+        self.delete_nodegroup_operator.execute({})
+
+        mock_delete_nodegroup.assert_called_once_with(
+            clusterName=self.cluster_name, nodegroupName=self.nodegroup_name
+        )
+        mock_waiter.assert_called_with(
+            mock.ANY,
+            clusterName=CLUSTER_NAME,
+            nodegroupName=NODEGROUP_NAME,
+            WaiterConfig={"Delay": 30, "MaxAttempts": 40},
+        )
+        assert_expected_waiter_type(mock_waiter, "NodegroupDeleted")
+
+    @mock.patch("time.sleep", return_value=None)
+    @mock.patch.object(Waiter, "wait")
+    @mock.patch.object(EksHook, "delete_nodegroup")
+    def test_delete_nodegroup_retries_on_resource_in_use(
+        self, mock_delete_nodegroup, mock_waiter, mock_sleep
+    ):
+        mock_delete_nodegroup.side_effect = [RESOURCE_IN_USE_ERROR, RESOURCE_IN_USE_ERROR, None]
+
+        self.delete_nodegroup_operator.execute({})
+
+        assert mock_delete_nodegroup.call_count == 3
+        mock_delete_nodegroup.assert_called_with(
+            clusterName=self.cluster_name, nodegroupName=self.nodegroup_name
+        )
+
+    @mock.patch.object(Waiter, "wait")
+    @mock.patch.object(EksHook, "delete_nodegroup")
+    def test_delete_nodegroup_with_waiter_config(self, mock_delete_nodegroup, mock_waiter):
+        op = EksDeleteNodegroupOperator(
+            task_id=TASK_ID,
+            cluster_name=CLUSTER_NAME,
+            nodegroup_name=NODEGROUP_NAME,
+            wait_for_completion=True,
+            waiter_delay=15,
+            waiter_max_attempts=10,
+        )
+        op.execute({})
+        mock_delete_nodegroup.assert_called_once_with(
+            clusterName=CLUSTER_NAME,
+            nodegroupName=NODEGROUP_NAME,
+        )
+        mock_waiter.assert_called_with(
+            mock.ANY,
+            clusterName=CLUSTER_NAME,
+            nodegroupName=NODEGROUP_NAME,
+            WaiterConfig={"Delay": 15, "MaxAttempts": 10},
+        )
+        assert_expected_waiter_type(mock_waiter, "NodegroupDeleted")
+
+    @pytest.mark.parametrize("wait_for_completion", [True, False], ids=["wait", "no_wait"])
+    @mock.patch.object(EksHook, "delete_nodegroup")
+    def test_delete_nodegroup_deferrable(self, _, wait_for_completion):
+        self.delete_nodegroup_operator.deferrable = True
+        self.delete_nodegroup_operator.wait_for_completion = wait_for_completion
+
+        with (
+            expect_deferral_warning(deferrable=True, wait_for_completion=wait_for_completion),
+            pytest.raises(TaskDeferred) as exc,
+        ):
+            self.delete_nodegroup_operator.execute({})
+        assert isinstance(exc.value.trigger, EksDeleteNodegroupTrigger)
+
+    def test_template_fields(self):
+        validate_template_fields(self.delete_nodegroup_operator)
+
+    def test_init_with_region(self):
+        with pytest.warns(AirflowProviderDeprecationWarning) as m:
+            m.operator = EksDeleteNodegroupOperator(
+                task_id=TASK_ID,
+                cluster_name=self.cluster_name,
+                nodegroup_name=self.nodegroup_name,
+                region="us-east-2",
+            )
+        assert m.operator.region_name == "us-east-2"
+
+
+class TestEksDeleteFargateProfileOperator:
+    def setup_method(self) -> None:
+        self.cluster_name: str = CLUSTER_NAME
+        self.fargate_profile_name: str = FARGATE_PROFILE_NAME
+
+        self.delete_fargate_profile_operator = EksDeleteFargateProfileOperator(
+            task_id=TASK_ID, cluster_name=self.cluster_name, fargate_profile_name=self.fargate_profile_name
+        )
+
+    @mock.patch.object(Waiter, "wait")
+    @mock.patch.object(EksHook, "delete_fargate_profile")
+    def test_existing_fargate_profile(self, mock_delete_fargate_profile, mock_waiter):
+        self.delete_fargate_profile_operator.execute({})
+
+        mock_delete_fargate_profile.assert_called_once_with(
+            clusterName=self.cluster_name, fargateProfileName=self.fargate_profile_name
+        )
+        mock_waiter.assert_not_called()
+
+    @mock.patch.object(Waiter, "wait")
+    @mock.patch.object(EksHook, "delete_fargate_profile")
+    def test_existing_fargate_profile_with_wait(self, mock_delete_fargate_profile, mock_waiter):
+        self.delete_fargate_profile_operator.wait_for_completion = True
+
+        self.delete_fargate_profile_operator.execute({})
+
+        mock_delete_fargate_profile.assert_called_once_with(
+            clusterName=self.cluster_name, fargateProfileName=self.fargate_profile_name
+        )
+        mock_waiter.assert_called_with(
+            mock.ANY,
+            clusterName=CLUSTER_NAME,
+            fargateProfileName=FARGATE_PROFILE_NAME,
+            WaiterConfig={"Delay": 30, "MaxAttempts": 60},
+        )
+        assert_expected_waiter_type(mock_waiter, "FargateProfileDeleted")
+
+    @pytest.mark.parametrize("wait_for_completion", [True, False], ids=["wait", "no_wait"])
+    @mock.patch.object(EksHook, "delete_fargate_profile")
+    def test_delete_fargate_profile_deferrable(self, _, wait_for_completion):
+        self.delete_fargate_profile_operator.deferrable = True
+        self.delete_fargate_profile_operator.wait_for_completion = wait_for_completion
+
+        with (
+            expect_deferral_warning(deferrable=True, wait_for_completion=wait_for_completion),
+            pytest.raises(TaskDeferred) as exc,
+        ):
+            self.delete_fargate_profile_operator.execute({})
+        assert isinstance(exc.value.trigger, EksDeleteFargateProfileTrigger), (
+            "Trigger is not a EksDeleteFargateProfileTrigger"
+        )
+
+    @mock.patch("time.sleep", return_value=None)
+    @mock.patch.object(Waiter, "wait")
+    @mock.patch.object(EksHook, "delete_fargate_profile")
+    def test_delete_fargate_profile_retries_on_resource_in_use(
+        self, mock_delete_fargate_profile, mock_waiter, mock_sleep
+    ):
+        mock_delete_fargate_profile.side_effect = [RESOURCE_IN_USE_ERROR, RESOURCE_IN_USE_ERROR, None]
+
+        self.delete_fargate_profile_operator.execute({})
+
+        assert mock_delete_fargate_profile.call_count == 3
+        mock_delete_fargate_profile.assert_called_with(
+            clusterName=self.cluster_name, fargateProfileName=self.fargate_profile_name
+        )
+
+    def test_template_fields(self):
+        validate_template_fields(self.delete_fargate_profile_operator)
+
+    def test_init_with_region(self):
+        with pytest.warns(AirflowProviderDeprecationWarning) as m:
+            m.operator = EksDeleteFargateProfileOperator(
+                task_id=TASK_ID,
+                cluster_name=self.cluster_name,
+                fargate_profile_name=self.fargate_profile_name,
+                region="us-east-2",
+            )
+        assert m.operator.region_name == "us-east-2"
+
+
+class TestEksPodOperator:
+    @mock.patch(
+        "airflow.providers.cncf.kubernetes.operators.pod.KubernetesPodOperator.execute", autospec=True
+    )
+    @mock.patch.object(EksHook, "generate_config_file_with_credentials", autospec=True)
+    @pytest.mark.parametrize("fails", [False, True])
+    def test_execute_uses_shared_auth_context(self, generate_config, execute, fails):
+        config_context = mock.MagicMock(spec=AbstractContextManager)
+        config_context.__enter__.return_value = ("/tmp/kubeconfig", "/tmp/credentials")
+        generate_config.return_value = config_context
+        operator = EksPodOperator(
+            task_id="run_pod", cluster_name=CLUSTER_NAME, namespace="workloads", image="test-image"
+        )
+
+        def run_in_context(op, context):
+            assert op.config_file == "/tmp/kubeconfig"
+            assert op._credentials_file_path == "/tmp/credentials"
+            config_context.__exit__.assert_not_called()
+            if fails:
+                raise RuntimeError("parent failed")
+            return "result"
+
+        execute.side_effect = run_in_context
+        with pytest.raises(RuntimeError, match="parent failed") if fails else nullcontext():
+            assert operator.execute({}) == "result"
+
+        generate_config.assert_called_once_with(
+            mock.ANY, eks_cluster_name=CLUSTER_NAME, pod_namespace="workloads"
+        )
+        execute.assert_called_once_with(operator, {})
+        config_context.__exit__.assert_called_once()
+
+    @mock.patch(
+        "airflow.providers.cncf.kubernetes.operators.pod.KubernetesPodOperator.trigger_reentry", autospec=True
+    )
+    @mock.patch.object(EksHook, "generate_config_file_with_credentials", autospec=True)
+    @pytest.mark.parametrize("fails", [False, True])
+    def test_trigger_reentry_uses_shared_auth_context(self, generate_config, reentry, fails):
+        config_context = mock.MagicMock(spec=AbstractContextManager)
+        config_context.__enter__.return_value = ("/tmp/kubeconfig", "/tmp/credentials")
+        generate_config.return_value = config_context
+        operator = EksPodOperator(
+            task_id="run_pod", cluster_name=CLUSTER_NAME, namespace="workloads", image="test-image"
+        )
+        event = {"eks_cluster_name": "event-cluster", "namespace": "event-namespace"}
+
+        def run_in_context(op, context, event):
+            assert op.config_file == "/tmp/kubeconfig"
+            assert op._credentials_file_path == "/tmp/credentials"
+            config_context.__exit__.assert_not_called()
+            if fails:
+                raise RuntimeError("parent failed")
+            return "result"
+
+        reentry.side_effect = run_in_context
+        with pytest.raises(RuntimeError, match="parent failed") if fails else nullcontext():
+            assert operator.trigger_reentry({}, event) == "result"
+
+        generate_config.assert_called_once_with(
+            mock.ANY, eks_cluster_name="event-cluster", pod_namespace="event-namespace"
+        )
+        reentry.assert_called_once_with(operator, {}, event)
+        config_context.__exit__.assert_called_once()
+
+    @mock.patch("airflow.providers.cncf.kubernetes.operators.pod.KubernetesPodOperator.execute")
+    @mock.patch("airflow.providers.amazon.aws.hooks.eks.EksHook.generate_config_file")
+    @mock.patch("airflow.providers.amazon.aws.hooks.eks.EksHook._secure_credential_context")
+    @mock.patch("airflow.providers.amazon.aws.hooks.eks.EksHook.get_session")
+    @mock.patch("airflow.providers.amazon.aws.hooks.eks.EksHook.__init__", return_value=None)
+    def test_existing_nodegroup(
+        self,
+        mock_eks_hook,
+        mock_get_session,
+        mock_secure_credential_context,
+        mock_generate_config_file,
+        mock_k8s_pod_operator_execute,
+    ):
+        ti_context = mock.MagicMock(name="ti_context")
+
+        # Mock the credential chain
+        mock_session = mock.MagicMock()
+        mock_credentials = mock.MagicMock()
+        mock_frozen_credentials = mock.MagicMock()
+        mock_frozen_credentials.access_key = "test_access_key"
+        mock_frozen_credentials.secret_key = "test_secret_key"
+        mock_frozen_credentials.token = "test_token"
+
+        mock_get_session.return_value = mock_session
+        mock_session.get_credentials.return_value = mock_credentials
+        mock_credentials.get_frozen_credentials.return_value = mock_frozen_credentials
+
+        # Mock the credential context manager
+        mock_credentials_file = "/tmp/test_creds.aws_creds"
+        mock_secure_credential_context.return_value.__enter__.return_value = mock_credentials_file
+
+        # Mock the config file context manager
+        mock_config_file = "/tmp/test_kubeconfig"
+        mock_generate_config_file.return_value.__enter__.return_value = mock_config_file
+
+        op = EksPodOperator(
+            task_id="run_pod",
+            pod_name="run_pod",
+            cluster_name=CLUSTER_NAME,
+            image="amazon/aws-cli:latest",
+            cmds=["sh", "-c", "ls"],
+            labels={"demo": "hello_world"},
+            get_logs=True,
+            # Delete the pod when it reaches its final state, or the execution is interrupted.
+            on_finish_action="delete_pod",
+        )
+        op_return_value = op.execute(ti_context)
+
+        # Verify all the expected calls were made
+        mock_k8s_pod_operator_execute.assert_called_once_with(ti_context)
+        mock_eks_hook.assert_called_once_with(aws_conn_id="aws_default", region_name=None)
+        mock_get_session.assert_called_once()
+        mock_session.get_credentials.assert_called_once()
+        mock_credentials.get_frozen_credentials.assert_called_once()
+        mock_secure_credential_context.assert_called_once_with(
+            "test_access_key", "test_secret_key", "test_token"
+        )
+        mock_generate_config_file.assert_called_once_with(
+            eks_cluster_name=CLUSTER_NAME, pod_namespace="default", credentials_file=mock_credentials_file
+        )
+
+        assert mock_k8s_pod_operator_execute.return_value == op_return_value
+        assert op.config_file == mock_config_file
+
+    @pytest.mark.parametrize(
+        ("compatible_kpo", "kwargs", "expected_attributes"),
+        [
+            (
+                True,
+                {"on_finish_action": "delete_succeeded_pod"},
+                {"on_finish_action": OnFinishAction.DELETE_SUCCEEDED_POD},
+            ),
+            (
+                # test default
+                True,
+                {},
+                {"on_finish_action": OnFinishAction.DELETE_POD},
+            ),
+            (
+                # test default
+                False,
+                {},
+                {},
+            ),
+        ],
+    )
+    def test_on_finish_action_handler(self, compatible_kpo, kwargs, expected_attributes):
+        kpo_init_args_mock = mock.MagicMock(**{"parameters": ["on_finish_action"] if compatible_kpo else []})
+
+        with mock.patch("inspect.signature", return_value=kpo_init_args_mock):
+            op = EksPodOperator(
+                task_id="run_pod",
+                pod_name="run_pod",
+                cluster_name=CLUSTER_NAME,
+                image="amazon/aws-cli:latest",
+                cmds=["sh", "-c", "ls"],
+                labels={"demo": "hello_world"},
+                get_logs=True,
+                **kwargs,
+            )
+            for expected_attr in expected_attributes:
+                assert op.__getattribute__(expected_attr) == expected_attributes[expected_attr]
+
+    def test_template_fields(self):
+        op = EksPodOperator(
+            task_id="run_pod",
+            pod_name="run_pod",
+            cluster_name=CLUSTER_NAME,
+            image="amazon/aws-cli:latest",
+            cmds=["sh", "-c", "ls"],
+            labels={"demo": "hello_world"},
+            get_logs=True,
+            on_finish_action="delete_pod",
+        )
+
+        validate_template_fields(op)
+
+    @mock.patch("airflow.providers.cncf.kubernetes.operators.pod.KubernetesPodOperator.trigger_reentry")
+    @mock.patch("airflow.providers.amazon.aws.hooks.eks.EksHook.generate_config_file")
+    @mock.patch("airflow.providers.amazon.aws.hooks.eks.EksHook._secure_credential_context")
+    @mock.patch("airflow.providers.amazon.aws.hooks.eks.EksHook.get_session")
+    @mock.patch("airflow.providers.amazon.aws.hooks.eks.EksHook.__init__", return_value=None)
+    def test_trigger_reentry(
+        self,
+        mock_eks_hook,
+        mock_get_session,
+        mock_secure_credential_context,
+        mock_generate_config_file,
+        mock_k8s_pod_operator_trigger_reentry,
+    ):
+        ti_context = mock.MagicMock(name="ti_context")
+        event = {"eks_cluster_name": "eks_cluster_name", "namespace": "namespace"}
+
+        # Mock the credential chain
+        mock_session = mock.MagicMock()
+        mock_credentials = mock.MagicMock()
+        mock_frozen_credentials = mock.MagicMock()
+        mock_frozen_credentials.access_key = "test_access_key"
+        mock_frozen_credentials.secret_key = "test_secret_key"
+        mock_frozen_credentials.token = "test_token"
+
+        mock_get_session.return_value = mock_session
+        mock_session.get_credentials.return_value = mock_credentials
+        mock_credentials.get_frozen_credentials.return_value = mock_frozen_credentials
+
+        # Mock the credential context manager
+        mock_credentials_file = "/tmp/test_creds.aws_creds"
+        mock_secure_credential_context.return_value.__enter__.return_value = mock_credentials_file
+
+        # Mock the config file context manager
+        mock_config_file = "/tmp/test_kubeconfig"
+        mock_generate_config_file.return_value.__enter__.return_value = mock_config_file
+
+        op = EksPodOperator(
+            task_id="run_pod",
+            pod_name="run_pod",
+            cluster_name=CLUSTER_NAME,
+            image="amazon/aws-cli:latest",
+            cmds=["sh", "-c", "ls"],
+            labels={"demo": "hello_world"},
+            get_logs=True,
+            # Delete the pod when it reaches its final state, or the execution is interrupted.
+            on_finish_action="delete_pod",
+        )
+        op.trigger_reentry(ti_context, event)
+
+        # Verify all the expected calls were made
+        mock_k8s_pod_operator_trigger_reentry.assert_called_once_with(ti_context, event)
+        mock_get_session.assert_called_once()
+        mock_session.get_credentials.assert_called_once()
+        mock_credentials.get_frozen_credentials.assert_called_once()
+        mock_secure_credential_context.assert_called_once_with(
+            "test_access_key", "test_secret_key", "test_token"
+        )
+        mock_generate_config_file.assert_called_once_with(
+            eks_cluster_name="eks_cluster_name",
+            pod_namespace="namespace",
+            credentials_file=mock_credentials_file,
+        )
+        assert op.config_file == mock_config_file
+
+    @mock.patch("airflow.providers.amazon.aws.hooks.eks.EksHook.get_session")
+    @mock.patch("airflow.providers.amazon.aws.hooks.eks.EksHook.__init__", return_value=None)
+    @mock.patch(
+        "airflow.providers.cncf.kubernetes.operators.pod.KubernetesPodOperator._refresh_cached_properties"
+    )
+    def test_refresh_cached_properties_refreshes_credentials(
+        self,
+        mock_super_refresh,
+        mock_eks_hook,
+        mock_get_session,
+        tmp_path,
+    ):
+        """Test that _refresh_cached_properties refreshes AWS credentials file."""
+        # Create a temporary credentials file
+        credentials_file = tmp_path / "test_creds.aws_creds"
+        credentials_file.write_text(
+            "export AWS_ACCESS_KEY_ID='old_key'\n"
+            "export AWS_SECRET_ACCESS_KEY='old_secret'\n"
+            "export AWS_SESSION_TOKEN='old_token'\n"
+        )
+
+        # Mock the credential chain for refresh
+        mock_session = mock.MagicMock()
+        mock_credentials = mock.MagicMock()
+        mock_frozen_credentials = mock.MagicMock()
+        mock_frozen_credentials.access_key = "new_access_key"
+        mock_frozen_credentials.secret_key = "new_secret_key"
+        mock_frozen_credentials.token = "new_token"
+
+        mock_get_session.return_value = mock_session
+        mock_session.get_credentials.return_value = mock_credentials
+        mock_credentials.get_frozen_credentials.return_value = mock_frozen_credentials
+
+        op = EksPodOperator(
+            task_id="run_pod",
+            pod_name="run_pod",
+            cluster_name=CLUSTER_NAME,
+            image="amazon/aws-cli:latest",
+            cmds=["sh", "-c", "ls"],
+            labels={"demo": "hello_world"},
+            get_logs=True,
+            on_finish_action="delete_pod",
+        )
+        # Set the credentials file path as it would be during execute()
+        op._credentials_file_path = str(credentials_file)
+
+        # Call the refresh method
+        op._refresh_cached_properties()
+
+        # Verify the credentials file was updated with new credentials
+        updated_content = credentials_file.read_text()
+        assert "new_access_key" in updated_content
+        assert "new_secret_key" in updated_content
+        assert "new_token" in updated_content
+        assert "old_key" not in updated_content
+
+        # Verify super()._refresh_cached_properties() was called
+        mock_super_refresh.assert_called_once()
+
+    @mock.patch("airflow.providers.amazon.aws.hooks.eks.EksHook.get_session")
+    @mock.patch("airflow.providers.amazon.aws.hooks.eks.EksHook.__init__", return_value=None)
+    @mock.patch(
+        "airflow.providers.cncf.kubernetes.operators.pod.KubernetesPodOperator._refresh_cached_properties"
+    )
+    def test_refresh_cached_properties_raises_when_no_credentials(
+        self,
+        mock_super_refresh,
+        mock_eks_hook,
+        mock_get_session,
+        tmp_path,
+    ):
+        """Test that _refresh_cached_properties raises when credentials cannot be retrieved."""
+        # Create a temporary credentials file
+        credentials_file = tmp_path / "test_creds.aws_creds"
+        credentials_file.write_text("export AWS_ACCESS_KEY_ID='old_key'\n")
+
+        # Mock the credential chain to return None (simulating expired/missing credentials)
+        mock_session = mock.MagicMock()
+        mock_get_session.return_value = mock_session
+        mock_session.get_credentials.return_value = None
+
+        op = EksPodOperator(
+            task_id="run_pod",
+            pod_name="run_pod",
+            cluster_name=CLUSTER_NAME,
+            image="amazon/aws-cli:latest",
+            cmds=["sh", "-c", "ls"],
+            labels={"demo": "hello_world"},
+            get_logs=True,
+            on_finish_action="delete_pod",
+        )
+        op._credentials_file_path = str(credentials_file)
+
+        # Call the refresh method and expect it to raise
+        with pytest.raises(AirflowException, match="Unable to retrieve fresh AWS credentials"):
+            op._refresh_cached_properties()
+
+        # Verify super()._refresh_cached_properties() was NOT called since we raised
+        mock_super_refresh.assert_not_called()
+
+    @mock.patch(
+        "airflow.providers.cncf.kubernetes.operators.pod.KubernetesPodOperator.convert_config_file_to_dict"
+    )
+    def test_invoke_defer_method_uses_eks_trigger(self, mock_convert_config):
+        """invoke_defer_method should create an EksPodTrigger and call defer."""
+        op = EksPodOperator(
+            task_id="run_pod",
+            pod_name="run_pod",
+            cluster_name=CLUSTER_NAME,
+            image="amazon/aws-cli:latest",
+            cmds=["sh", "-c", "ls"],
+            labels={"demo": "hello_world"},
+            get_logs=True,
+            on_finish_action="delete_pod",
+        )
+
+        # Set up pod metadata as it would be after execute creates the pod
+        mock_pod = mock.MagicMock()
+        mock_pod.metadata.name = "test-pod-abc123"
+        mock_pod.metadata.namespace = "default"
+        # Set status to None so define_container_state returns UNDEFINED (not terminal)
+        mock_pod.status = None
+        op.pod = mock_pod
+
+        with pytest.raises(TaskDeferred) as exc:
+            op.invoke_defer_method()
+
+        # Verify the trigger is an EksPodTrigger (not the base KubernetesPodTrigger)
+        trigger = exc.value.trigger
+        assert isinstance(trigger, EksPodTrigger)
+        assert trigger.eks_cluster_name == CLUSTER_NAME
+        assert trigger._aws_conn_id == "aws_default"
+        assert trigger.pod_name == "test-pod-abc123"
+        assert trigger.pod_namespace == "default"
+
+    @mock.patch(
+        "airflow.providers.cncf.kubernetes.operators.pod.KubernetesPodOperator.convert_config_file_to_dict"
+    )
+    def test_invoke_defer_method_raises_when_pod_is_none(self, mock_convert_config):
+        """invoke_defer_method should raise RuntimeError when pod is None."""
+        op = EksPodOperator(
+            task_id="run_pod",
+            pod_name="run_pod",
+            cluster_name=CLUSTER_NAME,
+            image="amazon/aws-cli:latest",
+            cmds=["sh", "-c", "ls"],
+            labels={"demo": "hello_world"},
+            get_logs=True,
+            on_finish_action="delete_pod",
+        )
+
+        # pod is None by default
+        op.pod = None
+
+        with pytest.raises(RuntimeError, match="Pod must be created with metadata before deferring"):
+            op.invoke_defer_method()
+
+
+@mock.patch.dict("sys.modules", {"airflow.providers.cncf.kubernetes.operators.pod_exec": None})
+def test_eks_operators_remain_available_without_pod_exec():
+    operators = runpy.run_path(eks.__file__)
+
+    operators["EksPodOperator"](task_id="existing_operator", cluster_name=CLUSTER_NAME)
+
+
+@mock.patch.dict("sys.modules", {"airflow.providers.cncf.kubernetes.operators.pod_exec": None})
+def test_eks_pod_exec_requires_available_kubernetes_pod_exec():
+    operators = runpy.run_path(eks.__file__)
+
+    with pytest.raises(
+        AirflowOptionalProviderFeatureException,
+        match=r"EksPodExecOperator requires apache-airflow-providers-cncf-kubernetes>=10\.22\.0",
+    ):
+        operators["EksPodExecOperator"](
+            task_id="exec_operator", cluster_name=CLUSTER_NAME, pod_name="existing-pod", command=["true"]
+        )
+
+
+class TestEksPodExecOperator:
+    @pytest.mark.parametrize("parameter", ["in_cluster", "config_file", "cluster_context"])
+    @pytest.mark.parametrize("value", [None, "custom-value"])
+    def test_rejects_managed_kubernetes_parameters(self, parameter, value):
+        with pytest.raises(
+            ValueError, match=f"The {parameter} is not an allowed parameter for the EksPodExecOperator"
+        ):
+            EksPodExecOperator(
+                task_id="run_command",
+                cluster_name=CLUSTER_NAME,
+                pod_name="existing-pod",
+                command=["echo", "hello"],
+                **{parameter: value},
+            )
+
+    @staticmethod
+    def configure_eks_auth(eks_hook_mock):
+        eks_hook = eks_hook_mock.return_value
+        auth_context = mock.MagicMock(spec=AbstractContextManager)
+        auth_context.__enter__.return_value = (
+            "/tmp/eks-kubeconfig",
+            "/tmp/aws-credentials",
+        )
+        eks_hook.generate_config_file_with_credentials.return_value = auth_context
+        return eks_hook
+
+    @mock.patch(
+        "airflow.providers.cncf.kubernetes.operators.pod_exec.KubernetesPodExecOperator.execute",
+        autospec=True,
+    )
+    @mock.patch("airflow.providers.amazon.aws.operators.eks.EksHook", autospec=True)
+    def test_execute_uses_shared_auth_context(self, eks_hook_mock, pod_exec_execute_mock):
+        eks_hook = self.configure_eks_auth(eks_hook_mock)
+
+        def execute_with_generated_config(operator, context):
+            assert operator.config_file == "/tmp/eks-kubeconfig"
+            eks_hook.generate_config_file_with_credentials.return_value.__exit__.assert_not_called()
+            return "command output"
+
+        pod_exec_execute_mock.side_effect = execute_with_generated_config
+        operator = EksPodExecOperator(
+            task_id="run_command",
+            cluster_name=CLUSTER_NAME,
+            pod_name="existing-pod",
+            namespace="workloads",
+            container_name="worker",
+            command=["dbt", "run"],
+            aws_conn_id="aws_test",
+            region_name="us-east-2",
+            verify=False,
+            botocore_config={"retries": {"max_attempts": 5}},
+            do_xcom_push=True,
+            max_xcom_output_size=1024,
+        )
+
+        result = operator.execute({})
+
+        assert result == "command output"
+        eks_hook_mock.assert_called_once_with(
+            aws_conn_id="aws_test",
+            region_name="us-east-2",
+            verify=False,
+            config={"retries": {"max_attempts": 5}},
+        )
+        eks_hook.generate_config_file_with_credentials.assert_called_once_with(
+            eks_cluster_name=CLUSTER_NAME,
+            pod_namespace="workloads",
+        )
+        eks_hook.generate_config_file_with_credentials.return_value.__exit__.assert_called_once_with(
+            None, None, None
+        )
+        pod_exec_execute_mock.assert_called_once_with(operator, {})
+        assert operator.config_file is None
+
+    @mock.patch(
+        "airflow.providers.cncf.kubernetes.operators.pod_exec.KubernetesPodExecOperator.execute",
+        autospec=True,
+    )
+    @mock.patch("airflow.providers.amazon.aws.operators.eks.EksHook", autospec=True)
+    def test_execute_clears_config_file_on_failure(self, eks_hook_mock, pod_exec_execute_mock):
+        eks_hook = self.configure_eks_auth(eks_hook_mock)
+        error = RuntimeError("command failed")
+        pod_exec_execute_mock.side_effect = error
+        operator = EksPodExecOperator(
+            task_id="run_command",
+            cluster_name=CLUSTER_NAME,
+            pod_name="existing-pod",
+            command=["false"],
+        )
+
+        with pytest.raises(RuntimeError, match="command failed") as raised:
+            operator.execute({})
+
+        assert raised.value is error
+        eks_hook.generate_config_file_with_credentials.return_value.__exit__.assert_called_once_with(
+            RuntimeError, error, mock.ANY
+        )
+        assert operator.config_file is None
+
+    @pytest.mark.parametrize("first_execution_fails", [False, True])
+    @mock.patch("airflow.providers.cncf.kubernetes.operators.pod_exec.KubernetesHook", autospec=True)
+    @mock.patch(
+        "airflow.providers.cncf.kubernetes.operators.pod_exec.KubernetesPodExecOperator.execute",
+        autospec=True,
+    )
+    @mock.patch("airflow.providers.amazon.aws.operators.eks.EksHook", autospec=True)
+    def test_execute_recreates_client_with_new_config(
+        self, eks_hook_mock, pod_exec_execute_mock, kubernetes_hook_mock, first_execution_fails
+    ):
+        eks_hook = self.configure_eks_auth(eks_hook_mock)
+        eks_hook.generate_config_file_with_credentials.return_value.__enter__.side_effect = [
+            ("/tmp/first-kubeconfig", "/tmp/first-credentials"),
+            ("/tmp/second-kubeconfig", "/tmp/second-credentials"),
+        ]
+        clients = []
+
+        def execute_with_client(operator, context):
+            clients.append(operator.client)
+            if first_execution_fails and len(clients) == 1:
+                raise RuntimeError("command failed")
+            return "command output"
+
+        pod_exec_execute_mock.side_effect = execute_with_client
+        operator = EksPodExecOperator(
+            task_id="run_command",
+            cluster_name=CLUSTER_NAME,
+            pod_name="existing-pod",
+            command=["true"],
+        )
+
+        if first_execution_fails:
+            with pytest.raises(RuntimeError, match="command failed"):
+                operator.execute({})
+        else:
+            operator.execute({})
+        assert operator.execute({}) == "command output"
+
+        assert kubernetes_hook_mock.call_args_list == [
+            mock.call(
+                conn_id="kubernetes_default", in_cluster=False, config_file=config_file, cluster_context=None
+            )
+            for config_file in ("/tmp/first-kubeconfig", "/tmp/second-kubeconfig")
+        ]
+
+    @pytest.mark.parametrize("kubernetes_conn_id", ["eks_kubernetes", None])
+    def test_kubernetes_connection_can_be_configured(self, kubernetes_conn_id):
+        operator = EksPodExecOperator(
+            task_id="run_command",
+            cluster_name=CLUSTER_NAME,
+            pod_name="existing-pod",
+            command=["true"],
+            kubernetes_conn_id=kubernetes_conn_id,
+        )
+
+        assert operator.kubernetes_conn_id == kubernetes_conn_id
+        assert operator.hook.conn_id == (kubernetes_conn_id or "kubernetes_default")
+
+    @mock.patch(
+        "airflow.providers.cncf.kubernetes.operators.pod_exec.KubernetesPodExecOperator.execute",
+        autospec=True,
+    )
+    @mock.patch("airflow.providers.amazon.aws.operators.eks.EksHook", autospec=True)
+    def test_execute_propagates_auth_context_failure(self, eks_hook_mock, pod_exec_execute_mock):
+        eks_hook = self.configure_eks_auth(eks_hook_mock)
+        error = RuntimeError("Unable to retrieve AWS credentials")
+        eks_hook.generate_config_file_with_credentials.return_value.__enter__.side_effect = error
+        operator = EksPodExecOperator(
+            task_id="run_command",
+            cluster_name=CLUSTER_NAME,
+            pod_name="existing-pod",
+            command=["true"],
+        )
+
+        with pytest.raises(RuntimeError, match="Unable to retrieve AWS credentials") as raised:
+            operator.execute({})
+
+        assert raised.value is error
+        pod_exec_execute_mock.assert_not_called()
+
+    def test_template_fields(self):
+        operator = EksPodExecOperator(
+            task_id="run_command",
+            cluster_name=CLUSTER_NAME,
+            pod_name="existing-pod",
+            command=["dbt", "run"],
+        )
+
+        validate_template_fields(operator)
+        assert "cluster_name" in operator.template_fields
+        assert "pod_name" in operator.template_fields
+        assert "command" in operator.template_fields
+
+        assert "cluster_context" not in operator.template_fields
+        assert "config_file" not in operator.template_fields
+        assert "kubernetes_conn_id" in operator.template_fields

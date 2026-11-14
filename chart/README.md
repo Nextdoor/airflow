@@ -25,22 +25,34 @@
 
 ## Introduction
 
-This chart will bootstrap an [Airflow](https://airflow.apache.org) deployment on a [Kubernetes](http://kubernetes.io)
+This chart will bootstrap an [Airflow](https://airflow.apache.org) deployment on a [Kubernetes](https://kubernetes.io)
 cluster using the [Helm](https://helm.sh) package manager.
 
 ## Requirements
 
-- Kubernetes 1.21+ cluster
+- Kubernetes 1.31+ cluster
 - Helm 3.0+
 - PV provisioner support in the underlying infrastructure (optionally)
 
 ## Features
 
-* Supported executors: ``LocalExecutor``, ``CeleryExecutor``, ``KubernetesExecutor``, ``LocalKubernetesExecutor``, ``CeleryKubernetesExecutor``
-* Supported Airflow version: ``1.10+``, ``2.0+``
-* Supported database backend: ``PostgresSQL``, ``MySQL``
+* Supported executors (all Airflow versions): ``LocalExecutor``, ``CeleryExecutor``, ``KubernetesExecutor``
+* Supported multiple Executors
+* Supported AWS executors with AWS provider version ``8.21.0+``:
+   * ``airflow.providers.amazon.aws.executors.batch.AwsBatchExecutor``
+   * ``airflow.providers.amazon.aws.executors.ecs.AwsEcsExecutor``
+* Supported Edge executor with edge3 provider version ``1.0.0+``:
+   * ``airflow.providers.edge3.executors.EdgeExecutor``
+* Supported Airflow version: ``3.1+``
+* Supported database backend: ``PostgreSQL``, ``MySQL``
 * Autoscaling for ``CeleryExecutor`` provided by KEDA
-* PostgreSQL and PgBouncer with a battle-tested configuration
+* ``PostgreSQL`` and ``PgBouncer`` with a battle-tested configuration
+* **Security enhancements**:
+   * Container-specific Service Account Token Volume configuration implementing Principle of Least Privilege
+   * Only scheduler containers receive API access; init and sidecar containers operate without tokens
+   * Defense-in-depth security with both ServiceAccount and Pod-level controls
+   * Default container hardening with security contexts set
+   * Compatibility with security policies like Kyverno and compliance frameworks
 * Monitoring:
    * StatsD/Prometheus metrics for Airflow
    * Prometheus metrics for PgBouncer
@@ -54,10 +66,10 @@ cluster using the [Helm](https://helm.sh) package manager.
 
 Full documentation for Helm Chart (latest **stable** release) lives [on the website](https://airflow.apache.org/docs/helm-chart/).
 
-> Note: If you're looking for documentation for main branch (latest development branch): you can find it on [s.apache.org/airflow-docs/](http://apache-airflow-docs.s3-website.eu-central-1.amazonaws.com/docs/helm-chart/latest/index.html).
-> Source code for documentation is in [../docs/helm-chart](https://github.com/apache/airflow/tree/main/docs/helm-chart)
+> Note: If you're looking for documentation for main branch (latest development branch): you can find it on [s.apache.org/airflow-docs/](http://apache-airflow-docs.s3-website.eu-central-1.amazonaws.com/docs/helm-chart/stable/index.html).
+> Source code for documentation is in [`chart/docs`](https://github.com/apache/airflow/tree/main/chart/docs)
 >
 
 ## Contributing
 
-Want to help build Apache Airflow? Check out our [contributing documentation](https://github.com/apache/airflow/blob/main/CONTRIBUTING.rst).
+Want to help build Apache Airflow? Check out our [contributing documentation](https://github.com/apache/airflow/blob/main/contributing-docs/README.rst).

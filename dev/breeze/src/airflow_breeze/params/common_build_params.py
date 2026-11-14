@@ -18,13 +18,24 @@ from __future__ import annotations
 
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any
 
 from airflow_breeze.branch_defaults import AIRFLOW_BRANCH, DEFAULT_AIRFLOW_CONSTRAINTS_BRANCH
-from airflow_breeze.global_constants import APACHE_AIRFLOW_GITHUB_REPOSITORY, DOCKER_DEFAULT_PLATFORM
-from airflow_breeze.utils.console import get_console
-from airflow_breeze.utils.platforms import get_real_platform
+from airflow_breeze.global_constants import (
+    ALLOWED_BUILD_PROGRESS,
+    ALLOWED_DEBIAN_VERSIONS,
+    ALLOWED_INSTALL_MYSQL_CLIENT_TYPES,
+    APACHE_AIRFLOW_GITHUB_REPOSITORY,
+    DOCKER_DEFAULT_PLATFORM,
+    OS_DEPS_IMAGE_DEBIAN_VERSION,
+    get_airflow_version,
+    get_hardened_python_base_image,
+    get_pinned_os_deps_image,
+)
+from airflow_breeze.utils.console import console_print
+from airflow_breeze.utils.platforms import get_normalized_platform
 
 
 @dataclass
@@ -33,51 +44,51 @@ class CommonBuildParams:
     Common build parameters. Those parameters are common parameters for CI And PROD build.
     """
 
-    additional_airflow_extras: str = ""
-    additional_dev_apt_command: str = ""
-    additional_dev_apt_deps: str = ""
-    additional_dev_apt_env: str = ""
-    additional_python_deps: str = ""
-    additional_pip_install_flags: str = ""
-    airflow_branch: str = os.environ.get("DEFAULT_BRANCH", AIRFLOW_BRANCH)
-    default_constraints_branch: str = os.environ.get(
-        "DEFAULT_CONSTRAINTS_BRANCH", DEFAULT_AIRFLOW_CONSTRAINTS_BRANCH
-    )
-    airflow_constraints_location: str = ""
-    build_id: int = 0
-    builder: str = "default"
+    additional_airflow_extras: str | None = None
+    additional_dev_apt_command: str | None = None
+    additional_dev_apt_deps: str | None = None
+    additional_dev_apt_env: str | None = None
+    additional_python_deps: str | None = None
+    additional_pip_install_flags: str | None = None
+    airflow_branch: str = AIRFLOW_BRANCH
+    default_constraints_branch: str = DEFAULT_AIRFLOW_CONSTRAINTS_BRANCH
+    airflow_constraints_location: str | None = None
+    builder: str = "autodetect"
+    build_progress: str = ALLOWED_BUILD_PROGRESS[0]
+    cache_from_image: str | None = None
     constraints_github_repository: str = APACHE_AIRFLOW_GITHUB_REPOSITORY
-    dev_apt_command: str = ""
-    dev_apt_deps: str = ""
+    commit_sha: str | None = None
+    dev_apt_command: str | None = None
+    dev_apt_deps: str | None = None
+    disable_airflow_repo_cache: bool = False
     docker_cache: str = "registry"
-    empty_image: bool = False
+    docker_host: str | None = os.environ.get("DOCKER_HOST")
     github_actions: str = os.environ.get("GITHUB_ACTIONS", "false")
     github_repository: str = APACHE_AIRFLOW_GITHUB_REPOSITORY
     github_token: str = os.environ.get("GITHUB_TOKEN", "")
-    github_username: str = ""
-    image_tag: str | None = None
-    install_providers_from_sources: bool = False
+    install_mysql_client_type: str = ALLOWED_INSTALL_MYSQL_CLIENT_TYPES[0]
     platform: str = DOCKER_DEFAULT_PLATFORM
     prepare_buildx_cache: bool = False
     python_image: str | None = None
     push: bool = False
-    python: str = "3.7"
-    tag_as_latest: bool = False
-    upgrade_to_newer_dependencies: bool = False
-    upgrade_on_failure: bool = False
+    python: str = "3.11"
     dry_run: bool = False
+    version_suffix: str | None = None
     verbose: bool = False
+    debian_version: str = ALLOWED_DEBIAN_VERSIONS[0]
+    use_pinned_os_deps_images: bool = True
+    build_arg_values: list[str] = field(default_factory=list)
 
     @property
     def airflow_version(self):
         raise NotImplementedError()
 
     @property
-    def image_type(self) -> str:
-        raise NotImplementedError()
+    def build_id(self) -> str:
+        return os.environ.get("CI_BUILD_ID", "0")
 
     @property
-    def airflow_pre_cached_pip_packages(self):
+    def image_type(self) -> str:
         raise NotImplementedError()
 
     @property
@@ -95,27 +106,64 @@ class CommonBuildParams:
         return image
 
     @property
-    def extra_docker_build_flags(self) -> list[str]:
-        raise NotImplementedError()
-
-    @property
-    def docker_cache_directive(self) -> list[str]:
-        docker_cache_directive = []
+    def common_docker_build_flags(self) -> list[str]:
+        extra_flags = []
+        extra_flags.append(f"--progress={self.build_progress}")
         if self.docker_cache == "registry":
-            for platform in self.platforms:
-                docker_cache_directive.append(f"--cache-from={self.get_cache(platform)}")
+            extra_flags.append(f"--cache-from={self.get_cache(self.platform)}")
         elif self.docker_cache == "disabled":
-            docker_cache_directive.append("--no-cache")
-        else:
-            docker_cache_directive = []
-        return docker_cache_directive
+            extra_flags.append("--no-cache")
+        if self.cache_from_image:
+            extra_flags.append(f"--cache-from={self.cache_from_image}")
+        if self.docker_cache != "disabled":
+            # Records the layer cache keys in the image config, which is what lets an image
+            # built by an earlier run serve as `--cache-from` for a later one. BuildKit only
+            # honours those records when it can pull the layers from a registry, so an image
+            # that travelled as a saved tarball has to be pushed to one (even a throw-away
+            # local registry) before it can be passed as `--cache-from-image`.
+            extra_flags.append("--build-arg=BUILDKIT_INLINE_CACHE=1")
+        return extra_flags
 
     @property
     def python_base_image(self):
         """Construct Python Base Image"""
         if self.python_image is not None:
             return self.python_image
-        return f"python:{self.python}-slim-bullseye"
+        return get_hardened_python_base_image(self.python, self.debian_version)
+
+    @property
+    def _has_custom_dev_apt_dependencies(self) -> bool:
+        return any(
+            [
+                self.dev_apt_deps,
+                self.additional_dev_apt_deps,
+                self.dev_apt_command,
+                self.additional_dev_apt_command,
+                self.additional_dev_apt_env,
+            ]
+        )
+
+    def _has_custom_database_clients(self) -> bool:
+        """Whether the build installs other database clients than the OS-dependencies images carry."""
+        return self.install_mysql_client_type != ALLOWED_INSTALL_MYSQL_CLIENT_TYPES[0]
+
+    def _can_use_pinned_os_deps_images(self) -> bool:
+        """Whether the build may start from the pinned OS-dependencies images instead of BASE_IMAGE.
+
+        Those images are built on the pinned base image of the default Debian version with the default
+        apt dependencies and database clients, so any other base image, apt customization or choice
+        of database clients installs from the repositories.
+        A disabled image cache does not turn them off - the CI build retries with it after any failure.
+        """
+        return (
+            self.use_pinned_os_deps_images
+            and self.python_image is None
+            and self.debian_version == OS_DEPS_IMAGE_DEBIAN_VERSION
+            and not self._has_custom_database_clients()
+        )
+
+    def _set_os_deps_image_arg(self, image_type: str, build_arg: str):
+        self._opt_arg(build_arg, get_pinned_os_deps_image(image_type, self.python))
 
     @property
     def airflow_image_repository(self):
@@ -128,47 +176,83 @@ class CommonBuildParams:
 
     @property
     def airflow_image_readme_url(self):
-        return "https://raw.githubusercontent.com/apache/airflow/main/docs/docker-stack/README.md"
-
-    @property
-    def airflow_image_name_with_tag(self):
-        """Construct image link"""
-        image = (
-            f"{self.airflow_base_image_name}/{self.airflow_branch}/"
-            f"{self.image_type.lower()}/python{self.python}"
-        )
-        return image if self.image_tag is None else image + f":{self.image_tag}"
+        return "https://raw.githubusercontent.com/apache/airflow/refs/heads/main/docker-stack-docs/README.md"
 
     def get_cache(self, single_platform: str) -> str:
         if "," in single_platform:
-            get_console().print(
+            console_print(
                 "[error]Cache can only be retrieved for single platform and you "
                 f"tried for {single_platform}[/]"
             )
             sys.exit(1)
-        return f"{self.airflow_image_name}:cache-{get_real_platform(single_platform)}"
+        platform_tag = get_normalized_platform(single_platform).replace("/", "-")
+        return f"{self.airflow_image_name}:cache-{platform_tag}"
 
     def is_multi_platform(self) -> bool:
         return "," in self.platform
 
-    def preparing_latest_image(self) -> bool:
-        return (
-            self.tag_as_latest
-            or self.airflow_image_name == self.airflow_image_name_with_tag
-            or self.airflow_image_name_with_tag.endswith("latest")
-        )
-
     @property
     def platforms(self) -> list[str]:
-        return self.platform.split(",")
+        return [get_normalized_platform(single_platform) for single_platform in self.platform.split(",")]
 
-    @property
-    def required_image_args(self) -> list[str]:
+    def _build_arg(self, name: str, value: Any, optional: bool):
+        if value is None or "":
+            if optional:
+                return
+            raise ValueError(f"Value for {name} cannot be empty or None")
+        if value is True:
+            str_value = "true"
+        elif value is False:
+            str_value = "false"
+        else:
+            str_value = str(value) if value is not None else ""
+        self.build_arg_values.append(f"{name}={str_value}")
+
+    def _req_arg(self, name: str, value: Any):
+        self._build_arg(name, value, False)
+
+    def _opt_arg(self, name: str, value: Any):
+        self._build_arg(name, value, True)
+
+    def prepare_arguments_for_docker_build_command(self) -> list[str]:
         raise NotImplementedError()
 
-    @property
-    def optional_image_args(self) -> list[str]:
-        raise NotImplementedError()
+    def _to_build_args(self):
+        build_args = []
+        for arg in self.build_arg_values:
+            build_args.extend(["--build-arg", arg])
+        return build_args
 
-    def __post_init__(self):
-        pass
+    def _get_version_with_suffix(self) -> str:
+        from packaging.version import Version
+
+        airflow_version = get_airflow_version()
+        try:
+            if self.version_suffix and self.version_suffix not in airflow_version:
+                version = Version(airflow_version)
+                return version.base_version + f".{self.version_suffix}"
+        except Exception:
+            # in case of any failure just fall back to the original version set
+            pass
+        return airflow_version
+
+    def _set_common_opt_args(self):
+        self._opt_arg("AIRFLOW_CONSTRAINTS_LOCATION", self.airflow_constraints_location)
+        self._opt_arg("ADDITIONAL_AIRFLOW_EXTRAS", self.additional_airflow_extras)
+        self._opt_arg("ADDITIONAL_DEV_APT_COMMAND", self.additional_dev_apt_command)
+        self._opt_arg("ADDITIONAL_DEV_APT_DEPS", self.additional_dev_apt_deps)
+        self._opt_arg("ADDITIONAL_DEV_APT_ENV", self.additional_dev_apt_env)
+        self._opt_arg("ADDITIONAL_PIP_INSTALL_FLAGS", self.additional_pip_install_flags)
+        self._opt_arg("ADDITIONAL_PYTHON_DEPS", self.additional_python_deps)
+        self._opt_arg("COMMIT_SHA", self.commit_sha)
+        self._opt_arg("DEV_APT_COMMAND", self.dev_apt_command)
+        self._opt_arg("DEV_APT_DEPS", self.dev_apt_deps)
+        self._opt_arg("DOCKER_HOST", self.docker_host)
+        self._opt_arg("VERSION_SUFFIX", self.version_suffix)
+
+    def _set_common_req_args(self):
+        self._req_arg("AIRFLOW_BRANCH", self.airflow_branch)
+        self._req_arg("AIRFLOW_IMAGE_DATE_CREATED", self.airflow_image_date_created)
+        self._req_arg("AIRFLOW_IMAGE_REPOSITORY", self.airflow_image_repository)
+        self._req_arg("BUILD_ID", self.build_id)
+        self._req_arg("CONSTRAINTS_GITHUB_REPOSITORY", self.constraints_github_repository)

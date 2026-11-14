@@ -1,0 +1,220 @@
+ .. Licensed to the Apache Software Foundation (ASF) under one
+    or more contributor license agreements.  See the NOTICE file
+    distributed with this work for additional information
+    regarding copyright ownership.  The ASF licenses this file
+    to you under the Apache License, Version 2.0 (the
+    "License"); you may not use this file except in compliance
+    with the License.  You may obtain a copy of the License at
+
+ ..   http://www.apache.org/licenses/LICENSE-2.0
+
+ .. Unless required by applicable law or agreed to in writing,
+    software distributed under the License is distributed on an
+    "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+    KIND, either express or implied.  See the License for the
+    specific language governing permissions and limitations
+    under the License.
+
+.. _howto/connection:gcpcloudsql:
+
+Google Cloud SQL Connection
+===========================
+
+The ``gcpcloudsql://`` connection is used by
+:class:`airflow.providers.google.cloud.operators.cloud_sql.CloudSQLExecuteQueryOperator` to perform query
+on a Google Cloud SQL database. Google Cloud SQL database can be either
+Postgres or MySQL, so this is a "meta" connection type. It introduces common schema
+for both MySQL and Postgres, including what kind of connectivity should be used.
+Google Cloud SQL supports connecting via public IP or via Cloud SQL Proxy.
+In the latter case the
+:class:`~airflow.providers.google.cloud.operators.hooks.cloud_sql.CloudSQLHook` uses
+:class:`~airflow.providers.google.cloud.operators.hooks.CloudSqlProxyRunner` to automatically prepare
+and use temporary Postgres or MySQL connection that will use the proxy to connect
+(either via TCP or UNIX socket.
+
+Configuring the Connection
+--------------------------
+
+Host (required)
+    The host to connect to.
+
+Schema (optional)
+    Specify the schema name to be used in the database.
+
+Login (required)
+    Specify the user name to connect.
+
+Password (required unless IAM authentication is used)
+    Specify the password to connect. Leave it empty when using IAM authentication with either
+    ``use_iam`` or ``sql_proxy_enable_iam_login``.
+
+Extra (optional)
+    Specify the extra parameters (as JSON dictionary) that can be used in Google Cloud SQL
+    connection.
+
+    Details of all the parameters supported in extra field can be found in
+    :class:`~airflow.providers.google.cloud.operators.hooks.cloud_sql.CloudSQLHook`.
+
+    Example "extras" field:
+
+    .. code-block:: json
+
+       {
+          "database_type": "mysql",
+          "project_id": "example-project",
+          "location": "europe-west1",
+          "instance": "testinstance",
+          "use_proxy": true,
+          "sql_proxy_use_tcp": false
+       }
+
+    When specifying the connection as URI (in :envvar:`AIRFLOW_CONN_{CONN_ID}` variable), you should specify
+    it following the standard syntax of DB connection, where extras are passed as
+    parameters of the URI. Note that all components of the URI should be URL-encoded.
+
+    For example:
+
+    .. code-block:: bash
+
+        export AIRFLOW_CONN_GOOGLE_CLOUD_SQL_DEFAULT='gcpcloudsql://user:XXXXXXXXX@1.1.1.1:3306/mydb?database_type=mysql&project_id=example-project&location=europe-west1&instance=testinstance&use_proxy=True&sql_proxy_use_tcp=False'
+
+Using Cloud SQL Auth Proxy v2
+-----------------------------
+
+By default Airflow runs Cloud SQL Auth Proxy v1. To run Cloud SQL Auth Proxy v2 instead, set
+``"sql_proxy_major_version": 2`` in the ``extra`` field. ``sql_proxy_version`` must also be set to the v2
+release to download, as there is no "latest" download for v2, unless the ``sql_proxy_binary_path`` argument
+of the hook or operator points to an existing v2 binary. Both must be v2.2.0 or newer.
+
+Cloud SQL for MySQL 8.4 users authenticating with ``caching_sha2_password`` need v2.19.0 or newer, and
+must keep the default Unix socket mode (``sql_proxy_use_tcp`` disabled). v1 and older v2 releases cannot
+complete that plugin's full authentication, so connections fail with ``1045 Access denied`` after the
+server's authentication cache is emptied, for example by an instance restart. Over TCP, full authentication
+needs the client to retrieve the server's public key, which the MySQL hook cannot be configured to do.
+
+Cloud SQL Auth Proxy v2 connects only to the instance's public IP by default, while v1 falls back to the
+private IP when the instance has no public IP. Airflow passes ``--auto-ip`` to v2 to keep the v1 behavior,
+so instances with only a private IP work with both versions. ``--auto-ip`` was added in v2.2.0, which is
+why older v2 releases exit at startup.
+
+The two versions also differ in authentication:
+
+* When the Google Cloud connection has neither ``key_path`` nor ``keyfile_dict``, v1 tries the
+  ``GOOGLE_APPLICATION_CREDENTIALS`` file, then the active ``gcloud`` account, then Application Default
+  Credentials. v2 uses Application Default Credentials only. A worker authenticated only with
+  ``gcloud auth login`` or ``gcloud auth activate-service-account`` can therefore work with v1 but fail,
+  or connect as a different identity, with v2.
+* v2 attributes its Cloud SQL Admin API calls to the quota project of its credentials. Credentials whose
+  quota project is unrelated to the instance, which is common for local Application Default Credentials,
+  make v2 fail with ``403 SERVICE_DISABLED`` naming that other project.
+
+Example "extras" field:
+
+.. code-block:: json
+
+   {
+      "database_type": "mysql",
+      "project_id": "example-project",
+      "location": "europe-west1",
+      "instance": "testinstance",
+      "use_proxy": true,
+      "sql_proxy_major_version": 2,
+      "sql_proxy_version": "v2.27.0"
+   }
+
+Configuring and using IAM authentication
+----------------------------------------
+
+The Google provider supports two IAM authentication paths:
+
+* Direct IAM token authentication with ``use_iam``. Airflow generates a database login token and uses
+  it as the database password.
+* Cloud SQL Auth Proxy IAM authentication with ``sql_proxy_enable_iam_login``. Airflow starts Cloud SQL
+  Auth Proxy with IAM database authentication enabled and connects with an empty password.
+
+.. warning::
+  Direct IAM token authentication with ``use_iam`` requires the ``gcloud`` command (Google Cloud SDK)
+  to be `installed <https://cloud.google.com/sdk/docs/install>`_ on the Airflow worker.
+
+.. warning::
+  IAM authentication working only for Google Service Accounts.
+
+Configure Service Accounts on Google Cloud IAM side
+"""""""""""""""""""""""""""""""""""""""""""""""""""
+
+For connecting via IAM you need to use Service Account. It must be the same service account which you use for
+the ``gcloud`` authentication.
+
+Also the Service Account should be configured for working with IAM.
+Here are links describing what should be done before the start: `PostgreSQL
+<https://cloud.google.com/sql/docs/postgres/iam-logins#before_you_begin>`_ and `MySQL
+<https://cloud.google.com/sql/docs/mysql/iam-logins#before_you_begin>`_.
+
+Configure ``gcpcloudsql`` connection with direct IAM token authentication
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+For using IAM you need to enable ``"use_iam": "True"`` in the ``extra`` field. And specify IAM account in this format
+``USERNAME@PROJECT_ID.iam.gserviceaccount.com`` in ``login`` field and empty string in the ``password`` field.
+Do not combine ``use_iam`` with ``sql_proxy_enable_iam_login``.
+
+For example:
+
+.. exampleinclude:: /../../google/tests/system/google/cloud/cloud_sql/example_cloud_sql_query_iam.py
+    :language: python
+    :start-after: [START howto_operator_cloudsql_iam_connections]
+    :end-before: [END howto_operator_cloudsql_iam_connections]
+
+Configure ``gcpcloudsql`` connection with Cloud SQL Auth Proxy IAM authentication
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+For using Cloud SQL Auth Proxy IAM authentication, enable ``"use_proxy": "True"`` and
+``"sql_proxy_enable_iam_login": "True"`` in the ``extra`` field. Airflow passes ``-enable_iam_login`` to
+Cloud SQL Auth Proxy v1 or ``--auto-iam-authn`` to v2, so the ``password`` field can be empty.
+Cloud SQL Auth Proxy v1 supports IAM database authentication for Postgres only; for MySQL, use
+Cloud SQL Auth Proxy v2 (see `Using Cloud SQL Auth Proxy v2`_).
+
+Example "extras" field for Postgres:
+
+.. code-block:: json
+
+   {
+      "database_type": "postgres",
+      "project_id": "example-project",
+      "location": "europe-west1",
+      "instance": "testinstance",
+      "use_proxy": true,
+      "sql_proxy_use_tcp": true,
+      "sql_proxy_enable_iam_login": true
+   }
+
+Example "extras" field for MySQL:
+
+.. code-block:: json
+
+   {
+      "database_type": "mysql",
+      "project_id": "example-project",
+      "location": "europe-west1",
+      "instance": "testinstance",
+      "use_proxy": true,
+      "sql_proxy_use_tcp": true,
+      "sql_proxy_enable_iam_login": true,
+      "sql_proxy_major_version": 2,
+      "sql_proxy_version": "v2.27.0"
+   }
+
+.. note::
+   Cloud SQL for MySQL does not grant database-level privileges to IAM service-account users
+   automatically when the user is created. After creating the IAM service-account user (for example
+   via ``gcloud sql users create <user> --type=cloud_iam_service_account``) a database administrator
+   must grant the required privileges using SQL, for example
+   ``GRANT SELECT ON <database>.* TO '<service-account-prefix>'@'%';``. This is a Cloud SQL operational
+   step and is outside the scope of Airflow. Cloud SQL for Postgres does not have this requirement
+   for the default ``public`` schema.
+
+For example:
+
+.. exampleinclude:: /../../google/tests/system/google/cloud/cloud_sql/example_cloud_sql_query_proxy_iam.py
+    :language: python
+    :start-after: [START howto_operator_cloudsql_proxy_iam_connections]
+    :end-before: [END howto_operator_cloudsql_proxy_iam_connections]

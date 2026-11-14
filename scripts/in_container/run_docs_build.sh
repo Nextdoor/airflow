@@ -18,11 +18,19 @@
 # shellcheck source=scripts/in_container/_in_container_script_init.sh
 . "$( dirname "${BASH_SOURCE[0]}" )/_in_container_script_init.sh"
 
+git config --global --add safe.directory /opt/airflow
+
 cd "${AIRFLOW_SOURCES}" || exit 1
+
+# Mounted by `breeze build-docs --sphinx-airflow-theme-path`.
+if [[ -n "${SPHINX_AIRFLOW_THEME_PATH:-}" ]]; then
+    uv pip install --reinstall-package sphinx-airflow-theme /opt/sphinx_airflow_theme
+fi
+
 python -m docs.build_docs "${@}"
 
-
-if [[ ( ${CI:="false"} == "true" || ${CI} == "True" ) && -d "${AIRFLOW_SOURCES}/docs/_build/docs/" ]]; then
+# Copy the generated documentation to the mounted volume
+if [[ ( ${CI:="false"} == "true" || ${CI} == "True" ) && -d "${AIRFLOW_SOURCES}/generated/_build/docs/" ]]; then
     rm -rf "/files/documentation"
-    cp -r "${AIRFLOW_SOURCES}/docs/_build" "/files/documentation"
+    cp -r "${AIRFLOW_SOURCES}/generated/_build" "/files/documentation"
 fi

@@ -1,0 +1,304 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+import json
+
+import jmespath
+import pytest
+from chart_utils.helm_template_generator import HelmFailedError, render_chart
+
+
+class TestKerberos:
+    """Tests kerberos."""
+
+    def test_kerberos_not_mentioned_in_render_if_disabled(self):
+        # the name is deliberately shorter as we look for "kerberos" in the rendered chart
+        k8s_objects = render_chart(name="no-krbros", values={"kerberos": {"enabled": False}})
+        # ignore airflow config map
+        k8s_objects_to_consider = [
+            obj for obj in k8s_objects if obj["metadata"]["name"] != "no-krbros-config"
+        ]
+        k8s_objects_to_consider_str = json.dumps(k8s_objects_to_consider)
+        assert k8s_objects_to_consider_str.count("kerberos") == 1
+
+    def test_kerberos_envs_available_in_worker_with_persistence(self):
+        docs = render_chart(
+            values={
+                "executor": "CeleryExecutor",
+                "workers": {
+                    "celery": {"kerberosSidecar": {"enabled": True}, "persistence": {"enabled": True}}
+                },
+                "kerberos": {
+                    "enabled": True,
+                    "configPath": "/etc/krb5.conf",
+                    "ccacheMountPath": "/var/kerberos-ccache",
+                    "ccacheFileName": "ccache",
+                },
+            },
+            show_only=["templates/workers/worker-deployment.yaml"],
+        )
+
+        assert {"name": "KRB5_CONFIG", "value": "/etc/krb5.conf"} in jmespath.search(
+            "spec.template.spec.containers[0].env", docs[0]
+        )
+        assert {"name": "KRB5CCNAME", "value": "/var/kerberos-ccache/ccache"} in jmespath.search(
+            "spec.template.spec.containers[0].env", docs[0]
+        )
+
+    def test_kerberos_sidecar_is_native_sidecar(self):
+        docs = render_chart(
+            values={
+                "executor": "CeleryExecutor",
+                "workers": {"celery": {"kerberosSidecar": {"enabled": True}}},
+            },
+            show_only=["templates/workers/worker-deployment.yaml"],
+        )
+        sidecar = jmespath.search(
+            "spec.template.spec.initContainers[?name=='worker-kerberos'] | [0]", docs[0]
+        )
+        assert sidecar is not None
+        assert sidecar["restartPolicy"] == "Always"
+
+    def test_kerberos_sidecar_disabled(self):
+        docs = render_chart(
+            values={
+                "executor": "CeleryExecutor",
+                "workers": {
+                    "celery": {
+                        "persistence": {"enabled": True, "fixPermissions": True},
+                        "kerberosSidecar": {"enabled": False},
+                        "extraInitContainers": [{"name": "custom-init", "image": "custom-image"}],
+                    }
+                },
+                "dags": {"gitSync": {"enabled": True}},
+            },
+            show_only=["templates/workers/worker-deployment.yaml"],
+        )
+        assert jmespath.search("spec.template.spec.initContainers[].name", docs[0]) == [
+            "volume-permissions",
+            "wait-for-airflow-migrations",
+            "git-sync-init",
+            "custom-init",
+        ]
+
+    def test_kerberos_sidecar_enabled(self):
+        docs = render_chart(
+            values={
+                "executor": "CeleryExecutor",
+                "workers": {
+                    "celery": {
+                        "persistence": {"enabled": True, "fixPermissions": True},
+                        "kerberosSidecar": {"enabled": True},
+                        "extraInitContainers": [{"name": "custom-init", "image": "custom-image"}],
+                    }
+                },
+                "dags": {"gitSync": {"enabled": True}},
+            },
+            show_only=["templates/workers/worker-deployment.yaml"],
+        )
+        assert jmespath.search("spec.template.spec.initContainers[].name", docs[0]) == [
+            "volume-permissions",
+            "worker-kerberos",
+            "wait-for-airflow-migrations",
+            "git-sync-init",
+            "custom-init",
+        ]
+        sidecar = jmespath.search(
+            "spec.template.spec.initContainers[?name=='worker-kerberos'] | [0]", docs[0]
+        )
+        assert sidecar["args"] == ["kerberos"]
+        assert sidecar["restartPolicy"] == "Always"
+
+    def test_kerberos_sidecar_resources(self):
+        docs = render_chart(
+            values={
+                "executor": "CeleryExecutor",
+                "workers": {
+                    "celery": {
+                        "kerberosSidecar": {
+                            "enabled": True,
+                            "resources": {"requests": {"cpu": "200m", "memory": "200Mi"}},
+                        }
+                    }
+                },
+            },
+            show_only=["templates/workers/worker-deployment.yaml"],
+        )
+
+        assert jmespath.search(
+            "spec.template.spec.initContainers[?name=='worker-kerberos'] | [0].resources", docs[0]
+        ) == {"requests": {"cpu": "200m", "memory": "200Mi"}}
+
+    def test_keberos_sidecar_resources_are_not_added_by_default(self):
+        docs = render_chart(
+            show_only=["templates/workers/worker-deployment.yaml"],
+        )
+        assert jmespath.search("spec.template.spec.containers[0].resources", docs[0]) == {}
+
+    def test_kerberos_keytab_exists_in_worker_when_enable(self):
+        docs = render_chart(
+            values={
+                "executor": "CeleryExecutor",
+                "kerberos": {
+                    "enabled": True,
+                    "keytabBase64Content": "dGVzdGtleXRhYg==",
+                    "configPath": "/etc/krb5.conf",
+                    "ccacheMountPath": "/var/kerberos-ccache",
+                    "ccacheFileName": "ccache",
+                },
+            },
+            show_only=["templates/workers/worker-deployment.yaml"],
+        )
+
+        assert {
+            "name": "kerberos-keytab",
+            "subPath": "kerberos.keytab",
+            "mountPath": "/etc/airflow.keytab",
+            "readOnly": True,
+        } in jmespath.search("spec.template.spec.containers[0].volumeMounts", docs[0])
+
+    def test_kerberos_keytab_secret_available(self):
+        docs = render_chart(
+            values={
+                "executor": "CeleryExecutor",
+                "kerberos": {
+                    "enabled": True,
+                    "keytabBase64Content": "dGVzdGtleXRhYg==",
+                    "configPath": "/etc/krb5.conf",
+                    "ccacheMountPath": "/var/kerberos-ccache",
+                    "ccacheFileName": "ccache",
+                },
+            },
+            show_only=["templates/secrets/kerberos-keytab-secret.yaml"],
+        )
+
+        assert jmespath.search('data."kerberos.keytab"', docs[0]) == "dGVzdGtleXRhYg=="
+
+    def test_kerberos_keytab_secret_unavailable_when_keberos_disabled(self):
+        docs = render_chart(
+            values={
+                "executor": "CeleryExecutor",
+                "kerberos": {
+                    "enabled": False,
+                    "keytabBase64Content": "dGVzdGtleXRhYg==",
+                },
+            },
+            show_only=["templates/secrets/kerberos-keytab-secret.yaml"],
+        )
+
+        assert len(docs) == 0
+
+    def test_kerberos_keytab_secret_unavailable_when_not_specified(self):
+        docs = render_chart(
+            values={
+                "executor": "CeleryExecutor",
+                "kerberos": {
+                    "enabled": True,
+                    "configPath": "/etc/krb5.conf",
+                    "ccacheMountPath": "/var/kerberos-ccache",
+                    "ccacheFileName": "ccache",
+                },
+            },
+            show_only=["templates/secrets/kerberos-keytab-secret.yaml"],
+        )
+
+        assert len(docs) == 0
+
+    @pytest.mark.parametrize(
+        ("override", "expected"),
+        [
+            (
+                {},
+                {
+                    "exec": {"command": ["klist", "-s"]},
+                    "timeoutSeconds": 5,
+                    "initialDelaySeconds": 0,
+                    "periodSeconds": 10,
+                    "failureThreshold": 6,
+                },
+            ),
+            (
+                {
+                    "timeoutSeconds": 11,
+                    "initialDelaySeconds": 12,
+                    "periodSeconds": 13,
+                    "failureThreshold": 14,
+                },
+                {
+                    "exec": {"command": ["klist", "-s"]},
+                    "timeoutSeconds": 11,
+                    "initialDelaySeconds": 12,
+                    "periodSeconds": 13,
+                    "failureThreshold": 14,
+                },
+            ),
+        ],
+        ids=["default", "custom"],
+    )
+    def test_kerberos_sidecar_startup_probe(self, override, expected):
+        docs = render_chart(
+            values={
+                "executor": "CeleryExecutor",
+                "workers": {"celery": {"kerberosSidecar": {"enabled": True, "startupProbe": override}}},
+            },
+            show_only=["templates/workers/worker-deployment.yaml"],
+        )
+
+        sidecar = jmespath.search(
+            "spec.template.spec.initContainers[?name=='worker-kerberos'] | [0]", docs[0]
+        )
+        assert sidecar is not None
+        assert sidecar["restartPolicy"] == "Always"
+        assert sidecar["startupProbe"] == expected
+
+    def test_kerberos_sidecar_startup_probe_disabled(self):
+        docs = render_chart(
+            values={
+                "executor": "CeleryExecutor",
+                "workers": {
+                    "celery": {"kerberosSidecar": {"enabled": True, "startupProbe": {"enabled": False}}}
+                },
+            },
+            show_only=["templates/workers/worker-deployment.yaml"],
+        )
+
+        sidecar = jmespath.search(
+            "spec.template.spec.initContainers[?name=='worker-kerberos'] | [0]", docs[0]
+        )
+        assert sidecar is not None
+        assert "startupProbe" not in sidecar
+
+    @pytest.mark.parametrize(
+        "override",
+        [
+            {"timeoutSeconds": 0},
+            {"initialDelaySeconds": -1},
+            {"periodSeconds": 0},
+            {"failureThreshold": 0},
+        ],
+        ids=["timeout", "initial-delay", "period", "failure-threshold"],
+    )
+    def test_kerberos_sidecar_startup_probe_rejects_invalid_values(self, override):
+        with pytest.raises(HelmFailedError):
+            render_chart(
+                values={
+                    "executor": "CeleryExecutor",
+                    "workers": {"celery": {"kerberosSidecar": {"enabled": True, "startupProbe": override}}},
+                },
+                show_only=["templates/workers/worker-deployment.yaml"],
+            )

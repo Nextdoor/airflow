@@ -1,0 +1,97 @@
+[
+  {
+    "id": "operator",
+    "label": "Operators",
+    "icon": "O"
+  },
+  {
+    "id": "hook",
+    "label": "Hooks",
+    "icon": "H"
+  },
+  {
+    "id": "sensor",
+    "label": "Sensors",
+    "icon": "S"
+  },
+  {
+    "id": "trigger",
+    "label": "Triggers",
+    "icon": "T"
+  },
+  {
+    "id": "transfer",
+    "label": "Transfers",
+    "icon": "X"
+  },
+  {
+    "id": "bundle",
+    "label": "Bundles",
+    "icon": "B"
+  },
+  {
+    "id": "notifier",
+    "label": "Notifiers",
+    "icon": "N"
+  },
+  {
+    "id": "secret",
+    "label": "Secrets Backend",
+    "icon": "K"
+  },
+  {
+    "id": "logging",
+    "label": "Log Handler",
+    "icon": "L"
+  },
+  {
+    "id": "executor",
+    "label": "Executors",
+    "icon": "E"
+  },
+  {
+    "id": "decorator",
+    "label": "Decorators",
+    "icon": "@"
+  },
+  {
+    "id": "toolset",
+    "label": "Toolsets",
+    "icon": "U"
+  },
+  {
+    "id": "retry_policy",
+    "label": "Retry Policies",
+    "icon": "R"
+  },
+  {
+    "id": "extra_link",
+    "label": "Extra Links",
+    "icon": "I"
+  },
+  {
+    "id": "queue",
+    "label": "Message Queues",
+    "icon": "Q"
+  },
+  {
+    "id": "plugin",
+    "label": "Plugins",
+    "icon": "P"
+  },
+  {
+    "id": "auth_manager",
+    "label": "Auth Managers",
+    "icon": "A"
+  },
+  {
+    "id": "db_manager",
+    "label": "DB Managers",
+    "icon": "M"
+  },
+  {
+    "id": "dialect",
+    "label": "Dialects",
+    "icon": "D"
+  }
+]

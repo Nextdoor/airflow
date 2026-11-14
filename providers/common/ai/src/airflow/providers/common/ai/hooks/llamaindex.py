@@ -1,0 +1,271 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+"""Hook for LlamaIndex integration with Airflow connections."""
+
+from __future__ import annotations
+
+import inspect
+import warnings
+from typing import TYPE_CHECKING, Any
+
+from airflow.exceptions import AirflowProviderDeprecationWarning
+from airflow.providers.common.compat.sdk import (
+    AirflowOptionalProviderFeatureException,
+    BaseHook,
+)
+
+if TYPE_CHECKING:
+    from llama_index.core.base.embeddings.base import BaseEmbedding
+    from llama_index.core.llms.llm import LLM
+
+
+class LlamaIndexHook(BaseHook):
+    """
+    Bridge an Airflow connection to LlamaIndex chat and embedding models.
+
+    .. note::
+
+        Experimental: this can change or be removed in a minor release of this provider.
+        See :ref:`howto/stability`.
+
+    The hook resolves credentials (API key, optional API base URL) from the
+    Airflow connection and returns native LlamaIndex objects ready to pass
+    to ``VectorStoreIndex(..., embed_model=...)``,
+    ``load_index_from_storage(..., embed_model=...)``, or
+    ``index.as_retriever(..., llm=...)``.
+
+    LlamaIndex does not ship a universal ``init_chat_model`` /
+    ``init_embedding_model`` equivalent (each vendor is a separate package
+    under ``llama-index-llms-*`` / ``llama-index-embeddings-*`` with its own
+    constructor kwargs). The hook therefore covers the OpenAI-compatible
+    surface that matches LlamaIndex's own ``resolve_embed_model("default")``
+    behaviour. For other vendors (Cohere, Bedrock, Vertex, HuggingFace, ...)
+    instantiate the LlamaIndex class directly in your ``@task`` and pass it
+    to the operator's ``embed_model=`` / ``llm=`` parameter -- both
+    ``LlamaIndexEmbeddingOperator`` and ``LlamaIndexRetrievalOperator`` accept a pre-built
+    ``BaseEmbedding`` / ``LLM`` instance and bypass the hook in that case.
+
+    .. note::
+
+        The hook deliberately does **not** mutate LlamaIndex's global
+        ``Settings`` singleton. Operators pass the resolved model directly
+        to LlamaIndex constructors so concurrent tasks in the same worker
+        don't race on shared state.
+
+    .. note::
+
+        ``get_llm()`` and ``get_embedding_model()`` return LlamaIndex's
+        ``OpenAI`` / ``OpenAIEmbedding`` classes, which validate ``model=``
+        client-side against LlamaIndex's OpenAI-only model-name allowlists
+        before any request is sent. Pointing **host** at an Ollama or vLLM
+        endpoint does not add support for those backends: their model names
+        (e.g. ``llama3.2``) are never in the OpenAI allowlist, so the call
+        still fails on the model name, not on connectivity.
+        ``get_embedding_model()`` raises immediately at construction;
+        ``get_llm()`` defers the error until the first call that reads
+        ``.metadata`` (``.chat()`` / ``.complete()``); ``test_connection()``
+        reads it, so it reports such a model name as a failure.
+
+    Connection fields:
+
+    * **password**: API key passed as ``api_key=``.
+    * **host**: Optional base URL passed as ``api_base=``. Only useful for
+      an OpenAI-compatible proxy that accepts OpenAI's exact model names
+      (e.g. an internal gateway) -- not Ollama or vLLM, whose model
+      catalogs are rejected regardless of ``host`` (see note above).
+    * **extra** JSON: ``{"embed_model": "text-embedding-3-small",
+      "llm_model": "gpt-5"}`` -- default model identifiers stored on the
+      connection.
+
+    :param llm_conn_id: Airflow connection ID for the LLM provider. Falls
+        back to :attr:`default_conn_name` (``"llamaindex_default"``) when
+        not provided.
+    :param embed_conn_id: Optional separate Airflow connection ID for the
+        embedding provider. Falls back to ``llm_conn_id`` when not set.
+    :param embed_model: Embedding model name (e.g.
+        ``"text-embedding-3-small"``). Overrides ``extra["embed_model"]``
+        on the connection. Passing it positionally (1.0.0 order: ``embed_model, llm_model``) is deprecated.
+    :param llm_model: LLM model name (e.g. ``"gpt-5"``). Overrides
+        ``extra["llm_model"]`` on the connection. Required when calling
+        :meth:`get_llm`. Passing it positionally (1.0.0 order: ``embed_model, llm_model``) is deprecated.
+    :param embedding_kwargs: Additional keyword arguments to pass to the embedding
+        model constructor without filtering. Connection ``api_key`` and ``api_base``
+        values take precedence at the top level, but nested options supported by the
+        underlying library can override hook-provided request values, including
+        credentials, the model, and the input. Only pass trusted values.
+    """
+
+    conn_name_attr = "llm_conn_id"
+    default_conn_name = "llamaindex_default"
+    conn_type = "llamaindex"
+    hook_name = "LlamaIndex"
+
+    def __init__(
+        self,
+        llm_conn_id: str | None = None,
+        embed_conn_id: str | None = None,
+        *args: Any,
+        llm_model: str | None = None,
+        embed_model: str | None = None,
+        embedding_kwargs: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        # ``*args`` only exists to keep the 1.0.0 positional order working: ``embed_model``, ``llm_model``.
+        if len(args) > 2:
+            raise TypeError(
+                f"{type(self).__name__}.__init__() takes from 1 to 5 positional arguments "
+                f"but {3 + len(args)} were given"
+            )
+        legacy_values = dict(zip(("embed_model", "llm_model"), args))
+        keyword_values = {"embed_model": embed_model, "llm_model": llm_model}
+        for name in legacy_values:
+            # A keyword of None counts as not provided, so ``name=None`` plus a positional keeps the positional.
+            if keyword_values[name] is not None:
+                raise TypeError(f"{type(self).__name__}.__init__() got multiple values for argument '{name}'")
+            warnings.warn(
+                f"Parameter `{name}` passed positionally is deprecated. Use `{name}=...` instead; "
+                f"positional support will be removed in a future release.",
+                category=AirflowProviderDeprecationWarning,
+                stacklevel=2,
+            )
+        embed_model = legacy_values.get("embed_model", embed_model)
+        llm_model = legacy_values.get("llm_model", llm_model)
+        super().__init__(**kwargs)
+        # Resolve at runtime so a future per-vendor subclass with its own
+        # ``default_conn_name`` is honoured.
+        self.llm_conn_id = llm_conn_id if llm_conn_id is not None else self.default_conn_name
+        self.embed_conn_id = embed_conn_id if embed_conn_id is not None else self.llm_conn_id
+        self.embed_model = embed_model
+        self.embedding_kwargs = embedding_kwargs or {}
+        self.llm_model = llm_model
+
+    @staticmethod
+    def get_ui_field_behaviour() -> dict[str, Any]:
+        """Return custom field behaviour for the Airflow connection form."""
+        return {
+            "hidden_fields": ["schema", "port", "login"],
+            "relabeling": {"password": "API Key"},
+            "placeholders": {
+                "host": "https://api.openai.com/v1 (optional, for an OpenAI-compatible proxy)",
+                "extra": '{"embed_model": "text-embedding-3-small", "llm_model": "gpt-5"}',
+            },
+        }
+
+    @staticmethod
+    def _resolve_model(
+        conn_extra: dict[str, Any],
+        *,
+        constructor_value: str | None,
+        extra_key: str,
+        kind: str,
+    ) -> str:
+        """Resolve a model identifier from the constructor arg or connection extra."""
+        model_id = constructor_value or conn_extra.get(extra_key)
+        if not model_id:
+            raise ValueError(
+                f"No {kind} model identifier set. Pass {extra_key}= to the hook "
+                f'constructor or set extra={{"{extra_key}": "model-name"}} on '
+                "the connection."
+            )
+        return model_id
+
+    @staticmethod
+    def _connection_kwargs(conn: Any) -> dict[str, Any]:
+        """Return shared OpenAI-style kwargs (api_key, api_base) from the connection."""
+        kwargs: dict[str, Any] = {}
+        if conn.password:
+            kwargs["api_key"] = conn.password
+        if conn.host:
+            kwargs["api_base"] = conn.host
+        return kwargs
+
+    def get_embedding_model(self) -> BaseEmbedding:
+        """
+        Return a LlamaIndex embedding model configured from the Airflow connection.
+
+        Uses ``embed_conn_id`` (falls back to ``llm_conn_id``) for credentials.
+        Returns an ``OpenAIEmbedding`` instance; for other vendors,
+        instantiate the LlamaIndex class directly and pass it to the
+        operator's ``embed_model=`` parameter.
+        """
+        # Lazy: llama-index is an optional extra; importing at module level
+        # would break common.ai for users who haven't installed ``[llamaindex]``.
+        try:
+            from llama_index.embeddings.openai import OpenAIEmbedding
+        except ImportError as e:
+            raise AirflowOptionalProviderFeatureException(e)
+
+        conn = self.get_connection(self.embed_conn_id)
+        model_id = self._resolve_model(
+            conn.extra_dejson,
+            constructor_value=self.embed_model,
+            extra_key="embed_model",
+            kind="embedding",
+        )
+        connection_kwargs = self._connection_kwargs(conn)
+        overridden_keys = sorted(self.embedding_kwargs.keys() & connection_kwargs.keys())
+        if overridden_keys:
+            self.log.warning("Connection parameters override embedding_kwargs values: %s", overridden_keys)
+        kwargs = {**self.embedding_kwargs, **connection_kwargs}
+        supported_kwargs = {
+            name
+            for name, parameter in inspect.signature(OpenAIEmbedding.__init__).parameters.items()
+            if name != "self"
+            and parameter.kind not in {inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD}
+        } | set(OpenAIEmbedding.model_fields)
+        unsupported_keys = sorted(self.embedding_kwargs.keys() - supported_kwargs)
+        if unsupported_keys:
+            self.log.warning("OpenAIEmbedding ignores unsupported embedding_kwargs: %s", unsupported_keys)
+        return OpenAIEmbedding(model=model_id, **kwargs)
+
+    def get_llm(self) -> LLM:
+        """
+        Return a LlamaIndex LLM configured from the Airflow connection.
+
+        Returns an ``OpenAI`` LLM instance; for other vendors, instantiate
+        the LlamaIndex class directly and pass it to the operator's ``llm=``
+        parameter.
+        """
+        try:
+            from llama_index.llms.openai import OpenAI
+        except ImportError as e:
+            raise AirflowOptionalProviderFeatureException(e)
+
+        conn = self.get_connection(self.llm_conn_id)
+        model_id = self._resolve_model(
+            conn.extra_dejson,
+            constructor_value=self.llm_model,
+            extra_key="llm_model",
+            kind="llm",
+        )
+        return OpenAI(model=model_id, **self._connection_kwargs(conn))
+
+    def test_connection(self) -> tuple[bool, str]:
+        """
+        Test connection by resolving the LLM and reading its metadata.
+
+        Reading ``.metadata`` makes LlamaIndex validate the model name against its
+        OpenAI-only allowlist, so an Ollama or vLLM model name fails here instead of at the
+        first ``.chat()`` call. Does NOT make an LLM API call -- that would be expensive and
+        fail for reasons unrelated to connectivity (quotas, billing, rate limits), so a
+        revoked API key or an unreachable **host** still passes.
+        """
+        try:
+            self.get_llm().metadata
+            return True, "Model resolved successfully."
+        except Exception as e:
+            return False, str(e)

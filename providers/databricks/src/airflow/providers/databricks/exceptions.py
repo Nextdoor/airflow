@@ -1,0 +1,90 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+# Note: Any AirflowException raised is expected to cause the TaskInstance
+#       to be marked in an ERROR state
+"""Exceptions used by Databricks Provider."""
+
+from __future__ import annotations
+
+from airflow.providers.common.compat.sdk import AirflowException
+
+
+class DatabricksSqlExecutionError(AirflowException):
+    """Raised when there is an error in sql execution."""
+
+
+class DatabricksSqlExecutionTimeout(DatabricksSqlExecutionError):
+    """Raised when a sql execution times out."""
+
+
+class DatabricksOperatorPayloadError(AirflowException):
+    """Raised when a Databricks operator payload is invalid."""
+
+
+class DatabricksWarehouseError(AirflowException):
+    """Raised when a SQL warehouse fails to reach or times out waiting for a target state."""
+
+
+class DatabricksAgentInvocationError(AirflowException):
+    """Raised when an agent invocation fails or cannot be completed."""
+
+
+class DatabricksAgentInvocationTimeout(DatabricksAgentInvocationError):
+    """Raised when waiting for an agent invocation times out."""
+
+
+class DatabricksApiError(AirflowException):
+    """Raised when a Databricks REST API call returns an error response."""
+
+    def __init__(
+        self, message: str, *, http_status_code: int | None = None, error_code: str | None = None
+    ) -> None:
+        super().__init__(message)
+        self.http_status_code = http_status_code
+        self.error_code = error_code
+
+
+class DatabricksUnityMCPError(DatabricksApiError):
+    """Raised when a call to a Unity Gateway MCP Service fails."""
+
+
+class DatabricksUnityMCPAccessDeniedError(DatabricksUnityMCPError):
+    """
+    Raised when the gateway will not let the caller invoke the service.
+
+    The service may not exist, the caller may lack a privilege on it, or its credentials may be invalid.
+    """
+
+
+class DatabricksUnityMCPThrottledError(DatabricksUnityMCPError):
+    """Raised when the gateway rate-limits the caller."""
+
+    def __init__(
+        self, message: str, *, http_status_code: int | None = None, retry_after: float | None = None
+    ) -> None:
+        super().__init__(message, http_status_code=http_status_code)
+        self.retry_after = retry_after
+
+
+class DatabricksUnityMCPTransportError(DatabricksUnityMCPError):
+    """
+    Raised when the gateway cannot be reached or the connection drops.
+
+    When this interrupts a tool call, the tool may or may not have run, so the call is not
+    retried automatically.
+    """

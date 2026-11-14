@@ -1,0 +1,507 @@
+ .. Licensed to the Apache Software Foundation (ASF) under one
+    or more contributor license agreements.  See the NOTICE file
+    distributed with this work for additional information
+    regarding copyright ownership.  The ASF licenses this file
+    to you under the Apache License, Version 2.0 (the
+    "License"); you may not use this file except in compliance
+    with the License.  You may obtain a copy of the License at
+
+ ..   http://www.apache.org/licenses/LICENSE-2.0
+
+ .. Unless required by applicable law or agreed to in writing,
+    software distributed under the License is distributed on an
+    "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+    KIND, either express or implied.  See the License for the
+    specific language governing permissions and limitations
+    under the License.
+
+SQL Operators
+=============
+
+These operators perform various queries against a SQL database, including
+column- and table-level data quality checks.
+
+.. _howto/operator:SQLExecuteQueryOperator:
+
+Execute SQL query
+~~~~~~~~~~~~~~~~~
+
+Use the :class:`~airflow.providers.common.sql.operators.sql.SQLExecuteQueryOperator` to run SQL query against
+different databases. Parameters of the operators are:
+
+- ``sql`` - single string, list of strings or string pointing to a template file to be executed;
+- ``autocommit`` (optional) if True, each command is automatically committed (default: False);
+- ``parameters`` (optional) the parameters to render the SQL query with.
+- ``handler`` (optional) the function that will be applied to the cursor. If it's ``None`` results won't returned (default: fetch_all_handler).
+- ``split_statements`` (optional) if split single SQL string into statements and run separately (default: False).
+- ``return_last`` (optional) depends ``split_statements`` and if it's ``True`` this parameter is used to return the result of only last statement or all split statements (default: True).
+
+The example below shows how to instantiate the SQLExecuteQueryOperator task.
+
+.. exampleinclude:: /../tests/system/common/sql/example_sql_execute_query.py
+    :language: python
+    :dedent: 4
+    :start-after: [START howto_operator_sql_execute_query]
+    :end-before: [END howto_operator_sql_execute_query]
+
+The ``@task.sql`` decorator can also be used to execute a SQL query (or queries). The code below executes the same
+queries as the snippet above, but this time, using the TaskFlow API. Using ``@task.sql`` provides a way for DAG authors
+to dynamically build SQL queries without having to worry about top-level code. The string returns from the function
+(in this case, ``execute_query_taskflow``) is the query/queries that are executed.
+
+.. exampleinclude:: /../tests/system/common/sql/example_sql_execute_query.py
+    :language: python
+    :dedent: 4
+    :start-after: [START howto_decorator_sql_execute_query]
+    :end-before: [END howto_decorator_sql_execute_query]
+
+.. _howto/operator:SQLColumnCheckOperator:
+
+Check SQL Table Columns
+~~~~~~~~~~~~~~~~~~~~~~~
+
+Use the :class:`~airflow.providers.common.sql.operators.sql.SQLColumnCheckOperator` to run data quality
+checks against columns of a given table. As well as a connection ID and table, a column_mapping
+describing the relationship between columns and tests to run must be supplied. An example column mapping
+is a set of three nested dictionaries and looks like:
+
+.. code-block:: python
+
+        column_mapping = {
+            "col_name": {
+                "null_check": {"equal_to": 0, "partition_clause": "other_col LIKE 'this'"},
+                "min": {
+                    "greater_than": 5,
+                    "leq_to": 10,
+                    "tolerance": 0.2,
+                },
+                "max": {"less_than": 1000, "geq_to": 10, "tolerance": 0.01},
+            }
+        }
+
+Where col_name is the name of the column to run checks on, and each entry in its dictionary is a check.
+The valid checks are:
+
+- null_check: checks the number of NULL values in the column
+- distinct_check: checks the COUNT of values in the column that are distinct
+- unique_check: checks the number of distinct values in a column against the number of rows
+- min: checks the minimum value in the column
+- max: checks the maximum value in the column
+
+Each entry in the check's dictionary is either a condition for success of the check, the tolerance,
+or a partition clause. The conditions for success are:
+
+- greater_than
+- geq_to
+- less_than
+- leq_to
+- equal_to
+
+When specifying conditions, equal_to is not compatible with other conditions. Both a lower- and an upper-
+bound condition may be specified in the same check. The tolerance is a percentage that the result may
+be out of bounds but still considered successful.
+
+The partition clauses may be given at the operator level as a parameter where it partitions all checks,
+at the column level in the column mapping where it partitions all checks for that column, or at the
+check level for a column where it partitions just that check.
+
+A database may also be specified if not using the database from the supplied connection.
+
+The accept_none argument, true by default, will convert None values returned by the query to 0s, allowing
+empty tables to return valid integers.
+
+The below example demonstrates how to instantiate the SQLColumnCheckOperator task.
+
+.. exampleinclude:: /../tests/system/common/sql/example_sql_column_table_check.py
+    :language: python
+    :dedent: 4
+    :start-after: [START howto_operator_sql_column_check]
+    :end-before: [END howto_operator_sql_column_check]
+
+.. _howto/operator:SQLTableCheckOperator:
+
+Check SQL Table Values
+~~~~~~~~~~~~~~~~~~~~~~~
+
+Use the :class:`~airflow.providers.common.sql.operators.sql.SQLTableCheckOperator` to run data quality
+checks against a given table. As well as a connection ID and table, a checks dictionary
+describing the relationship between the table and tests to run must be supplied. An example
+checks argument is a set of two nested dictionaries and looks like:
+
+.. code-block:: python
+
+        checks = (
+            {
+                "row_count_check": {
+                    "check_statement": "COUNT(*) = 1000",
+                },
+                "column_sum_check": {
+                    "check_statement": "col_a + col_b < col_c",
+                    "partition_clause": "col_a IS NOT NULL",
+                },
+            },
+        )
+
+The first set of keys are the check names, which are referenced in the templated query the operator builds.
+A dictionary key under the check name must include check_statement and the value a SQL statement that
+resolves to a boolean (this can be any string or int that resolves to a boolean in
+airflow.operators.sql.parse_boolean). The other possible key to supply is partition_clause, which is a
+check level statement that will partition the data in the table using a WHERE clause for that check.
+This statement is compatible with the parameter partition_clause, where the latter filters across all
+checks.
+
+The below example demonstrates how to instantiate the SQLTableCheckOperator task.
+
+.. exampleinclude:: /../tests/system/common/sql/example_sql_column_table_check.py
+    :language: python
+    :dedent: 4
+    :start-after: [START howto_operator_sql_table_check]
+    :end-before: [END howto_operator_sql_table_check]
+
+
+.. _howto/operator:SQLValueCheckOperator:
+
+Check value against expected
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use the :class:`~airflow.providers.common.sql.operators.sql.SQLValueCheckOperator` to compare a SQL query result
+against an expected value, with some optionally specified tolerance for numeric results.
+The parameters for this operator are:
+
+- ``sql`` - the sql query to be executed, as a templated string.
+- ``pass_value`` - the expected value to compare the query result against.
+- ``tolerance`` (optional) - numerical tolerance for comparisons involving numeric values.
+- ``conn_id`` (optional) - the connection ID used to connect to the database.
+- ``database`` (optional) - name of the database which overwrites the name defined in the connection.
+
+The below example demonstrates how to instantiate the SQLValueCheckOperator task.
+
+.. exampleinclude:: /../tests/system/common/sql/example_sql_value_check.py
+    :language: python
+    :dedent: 4
+    :start-after: [START howto_operator_sql_value_check]
+    :end-before: [END howto_operator_sql_value_check]
+
+.. _howto/operator:SQLThresholdCheckOperator:
+
+Check values against a threshold
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use the :class:`~airflow.providers.common.sql.operators.sql.SQLThresholdCheckOperator` to compare a specific SQL query result against defined minimum and maximum thresholds.
+Both thresholds can either be a numeric value or another SQL query that evaluates to a numeric value.
+This operator requires a connection ID, along with the SQL query to execute, and allows optional specification of a database, if the one from the connection_id should be overridden.
+The parameters are:
+- ``sql`` - the sql query to be executed, as a templated string.
+- ``min_threshold`` The minimum threshold that is checked against. Either as a numeric value or templated sql query.
+- ``max_threshold`` The maximum threshold that is checked against. Either as a numeric value or templated sql query.
+- ``conn_id`` (optional) The connection ID used to connect to the database.
+- ``database`` (optional) name of the database which overwrites the one from the connection.
+
+
+The below example demonstrates how to instantiate the SQLThresholdCheckOperator task.
+
+.. exampleinclude:: /../tests/system/common/sql/example_sql_threshold_check.py
+    :language: python
+    :dedent: 4
+    :start-after: [START howto_operator_sql_threshold_check]
+    :end-before: [END howto_operator_sql_threshold_check]
+
+If the value returned by the query, is within the thresholds, the task passes. Otherwise, it fails.
+
+.. _howto/operator:SQLInsertRowsOperator:
+
+Insert rows into Table
+~~~~~~~~~~~~~~~~~~~~~~
+
+Use the :class:`~airflow.providers.common.sql.operators.sql.SQLInsertRowsOperator` to insert rows into a database table
+directly from Python data structures or an XCom. Parameters of the operator are:
+
+- ``table_name`` - name of the table in which the rows will be inserted (templated).
+- ``conn_id`` - the Airflow connection ID used to connect to the database.
+- ``schema`` (optional) - the schema in which the table is defined.
+- ``database`` (optional) - name of the database which overrides the one defined in the connection.
+- ``columns`` (optional) - list of columns to use for the insert when passing a list of dictionaries.
+- ``ignored_columns`` (optional) - list of columns to ignore for the insert, if no columns are specified,
+  columns will be dynamically resolved from the metadata.
+- ``rows`` - rows to insert, a list of tuples.
+- ``rows_processor`` (optional) - a function applied to the rows before inserting them.
+- ``preoperator`` (optional) - SQL statement or list of statements to execute before inserting data (templated).
+- ``postoperator`` (optional) - SQL statement or list of statements to execute after inserting data (templated).
+- ``hook_params`` (optional) - dictionary of additional parameters passed to the underlying hook.
+- ``insert_args`` (optional) - dictionary of additional arguments passed to the hook's ``insert_rows`` method,
+  can include ``replace``, ``executemany``, ``fast_executemany``, ``autocommit``, and others supported by the hook.
+
+The example below shows how to instantiate the SQLInsertRowsOperator task.
+
+.. exampleinclude:: /../tests/system/common/sql/example_sql_insert_rows.py
+    :language: python
+    :dedent: 4
+    :start-after: [START howto_operator_sql_insert_rows]
+    :end-before: [END howto_operator_sql_insert_rows]
+
+.. _howto/operator:SQLBulkLoadOperator:
+
+Bulk load data into a table
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use the :class:`~airflow.providers.common.sql.operators.sql.SQLBulkLoadOperator`
+to bulk load a tab-delimited file into a database table using the database's
+native bulk loading mechanism. Parameters of the operator are:
+
+- ``table`` - name of the target table (templated).
+- ``tmp_file`` - path to the tab-delimited file to load (templated).
+- ``conn_id`` - the Airflow connection ID used to connect to the database.
+- ``database`` (optional) - name of the database which overrides the one defined
+  in the connection.
+- ``preoperator`` (optional) - SQL statement or list of statements to execute
+  before bulk loading (templated).
+- ``postoperator`` (optional) - SQL statement or list of statements to execute
+  after bulk loading (templated).
+- ``hook_params`` (optional) - dictionary of additional parameters passed to the
+  underlying hook.
+
+The example below shows how to instantiate the SQLBulkLoadOperator task.
+
+.. exampleinclude:: /../tests/system/common/sql/example_sql_bulk_load.py
+    :language: python
+    :dedent: 4
+    :start-after: [START howto_operator_sql_bulk_load]
+    :end-before: [END howto_operator_sql_bulk_load]
+
+.. _howto/operator:GenericTransfer:
+
+Generic Transfer
+~~~~~~~~~~~~~~~~
+
+Use the :class:`~airflow.providers.common.sql.operators.generic_transfer.GenericTransfer` to transfer data between
+between two connections.
+
+.. exampleinclude:: /../tests/system/common/sql/example_generic_transfer.py
+    :language: python
+    :dedent: 4
+    :start-after: [START howto_operator_generic_transfer]
+    :end-before: [END howto_operator_generic_transfer]
+
+.. _howto/sensor:SqlSensor:
+
+Wait for a SQL condition
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use the :class:`~airflow.providers.common.sql.sensors.sql.SqlSensor` to wait until a query returns a row
+whose first cell is truthy, for example until today's orders have landed. It works with any connection
+whose hook is a :class:`~airflow.providers.common.sql.hooks.sql.DbApiHook`. The examples below use
+PostgreSQL; write ``sql`` and ``parameters`` in your database's dialect and placeholder style.
+
+.. exampleinclude:: /../tests/system/common/sql/example_sql_sensor.py
+    :language: python
+    :dedent: 4
+    :start-after: [START howto_sensor_sql]
+    :end-before: [END howto_sensor_sql]
+
+For a condition you cannot write in SQL, pass ``success`` or ``failure`` callables. They receive the first
+cell of the first row, or whatever ``selector`` returns for that row. ``fail_on_empty=True`` fails the task
+when the query returns no rows instead of checking again.
+
+Deferrable mode
+---------------
+
+With ``deferrable=True``, the sensor checks once on the worker. If the condition is not met, it defers and
+the triggerer runs the query every ``poke_interval`` seconds, so the task holds no worker slot while it
+waits. ``timeout`` caps the time spent deferred.
+
+.. exampleinclude:: /../tests/system/common/sql/example_sql_sensor.py
+    :language: python
+    :dedent: 4
+    :start-after: [START howto_sensor_sql_deferrable]
+    :end-before: [END howto_sensor_sql_deferrable]
+
+The triggerer only checks the default condition, that the first cell of the first row is truthy, so write
+the condition in SQL as above. The sensor logs a warning and runs in its usual ``mode`` instead of
+deferring when:
+
+- ``success``, ``failure`` or ``selector`` is set, because these Python callables only run on a worker;
+- ``silent_fail``, ``never_fail`` or ``exponential_backoff`` is set, because they only apply to pokes on a
+  worker;
+- a subclass overrides ``poke`` or ``_get_hook``, because the triggerer would not run that code;
+- it runs on Airflow 3 before 3.2.2, whose triggerer cannot safely look up connections from the thread
+  that runs the query. Deferring works on Airflow 2.11 and on 3.2.2 and later;
+- on Airflow 2, ``parameters`` holds values other than strings, numbers, booleans and ``None``.
+  Airflow 2 stores trigger arguments as JSON, so dates, datetimes and ``Decimal`` values would reach
+  the triggerer as strings.
+
+Analytics Operator
+~~~~~~~~~~~~~~~~~~
+
+The Analytics operator is designed to run analytic queries on data stored in various datastores. It is a generic operator that can query data in S3, GCS, Azure, and Local File System.
+
+When to Use Analytics Operator
+------------------------------
+
+The Analytics Operator is ideal for performing efficient, high-performance analytics on large volumes of data across various storage systems. Under the hood, it uses Apache DataFusion, a high-performance, extensible query engine for Apache Arrow, which enables fast SQL queries on various data formats and storage systems. DataFusion is chosen for its ability to handle large-scale data processing on a single node, providing low-latency analytics without the need for a full database setup and without the need for high compute clusters. For more on Analytics Operator with DataFusion use cases, see `<https://datafusion.apache.org/user-guide/introduction.html#use-cases>`_.
+
+
+Supported Storage Systems
+-------------------------
+- S3
+- GCS
+- Azure Blob Storage
+- Local File System
+
+.. note::
+   HTTP, Delta are not yet supported but will be added in the future.
+
+
+
+Supported File Formats
+----------------------
+- Parquet
+- CSV
+- Avro
+
+.. _howto/operator:AnalyticsOperator:
+
+Use the :class:`~airflow.providers.common.sql.operators.analytics.AnalyticsOperator` to run analytic queries.
+
+Parameters
+----------
+* ``datasource_configs`` (list[DataSourceConfig], required): List of datasource configurations
+* ``queries`` (list[str], required): List of SQL queries to run on the data
+* ``max_rows_check`` (int, optional): Maximum number of rows returned for each query. Default is 100. If a query returns more rows, the engine logs a warning and returns only the first ``max_rows_check`` rows. This prevents returning too many rows, which can cause xcom rendering issues in the Airflow UI.
+* ``engine`` (DataFusionEngine, optional): Query engine to use. Default is "datafusion". Currently, only "datafusion" is supported.
+* ``result_output_format`` (str, optional): Output format for the results. Default is ``tabulate``. Supported formats are ``tabulate``, ``json``.
+
+DataSourceConfig Parameters
+---------------------------
+
+* ``conn_id`` (str, required): Connection ID of the storage. e.g: "aws_default" for S3.
+* ``uri`` (str, required): URI of the datasource.
+* ``format`` (str, required): Format of the data.
+* ``table_name`` (str, required): Name of the table. Note: This name can be any identifier and should match the table name used in the SQL queries.
+* ``db_name`` (str, optional): Name of the database. Default is None. Ideally this is for catalog based storages like iceberg, provide the database name here and it will be used to fetch the table metadata.
+* ``storage_type`` (StorageType, optional): Type of storage. Default is None. If not provided, it will be inferred from the URI.
+* ``options`` (dict, optional): Additional options for the datasource. eg: if the datasource is partitioned, you can provide partitioning information in the options, e.g: ``{"table_partition_cols": [("year", "integer")]}``
+    look at here for more options: `<https://datafusion.apache.org/python/autoapi/datafusion/context/index.html#datafusion.context.SessionContext>_.`
+
+S3 Storage
+----------
+.. exampleinclude:: /../../sql/src/airflow/providers/common/sql/example_dags/example_analytics.py
+    :language: python
+    :dedent: 4
+    :start-after: [START howto_analytics_operator_with_s3]
+    :end-before: [END howto_analytics_operator_with_s3]
+
+GCS Storage
+-----------
+Use a ``conn_id`` pointing to a ``google_cloud_platform`` connection. Credentials are
+resolved in this order:
+
+1. ``key_path`` -- a service account JSON file on disk
+2. ``keyfile_dict`` -- the service account JSON contents, inline
+3. the ``GOOGLE_APPLICATION_CREDENTIALS`` environment variable
+4. Application Default Credentials -- the local ``gcloud`` CLI credentials file, or
+   the GCE/GKE metadata server
+
+``key_path`` and ``keyfile_dict`` are mutually exclusive. ``key_secret_name``,
+``credential_config_file``, and ``impersonation_chain`` are not supported.
+
+.. exampleinclude:: /../../sql/src/airflow/providers/common/sql/example_dags/example_analytics.py
+    :language: python
+    :dedent: 4
+    :start-after: [START howto_analytics_operator_with_gcs]
+    :end-before: [END howto_analytics_operator_with_gcs]
+
+Azure Storage
+-------------
+Use an ``az://``, ``abfs://``, or ``abfss://`` URI with a ``conn_id`` pointing
+to a ``wasb`` connection. ``az://container/path`` takes the storage account
+from the connection; when the connection resolves none (no ``host``, and no ``login``
+or a service principal), the binding falls back to ``AZURE_STORAGE_ACCOUNT_NAME`` on
+the worker.
+``abfs://container@account.dfs.core.windows.net/path`` and ``abfss://...``
+additionally name the account in the URI itself -- if it disagrees with the
+account the connection resolves to, registering the datasource raises rather
+than silently picking one, and when the connection names no account at all, the
+URI's account is used instead of ``AZURE_STORAGE_ACCOUNT_NAME``. The URI host
+follows the same cloud rule as the connection host below: a host outside
+``*.core.windows.net`` raises unless ``AZURE_STORAGE_ENDPOINT``/``AZURE_ENDPOINT``
+is set. The account name
+comes from ``host`` (its first DNS label) when set, falling back to
+``login`` only when ``host`` is empty and the connection is not a service principal
+(``tenant_id`` set, where ``login`` is the client ID); only the public
+``*.blob.core.windows.net`` cloud is supported, since DataFusion's binding
+otherwise has no endpoint override -- unless the worker sets
+``AZURE_STORAGE_ENDPOINT``/``AZURE_ENDPOINT`` for a real sovereign-cloud
+hostname. A ``host:port`` address (the Azurite emulator's shape, e.g.
+``azurite:10000``) is never a real DNS hostname and always raises instead,
+even with those variables set: put the account name in ``login`` with
+``host`` left empty for Azurite, alongside those same variables and
+``AZURE_ALLOW_HTTP=true``. ``client_secret_auth_config`` (the authority
+override ``WasbHook`` honors) is not read here.
+
+The connection supplies one of the following credentials, checked in this
+order (matching ``WasbHook.get_conn``):
+
+1. Azure AD service principal -- ``tenant_id`` extra, with ``login`` as the
+   client ID and ``password`` as the client secret (both required together)
+2. Shared key -- the ``shared_access_key`` extra
+3. SAS token -- ``sas_token`` extra, as a query string
+4. Shared key -- ``password``, or the ``account_key`` extra
+5. None of the above -- ambient auth (see below)
+
+**A worker environment variable can override the connection, but only from a
+higher-priority tier.** DataFusion reads ``AZURE_*`` environment variables
+first, and resolves credentials in this priority order:
+
+1. Bearer token
+2. Access key -- the shared-key connection's tier
+3. Workload identity
+4. Client secret -- the service-principal connection's tier
+5. SAS -- the SAS connection's tier
+
+Only a complete credential from an earlier tier can override the
+connection -- a single bearer or access-key variable, or every variable a
+multi-field tier needs. This raises when found, naming the variables,
+instead of silently using the wrong identity.
+
+With no explicit credential, authentication falls back to ``AZURE_*``
+environment variables, managed identity, or workload identity. Unlike
+``WasbHook`` (which tries ``az login`` automatically), DataFusion's
+underlying ``object_store`` binding only tries the Azure CLI if
+``AZURE_USE_AZURE_CLI=true`` is set; otherwise it defaults straight to
+IMDS managed identity.
+
+``connection_string``, ``managed_identity_client_id``, ``workload_identity_tenant_id``,
+and a URL-form ``sas_token`` are not supported.
+
+.. exampleinclude:: /../../sql/src/airflow/providers/common/sql/example_dags/example_analytics.py
+    :language: python
+    :dedent: 4
+    :start-after: [START howto_analytics_operator_with_azure]
+    :end-before: [END howto_analytics_operator_with_azure]
+
+Local File System Storage
+-------------------------
+.. exampleinclude:: /../../sql/src/airflow/providers/common/sql/example_dags/example_analytics.py
+    :language: python
+    :dedent: 4
+    :start-after: [START howto_analytics_operator_with_local]
+    :end-before: [END howto_analytics_operator_with_local]
+
+Analytics TaskFlow Decorator
+----------------------------
+
+The ``@task.analytics`` decorator lets you write a function that returns the
+analytics sql queries:
+
+.. exampleinclude:: /../../sql/src/airflow/providers/common/sql/example_dags/example_analytics.py
+    :language: python
+    :start-after: [START howto_analytics_decorator]
+    :end-before: [END howto_analytics_decorator]
+
+Analytics with Iceberg
+-------------------------
+.. exampleinclude:: /../../sql/src/airflow/providers/common/sql/example_dags/example_analytics.py
+    :language: python
+    :dedent: 4
+    :start-after: [START howto_analytics_iceberg]
+    :end-before: [END howto_analytics_iceberg]

@@ -1,0 +1,1584 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+"""This module contains SFTP hook."""
+
+from __future__ import annotations
+
+import asyncio
+import concurrent.futures
+import datetime
+import functools
+import inspect
+import os
+import posixpath
+import stat
+import warnings
+from collections.abc import AsyncGenerator, Callable, Generator, Sequence
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager, suppress
+from enum import Enum
+from fnmatch import fnmatch
+from io import BytesIO
+from pathlib import Path, PurePosixPath
+from typing import IO, TYPE_CHECKING, Any, cast
+
+import asyncssh
+from paramiko.config import SSH_PORT
+
+from airflow.exceptions import AirflowProviderDeprecationWarning
+from airflow.providers.common.compat.connection import get_async_connection
+from airflow.providers.common.compat.sdk import AirflowException, BaseHook, Connection, timezone
+from airflow.providers.sftp.exceptions import ConnectionNotOpenedException
+from airflow.providers.ssh.hooks.ssh import SSHHook
+
+if TYPE_CHECKING:
+    from paramiko import SSHClient
+    from paramiko.sftp_attr import SFTPAttributes
+    from paramiko.sftp_client import SFTPClient
+
+CHUNK_SIZE = 64 * 1024  # 64KB
+
+
+class SFTPOperation(str, Enum):
+    """SFTP operation constants."""
+
+    GET = "get"
+    PUT = "put"
+    DELETE = "delete"
+
+
+def handle_connection_management(func: Callable) -> Callable:
+    """
+    Run the wrapped hook method inside the hook's managed connection.
+
+    Both :class:`SFTPHook` and :class:`SFTPHookAsync` expose ``get_managed_conn()``, which
+    opens the connection on first entry and reuses it for nested entries, so a decorated
+    method calling other decorated methods shares one connection with them.
+    """
+    if inspect.iscoroutinefunction(func):
+
+        @functools.wraps(func)
+        async def handle_async_connection_management_wrapper(self, *args: Any, **kwargs: Any) -> Any:
+            async with self.get_managed_conn():
+                return await func(self, *args, **kwargs)
+
+        return handle_async_connection_management_wrapper
+
+    @functools.wraps(func)
+    def handle_connection_management_wrapper(self, *args: Any, **kwargs: dict[str, Any]) -> Any:
+        if not self.use_managed_conn:
+            if self.conn is None:
+                raise ConnectionNotOpenedException(
+                    "Connection not open, use with hook.get_managed_conn() Managed Connection in order to create and open the connection"
+                )
+
+            return func(self, *args, **kwargs)
+
+        with self.get_managed_conn() as conn:
+            self.conn = conn
+            result = func(self, *args, **kwargs)
+            return result
+
+    return handle_connection_management_wrapper
+
+
+class SFTPHook(SSHHook):
+    """
+    Interact with SFTP.
+
+    This hook inherits the SSH hook. Please refer to SSH hook for the input
+    arguments.
+
+    :Pitfalls::
+
+        - In contrast with FTPHook describe_directory only returns size, type and
+          modify. It doesn't return unix.owner, unix.mode, perm, unix.group and
+          unique.
+        - If no mode is passed to create_directory it will be created with 777
+          permissions.
+
+    Errors that may occur throughout but should be handled downstream.
+
+    For consistency reasons with SSHHook, the preferred parameter is "ssh_conn_id".
+
+    :param ssh_conn_id: The :ref:`sftp connection id<howto/connection:sftp>`
+    """
+
+    conn_name_attr = "ssh_conn_id"
+    default_conn_name = "sftp_default"
+    conn_type = "sftp"
+    hook_name = "SFTP"
+
+    @classmethod
+    def get_ui_field_behaviour(cls) -> dict[str, Any]:
+        return {
+            "hidden_fields": ["schema"],
+            "relabeling": {
+                "login": "Username",
+            },
+        }
+
+    def __init__(
+        self,
+        ssh_conn_id: str | None = "sftp_default",
+        host_proxy_cmd: str | None = None,
+        use_managed_conn: bool = True,
+        *args,
+        **kwargs,
+    ) -> None:
+        self.conn: SFTPClient | None = None
+        self.use_managed_conn = use_managed_conn
+
+        # TODO: remove support for ssh_hook when it is removed from SFTPOperator
+        if kwargs.get("ssh_hook") is not None:
+            warnings.warn(
+                "Parameter `ssh_hook` is deprecated and will be ignored.",
+                AirflowProviderDeprecationWarning,
+                stacklevel=2,
+            )
+
+        ftp_conn_id = kwargs.pop("ftp_conn_id", None)
+        if ftp_conn_id:
+            warnings.warn(
+                "Parameter `ftp_conn_id` is deprecated. Please use `ssh_conn_id` instead.",
+                AirflowProviderDeprecationWarning,
+                stacklevel=2,
+            )
+            ssh_conn_id = ftp_conn_id
+
+        kwargs["ssh_conn_id"] = ssh_conn_id
+        kwargs["host_proxy_cmd"] = host_proxy_cmd
+        self.ssh_conn_id = ssh_conn_id
+
+        self._ssh_conn: SSHClient | None = None
+        self._sftp_conn: SFTPClient | None = None
+        self._conn_count = 0
+
+        super().__init__(*args, **kwargs)
+
+    def get_conn(self) -> SFTPClient:  # type: ignore[override]
+        """Open an SFTP connection to the remote host."""
+        if self.conn is None:
+            self.conn = super().get_conn().open_sftp()
+        return self.conn
+
+    def close_conn(self) -> None:
+        """Close the SFTP connection."""
+        if self.conn is not None:
+            self.conn.close()
+            self.conn = None
+
+    @contextmanager
+    def get_managed_conn(self) -> Generator[SFTPClient, None, None]:
+        """Context manager that closes the connection after use."""
+        if self._sftp_conn is None:
+            ssh_conn: SSHClient = super().get_conn()
+            self._ssh_conn = ssh_conn
+            self._sftp_conn = ssh_conn.open_sftp()
+        self._conn_count += 1
+
+        try:
+            yield self._sftp_conn
+        finally:
+            self._conn_count -= 1
+            if self._conn_count == 0 and self._ssh_conn is not None and self._sftp_conn is not None:
+                self._sftp_conn.close()
+                self._sftp_conn = None
+                self._ssh_conn.close()
+                self._ssh_conn = None
+                if hasattr(self, "host_proxy"):
+                    del self.host_proxy
+
+    def get_conn_count(self) -> int:
+        """Get the number of open connections."""
+        return self._conn_count
+
+    def _build_worker_hook(self) -> SFTPHook:
+        """
+        Build a new SFTPHook for a concurrent-transfer worker.
+
+        Mirrors this hook's effective connection settings -- i.e. the result of merging
+        this hook's constructor overrides (``remote_host``, ``port``, ``username``, etc.)
+        with the underlying Airflow connection -- so worker hooks used by
+        ``store_directory_concurrently`` and ``retrieve_directory_concurrently`` connect
+        the same way the parent hook does, instead of falling back to the connection's
+        raw defaults.
+        """
+        worker_hook = SFTPHook(
+            ssh_conn_id=self.ssh_conn_id,
+            remote_host=self.remote_host,
+            username=self.username,
+            password=self.password,
+            # Re-resolve key_file when pkey is set to avoid the key_file/private_key guard.
+            key_file=None if self.pkey else self.key_file,
+            port=self.port,
+            conn_timeout=self.conn_timeout,
+            cmd_timeout=self.cmd_timeout,
+            keepalive_interval=self.keepalive_interval,
+            banner_timeout=self.banner_timeout,
+            disabled_algorithms=self.disabled_algorithms,
+            ciphers=self.ciphers,
+            auth_timeout=self.auth_timeout,
+            host_proxy_cmd=self.host_proxy_cmd,
+            conn_retry_attempts=self.conn_retry_attempts,
+            no_host_key_check=self.no_host_key_check,
+        )
+        # These have no constructor parameter and are only ever resolved from the
+        # connection's `extra` field or left at their class default, so copy the
+        # parent's already-resolved values across explicitly.
+        worker_hook.allow_host_key_change = self.allow_host_key_change
+        worker_hook.host_key = self.host_key
+        worker_hook.look_for_keys = self.look_for_keys
+        worker_hook.compress = self.compress
+        worker_hook.pkey = self.pkey
+        return worker_hook
+
+    @handle_connection_management
+    def describe_directory(self, path: str) -> dict[str, dict[str, str | int | None]]:
+        """
+        Get file information in a directory on the remote system.
+
+        The return format is ``{filename: {attributes}}``. The remote system
+        support the MLSD command.
+
+        :param path: full path to the remote directory
+        """
+        return {
+            f.filename: {
+                "size": f.st_size,
+                "type": "dir" if stat.S_ISDIR(f.st_mode) else "file",  # type: ignore[union-attr]
+                "modify": datetime.datetime.fromtimestamp(f.st_mtime or 0).strftime("%Y%m%d%H%M%S"),
+            }
+            for f in sorted(self.conn.listdir_attr(path), key=lambda f: f.filename)  # type: ignore[union-attr]
+        }
+
+    @handle_connection_management
+    def list_directory(self, path: str, recursive: bool = False) -> list[str] | None:
+        """
+        List files in a directory on the remote system.
+
+        Lists one-level entry names under the given directory path.
+
+        If ``recursive=True``, returns files recursively as paths relative to ``path``.
+
+        :param path: full path to the remote directory to list
+        :param recursive: Whether to recursively list descendants.
+        :return: List of entry names found under the directory, or None if the directory does not exist.
+        """
+        if recursive:
+            files: list[str] = []
+
+            def append_relative(item: str) -> None:
+                files.append(os.path.relpath(item, path))
+
+            try:
+                self.walktree(
+                    path=path,
+                    fcallback=append_relative,
+                    dcallback=lambda _: None,
+                    ucallback=lambda _: None,
+                )
+            except OSError:
+                return None
+            return sorted(files)
+
+        try:
+            return sorted(self.conn.listdir(path))  # type: ignore[union-attr]
+        except OSError:
+            return None
+
+    @handle_connection_management
+    def list_directory_with_attr(self, path: str) -> list[SFTPAttributes]:
+        """
+        List files in a directory on the remote system including their SFTPAttributes.
+
+        :param path: full path to the remote directory to list
+        """
+        return [file for file in self.conn.listdir_attr(path)]  # type: ignore[union-attr]
+
+    @handle_connection_management
+    def mkdir(self, path: str, mode: int = 0o777) -> None:
+        """
+        Create a directory on the remote system.
+
+        The default mode is ``0o777``, but on some systems, the current umask
+        value may be first masked out.
+
+        :param path: full path to the remote directory to create
+        :param mode: int permissions of octal mode for directory
+        """
+        return self.conn.mkdir(path, mode)  # type: ignore[union-attr,return-value]
+
+    @handle_connection_management
+    def isdir(self, path: str) -> bool:
+        """
+        Check if the path provided is a directory.
+
+        :param path: full path to the remote directory to check
+        """
+        try:
+            return stat.S_ISDIR(self.conn.stat(path).st_mode)  # type: ignore[union-attr,arg-type]
+        except OSError:
+            return False
+
+    @handle_connection_management
+    def isfile(self, path: str) -> bool:
+        """
+        Check if the path provided is a file.
+
+        :param path: full path to the remote file to check
+        """
+        try:
+            return stat.S_ISREG(self.conn.stat(path).st_mode)  # type: ignore[arg-type,union-attr]
+        except OSError:
+            return False
+
+    @handle_connection_management
+    def create_directory(self, path: str, mode: int = 0o777) -> None:
+        """
+        Create a directory on the remote system.
+
+        The default mode is ``0o777``, but on some systems, the current umask
+        value may be first masked out. Different from :func:`.mkdir`, this
+        function attempts to create parent directories if needed, and returns
+        silently if the target directory already exists.
+
+        :param path: full path to the remote directory to create
+        :param mode: int permissions of octal mode for directory
+        """
+        if self.isdir(path):
+            self.log.info("%s already exists", path)
+            return
+        if self.isfile(path):
+            raise AirflowException(f"{path} already exists and is a file")
+        dirname, basename = os.path.split(path)
+        if dirname and not self.isdir(dirname):
+            self.create_directory(dirname, mode)
+        if basename:
+            self.log.info("Creating %s", path)
+            self.conn.mkdir(path, mode=mode)  # type: ignore
+
+    @handle_connection_management
+    def delete_directory(self, path: str, include_files: bool = False) -> None:
+        """
+        Delete a directory on the remote system.
+
+        :param path: full path to the remote directory to delete
+        """
+        files: list[str] = []
+        dirs: list[str] = []
+
+        if include_files is True:
+            files, dirs, _ = self.get_tree_map(path)
+            dirs = dirs[::-1]  # reverse the order for deleting deepest directories first
+
+        for file_path in files:
+            self.conn.remove(file_path)  # type: ignore
+        for dir_path in dirs:
+            self.conn.rmdir(dir_path)  # type: ignore
+        self.conn.rmdir(path)  # type: ignore
+
+    @handle_connection_management
+    def retrieve_file(self, remote_full_path: str, local_full_path: str, prefetch: bool = True) -> None:
+        """
+        Transfer the remote file to a local location.
+
+        If local_full_path is a string path, the file will be put
+        at that location.
+
+        :param remote_full_path: full path to the remote file
+        :param local_full_path: full path to the local file or a file-like buffer
+        :param prefetch: controls whether prefetch is performed (default: True)
+        """
+        if isinstance(local_full_path, BytesIO):
+            # It's a file-like object ( BytesIO), so use getfo().
+            self.log.info("Using streaming download for %s", remote_full_path)
+            self.conn.getfo(remote_full_path, local_full_path, prefetch=prefetch)
+        # We use hasattr checking for 'write' for cases like google.cloud.storage.fileio.BlobWriter
+        elif hasattr(local_full_path, "write"):
+            self.log.info("Using streaming download for %s", remote_full_path)
+            # We need to cast to pass prek hook checks
+            stream_full_path = cast("IO[bytes]", local_full_path)
+            self.conn.getfo(remote_full_path, stream_full_path, prefetch=prefetch)  # type: ignore[union-attr]
+        elif isinstance(local_full_path, (str, bytes, os.PathLike)):
+            # It's a string path, so use get().
+            self.log.info("Using standard file download for %s", remote_full_path)
+            self.conn.get(remote_full_path, local_full_path, prefetch=prefetch)  # type: ignore[union-attr]
+        # If it's neither, it's an unsupported type.
+        else:
+            raise TypeError(
+                f"Unsupported type for local_full_path: {type(local_full_path)}. "
+                "Expected a stream-like object or a path-like object."
+            )
+
+    @handle_connection_management
+    def store_file(self, remote_full_path: str, local_full_path: str, confirm: bool = True) -> None:
+        """
+        Transfer a local file to the remote location.
+
+        If local_full_path_or_buffer is a string path, the file will be read
+        from that location.
+
+        :param remote_full_path: full path to the remote file
+        :param local_full_path: full path to the local file or a file-like buffer
+        """
+        if isinstance(local_full_path, BytesIO):
+            self.conn.putfo(local_full_path, remote_full_path, confirm=confirm)  # type: ignore
+        else:
+            self.conn.put(local_full_path, remote_full_path, confirm=confirm)  # type: ignore
+
+    @handle_connection_management
+    def delete_file(self, path: str) -> None:
+        """
+        Remove a file on the server.
+
+        :param path: full path to the remote file
+        """
+        self.conn.remove(path)  # type: ignore[arg-type, union-attr]
+
+    def retrieve_directory(self, remote_full_path: str, local_full_path: str, prefetch: bool = True) -> None:
+        """
+        Transfer the remote directory to a local location.
+
+        If local_full_path is a string path, the directory will be put
+        at that location.
+
+        :param remote_full_path: full path to the remote directory
+        :param local_full_path: full path to the local directory
+        :param prefetch: controls whether prefetch is performed (default: True)
+        """
+        if Path(local_full_path).exists():
+            raise AirflowException(f"{local_full_path} already exists")
+        dest = Path(local_full_path).resolve()
+        dest.mkdir(parents=True)
+        files, dirs, _ = self.get_tree_map(remote_full_path)
+        for dir_path in dirs:
+            new_local_path = str(dest / os.path.relpath(dir_path, remote_full_path))
+            self._validate_within_directory(str(dest), new_local_path)
+            Path(new_local_path).mkdir(parents=True, exist_ok=True)
+        for file_path in files:
+            new_local_path = str(dest / os.path.relpath(file_path, remote_full_path))
+            self._validate_within_directory(str(dest), new_local_path)
+            self.retrieve_file(file_path, new_local_path, prefetch)
+
+    def retrieve_directory_concurrently(
+        self,
+        remote_full_path: str,
+        local_full_path: str,
+        workers: int = os.cpu_count() or 2,
+        prefetch: bool = True,
+    ) -> None:
+        """
+        Transfer the remote directory to a local location concurrently.
+
+        If local_full_path is a string path, the directory will be put
+        at that location.
+
+        :param remote_full_path: full path to the remote directory
+        :param local_full_path: full path to the local directory
+        :param prefetch: controls whether prefetch is performed (default: True)
+        :param workers: number of workers to use for concurrent transfer (default: number of CPUs or 2 if undetermined)
+        """
+
+        def retrieve_file_chunk(
+            conn: SFTPClient, local_file_chunk: list[str], remote_file_chunk: list[str], prefetch: bool = True
+        ):
+            for local_file, remote_file in zip(local_file_chunk, remote_file_chunk):
+                conn.get(remote_file, local_file, prefetch=prefetch)
+
+        with self.get_managed_conn():
+            if Path(local_full_path).exists():
+                raise AirflowException(f"{local_full_path} already exists")
+            Path(local_full_path).mkdir(parents=True)
+            new_local_file_paths, remote_file_paths = [], []
+            files, dirs, _ = self.get_tree_map(remote_full_path)
+            for dir_path in dirs:
+                new_local_path = os.path.join(local_full_path, os.path.relpath(dir_path, remote_full_path))
+                self._validate_within_directory(local_full_path, new_local_path)
+                Path(new_local_path).mkdir(parents=True, exist_ok=True)
+            for file in files:
+                new_local_path = os.path.join(local_full_path, os.path.relpath(file, remote_full_path))
+                self._validate_within_directory(local_full_path, new_local_path)
+                remote_file_paths.append(file)
+                new_local_file_paths.append(new_local_path)
+        remote_file_chunks = [remote_file_paths[i::workers] for i in range(workers)]
+        local_file_chunks = [new_local_file_paths[i::workers] for i in range(workers)]
+        self.log.info("Opening %s new SFTP connections", workers)
+        conns = [self._build_worker_hook().get_conn() for _ in range(workers)]
+        try:
+            self.log.info("Retrieving files concurrently with %s threads", workers)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [
+                    executor.submit(
+                        retrieve_file_chunk,
+                        conns[i],
+                        local_file_chunks[i],
+                        remote_file_chunks[i],
+                        prefetch,
+                    )
+                    for i in range(workers)
+                ]
+                for future in concurrent.futures.as_completed(futures):
+                    future.result()
+        finally:
+            for conn in conns:
+                conn.close()
+
+    @handle_connection_management
+    def store_directory(self, remote_full_path: str, local_full_path: str, confirm: bool = True) -> None:
+        """
+        Transfer a local directory to the remote location.
+
+        If local_full_path is a string path, the directory will be read
+        from that location.
+
+        :param remote_full_path: full path to the remote directory
+        :param local_full_path: full path to the local directory
+        """
+        if self.path_exists(remote_full_path):
+            raise AirflowException(f"{remote_full_path} already exists")
+        self.create_directory(remote_full_path)
+        for root, dirs, files in os.walk(local_full_path):
+            for dir_name in dirs:
+                dir_path = os.path.join(root, dir_name)
+                new_remote_path = os.path.join(remote_full_path, os.path.relpath(dir_path, local_full_path))
+                self.create_directory(new_remote_path)
+            for file_name in files:
+                file_path = os.path.join(root, file_name)
+                new_remote_path = os.path.join(remote_full_path, os.path.relpath(file_path, local_full_path))
+                self.store_file(new_remote_path, file_path, confirm)
+
+    def store_directory_concurrently(
+        self,
+        remote_full_path: str,
+        local_full_path: str,
+        confirm: bool = True,
+        workers: int = os.cpu_count() or 2,
+    ) -> None:
+        """
+        Transfer a local directory to the remote location concurrently.
+
+        If local_full_path is a string path, the directory will be read
+        from that location.
+
+        :param remote_full_path: full path to the remote directory
+        :param local_full_path: full path to the local directory
+        :param confirm: whether to confirm the file size after transfer (default: True)
+        :param workers: number of workers to use for concurrent transfer (default: number of CPUs or 2 if undetermined)
+        """
+
+        def store_file_chunk(
+            conn: SFTPClient, local_file_chunk: list[str], remote_file_chunk: list[str], confirm: bool
+        ):
+            for local_file, remote_file in zip(local_file_chunk, remote_file_chunk):
+                conn.put(local_file, remote_file, confirm=confirm)
+
+        with self.get_managed_conn():
+            if self.path_exists(remote_full_path):
+                raise AirflowException(f"{remote_full_path} already exists")
+            self.create_directory(remote_full_path)
+
+            local_file_paths, new_remote_file_paths = [], []
+            for root, dirs, files in os.walk(local_full_path):
+                for dir_name in dirs:
+                    dir_path = os.path.join(root, dir_name)
+                    new_remote_path = os.path.join(
+                        remote_full_path, os.path.relpath(dir_path, local_full_path)
+                    )
+                    self.create_directory(new_remote_path)
+                for file_name in files:
+                    file_path = os.path.join(root, file_name)
+                    new_remote_path = os.path.join(
+                        remote_full_path, os.path.relpath(file_path, local_full_path)
+                    )
+                    local_file_paths.append(file_path)
+                    new_remote_file_paths.append(new_remote_path)
+
+        remote_file_chunks = [new_remote_file_paths[i::workers] for i in range(workers)]
+        local_file_chunks = [local_file_paths[i::workers] for i in range(workers)]
+        self.log.info("Opening %s new SFTP connections", workers)
+        conns = [self._build_worker_hook().get_conn() for _ in range(workers)]
+        try:
+            self.log.info("Storing files concurrently with %s threads", workers)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [
+                    executor.submit(
+                        store_file_chunk, conns[i], local_file_chunks[i], remote_file_chunks[i], confirm
+                    )
+                    for i in range(workers)
+                ]
+                for future in concurrent.futures.as_completed(futures):
+                    future.result()
+        finally:
+            for conn in conns:
+                conn.close()
+
+    @handle_connection_management
+    def get_mod_time(self, path: str) -> str:
+        """
+        Get an entry's modification time.
+
+        :param path: full path to the remote file
+        """
+        ftp_mdtm = self.conn.stat(path).st_mtime  # type: ignore[union-attr]
+        return datetime.datetime.fromtimestamp(ftp_mdtm).strftime("%Y%m%d%H%M%S")  # type: ignore
+
+    @handle_connection_management
+    def path_exists(self, path: str) -> bool:
+        """
+        Whether a remote entity exists.
+
+        :param path: full path to the remote file or directory
+        """
+        try:
+            self.conn.stat(path)  # type: ignore[union-attr]
+        except OSError:
+            return False
+        return True
+
+    @staticmethod
+    def _is_path_match(path: str, prefix: str | None = None, delimiter: str | None = None) -> bool:
+        """
+        Whether given path starts with ``prefix`` (if set) and ends with ``delimiter`` (if set).
+
+        :param path: path to be checked
+        :param prefix: if set path will be checked is starting with prefix
+        :param delimiter: if set path will be checked is ending with suffix
+        :return: bool
+        """
+        if prefix is not None and not path.startswith(prefix):
+            return False
+        if delimiter is not None and not path.endswith(delimiter):
+            return False
+        return True
+
+    @staticmethod
+    def _validate_within_directory(base: str, target: str) -> str:
+        """
+        Validate that target path is within the base directory.
+
+        Prevents directory traversal attacks.
+
+        :param base: The base/destination directory path
+        :param target: The target path to validate
+        :return: The target path if valid
+        :raises ValueError: If target path escapes the base directory
+        """
+        base_real = os.path.realpath(os.path.expanduser(base))
+        target_real = os.path.realpath(os.path.expanduser(target))
+
+        # Ensure target is within base directory
+        if not (target_real == base_real or target_real.startswith(base_real + os.sep)):
+            raise ValueError(f"Path {target} is outside the destination directory {base}")
+
+        return target
+
+    def walktree(
+        self,
+        path: str,
+        fcallback: Callable[[str], Any | None],
+        dcallback: Callable[[str], Any | None],
+        ucallback: Callable[[str], Any | None],
+        recurse: bool = True,
+    ) -> None:
+        """
+        Recursively descend, depth first, the directory tree at ``path``.
+
+        This calls discrete callback functions for each regular file, directory,
+        and unknown file type.
+
+        :param str path:
+            root of remote directory to descend, use '.' to start at
+            :attr:`.pwd`
+        :param callable fcallback:
+            callback function to invoke for a regular file.
+            (form: ``func(str)``)
+        :param callable dcallback:
+            callback function to invoke for a directory. (form: ``func(str)``)
+        :param callable ucallback:
+            callback function to invoke for an unknown file type.
+            (form: ``func(str)``)
+        :param bool recurse: *Default: True* - should it recurse
+        """
+        for entry in self.list_directory_with_attr(path):
+            pathname = os.path.join(path, entry.filename)
+            mode = entry.st_mode
+            if stat.S_ISDIR(mode):  # type: ignore
+                # It's a directory, call the dcallback function
+                dcallback(pathname)
+                if recurse:
+                    # now, recurse into it
+                    self.walktree(pathname, fcallback, dcallback, ucallback)
+            elif stat.S_ISREG(mode):  # type: ignore
+                # It's a file, call the fcallback function
+                fcallback(pathname)
+            else:
+                # Unknown file type
+                ucallback(pathname)
+
+    def get_tree_map(
+        self, path: str, prefix: str | None = None, delimiter: str | None = None
+    ) -> tuple[list[str], list[str], list[str]]:
+        """
+        Get tuple with recursive lists of files, directories and unknown paths.
+
+        It is possible to filter results by giving prefix and/or delimiter parameters.
+
+        :param path: path from which tree will be built
+        :param prefix: if set paths will be added if start with prefix
+        :param delimiter: if set paths will be added if end with delimiter
+        :return: tuple with list of files, dirs and unknown items
+        """
+        files: list[str] = []
+        dirs: list[str] = []
+        unknowns: list[str] = []
+
+        def append_matching_path_callback(list_: list[str]) -> Callable:
+            return lambda item: list_.append(item) if self._is_path_match(item, prefix, delimiter) else None
+
+        self.walktree(
+            path=path,
+            fcallback=append_matching_path_callback(files),
+            dcallback=append_matching_path_callback(dirs),
+            ucallback=append_matching_path_callback(unknowns),
+            recurse=True,
+        )
+
+        return files, dirs, unknowns
+
+    def test_connection(self) -> tuple[bool, str]:
+        """Test the SFTP connection by calling path with directory."""
+        try:
+            with self.get_managed_conn() as conn:
+                conn.normalize(".")
+                return True, "Connection successfully tested"
+        except Exception as e:
+            return False, str(e)
+
+    def get_file_by_pattern(self, path, fnmatch_pattern) -> str:
+        """
+        Get the first matching file based on the given fnmatch type pattern.
+
+        :param path: path to be checked
+        :param fnmatch_pattern: The pattern that will be matched with `fnmatch`
+        :return: string containing the first found file, or an empty string if none matched
+        """
+        for file in self.list_directory(path):
+            if fnmatch(file, fnmatch_pattern):
+                return file
+        return ""
+
+    def get_files_by_pattern(self, path, fnmatch_pattern) -> list[str]:
+        """
+        Get all matching files based on the given fnmatch type pattern.
+
+        :param path: path to be checked
+        :param fnmatch_pattern: The pattern that will be matched with `fnmatch`
+        :return: list of string containing the found files, or an empty list if none matched
+        """
+        matched_files = []
+        for file in self.list_directory_with_attr(path):
+            if fnmatch(file.filename, fnmatch_pattern):
+                matched_files.append(file.filename)
+
+        return matched_files
+
+    def transfer(
+        self,
+        operation: str,
+        local_filepath: str | list[str] | None,
+        remote_filepath: str | list[str],
+        confirm: bool = True,
+        create_intermediate_dirs: bool = False,
+        concurrency: int = 1,
+        prefetch: bool = True,
+    ) -> None:
+        """
+        Perform a synchronous SFTP transfer operation (GET, PUT, or DELETE).
+
+        Centralizes transfer logic so both the operator and the trigger
+        can delegate to the hook, in line with the DRY principle.
+
+        :param operation: The SFTP operation - put, get, or delete.
+        :param local_filepath: Local file path(s).
+        :param remote_filepath: Remote file path(s).
+        :param confirm: Whether to confirm file size after PUT (default: True).
+        :param create_intermediate_dirs: Create missing intermediate directories (default: False).
+        :param concurrency: Number of threads for directory transfers (default: 1).
+        :param prefetch: Whether to prefetch during GET (default: True).
+        """
+        if isinstance(local_filepath, str):
+            local_filepath_array = [local_filepath] if local_filepath else []
+        else:
+            local_filepath_array = local_filepath or []
+
+        if isinstance(remote_filepath, str):
+            remote_filepath_array = [remote_filepath]
+        else:
+            remote_filepath_array = list(remote_filepath)
+
+        if operation.lower() == SFTPOperation.GET:
+            for local, remote in zip(local_filepath_array, remote_filepath_array):
+                if create_intermediate_dirs:
+                    Path(os.path.dirname(local)).mkdir(parents=True, exist_ok=True)
+                if self.isdir(remote):
+                    if concurrency > 1:
+                        self.retrieve_directory_concurrently(
+                            remote, local, workers=concurrency, prefetch=prefetch
+                        )
+                    else:
+                        self.retrieve_directory(remote, local, prefetch=prefetch)
+                else:
+                    self.retrieve_file(remote, local, prefetch=prefetch)
+        elif operation.lower() == SFTPOperation.PUT:
+            for local, remote in zip(local_filepath_array, remote_filepath_array):
+                if create_intermediate_dirs:
+                    self.create_directory(os.path.dirname(remote))
+                if os.path.isdir(local):
+                    if concurrency > 1:
+                        self.store_directory_concurrently(remote, local, confirm=confirm, workers=concurrency)
+                    else:
+                        self.store_directory(remote, local, confirm=confirm)
+                else:
+                    self.store_file(remote, local, confirm=confirm)
+        elif operation.lower() == SFTPOperation.DELETE:
+            for remote in remote_filepath_array:
+                if self.isdir(remote):
+                    self.delete_directory(remote, include_files=True)
+                else:
+                    try:
+                        self.delete_file(remote)
+                    except FileNotFoundError:
+                        self.log.warning("Remote file %s does not exist. Skipping delete.", remote)
+
+
+class SFTPHookAsync(BaseHook):
+    """
+    Interact with an SFTP server via asyncssh package.
+
+    :param sftp_conn_id: SFTP connection ID to be used for connecting to SFTP server
+    :param host: hostname of the SFTP server
+    :param port: port of the SFTP server
+    :param username: username used when authenticating to the SFTP server
+    :param password: password used when authenticating to the SFTP server.
+        Can be left blank if using a key file
+    :param known_hosts: path to the known_hosts file on the local file system. Defaults to ``~/.ssh/known_hosts``.
+    :param key_file: path to the client key file used for authentication to SFTP server
+    :param passphrase: passphrase used with the key_file for authentication to SFTP server
+    :param no_host_key_check: Set to ``True`` to skip host key verification. Overrides the
+        connection's ``no_host_key_check`` extra. Defaults to ``None``, meaning the value is
+        taken from the connection (and host keys are verified when the connection does not set it).
+    """
+
+    conn_name_attr = "ssh_conn_id"
+    default_conn_name = "sftp_default"
+    conn_type = "sftp"
+    hook_name = "SFTP"
+    default_known_hosts = "~/.ssh/known_hosts"
+
+    def __init__(  # nosec: B107
+        self,
+        sftp_conn_id: str = default_conn_name,
+        host: str | None = None,
+        port: int | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        known_hosts: str = default_known_hosts,
+        key_file: str = "",
+        passphrase: str = "",
+        private_key: str = "",
+        no_host_key_check: bool | None = None,
+    ) -> None:
+        self.sftp_conn_id = sftp_conn_id
+        self.host = host
+        self.port = port
+        self.username = username
+        self.password = password
+        self.known_hosts: bytes | str = os.path.expanduser(known_hosts)
+        self.key_file = key_file
+        self.passphrase = passphrase
+        self.private_key = private_key
+        self.no_host_key_check = no_host_key_check
+        self.conn: asyncssh.SFTPClient | None = None
+        self._conn_count = 0
+        self._conn_lock = asyncio.Lock()
+        self._conn_stack: AsyncExitStack | None = None
+
+    def _parse_extras(self, conn: Connection) -> None:
+        """Parse extra fields from the connection into instance fields."""
+        extra_options = conn.extra_dejson
+        if "key_file" in extra_options and self.key_file == "":
+            self.key_file = extra_options["key_file"]
+        if "known_hosts" in extra_options:
+            expanded_default = os.path.expanduser(self.default_known_hosts)
+            if self.known_hosts == expanded_default:
+                self.known_hosts = extra_options["known_hosts"]
+        if "passphrase" in extra_options or "private_key_passphrase" in extra_options:
+            self.passphrase = extra_options.get("passphrase") or extra_options.get(
+                "private_key_passphrase", ""
+            )
+        if "private_key" in extra_options:
+            self.private_key = extra_options["private_key"]
+
+        host_key = extra_options.get("host_key")
+        nhkc_raw = extra_options.get("no_host_key_check")
+        if nhkc_raw is None and "ignore_hostkey_verification" in extra_options:
+            warnings.warn(
+                "The `ignore_hostkey_verification` connection extra is deprecated; "
+                "use `no_host_key_check` instead.",
+                AirflowProviderDeprecationWarning,
+                stacklevel=2,
+            )
+            nhkc_raw = extra_options["ignore_hostkey_verification"]
+        no_host_key_check = False if nhkc_raw is None else (str(nhkc_raw).lower() == "true")
+        if self.no_host_key_check is not None:
+            no_host_key_check = self.no_host_key_check
+
+        # Validated on the effective value, so the constructor argument can resolve a connection
+        # that sets both `host_key` and `no_host_key_check` -- the same rule as `SSHHook`.
+        if host_key is not None and no_host_key_check:
+            raise ValueError("Host key check was skipped, but `host_key` value was given")
+
+        if no_host_key_check:
+            self.log.warning("No Host Key Verification. This won't protect against Man-In-The-Middle attacks")
+            self.known_hosts = "none"
+        elif host_key is not None:
+            host_key = host_key.strip()
+            host_key_parts = host_key.split()
+            if host_key_parts and host_key_parts[0] == "ssh-dss":
+                raise ValueError(
+                    "DSA/DSS host keys are not supported. Paramiko 4.0 removed DSS support; "
+                    "use an RSA, ECDSA, or Ed25519 host key and update the connection `host_key`."
+                )
+            if len(host_key_parts) >= 2:
+                host_key = " ".join(host_key_parts[:2])
+            else:
+                # A bare key is RSA, as on the sync hook; asyncssh needs the type spelled out.
+                host_key = f"ssh-rsa {host_key}"
+            self.known_hosts = f"{self.host or conn.host} {host_key}".encode()
+
+    def _should_use_known_hosts(self) -> bool:
+        """Leave a missing default file unset so AsyncSSH reports an untrusted host."""
+        if self.known_hosts == os.path.expanduser(self.default_known_hosts):
+            return os.path.isfile(self.known_hosts)
+        return True
+
+    async def _get_conn(self) -> asyncssh.SSHClientConnection:
+        """
+        Asynchronously connect to the SFTP server as an SSH client.
+
+        The following parameters are provided either in the extra json object in
+        the SFTP connection definition
+
+        - key_file
+        - known_hosts
+        - passphrase
+        """
+        conn = await get_async_connection(self.sftp_conn_id)
+        # Parsed even without extras: a constructor `no_host_key_check` still has to be applied.
+        self._parse_extras(conn)  # type: ignore[arg-type]
+
+        def _get_value(self_val, conn_val, default=None):
+            """Return the first non-None value among self, conn, default."""
+            if self_val is not None:
+                return self_val
+            if conn_val is not None:
+                return conn_val
+            return default
+
+        conn_config = {
+            "host": _get_value(self.host, conn.host),
+            "port": _get_value(self.port, conn.port, SSH_PORT),
+            "username": _get_value(self.username, conn.login),
+            "password": _get_value(self.password, conn.password),
+        }
+        if self.key_file:
+            conn_config.update(client_keys=self.key_file)
+        if self.known_hosts:
+            if self.known_hosts.lower() == "none":
+                conn_config.update(known_hosts=None)
+            elif self._should_use_known_hosts():
+                conn_config.update(known_hosts=self.known_hosts)
+        if self.private_key:
+            _private_key = asyncssh.import_private_key(self.private_key, self.passphrase)
+            conn_config["client_keys"] = [_private_key]
+        if self.passphrase:
+            conn_config.update(passphrase=self.passphrase)
+        ssh_client_conn = await asyncssh.connect(**conn_config)
+        return ssh_client_conn
+
+    @asynccontextmanager
+    async def get_managed_conn(self) -> AsyncGenerator[asyncssh.SFTPClient]:
+        """
+        Context manager sharing one SSH connection and SFTP client across nested uses.
+
+        The connection is opened on the first entry, reused by any entry made while it is
+        still open, and closed when the last user exits, mirroring :meth:`SFTPHook.get_managed_conn`.
+        Hook methods are wrapped in it, so wrapping several calls in this context manager makes
+        them run over a single connection.
+        """
+        async with self._conn_lock:
+            if self.conn is None:
+                stack = AsyncExitStack()
+                try:
+                    ssh_conn = await stack.enter_async_context(await self._get_conn())
+                    self.conn = await stack.enter_async_context(ssh_conn.start_sftp_client())
+                except BaseException:
+                    await stack.aclose()
+                    raise
+                self._conn_stack = stack
+            self._conn_count += 1
+            sftp = self.conn
+        try:
+            yield sftp
+        finally:
+            self._conn_count -= 1
+            if self._conn_count == 0:
+                open_stack, self._conn_stack, self.conn = self._conn_stack, None, None
+                if open_stack is not None:
+                    await open_stack.aclose()
+
+    def get_conn_count(self) -> int:
+        """Get the number of users currently sharing the open connection."""
+        return self._conn_count
+
+    def _get_open_conn(self) -> asyncssh.SFTPClient:
+        if self.conn is None:
+            raise ConnectionNotOpenedException(
+                "Connection not open, use `async with hook.get_managed_conn()` to open it first."
+            )
+        return self.conn
+
+    @handle_connection_management
+    async def retrieve_file(
+        self,
+        remote_full_path: str,
+        local_full_path: str | os.PathLike[str] | IO[bytes],
+        chunk_size: int = CHUNK_SIZE,
+        prefetch: bool = True,
+    ) -> None:
+        """
+        Transfer the remote file to a local location asynchronously.
+
+        If local_full_path is a string or PathLike path, the file will be put at that location.
+        If it is a BytesIO or other binary file-like object, the file will be streamed into it.
+
+        :param remote_full_path: Full path to the remote file.
+        :param local_full_path: Full path to the local file or a binary file-like buffer.
+        :param chunk_size: Size of chunks to read at a time (default: 64KB).
+        :param prefetch: Whether to allow read-ahead requests to be sent concurrently (default: True). When
+            ``False``, only one request is kept in flight at a time, mirroring
+            :meth:`SFTPHook.retrieve_file`'s ``prefetch`` semantics.
+        """
+        sftp = self._get_open_conn()
+        if isinstance(local_full_path, (str, os.PathLike)):
+            get_kwargs: dict[str, Any] = {"block_size": chunk_size}
+            if not prefetch:
+                get_kwargs["max_requests"] = 1
+            await sftp.get(remote_full_path, os.fspath(local_full_path), **get_kwargs)
+            return
+
+        async with sftp.open(remote_full_path, "rb") as remote_file:
+            while True:
+                chunk = await remote_file.read(chunk_size)
+                if not chunk:
+                    break
+                local_full_path.write(cast("bytes", chunk))
+            if hasattr(local_full_path, "seek"):
+                local_full_path.seek(0)
+
+    @handle_connection_management
+    async def store_file(
+        self,
+        remote_full_path: str,
+        local_full_path: str | os.PathLike[str] | IO[bytes],
+        confirm: bool = True,
+    ) -> None:
+        """
+        Transfer a local file to the remote location.
+
+        If ``local_full_path`` is a path, the file will be read from that location.
+        If it is a binary file-like object, the content will be uploaded from the stream.
+        Raw ``bytes`` values are not accepted directly; wrap bytes in ``BytesIO``.
+
+        Parent directories for ``remote_full_path`` are created when missing.
+
+        :param remote_full_path: full path to the remote file
+        :param local_full_path: full path to the local file or a binary file-like buffer
+        :param confirm: whether to verify the remote file size matches the local size after
+            upload (default: True), mirroring :meth:`SFTPHook.store_file`'s ``confirm`` semantics.
+        """
+        if isinstance(local_full_path, bytes):
+            raise TypeError("Unsupported type for local_full_path: bytes. Wrap raw bytes in BytesIO.")
+
+        sftp = self._get_open_conn()
+        with suppress(asyncssh.SFTPFailure):
+            remote_path = PurePosixPath(remote_full_path)
+            await sftp.makedirs(str(remote_path.parent))
+
+        if isinstance(local_full_path, (str, os.PathLike)):
+            await sftp.put(str(local_full_path), remote_full_path)
+            uploaded_size = await asyncio.to_thread(os.path.getsize, local_full_path)
+        elif hasattr(local_full_path, "read"):
+            async with sftp.open(remote_full_path, "wb") as f:
+                stream = local_full_path
+                if hasattr(stream, "seek"):
+                    stream.seek(0)
+                data = stream.read()
+                await f.write(data)
+            uploaded_size = len(data)
+        else:
+            raise TypeError(
+                f"Unsupported type for local_full_path: {type(local_full_path)}. "
+                "Expected a binary file-like object or a path-like object."
+            )
+
+        if confirm:
+            remote_attrs = await sftp.stat(remote_full_path)
+            if remote_attrs.size != uploaded_size:
+                raise OSError(f"size mismatch in put!  {remote_attrs.size} != {uploaded_size}")
+
+    @handle_connection_management
+    async def mkdir(self, path: str) -> None:
+        """
+        Create a directory on the remote system asynchronously.
+
+        The default permissions are determined by the server. Parent directories are created as needed.
+
+        :param path: Full path to the remote directory to create.
+        """
+        await self._get_open_conn().makedirs(path)
+
+    @handle_connection_management
+    async def list_directory(self, path: str = "", recursive: bool = False) -> list[str] | None:
+        """
+        List files in a directory on the remote system asynchronously.
+
+        Lists one-level entry names under the given directory path.
+
+        If ``recursive=True``, returns files recursively as paths relative to ``path``.
+
+        :param path: Full path to the remote directory to list.
+        :param recursive: Whether to recursively list descendants.
+        :return: List of entry names found under the directory, or None if the directory does not exist.
+        """
+        if recursive:
+            files: list[str] = []
+
+            def append_relative(item: str) -> None:
+                files.append(posixpath.relpath(item, path))
+
+            try:
+                await self.walktree(
+                    path=path,
+                    fcallback=append_relative,
+                    dcallback=lambda _: None,
+                    ucallback=lambda _: None,
+                )
+            except asyncssh.SFTPNoSuchFile:
+                return None
+            return sorted(files)
+
+        try:
+            entries = await self._get_open_conn().readdir(path)
+        except asyncssh.SFTPNoSuchFile:
+            return None
+        return sorted(os.fsdecode(entry.filename) for entry in entries)
+
+    @handle_connection_management
+    async def walktree(
+        self,
+        path: str,
+        fcallback: Callable[[str], Any | None],
+        dcallback: Callable[[str], Any | None],
+        ucallback: Callable[[str], Any | None],
+        recurse: bool = True,
+    ) -> None:
+        """
+        Recursively descend, depth first, the directory tree at ``path``.
+
+        This mirrors :meth:`SFTPHook.walktree` contract and calls callback functions for
+        regular files, directories, and unknown file types.
+        """
+        sftp = self._get_open_conn()
+        visited_dirs: set[str] = set()
+
+        async def _canonical_dir(dir_path: str) -> str:
+            with suppress(asyncssh.SFTPError):
+                return os.fsdecode(await sftp.realpath(dir_path))
+            return posixpath.normpath(dir_path)
+
+        async def _walk(dir_path: str) -> None:
+            canonical_dir = await _canonical_dir(dir_path)
+            if canonical_dir in visited_dirs:
+                return
+            visited_dirs.add(canonical_dir)
+
+            try:
+                entries = await sftp.readdir(dir_path)
+            except asyncssh.SFTPNoSuchFile:
+                # Directory may disappear mid-walk on busy drops; skip and continue.
+                return
+
+            for entry in sorted(entries, key=lambda file: os.fsdecode(file.filename)):
+                filename = os.fsdecode(entry.filename)
+                if filename in {".", ".."}:
+                    continue
+
+                pathname = posixpath.join(dir_path, filename)
+                permissions = entry.attrs.permissions
+
+                if permissions is not None and stat.S_ISDIR(permissions):
+                    dcallback(pathname)
+                    if recurse:
+                        await _walk(pathname)
+                elif permissions is not None and stat.S_ISREG(permissions):
+                    fcallback(pathname)
+                else:
+                    ucallback(pathname)
+
+        await _walk(path)
+
+    @handle_connection_management
+    async def read_directory(self, path: str = "") -> Sequence[asyncssh.sftp.SFTPName] | None:
+        """Return a list of files along with their attributes on the SFTP server at the provided path."""
+        try:
+            return await self._get_open_conn().readdir(path)
+        except asyncssh.SFTPNoSuchFile:
+            return None
+
+    async def get_files_and_attrs_by_pattern(
+        self, path: str = "", fnmatch_pattern: str = ""
+    ) -> Sequence[asyncssh.sftp.SFTPName]:
+        """
+        Get the files along with their attributes matching the pattern (e.g. ``*.pdf``) at the provided path.
+
+        if one exists. Otherwise, raises an AirflowException to be handled upstream for deferring
+        """
+        files_list = await self.read_directory(path)
+        if files_list is None:
+            raise FileNotFoundError(f"No files at path {path!r} found...")
+        matched_files = [file for file in files_list if fnmatch(str(file.filename), fnmatch_pattern)]
+        return matched_files
+
+    @handle_connection_management
+    async def get_mod_time(self, path: str) -> str:
+        """
+        Make SFTP async connection.
+
+        Looks for last modified time in the specific file path and returns last modification time for
+         the file path.
+
+        :param path: full path to the remote file
+        """
+        try:
+            ftp_mdtm = await self._get_open_conn().stat(path)
+        except asyncssh.SFTPNoSuchFile:
+            raise AirflowException("No files matching")
+        modified_time = ftp_mdtm.mtime
+        mod_time = datetime.datetime.fromtimestamp(modified_time).strftime("%Y%m%d%H%M%S")  # type: ignore[arg-type]
+        self.log.info("Found File %s last modified: %s", str(path), str(mod_time))
+        return mod_time
+
+    async def sense_files_by_pattern(
+        self,
+        path: str,
+        fnmatch_pattern: str,
+        newer_than: datetime.datetime | None = None,
+    ) -> list[str]:
+        """
+        Return the names of files at ``path`` matching ``fnmatch_pattern``.
+
+        If ``newer_than`` is provided, only files modified after that timestamp are returned; files
+        without a reported modification time are skipped in that case.
+
+        :param path: directory on the SFTP server to search for files matching the pattern
+        :param fnmatch_pattern: pattern used to match filenames, see the ``fnmatch`` std library module
+        :param newer_than: if provided, only files modified after this UTC timestamp are returned
+        """
+        files = await self.get_files_and_attrs_by_pattern(path=path, fnmatch_pattern=fnmatch_pattern)
+        if not newer_than:
+            return [str(file.filename) for file in files]
+
+        matched_files = []
+        for file in files:
+            if file.attrs.mtime is None:
+                continue
+            if newer_than <= self._mod_time_to_utc(file.attrs.mtime):
+                matched_files.append(str(file.filename))
+        return matched_files
+
+    async def sense_path(self, path: str, newer_than: datetime.datetime | None = None) -> bool:
+        """
+        Return whether ``path`` exists and, if ``newer_than`` is provided, was modified since.
+
+        :param path: full path to the remote file
+        :param newer_than: if provided, the file must have been modified after this UTC timestamp
+        """
+        mod_time = await self.get_mod_time(path)
+        if not newer_than:
+            return True
+        return newer_than <= self._mod_time_to_utc(mod_time)
+
+    @staticmethod
+    def _mod_time_to_utc(mod_time: int | float | str) -> datetime.datetime:
+        """Convert a modification time, either an epoch timestamp or ``%Y%m%d%H%M%S`` string, to UTC."""
+        if not isinstance(mod_time, str):
+            mod_time = datetime.datetime.fromtimestamp(float(mod_time)).strftime("%Y%m%d%H%M%S")
+        return timezone.convert_to_utc(datetime.datetime.strptime(mod_time, "%Y%m%d%H%M%S"))
+
+    @handle_connection_management
+    async def isdir(self, path: str) -> bool:
+        """
+        Check if the path provided is a directory.
+
+        :param path: full path to the remote directory to check
+        """
+        try:
+            attrs = await self._get_open_conn().stat(path)
+        except asyncssh.SFTPNoSuchFile:
+            return False
+        return attrs.permissions is not None and stat.S_ISDIR(attrs.permissions)
+
+    @handle_connection_management
+    async def path_exists(self, path: str) -> bool:
+        """
+        Whether a remote entity exists.
+
+        :param path: full path to the remote file or directory
+        """
+        try:
+            await self._get_open_conn().stat(path)
+        except asyncssh.SFTPNoSuchFile:
+            return False
+        return True
+
+    @handle_connection_management
+    async def create_directory(self, path: str) -> None:
+        """
+        Create a directory (and any missing parents) on the remote system asynchronously.
+
+        Returns silently if the target directory already exists, mirroring
+        :meth:`SFTPHook.create_directory`.
+
+        :param path: full path to the remote directory to create
+        """
+        await self._get_open_conn().makedirs(path, exist_ok=True)
+
+    @handle_connection_management
+    async def delete_file(self, path: str) -> None:
+        """
+        Remove a file on the server asynchronously.
+
+        :param path: full path to the remote file
+        """
+        await self._get_open_conn().unlink(path)
+
+    @handle_connection_management
+    async def delete_directory(self, path: str, include_files: bool = False) -> None:
+        """
+        Delete a directory on the remote system asynchronously.
+
+        :param path: full path to the remote directory to delete
+        :param include_files: whether to recursively delete the directory's contents first
+        """
+        files: list[str] = []
+        dirs: list[str] = []
+
+        if include_files:
+            files, dirs, _ = await self.get_tree_map(path)
+            dirs = dirs[::-1]  # reverse the order for deleting deepest directories first
+
+        sftp = self._get_open_conn()
+        for file_path in files:
+            await sftp.remove(file_path)
+        for dir_path in dirs:
+            await sftp.rmdir(dir_path)
+        await sftp.rmdir(path)
+
+    @handle_connection_management
+    async def get_tree_map(
+        self, path: str, prefix: str | None = None, delimiter: str | None = None
+    ) -> tuple[list[str], list[str], list[str]]:
+        """
+        Get tuple with recursive lists of files, directories and unknown paths asynchronously.
+
+        It is possible to filter results by giving prefix and/or delimiter parameters.
+
+        :param path: path from which tree will be built
+        :param prefix: if set paths will be added if start with prefix
+        :param delimiter: if set paths will be added if end with delimiter
+        :return: tuple with list of files, dirs and unknown items
+        """
+        files: list[str] = []
+        dirs: list[str] = []
+        unknowns: list[str] = []
+
+        def append_matching_path_callback(list_: list[str]) -> Callable:
+            return lambda item: (
+                list_.append(item) if SFTPHook._is_path_match(item, prefix, delimiter) else None
+            )
+
+        await self.walktree(
+            path=path,
+            fcallback=append_matching_path_callback(files),
+            dcallback=append_matching_path_callback(dirs),
+            ucallback=append_matching_path_callback(unknowns),
+            recurse=True,
+        )
+
+        return files, dirs, unknowns
+
+    @handle_connection_management
+    async def retrieve_directory(
+        self, remote_full_path: str, local_full_path: str, prefetch: bool = True
+    ) -> None:
+        """
+        Transfer the remote directory to a local location asynchronously.
+
+        The whole tree is walked and downloaded over a single connection.
+
+        :param remote_full_path: full path to the remote directory
+        :param local_full_path: full path to the local directory
+        :param prefetch: whether read-ahead requests are sent concurrently (default: True)
+        """
+        if await asyncio.to_thread(Path(local_full_path).exists):
+            raise FileExistsError(f"{local_full_path} already exists")
+        dest = await asyncio.to_thread(Path(local_full_path).resolve)
+        await asyncio.to_thread(dest.mkdir, parents=True)
+        files, dirs, _ = await self.get_tree_map(remote_full_path)
+        remote_base = PurePosixPath(remote_full_path)
+        for dir_path in dirs:
+            relative_path = PurePosixPath(dir_path).relative_to(remote_base)
+            new_local_path = str(dest / relative_path)
+            SFTPHook._validate_within_directory(str(dest), new_local_path)
+            await asyncio.to_thread(Path(new_local_path).mkdir, parents=True, exist_ok=True)
+        for file_path in files:
+            relative_path = PurePosixPath(file_path).relative_to(remote_base)
+            new_local_path = str(dest / relative_path)
+            SFTPHook._validate_within_directory(str(dest), new_local_path)
+            await self.retrieve_file(file_path, new_local_path, prefetch=prefetch)
+
+    @handle_connection_management
+    async def store_directory(
+        self, remote_full_path: str, local_full_path: str, confirm: bool = True
+    ) -> None:
+        """
+        Transfer a local directory to the remote location asynchronously.
+
+        The whole tree is created and uploaded over a single connection.
+
+        :param remote_full_path: full path to the remote directory
+        :param local_full_path: full path to the local directory
+        :param confirm: whether to verify each uploaded file's size (default: True)
+        """
+        if await self.path_exists(remote_full_path):
+            raise FileExistsError(f"{remote_full_path} already exists")
+        await self.create_directory(remote_full_path)
+        entries = await asyncio.to_thread(lambda: list(os.walk(local_full_path)))
+        local_base = Path(local_full_path)
+        for root, dirs, files in entries:
+            for dir_name in dirs:
+                dir_path = Path(root) / dir_name
+                relative_path = dir_path.relative_to(local_base).as_posix()
+                await self.create_directory(str(PurePosixPath(remote_full_path) / relative_path))
+            for file_name in files:
+                file_path = Path(root) / file_name
+                relative_path = file_path.relative_to(local_base).as_posix()
+                new_remote_path = str(PurePosixPath(remote_full_path) / relative_path)
+                await self.store_file(new_remote_path, str(file_path), confirm=confirm)
+
+    @handle_connection_management
+    async def transfer(
+        self,
+        operation: str,
+        local_filepath: str | list[str] | None,
+        remote_filepath: str | list[str],
+        confirm: bool = True,
+        create_intermediate_dirs: bool = False,
+        concurrency: int = 1,
+        prefetch: bool = True,
+    ) -> None:
+        """
+        Perform an SFTP transfer operation (GET, PUT, or DELETE) using native async I/O.
+
+        Mirrors :meth:`SFTPHook.transfer`, including directory transfers, missing-file
+        deletes, and the ``confirm``/``prefetch`` options, so ``deferrable=True`` behaves
+        the same as the synchronous path. The whole call runs over a single connection and
+        ``concurrency`` bounds how many top-level paths are in flight on it at once; files
+        inside a directory are transferred sequentially. The synchronous path differs there:
+        it opens one connection per worker and transfers directory contents concurrently.
+        """
+        if isinstance(local_filepath, str):
+            local_filepath_array = [local_filepath] if local_filepath else []
+        else:
+            local_filepath_array = local_filepath or []
+
+        if isinstance(remote_filepath, str):
+            remote_filepath_array = [remote_filepath]
+        else:
+            remote_filepath_array = list(remote_filepath)
+
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def _bounded(coro):
+            async with semaphore:
+                return await coro
+
+        if operation.lower() == SFTPOperation.GET:
+
+            async def _get(local: str, remote: str):
+                if create_intermediate_dirs:
+                    await asyncio.to_thread(Path(os.path.dirname(local)).mkdir, parents=True, exist_ok=True)
+                if await self.isdir(remote):
+                    await self.retrieve_directory(remote, local, prefetch=prefetch)
+                else:
+                    await self.retrieve_file(remote, local, prefetch=prefetch)
+
+            tasks = [
+                asyncio.create_task(_bounded(_get(local, remote)))
+                for local, remote in zip(local_filepath_array, remote_filepath_array)
+            ]
+            await asyncio.gather(*tasks)
+        elif operation.lower() == SFTPOperation.PUT:
+
+            async def _put(local: str, remote: str):
+                if create_intermediate_dirs:
+                    await self.create_directory(os.path.dirname(remote))
+                if await asyncio.to_thread(os.path.isdir, local):
+                    await self.store_directory(remote, local, confirm=confirm)
+                else:
+                    await self.store_file(remote, local, confirm=confirm)
+
+            tasks = [
+                asyncio.create_task(_bounded(_put(local, remote)))
+                for local, remote in zip(local_filepath_array, remote_filepath_array)
+            ]
+            await asyncio.gather(*tasks)
+        elif operation.lower() == SFTPOperation.DELETE:
+
+            async def _delete(remote: str):
+                if await self.isdir(remote):
+                    await self.delete_directory(remote, include_files=True)
+                else:
+                    try:
+                        await self.delete_file(remote)
+                    except asyncssh.SFTPNoSuchFile:
+                        self.log.warning("Remote file %s does not exist. Skipping delete.", remote)
+
+            tasks = [asyncio.create_task(_bounded(_delete(remote))) for remote in remote_filepath_array]
+            await asyncio.gather(*tasks)

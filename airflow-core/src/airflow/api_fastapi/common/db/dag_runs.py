@@ -1,0 +1,137 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+from __future__ import annotations
+
+from collections import defaultdict
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
+from uuid import UUID
+
+from sqlalchemy import func, select, tuple_
+from sqlalchemy.orm import joinedload
+from sqlalchemy.orm.interfaces import LoaderOption
+
+from airflow.api_fastapi.common.db.dags import eager_load_teams
+from airflow.models.dag import DagModel
+from airflow.models.dag_version import DagVersion
+from airflow.models.dagrun import DagRun
+from airflow.models.taskinstance import TaskInstance
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
+
+# Use the hybrid_property for dag_display_name so the CASE WHEN fallback to dag_id
+# is applied when dag_display_name is NULL.  Using __table__.c would return raw NULLs
+# and crash DagStatsResponse validation (https://github.com/apache/airflow/issues/64247).
+dagruns_select_with_state_count = (
+    select(  # type: ignore[call-overload]
+        DagRun.__table__.c.dag_id,
+        DagRun.__table__.c.state,
+        DagModel.dag_display_name,
+        func.count(DagRun.__table__.c.state).label("count"),
+    )
+    .join(DagModel, DagRun.__table__.c.dag_id == DagModel.__table__.c.dag_id)
+    .group_by(DagRun.__table__.c.dag_id, DagRun.__table__.c.state, DagModel.dag_display_name)
+    .order_by(DagRun.__table__.c.dag_id)
+)
+
+
+def eager_load_dag_run_for_list() -> tuple[LoaderOption, ...]:
+    """
+    Lightweight eager loading for the DagRun list endpoint.
+
+    Only loads the direct relationships needed for serialization (dag_model,
+    dag_run_note, created_dag_version, and the owning team).  The dag_versions
+    property — which requires iterating every attempt — is populated separately by
+    :func:`attach_dag_versions_to_runs` using a single DISTINCT query.
+    """
+    return (
+        joinedload(DagRun.dag_model),
+        joinedload(DagRun.dag_run_note),
+        joinedload(DagRun.created_dag_version).joinedload(DagVersion.bundle),
+        *eager_load_teams(DagRun.dag_model),
+    )
+
+
+def attach_dag_versions_to_runs(dag_runs: Sequence[DagRun], *, session: Session) -> None:
+    """
+    Prefetch distinct dag_version_ids for each DagRun via a lightweight query.
+
+    Instead of loading all attempt rows (potentially thousands per run)
+    through the ORM relationship just to extract distinct dag_version_ids,
+    this issues a single query that returns only the distinct
+    (dag_id, run_id, dag_version_id) tuples for the given runs.
+
+    The result is attached to each DagRun as ``_prefetched_dag_version_ids``
+    (a dict mapping version_id -> DagVersion), which the ``dag_versions``
+    property reads as an optimized substitute for traversing attempt
+    relationships.  All business logic (bundle_version shortcut, sorting,
+    deduplication) remains solely in ``DagRun.dag_versions``.
+    """
+    if not dag_runs:
+        return
+
+    # Only runs without a bundle_version need attempt traversal;
+    # runs with bundle_version use created_dag_version directly
+    # (handled by the dag_versions property).
+    runs_needing_versions = [dr for dr in dag_runs if not dr.bundle_version]
+    if not runs_needing_versions:
+        return
+
+    run_key_values = [(dr.dag_id, dr.run_id) for dr in runs_needing_versions]
+
+    rows = session.execute(
+        select(
+            TaskInstance.dag_id,
+            TaskInstance.run_id,
+            TaskInstance.dag_version_id.label("dag_version_id"),
+        )
+        .where(
+            TaskInstance.dag_version_id.is_not(None),
+            tuple_(TaskInstance.dag_id, TaskInstance.run_id).in_(run_key_values),
+        )
+        .distinct()
+    ).all()
+
+    all_version_ids = {r.dag_version_id for r in rows}
+    versions_by_id: dict[UUID, DagVersion] = {}
+    if all_version_ids:
+        dv_query = (
+            select(DagVersion)
+            .where(DagVersion.id.in_(all_version_ids))
+            .options(joinedload(DagVersion.bundle))
+        )
+        versions_by_id = {dv.id: dv for dv in session.scalars(dv_query)}
+
+    versions_per_run: dict[tuple[str, str], dict[UUID, DagVersion]] = defaultdict(dict)
+    for row in rows:
+        dv = versions_by_id.get(row.dag_version_id)
+        if dv:
+            versions_per_run[(row.dag_id, row.run_id)][dv.id] = dv
+
+    for dr in runs_needing_versions:
+        dr._prefetched_dag_version_ids = versions_per_run.get((dr.dag_id, dr.run_id), {})
+
+
+def is_filtered_existing_run(dag_id: str, run_id: str, *, has_filter: bool, session: Session) -> bool:
+    """Return whether an active filter can produce an empty result for this run."""
+    return (
+        has_filter
+        and session.scalar(select(DagRun.run_id).where(DagRun.dag_id == dag_id, DagRun.run_id == run_id))
+        is not None
+    )

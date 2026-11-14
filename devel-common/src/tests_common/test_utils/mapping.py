@@ -1,0 +1,115 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from sqlalchemy import select
+
+from airflow.models.taskinstance import TaskInstance
+from airflow.models.xcom import XCOM_RETURN_KEY, XComModel
+
+from tests_common.test_utils.version_compat import AIRFLOW_V_3_4_PLUS
+
+if TYPE_CHECKING:
+    from collections.abc import Collection, Sequence
+
+    from sqlalchemy.orm import Session
+
+    from airflow.serialization.definitions.mappedoperator import Operator
+
+
+def push_mapped_length(ti: TaskInstance, value: Collection, *, session: Session) -> None:
+    """Record ``value`` as ``ti``'s return value, usable as an expansion input."""
+    # A dict must keep its shape: expansion hands a mapped task the ``(key, value)`` tuple.
+    stored = value if isinstance(value, (list, dict)) else list(value)
+    if AIRFLOW_V_3_4_PLUS:
+        XComModel.set(
+            key=XCOM_RETURN_KEY,
+            value=stored,
+            dag_id=ti.dag_id,
+            task_id=ti.task_id,
+            run_id=ti.run_id,
+            map_index=ti.map_index,
+            mapped_length=len(value),
+            session=session,
+        )
+        return
+
+    # Local import: the module is gone from 3.4 on.
+    from airflow.models.taskmap import TaskMap
+
+    XComModel.set(
+        key=XCOM_RETURN_KEY,
+        value=stored,
+        dag_id=ti.dag_id,
+        task_id=ti.task_id,
+        run_id=ti.run_id,
+        map_index=ti.map_index,
+        session=session,
+    )
+    session.add(
+        TaskMap(
+            dag_id=ti.dag_id,
+            task_id=ti.task_id,
+            run_id=ti.run_id,
+            map_index=ti.map_index,
+            length=len(value),
+            keys=None,
+        )
+    )
+    session.flush()
+
+
+def expand_mapped_task_instances(
+    mapped: Operator,
+    run_id: str,
+    *,
+    session: Session,
+) -> tuple[Sequence[TaskInstance], int]:
+    # -1 sorts first, so this picks the unmapped TI where a test still has one.
+    query = (
+        select(TaskInstance)
+        .where(
+            TaskInstance.dag_id == mapped.dag_id,
+            TaskInstance.task_id == mapped.task_id,
+            TaskInstance.run_id == run_id,
+        )
+        .order_by(TaskInstance.map_index)
+        .limit(1)
+    )
+    ti = session.scalars(query).one()
+    ti.task = mapped
+    return ti.expand_mapped_task(session=session)
+
+
+def expand_mapped_task(
+    mapped: Operator,
+    run_id: str,
+    upstream_task_id: str,
+    length: int,
+    session: Session,
+):
+    query = select(TaskInstance).where(
+        TaskInstance.dag_id == mapped.dag_id,
+        TaskInstance.task_id == upstream_task_id,
+        TaskInstance.run_id == run_id,
+        TaskInstance.map_index == -1,
+    )
+    upstream_ti = session.scalars(query).one()
+    push_mapped_length(upstream_ti, list(range(length)), session=session)
+    expand_mapped_task_instances(mapped, run_id, session=session)

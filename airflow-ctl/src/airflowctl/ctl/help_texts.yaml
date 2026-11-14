@@ -1,0 +1,131 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+---
+assets:
+  get: "Retrieve an asset by its ID"
+  get-alias: "Retrieve an asset alias by its ID"
+  list: "List all assets"
+  list-aliases: "List all asset aliases"
+  create-event: "Create an event for a given asset"
+  materialize: "Trigger materialization of an asset by its ID"
+  get-queued-events: "List queued events for a given asset"
+  get-dag-queued-events: "List queued asset events for a given Dag"
+  get-dag-queued-event: "Retrieve a specific queued asset event for a given Dag and asset"
+  delete-queued-events: "Delete all queued events for a given asset"
+  delete-dag-queued-events: "Delete all queued asset events for a given Dag"
+  delete-queued-event: "Delete a specific queued asset event for a given Dag and asset"
+  list-state-store: "List all state store entries for an asset"
+  get-state-store: "Retrieve a single asset state store entry by its ID and key"
+  set-state-store: "Set an asset state store value. Parsed as JSON if valid, otherwise stored as a string"
+  delete-state-store: "Delete a single asset state store key by its ID and key"
+  clear-state-store: "Delete all state store keys for an asset by its ID"
+
+backfill:
+  create: "Create a backfill job for a given Dag ID and date range"
+  create-dry-run: "Preview a backfill job without executing it"
+  get: "Retrieve details of a backfill job by its ID"
+  list: "List all backfill jobs for a given Dag"
+  pause: "Pause an active backfill job"
+  unpause: "Resume a paused backfill job"
+  cancel: "Cancel a backfill job"
+
+config:
+  get: "Retrieve the value of a specific configuration option"
+  list: "List all configuration sections and their options"
+
+connections:
+  get: "Retrieve a connection by its ID"
+  list: "List all configured connections"
+  create: "Create a new connection"
+  create-defaults: "Populate default connections for installed providers"
+  delete: "Delete a connection by its ID"
+  update: "Update an existing connection"
+  test: "Test connectivity for a given connection"
+
+dags:
+  clear: "Clear task instances for Dag runs selected by run ID, partition key, or partition date"
+  get: "Retrieve a Dag by its ID"
+  get-details: "Retrieve detailed information for a Dag"
+  get-tags: "List all tags used across Dags"
+  list: "List all Dags"
+  update: "Update properties of a Dag"
+  delete: "Delete a Dag by its ID"
+  get-import-error: "Retrieve a Dag import error by its ID"
+  list-import-errors: "List all Dag import errors"
+  get-stats: "Retrieve run statistics for one or more Dags"
+  get-version: "Retrieve a specific version of a Dag"
+  list-version: "List all versions of a Dag"
+  list-warning: "List all Dag warnings"
+  state: "Get the status of a Dag run"
+  trigger: "Trigger a new Dag run"
+
+dagrun:
+  get: "Retrieve a Dag run by Dag ID and run ID"
+  list: "List Dag runs, optionally filtered by state and date range"
+  delete: "Delete a Dag run by Dag ID and run ID"
+
+jobs:
+  list: "List scheduler, triggerer, and other Airflow jobs"
+
+pools:
+  get: "Retrieve a pool by its name"
+  list: "List all pools"
+  create: "Create a new pool"
+  delete: "Delete a pool by its name"
+  update: "Update an existing pool"
+
+providers:
+  get: "Retrieve an installed provider by its package name"
+  list: "List all installed Airflow providers"
+
+taskinstances:
+  list: "List all task instances for a given Dag run"
+  get: "Get a task instance for a given Dag run"
+  get-dependencies: "Get unmet scheduler dependencies for a task instance"
+  logs: "Get the logs of a task instance for a given try number"
+  # state-store is the nested subcommand group. The *-state-store keys stay because
+  # help is still looked up by the operation method name, not the CLI path.
+  state-store: "Manage the state store of a task instance"
+  list-state-store: "List all state store entries for a task instance"
+  get-state-store: "Retrieve a single task state store entry by its key"
+  set-state-store: "Set a task state store value. Parsed as JSON if valid, otherwise stored as a string"
+  update-state-store: "Update an existing key's value. Parsed as JSON if valid, otherwise stored as a string"
+  delete-state-store: "Delete a single task state store key by its key"
+  clear-state-store: "Delete all state store keys for a task instance"
+
+tasks:
+  get: "Retrieve a task for a Dag by its ID and task ID"
+  list: "List tasks for a Dag"
+  clear: "Clear task instances of a Dag by its ID"
+
+variables:
+  get: "Retrieve a variable by its key"
+  list: "List all variables"
+  create: "Create a new variable"
+  delete: "Delete a variable by its key"
+  update: "Update an existing variable"
+
+xcom:
+  get: "Retrieve an XCom entry for a specific task instance"
+  list: "List XCom entries for a specific task instance"
+  add: "Add a new XCom entry for a specific task instance"
+  edit: "Update an existing XCom entry for a specific task instance"
+  delete: "Delete an XCom entry for a specific task instance"
+
+plugins:
+  list: "List all installed Airflow plugins"
+  list-import-errors: "List all plugin import errors"

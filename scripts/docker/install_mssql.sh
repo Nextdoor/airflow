@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -15,14 +16,16 @@
 # specific language governing permissions and limitations
 # under the License.
 # shellcheck shell=bash
+# shellcheck source=scripts/docker/common.sh
+. "$( dirname "${BASH_SOURCE[0]}" )/common.sh"
+
 set -euo pipefail
+
+common::get_colors
+declare -a packages
 
 : "${INSTALL_MSSQL_CLIENT:?Should be true or false}"
 
-COLOR_BLUE=$'\e[34m'
-readonly COLOR_BLUE
-COLOR_RESET=$'\e[0m'
-readonly COLOR_RESET
 
 function install_mssql_client() {
     # Install MsSQL client from Microsoft repositories
@@ -32,23 +35,26 @@ function install_mssql_client() {
         echo
         return
     fi
+    packages=("msodbcsql18")
+
+    common::import_trusted_gpg "EB3E94ADBE1229CF" "microsoft"
+    # The Debian 13 repository is signed with Microsoft's newer key, the older releases with the one above.
+    common::import_trusted_gpg "EE4D7792F748182B" "microsoft-2025"
+
     echo
     echo "${COLOR_BLUE}Installing mssql client${COLOR_RESET}"
     echo
-    local distro
-    local version
-    distro=$(lsb_release -is | tr '[:upper:]' '[:lower:]')
-    version=$(lsb_release -rs)
-    local driver=msodbcsql18
-    curl --silent https://packages.microsoft.com/keys/microsoft.asc | apt-key add - >/dev/null 2>&1
-    curl --silent "https://packages.microsoft.com/config/${distro}/${version}/prod.list" > \
-        /etc/apt/sources.list.d/mssql-release.list
-    apt-get update -yqq
-    apt-get upgrade -yqq
-    ACCEPT_EULA=Y apt-get -yqq install -y --no-install-recommends "${driver}"
+
+    echo "deb [arch=amd64,arm64] https://packages.microsoft.com/debian/$(common::debian_release)/prod $(common::debian_codename) main" > \
+        /etc/apt/sources.list.d/mssql-release.list &&
+    mkdir -p /opt/microsoft/msodbcsql18 &&
+    touch /opt/microsoft/msodbcsql18/ACCEPT_EULA &&
+    apt-get update -yqq &&
+    apt-get upgrade -yqq &&
+    apt-get -yqq install --no-install-recommends "${packages[@]}" &&
+    apt-get autoremove -yqq --purge &&
+    apt-get clean &&
     rm -rf /var/lib/apt/lists/*
-    apt-get autoremove -yqq --purge
-    apt-get clean && rm -rf /var/lib/apt/lists/*
 }
 
 install_mssql_client "${@}"

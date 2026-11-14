@@ -15,10 +15,15 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-if [[ ${VERBOSE_COMMANDS:="false"} == "true" ]]; then
-    set -x
-fi
+function set_verbose() {
+    if [[ ${VERBOSE_COMMANDS:="false"} == "true" ]]; then
+        set -x
+    else
+        set +x
+    fi
+}
 
+set_verbose
 # shellcheck source=scripts/in_container/_in_container_script_init.sh
 . "${AIRFLOW_SOURCES:-/opt/airflow}"/scripts/in_container/_in_container_script_init.sh
 
@@ -39,180 +44,115 @@ chmod 1777 /tmp
 
 AIRFLOW_SOURCES=$(cd "${IN_CONTAINER_DIR}/../.." || exit 1; pwd)
 
-PYTHON_MAJOR_MINOR_VERSION=${PYTHON_MAJOR_MINOR_VERSION:=3.7}
+PYTHON_MAJOR_MINOR_VERSION=${PYTHON_MAJOR_MINOR_VERSION:=3.11}
 
 export AIRFLOW_HOME=${AIRFLOW_HOME:=${HOME}}
 
-: "${AIRFLOW_SOURCES:?"ERROR: AIRFLOW_SOURCES not set !!!!"}"
+# Create folder where sqlite database file will be stored if it does not exist (which happens when
+# scripts are running rather than breeze shell)
+mkdir "${AIRFLOW_HOME}/sqlite" -p || true
 
+ASSET_COMPILATION_WAIT_MULTIPLIER=${ASSET_COMPILATION_WAIT_MULTIPLIER:=1}
+
+if [[ "${CI=}" == "true" ]]; then
+    export COLUMNS="202"
+fi
+
+# shellcheck disable=SC1091
+. "${IN_CONTAINER_DIR}/check_connectivity.sh"
+
+# Make sure that asset compilation is completed before we proceed
 function wait_for_asset_compilation() {
-    if [[ -f "${AIRFLOW_SOURCES}/.build/www/.asset_compile.lock" ]]; then
+    if [[ -f "${AIRFLOW_SOURCES}/.build/ui/.asset_compile.lock" ]]; then
         echo
         echo "${COLOR_YELLOW}Waiting for asset compilation to complete in the background.${COLOR_RESET}"
         echo
         local counter=0
-        while [[ -f "${AIRFLOW_SOURCES}/.build/www/.asset_compile.lock" ]]; do
-            echo "${COLOR_BLUE}Still waiting .....${COLOR_RESET}"
+        while [[ -f "${AIRFLOW_SOURCES}/.build/ui/.asset_compile.lock" ]]; do
+            if (( counter % 5 == 2 )); then
+                echo "${COLOR_BLUE}Still waiting .....${COLOR_RESET}"
+            fi
             sleep 1
             ((counter=counter+1))
-            if [[ ${counter} == "30" ]]; then
+            if [[ ${counter} == 30*$ASSET_COMPILATION_WAIT_MULTIPLIER ]]; then
                 echo
                 echo "${COLOR_YELLOW}The asset compilation is taking too long.${COLOR_YELLOW}"
                 echo """
 If it does not complete soon, you might want to stop it and remove file lock:
    * press Ctrl-C
-   * run 'rm ${AIRFLOW_SOURCES}/.build/www/.asset_compile.lock'
+   * run 'rm ${AIRFLOW_SOURCES}/.build/ui/.asset_compile.lock'
 """
             fi
-            if [[ ${counter} == "60" ]]; then
+            if [[ ${counter} == 60*$ASSET_COMPILATION_WAIT_MULTIPLIER ]]; then
                 echo
                 echo "${COLOR_RED}The asset compilation is taking too long. Exiting.${COLOR_RED}"
+                echo "${COLOR_RED}refer to dev/breeze/doc/04_troubleshooting.rst for resolution steps.${COLOR_RED}"
                 echo
                 exit 1
             fi
         done
     fi
+    if [ -f "${AIRFLOW_SOURCES}/.build/ui/asset_compile.out" ]; then
+        echo
+        echo "${COLOR_RED}The asset compilation failed. Exiting.${COLOR_RESET}"
+        echo
+        cat "${AIRFLOW_SOURCES}/.build/ui/asset_compile.out"
+        rm "${AIRFLOW_SOURCES}/.build/ui/asset_compile.out"
+        echo
+        exit 1
+    fi
 }
 
-if [[ ${SKIP_ENVIRONMENT_INITIALIZATION=} != "true" ]]; then
-
-    if [[ $(uname -m) == "arm64" || $(uname -m) == "aarch64" ]]; then
-        if [[ ${BACKEND:=} == "mysql" || ${BACKEND} == "mssql" ]]; then
-            echo "${COLOR_RED}ARM platform is not supported for ${BACKEND} backend. Exiting.${COLOR_RESET}"
-            exit 1
-        fi
+# Initialize environment variables to their default values that are used for running tests and
+# interactive shell.
+function environment_initialization() {
+    if [[ ${SKIP_ENVIRONMENT_INITIALIZATION=} == "true" ]]; then
+        return
     fi
-
     echo
     echo "${COLOR_BLUE}Running Initialization. Your basic configuration is:${COLOR_RESET}"
     echo
     echo "  * ${COLOR_BLUE}Airflow home:${COLOR_RESET} ${AIRFLOW_HOME}"
     echo "  * ${COLOR_BLUE}Airflow sources:${COLOR_RESET} ${AIRFLOW_SOURCES}"
-    echo "  * ${COLOR_BLUE}Airflow core SQL connection:${COLOR_RESET} ${AIRFLOW__CORE__SQL_ALCHEMY_CONN:=}"
+    echo "  * ${COLOR_BLUE}Airflow core SQL connection:${COLOR_RESET} ${AIRFLOW__DATABASE__SQL_ALCHEMY_CONN:=}"
+    if [[ ${BACKEND=} == "postgres" ]]; then
+        echo "  * ${COLOR_BLUE}Airflow backend:${COLOR_RESET} Postgres: ${POSTGRES_VERSION}"
+    elif [[ ${BACKEND=} == "mysql" ]]; then
+        echo "  * ${COLOR_BLUE}Airflow backend:${COLOR_RESET} MySQL: ${MYSQL_VERSION}"
+    elif [[ ${BACKEND=} == "sqlite" ]]; then
+        echo "  * ${COLOR_BLUE}Airflow backend:${COLOR_RESET} Sqlite"
+    elif [[ ${BACKEND=} == "custom" ]]; then
+        local _conn_url="${AIRFLOW__DATABASE__SQL_ALCHEMY_CONN:-}"
+        local _masked_url
+        _masked_url=$(echo "${_conn_url}" | sed -E 's|://([^:]+):([^@]+)@|://\1:***@|')
+        echo "  * ${COLOR_BLUE}Airflow backend:${COLOR_RESET} Custom (${_masked_url})"
+    fi
     echo
+
+    if [[ ${STANDALONE_DAG_PROCESSOR=} == "true" ]]; then
+        echo
+        echo "${COLOR_BLUE}Forcing scheduler/standalone_dag_processor to True${COLOR_RESET}"
+        echo
+        export AIRFLOW__SCHEDULER__STANDALONE_DAG_PROCESSOR=True
+    fi
 
     RUN_TESTS=${RUN_TESTS:="false"}
     CI=${CI:="false"}
-    USE_AIRFLOW_VERSION="${USE_AIRFLOW_VERSION:=""}"
-    TEST_TIMEOUT=${TEST_TIMEOUT:="60"}
-
-    if [[ ${USE_AIRFLOW_VERSION} == "" ]]; then
-        export PYTHONPATH=${AIRFLOW_SOURCES}
-        echo
-        echo "${COLOR_BLUE}Using airflow version from current sources${COLOR_RESET}"
-        echo
-        # Cleanup the logs, tmp when entering the environment
-        sudo rm -rf "${AIRFLOW_SOURCES}"/logs/*
-        sudo rm -rf "${AIRFLOW_SOURCES}"/tmp/*
-        mkdir -p "${AIRFLOW_SOURCES}"/logs/
-        mkdir -p "${AIRFLOW_SOURCES}"/tmp/
-    elif [[ ${USE_AIRFLOW_VERSION} == "none"  ]]; then
-        echo
-        echo "${COLOR_BLUE}Skip installing airflow - only install wheel/tar.gz packages that are present locally.${COLOR_RESET}"
-        echo
-        echo
-        echo "${COLOR_BLUE}Uninstalling airflow and providers"
-        echo
-        uninstall_airflow_and_providers
-    elif [[ ${USE_AIRFLOW_VERSION} == "wheel"  ]]; then
-        echo
-        echo "${COLOR_BLUE}Uninstalling airflow and providers"
-        echo
-        uninstall_airflow_and_providers
-        if [[ ${SKIP_CONSTRAINTS,,=} == "true" ]]; then
-            echo "${COLOR_BLUE}Install airflow from wheel package with extras: '${AIRFLOW_EXTRAS}' with no constraints.${COLOR_RESET}"
-            echo
-            install_airflow_from_wheel "${AIRFLOW_EXTRAS}" "none"
-        else
-            echo "${COLOR_BLUE}Install airflow from wheel package with extras: '${AIRFLOW_EXTRAS}' and constraints reference ${AIRFLOW_CONSTRAINTS_REFERENCE}.${COLOR_RESET}"
-            echo
-            install_airflow_from_wheel "${AIRFLOW_EXTRAS}" "${AIRFLOW_CONSTRAINTS_REFERENCE}"
-        fi
-        uninstall_providers
-    elif [[ ${USE_AIRFLOW_VERSION} == "sdist"  ]]; then
-        echo
-        echo "${COLOR_BLUE}Uninstalling airflow and providers"
-        echo
-        uninstall_airflow_and_providers
-        echo
-        if [[ ${SKIP_CONSTRAINTS,,=} == "true" ]]; then
-            echo "${COLOR_BLUE}Install airflow from sdist package with extras: '${AIRFLOW_EXTRAS}' with no constraints.${COLOR_RESET}"
-            echo
-            install_airflow_from_sdist "${AIRFLOW_EXTRAS}" "none"
-        else
-            echo "${COLOR_BLUE}Install airflow from sdist package with extras: '${AIRFLOW_EXTRAS}' and constraints reference ${AIRFLOW_CONSTRAINTS_REFERENCE}.${COLOR_RESET}"
-            echo
-            install_airflow_from_sdist "${AIRFLOW_EXTRAS}" "${AIRFLOW_CONSTRAINTS_REFERENCE}"
-        fi
-        uninstall_providers
-    else
-        echo
-        echo "${COLOR_BLUE}Uninstalling airflow and providers"
-        echo
-        uninstall_airflow_and_providers
-        echo
-        if [[ ${SKIP_CONSTRAINTS,,=} == "true" ]]; then
-            echo "${COLOR_BLUE}Install released airflow from PyPI with extras: '${AIRFLOW_EXTRAS}' with no constraints.${COLOR_RESET}"
-            echo
-            install_released_airflow_version "${USE_AIRFLOW_VERSION}" "none"
-        else
-            echo "${COLOR_BLUE}Install released airflow from PyPI with extras: '${AIRFLOW_EXTRAS}' and constraints reference ${AIRFLOW_CONSTRAINTS_REFERENCE}.${COLOR_RESET}"
-            echo
-            install_released_airflow_version "${USE_AIRFLOW_VERSION}" "${AIRFLOW_CONSTRAINTS_REFERENCE}"
-        fi
-        if [[ "${USE_AIRFLOW_VERSION}" =~ ^2\.2\..*|^2\.1\..*|^2\.0\..* && "${AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=}" != "" ]]; then
-            # make sure old variable is used for older airflow versions
-            export AIRFLOW__CORE__SQL_ALCHEMY_CONN="${AIRFLOW__DATABASE__SQL_ALCHEMY_CONN}"
-        fi
-    fi
-    if [[ ${USE_PACKAGES_FROM_DIST=} == "true" ]]; then
-        echo
-        echo "${COLOR_BLUE}Install all packages from dist folder${COLOR_RESET}"
-        if [[ ${USE_AIRFLOW_VERSION} == "wheel" ]]; then
-            echo "${COLOR_BLUE}(except apache-airflow)${COLOR_RESET}"
-        fi
-        if [[ ${PACKAGE_FORMAT} == "both" ]]; then
-            echo
-            echo "${COLOR_RED}ERROR:You can only specify 'wheel' or 'sdist' as PACKAGE_FORMAT not 'both'.${COLOR_RESET}"
-            echo
-            exit 1
-        fi
-        echo
-        installable_files=()
-        for file in /dist/*.{whl,tar.gz}
-        do
-            if [[ ${USE_AIRFLOW_VERSION} == "wheel" && ${file} == "/dist/apache?airflow-[0-9]"* ]]; then
-                # Skip Apache Airflow package - it's just been installed above with extras
-                echo "Skipping ${file}"
-                continue
-            fi
-            if [[ ${PACKAGE_FORMAT} == "wheel" && ${file} == *".whl" ]]; then
-                echo "Adding ${file} to install"
-                installable_files+=( "${file}" )
-            fi
-            if [[ ${PACKAGE_FORMAT} == "sdist" && ${file} == *".tar.gz" ]]; then
-                echo "Adding ${file} to install"
-                installable_files+=( "${file}" )
-            fi
-        done
-        if (( ${#installable_files[@]} )); then
-            pip install --root-user-action ignore "${installable_files[@]}"
-        fi
-    fi
 
     # Added to have run-tests on path
-    export PATH=${PATH}:${AIRFLOW_SOURCES}
-
-    # This is now set in conftest.py - only for pytest tests
-    unset AIRFLOW__CORE__UNIT_TEST_MODE
+    export PATH=${PATH}:${AIRFLOW_SOURCES}:/usr/local/go/bin/
 
     mkdir -pv "${AIRFLOW_HOME}/logs/"
-    cp -f "${IN_CONTAINER_DIR}/airflow_ci.cfg" "${AIRFLOW_HOME}/unittests.cfg"
 
     # Change the default worker_concurrency for tests
     export AIRFLOW__CELERY__WORKER_CONCURRENCY=8
 
     set +e
+
+    # shellcheck source=scripts/in_container/configure_environment.sh
+    . "${IN_CONTAINER_DIR}/configure_environment.sh"
+    # shellcheck source=scripts/in_container/run_init_script.sh
+    . "${IN_CONTAINER_DIR}/run_init_script.sh"
 
     "${IN_CONTAINER_DIR}/check_environment.sh"
     ENVIRONMENT_EXIT_CODE=$?
@@ -223,238 +163,452 @@ if [[ ${SKIP_ENVIRONMENT_INITIALIZATION=} != "true" ]]; then
         echo
         exit ${ENVIRONMENT_EXIT_CODE}
     fi
+
     mkdir -p /usr/lib/google-cloud-sdk/bin
     touch /usr/lib/google-cloud-sdk/bin/gcloud
     ln -s -f /usr/bin/gcloud /usr/lib/google-cloud-sdk/bin/gcloud
 
-    in_container_fix_ownership
-
     if [[ ${SKIP_SSH_SETUP="false"} == "false" ]]; then
-        # Set up ssh keys
-        echo 'yes' | ssh-keygen -t rsa -C your_email@youremail.com -m PEM -P '' -f ~/.ssh/id_rsa \
-            >"${AIRFLOW_HOME}/logs/ssh-keygen.log" 2>&1
+        # Set up the ssh-to-localhost plumbing used by the SSH/SFTP provider tests under a
+        # dedicated directory instead of ~/.ssh: `breeze --forward-credentials` bind-mounts
+        # the host's ~/.ssh at /root/.ssh and container startup must never modify it.
+        breeze_ssh_dir="/root/.breeze-ssh"
+        mkdir -p "${breeze_ssh_dir}"
+        chmod 700 "${breeze_ssh_dir}"
+        if [[ ! -f "${breeze_ssh_dir}/id_rsa" ]]; then
+            ssh-keygen -t rsa -C airflow-breeze-internal-key -m PEM -P '' -f "${breeze_ssh_dir}/id_rsa" \
+                >"${AIRFLOW_HOME}/logs/ssh-keygen.log" 2>&1
+        fi
+        cp "${breeze_ssh_dir}/id_rsa.pub" "${breeze_ssh_dir}/authorized_keys"
+        chmod 600 "${breeze_ssh_dir}/id_rsa" "${breeze_ssh_dir}/authorized_keys"
+        echo "AuthorizedKeysFile ${breeze_ssh_dir}/authorized_keys .ssh/authorized_keys" \
+            > /etc/ssh/sshd_config.d/airflow-breeze.conf
+        # The heredoc delimiter must not be "EOF": Dockerfile.ci inlines this script inside
+        # a COPY <<"EOF" heredoc and a bare EOF line would terminate it early.
+        cat > /etc/ssh/ssh_config.d/airflow-breeze.conf <<SSH_CONFIG
+Host localhost 127.0.0.1 ::1
+    IdentityFile ${breeze_ssh_dir}/id_rsa
+    UserKnownHostsFile ${breeze_ssh_dir}/known_hosts
+    StrictHostKeyChecking accept-new
+SSH_CONFIG
+        # Paramiko-based hooks do not read /etc/ssh/ssh_config.d but try ssh-agent keys by
+        # default, so expose the key through an agent. The fixed socket path lets shells
+        # entered via entrypoint_exec.sh (breeze exec) pick up the same agent.
+        rm -f "${breeze_ssh_dir}/agent.sock"
+        eval "$(ssh-agent -s -a "${breeze_ssh_dir}/agent.sock")" >/dev/null
+        ssh-add "${breeze_ssh_dir}/id_rsa" >>"${AIRFLOW_HOME}/logs/ssh-keygen.log" 2>&1
 
-        cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
-        ln -s -f ~/.ssh/authorized_keys ~/.ssh/authorized_keys2
-        chmod 600 ~/.ssh/*
-
-        # SSH Service
         sudo service ssh restart >/dev/null 2>&1
 
-        # Sometimes the server is not quick enough to load the keys!
-        while [[ $(ssh-keyscan -H localhost 2>/dev/null | wc -l) != "3" ]] ; do
+        # Sometimes the server is not quick enough to load the keys! OpenSSH 10 also prints a
+        # "# localhost:22 SSH-2.0-..." comment line per connection to stdout, so count only the keys.
+        while [[ $(ssh-keyscan -H localhost 2>/dev/null | grep -cv '^#') != "3" ]] ; do
             echo "Not all keys yet loaded by the server"
             sleep 0.05
         done
 
-        ssh-keyscan -H localhost >> ~/.ssh/known_hosts 2>/dev/null
+        ssh-keyscan -H localhost > "${breeze_ssh_dir}/known_hosts" 2>/dev/null
     fi
 
-    # shellcheck source=scripts/in_container/configure_environment.sh
-    . "${IN_CONTAINER_DIR}/configure_environment.sh"
+    if [[ ${INTEGRATION_LOCALSTACK:-"false"} == "true" ]]; then
+        echo
+        echo "${COLOR_BLUE}Configuring LocalStack integration${COLOR_RESET}"
+        echo
 
-    # shellcheck source=scripts/in_container/run_init_script.sh
-    . "${IN_CONTAINER_DIR}/run_init_script.sh"
+        # Define LocalStack AWS configuration
+        declare -A localstack_config=(
+            ["AWS_ENDPOINT_URL"]="http://localstack:4566"
+            ["AWS_ACCESS_KEY_ID"]="test"
+            ["AWS_SECRET_ACCESS_KEY"]="test"
+            ["AWS_DEFAULT_REGION"]="us-east-1"
+        )
+
+        # Export each configuration variable and log it
+        for key in "${!localstack_config[@]}"; do
+            export "$key"="${localstack_config[$key]}"
+            echo "  * ${COLOR_BLUE}${key}:${COLOR_RESET} ${localstack_config[$key]}"
+        done
+        echo
+    fi
 
     cd "${AIRFLOW_SOURCES}"
 
-    if [[ ${START_AIRFLOW:="false"} == "true" || ${START_AIRFLOW} == "True" ]]; then
-        export AIRFLOW__DATABASE__LOAD_DEFAULT_CONNECTIONS=${LOAD_DEFAULT_CONNECTIONS}
-        export AIRFLOW__CORE__LOAD_EXAMPLES=${LOAD_EXAMPLES}
-        wait_for_asset_compilation
-        # shellcheck source=scripts/in_container/bin/run_tmux
-        exec run_tmux
+    # Temporarily add /opt/airflow/providers/standard/tests to PYTHONPATH in order to see example dags
+    # in the UI when testing in Breeze. This might be solved differently in the future
+    if [[ -d /opt/airflow/providers/standard/tests  ]]; then
+        export PYTHONPATH=${PYTHONPATH=}:/opt/airflow/providers/standard/tests
     fi
-fi
 
-set +u
-# If we do not want to run tests, we simply drop into bash
-if [[ "${RUN_TESTS}" != "true" ]]; then
-    exec /bin/bash "${@}"
-fi
-set -u
+    if [[ ${START_AIRFLOW:="false"} == "true" || ${START_AIRFLOW} == "True" ]]; then
+        if [[ ${BREEZE_DEBUG_CELERY_WORKER=} == "true" ]]; then
+            export AIRFLOW__CELERY__POOL=${AIRFLOW__CELERY__POOL:-solo}
+        fi
+        export AIRFLOW__CORE__LOAD_EXAMPLES=${LOAD_EXAMPLES}
+        if [[ ${SKIP_ASSETS_COMPILATION:="false"} == "false" ]]; then
+            wait_for_asset_compilation
+        fi
+        if [[ ${TERMINAL_MULTIPLEXER:="mprocs"} == "mprocs" ]]; then
+            # shellcheck source=scripts/in_container/bin/run_mprocs
+            exec run_mprocs
+        else
+            # shellcheck source=scripts/in_container/bin/run_tmux
+            exec run_tmux
+        fi
+    fi
+}
 
-export RESULT_LOG_FILE="/files/test_result-${TEST_TYPE/\[*\]/}-${BACKEND}.xml"
-export WARNINGS_FILE="/files/warnings-${TEST_TYPE/\[*\]/}-${BACKEND}.txt"
+# Handle mount sources
+function handle_mount_sources() {
+    if [[ ${MOUNT_SOURCES=} == "remove" ]]; then
+        echo
+        echo "${COLOR_BLUE}Mounted sources are removed, cleaning up mounted dist-info files${COLOR_RESET}"
+        echo
+        rm -rf /usr/local/lib/python"${PYTHON_MAJOR_MINOR_VERSION}"/site-packages/apache_airflow*.dist-info/
+    fi
+}
 
-EXTRA_PYTEST_ARGS=(
-    "--verbosity=0"
-    "--strict-markers"
-    "--durations=100"
-    "--maxfail=50"
-    "--color=yes"
-    "--junitxml=${RESULT_LOG_FILE}"
-    # timeouts in seconds for individual tests
-    "--timeouts-order"
-    "moi"
-    "--setup-timeout=${TEST_TIMEOUT}"
-    "--execution-timeout=${TEST_TIMEOUT}"
-    "--teardown-timeout=${TEST_TIMEOUT}"
-    "--output=${WARNINGS_FILE}"
-    "--disable-warnings"
-    # Only display summary for non-expected case
-    # f - failed
-    # E - error
-    # X - xpassed (passed even if expected to fail)
-    # The following cases are not displayed:
-    # s - skipped
-    # x - xfailed (expected to fail and failed)
-    # p - passed
-    # P - passed with output
-    "-rfEX"
-)
+# Determine which airflow version to use
+function determine_airflow_to_use() {
+    USE_AIRFLOW_VERSION="${USE_AIRFLOW_VERSION:=""}"
+    if [[ "${USE_AIRFLOW_VERSION}" == "" && "${USE_DISTRIBUTIONS_FROM_DIST=}" != "true" ]]; then
+        export PYTHONPATH=${AIRFLOW_SOURCES}
+        echo
+        echo "${COLOR_BLUE}Using airflow version from current sources${COLOR_RESET}"
+        echo
+        # Cleanup the logs, tmp when entering the environment
+        sudo rm -rf "${AIRFLOW_SOURCES}"/logs/*
+        sudo rm -rf "${AIRFLOW_SOURCES}"/tmp/*
+        mkdir -p "${AIRFLOW_SOURCES}"/logs/
+        mkdir -p "${AIRFLOW_SOURCES}"/tmp/
+    else
+        if [[ ${CLEAN_AIRFLOW_INSTALLATION=} == "true" ]]; then
+            echo
+            echo "${COLOR_BLUE}Uninstalling all packages first${COLOR_RESET}"
+            echo
+            # shellcheck disable=SC2086
+            ${PACKAGING_TOOL_CMD} freeze | grep -ve "^-e" | grep -ve "^#" | grep -ve "^uv" | grep -v "@" | \
+                xargs ${PACKAGING_TOOL_CMD} uninstall ${EXTRA_UNINSTALL_FLAGS}
+            # Now install rich ad click first to use the installation script
+            # shellcheck disable=SC2086
+            ${PACKAGING_TOOL_CMD} install ${EXTRA_INSTALL_FLAGS} rich rich-click click \
+                --constraint https://raw.githubusercontent.com/apache/airflow/constraints-main/constraints-${PYTHON_MAJOR_MINOR_VERSION}.txt
+        fi
+        echo
+        echo "${COLOR_BLUE}Reinstalling all development dependencies${COLOR_RESET}"
+        echo
+        # Generate constraints from uv.lock and use them to install development dependencies
+        # via the Python script. --no-cache is needed - otherwise there is possibility of
+        # overriding temporary environments by multiple parallel processes
+        # --all-packages: without it the export only covers the root project's dependencies.
+        # Anything that only a workspace member's dependency group pulls in, such
+        # as mcp through common.ai's pydantic-ai-slim[mcp], stays unpinned and resolves fresh
+        # from PyPI instead of following uv.lock.
+        local constraint_file="/tmp/constraints-from-lock.txt"
+        uv export --frozen --no-hashes --no-emit-project --no-emit-workspace --no-editable --no-header \
+            --no-annotate --all-packages > "${constraint_file}" 2>/dev/null || true
+        uv run --no-cache /opt/airflow/scripts/in_container/install_development_dependencies.py \
+           --constraint "${constraint_file}"
+        # Some packages might leave legacy typing module which causes test issues
+        # shellcheck disable=SC2086
+        ${PACKAGING_TOOL_CMD} uninstall ${EXTRA_UNINSTALL_FLAGS} typing || true
+        echo
+        echo "${COLOR_BLUE}Installing airflow and providers ${COLOR_RESET}"
+        echo
+        python "${IN_CONTAINER_DIR}/install_airflow_and_providers.py"
+    fi
+    if [[ "${USE_AIRFLOW_VERSION}" =~ ^2.* ]]; then
+        # Remove auth manager setting
+        unset AIRFLOW__CORE__AUTH_MANAGER
+    fi
 
-if [[ "${TEST_TYPE}" == "Helm" ]]; then
-    _cpus="$(grep -c 'cpu[0-9]' /proc/stat)"
-    echo "Running tests with ${_cpus} CPUs in parallel"
-    # Enable parallelism
-    EXTRA_PYTEST_ARGS+=(
-        "-n" "${_cpus}"
-    )
-else
-    EXTRA_PYTEST_ARGS+=(
-        "--with-db-init"
-    )
-fi
+    if [[ "${USE_AIRFLOW_VERSION}" =~ ^2\.2\..*|^2\.1\..*|^2\.0\..* && "${AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=}" != "" ]]; then
+        # make sure old variable is used for older airflow versions
+        export AIRFLOW__CORE__SQL_ALCHEMY_CONN="${AIRFLOW__DATABASE__SQL_ALCHEMY_CONN}"
+    fi
+}
 
-if [[ ${ENABLE_TEST_COVERAGE:="false"} == "true" ]]; then
-    EXTRA_PYTEST_ARGS+=(
-        "--cov=airflow/"
-        "--cov-config=.coveragerc"
-        "--cov-report=xml:/files/coverage-${TEST_TYPE/\[*\]/}-${BACKEND}.xml"
-    )
-fi
+# Upgrade boto3 and botocore to latest version to run Amazon tests with them
+function check_boto_upgrade() {
+    if [[ ${UPGRADE_BOTO=} != "true" ]]; then
+        return
+    fi
+    echo
+    echo "${COLOR_BLUE}Upgrading boto3, botocore to latest version to run Amazon tests with them${COLOR_RESET}"
+    echo
+    # shellcheck disable=SC2086
+    ${PACKAGING_TOOL_CMD} uninstall ${EXTRA_UNINSTALL_FLAGS} aiobotocore s3fs || true
 
-declare -a SELECTED_TESTS CLI_TESTS API_TESTS PROVIDERS_TESTS CORE_TESTS WWW_TESTS \
-    ALL_TESTS ALL_PRESELECTED_TESTS ALL_OTHER_TESTS
+    # Urllib 2.6.0 broke kubernetes client by removing getheaders() (restored in 2.6.1+).
+    # Exclude exactly 2.6.0; any other version is fine.
+    # Tracked in https://github.com/kubernetes-client/python/issues/2477
+    # shellcheck disable=SC2086
+    ${PACKAGING_TOOL_CMD} install ${EXTRA_INSTALL_FLAGS} --upgrade "boto3" "botocore" "urllib3!=2.6.0"
+}
 
-# Finds all directories that are not on the list of tests
-# - so that we do not skip any in the future if new directories are added
-function find_all_other_tests() {
-    local all_tests_dirs
-    all_tests_dirs=$(find "tests" -type d ! -name '__pycache__')
-    all_tests_dirs=$(echo "${all_tests_dirs}" | sed "/tests$/d" )
-    all_tests_dirs=$(echo "${all_tests_dirs}" | sed "/tests\/dags/d" )
-    local path
-    for path in "${ALL_PRESELECTED_TESTS[@]}"
-    do
-        escaped_path="${path//\//\\\/}"
-        all_tests_dirs=$(echo "${all_tests_dirs}" | sed "/${escaped_path}/d" )
-    done
-    for path in ${all_tests_dirs}
-    do
-        ALL_OTHER_TESTS+=("${path}")
+# Upgrade sqlalchemy to the latest version to run tests with it
+function check_upgrade_sqlalchemy() {
+    if [[ "${UPGRADE_SQLALCHEMY=}" != "true" ]]; then
+        return
+    fi
+    echo
+    echo "${COLOR_BLUE}Upgrading sqlalchemy to the latest version to run tests with it${COLOR_RESET}"
+    echo
+    uv sync --all-packages --resolution highest --no-python-downloads --no-managed-python
+}
+
+# Download minimum supported version of sqlalchemy to run tests with it
+function check_downgrade_sqlalchemy() {
+    if [[ ${DOWNGRADE_SQLALCHEMY=} != "true" ]]; then
+        return
+    fi
+    local min_sqlalchemy_version
+    min_sqlalchemy_version=$(grep "sqlalchemy\[asyncio\]>=" airflow-core/pyproject.toml | sed "s/.*>=\([0-9\.]*\).*/\1/" | xargs)
+    echo
+    echo "${COLOR_BLUE}Downgrading sqlalchemy to minimum supported version: ${min_sqlalchemy_version}${COLOR_RESET}"
+    echo
+    # shellcheck disable=SC2086
+    ${PACKAGING_TOOL_CMD} install ${EXTRA_INSTALL_FLAGS} "sqlalchemy[asyncio]==${min_sqlalchemy_version}"
+    echo
+    echo "${COLOR_BLUE}Running 'pip check'${COLOR_RESET}"
+    echo
+    # We use pip check here to make sure that whatever `uv` installs, is also "correct" according to `pip`
+    pip check
+}
+
+# Download minimum supported version of pendulum to run tests with it
+function check_downgrade_pendulum() {
+    if [[ ${DOWNGRADE_PENDULUM=} != "true" || ${PYTHON_MAJOR_MINOR_VERSION} == "3.12" ]]; then
+        return
+    fi
+    local min_pendulum_version
+    min_pendulum_version=$(grep "pendulum>=" airflow-core/pyproject.toml | head -1 | sed "s/.*>=\([0-9\.]*\).*/\1/" | xargs)
+    echo
+    echo "${COLOR_BLUE}Downgrading pendulum to minimum supported version: ${min_pendulum_version}${COLOR_RESET}"
+    echo
+    # shellcheck disable=SC2086
+    ${PACKAGING_TOOL_CMD} install ${EXTRA_INSTALL_FLAGS} "pendulum==${min_pendulum_version}"
+    echo
+    echo "${COLOR_BLUE}Running 'pip check'${COLOR_RESET}"
+    echo
+    # We use pip check here to make sure that whatever `uv` installs, is also "correct" according to `pip`
+    pip check
+}
+
+# Check if we should run tests and run them if needed
+function check_run_tests() {
+    if [[ ${RUN_TESTS=} != "true" ]]; then
+        return
+    fi
+
+    if [[ ${TEST_GROUP:=""} == "system" ]]; then
+        exec "${IN_CONTAINER_DIR}/run_system_tests.sh" "${@}"
+    else
+        exec "${IN_CONTAINER_DIR}/run_ci_tests.sh" "${@}"
+    fi
+}
+
+function reinstall_shared_distributions() {
+    # The shared distributions under shared/<name>/ are workspace members that are not
+    # transitively required by airflow-core or any provider, so the lowest-direct
+    # `uv sync` above wipes them out from the environment. Re-install them with
+    # --no-deps so that the `airflow_shared.*` namespace used by devel-common test
+    # utils resolves at test collection time without disturbing the lowest-direct
+    # resolution that was just applied.
+    echo
+    echo "${COLOR_BLUE}Re-installing shared distributions (airflow_shared.*) after uv sync${COLOR_RESET}"
+    echo
+    # shellcheck disable=SC2046
+    uv pip install --no-deps $(ls -d /opt/airflow/shared/*/)
+}
+
+# Providers whose `uv sync --all-extras` (run below by check_force_lowest_dependencies)
+# needs additional native build prerequisites installed at test time rather than baked
+# into the base CI image. Each listed provider must ship a declarative manifest at
+# providers/<id>/pre_extras_install.yaml; the manifest is interpreted by
+# scripts/in_container/run_pre_extras_install.py, which restricts allowed operations
+# to pinned-checksum downloads, archive extraction under /opt or /tmp, and env-var
+# export. Providers cannot run arbitrary code through this hook. Maintainers should
+# review every addition to this list as a privileged change. See
+# contributing-docs/12_provider_distributions.rst.
+PROVIDERS_NEEDING_PRE_EXTRAS_INSTALL=()
+
+# Extras check_force_lowest_dependencies leaves out of a provider's sync, as
+# "<provider id>:<extra>", because the root pyproject.toml declares them as conflicting with
+# another extra of the same provider ([tool.uv] conflicts), and uv rejects syncing both.
+LOWEST_DEPENDENCIES_EXCLUDED_EXTRAS=("common.ai:llamaindex")
+
+function run_pre_extras_install_if_registered() {
+    local provider_id="${1}"
+    local registered_provider
+    for registered_provider in "${PROVIDERS_NEEDING_PRE_EXTRAS_INSTALL[@]}"; do
+        if [[ "${registered_provider}" == "${provider_id}" ]]; then
+            echo
+            echo "${COLOR_BLUE}Running pre-extras install manifest for ${provider_id}${COLOR_RESET}"
+            echo
+            local env_file
+            env_file=$(mktemp)
+            if ! python "${AIRFLOW_SOURCES}/scripts/in_container/run_pre_extras_install.py" \
+                    "${provider_id}" --emit-env-to "${env_file}"; then
+                rm -f "${env_file}"
+                echo "${COLOR_RED}Pre-extras install failed for ${provider_id}${COLOR_RESET}"
+                exit 1
+            fi
+            if [[ -s "${env_file}" ]]; then
+                # shellcheck disable=SC1090
+                source "${env_file}"
+            fi
+            rm -f "${env_file}"
+            return
+        fi
     done
 }
 
-if [[ ${#@} -gt 0 && -n "$1" ]]; then
-    SELECTED_TESTS=("${@}")
-else
-    CLI_TESTS=("tests/cli")
-    API_TESTS=("tests/api" "tests/api_connexion")
-    PROVIDERS_TESTS=("tests/providers")
-    ALWAYS_TESTS=("tests/always")
-    CORE_TESTS=(
-        "tests/core"
-        "tests/executors"
-        "tests/jobs"
-        "tests/models"
-        "tests/serialization"
-        "tests/ti_deps"
-        "tests/utils"
-    )
-    WWW_TESTS=("tests/www")
-    HELM_CHART_TESTS=("tests/charts")
-    INTEGRATION_TESTS=("tests/integration")
-    SYSTEM_TESTS=("tests/system")
-    ALL_TESTS=("tests")
-    ALL_PRESELECTED_TESTS=(
-        "${CLI_TESTS[@]}"
-        "${API_TESTS[@]}"
-        "${HELM_CHART_TESTS[@]}"
-        "${INTEGRATION_TESTS[@]}"
-        "${PROVIDERS_TESTS[@]}"
-        "${CORE_TESTS[@]}"
-        "${ALWAYS_TESTS[@]}"
-        "${WWW_TESTS[@]}"
-        "${SYSTEM_TESTS[@]}"
-    )
-
-    if [[ ${TEST_TYPE:=""} == "CLI" ]]; then
-        SELECTED_TESTS=("${CLI_TESTS[@]}")
-    elif [[ ${TEST_TYPE:=""} == "API" ]]; then
-        SELECTED_TESTS=("${API_TESTS[@]}")
-    elif [[ ${TEST_TYPE:=""} == "Providers" ]]; then
-        SELECTED_TESTS=("${PROVIDERS_TESTS[@]}")
-    elif [[ ${TEST_TYPE:=""} == "Core" ]]; then
-        SELECTED_TESTS=("${CORE_TESTS[@]}")
-    elif [[ ${TEST_TYPE:=""} == "Always" ]]; then
-        SELECTED_TESTS=("${ALWAYS_TESTS[@]}")
-    elif [[ ${TEST_TYPE:=""} == "WWW" ]]; then
-        SELECTED_TESTS=("${WWW_TESTS[@]}")
-    elif [[ ${TEST_TYPE:=""} == "Helm" ]]; then
-        SELECTED_TESTS=("${HELM_CHART_TESTS[@]}")
-    elif [[ ${TEST_TYPE:=""} == "Integration" ]]; then
-        SELECTED_TESTS=("${INTEGRATION_TESTS[@]}")
-    elif [[ ${TEST_TYPE:=""} == "Other" ]]; then
-        find_all_other_tests
-        SELECTED_TESTS=("${ALL_OTHER_TESTS[@]}")
-    elif [[ ${TEST_TYPE:=""} == "All" || ${TEST_TYPE} == "Quarantined" || \
-            ${TEST_TYPE} == "Always" || \
-            ${TEST_TYPE} == "Postgres" || ${TEST_TYPE} == "MySQL" || \
-            ${TEST_TYPE} == "Long" ]]; then
-        SELECTED_TESTS=("${ALL_TESTS[@]}")
-    elif [[ ${TEST_TYPE} =~ Providers\[(.*)\] ]]; then
-        SELECTED_TESTS=()
-        for provider in ${BASH_REMATCH[1]//,/ }
-        do
-            providers_dir="tests/providers/${provider//./\/}"
-            if [[ -d ${providers_dir} ]]; then
-                SELECTED_TESTS+=("${providers_dir}")
-            else
-                echo "${COLOR_YELLOW}Skip ${providers_dir} as the directory does not exist.${COLOR_RESET}"
+function check_force_lowest_dependencies() {
+    if [[ ${FORCE_LOWEST_DEPENDENCIES=} != "true" ]]; then
+        return
+    fi
+    if [[ ${TEST_TYPE=} =~ Providers\[.*\] ]]; then
+        local provider_id
+        # shellcheck disable=SC2001
+        provider_id=$(echo "${TEST_TYPE}" | sed 's/Providers\[\(.*\)\]/\1/')
+        # A split provider's test type names one part of its tests: Providers[<id>:<part>]
+        provider_id=${provider_id%%:*}
+        echo
+        echo "${COLOR_BLUE}Forcing dependencies to lowest versions for provider: ${provider_id}${COLOR_RESET}"
+        echo
+        if ! /opt/airflow/scripts/in_container/is_provider_excluded.py "${provider_id}"; then
+            echo
+            echo "S${COLOR_YELLOW}Skipping ${provider_id} provider check on Python ${PYTHON_MAJOR_MINOR_VERSION}!${COLOR_RESET}"
+            echo
+            exit 0
+        fi
+        cd "${AIRFLOW_SOURCES}/providers/${provider_id/.//}" || exit 1
+        run_pre_extras_install_if_registered "${provider_id}"
+        # Every extra of the provider is named instead of passing --all-extras: uv rejects
+        # --all-extras whenever a [tool.uv] conflicts group is reachable, even through another
+        # workspace provider (amazon -> common.ai), and --no-extra only accepts the provider's
+        # own extras. Both install the same packages.
+        local -a extra_flags=()
+        local extra
+        while IFS= read -r extra; do
+            if [[ -n "${extra}" && " ${LOWEST_DEPENDENCIES_EXCLUDED_EXTRAS[*]} " != *" ${provider_id}:${extra} "* ]]; then
+                extra_flags+=(--extra "${extra}")
             fi
+        done < <(python -c 'import tomllib; print("\n".join(tomllib.load(open("pyproject.toml", "rb"))["project"].get("optional-dependencies", {})))')
+        # --no-binary  is needed in order to avoid libxml and xmlsec using different version of libxml2
+        # (binary lxml embeds its own libxml2, while xmlsec uses system one).
+        # See https://bugs.launchpad.net/lxml/+bug/2110068
+
+        local sync_successful="false"
+        for attempt in 1 2 3; do
+            echo "Attempt ${attempt} of syncing to lowest dependencies"
+            set -x
+            if UV_LOCK_TIMEOUT=200 uv sync --resolution lowest-direct --no-binary-package lxml --no-binary-package xmlsec \
+                "${extra_flags[@]}" --no-python-downloads --no-managed-python; then
+                set +x
+                sync_successful="true"
+                break
+            fi
+            set +x
+            echo "Sleeping 30s"
+            sleep 30
+            echo "Attempt ${attempt} failed. Retrying..."
         done
+        if [[ "${sync_successful}" != "true" ]]; then
+            echo "${COLOR_RED}Failed to sync lowest dependencies after 3 attempts.${COLOR_RESET}"
+            exit 1
+        fi
     else
         echo
-        echo  "${COLOR_RED}ERROR: Wrong test type ${TEST_TYPE}  ${COLOR_RESET}"
+        echo "${COLOR_BLUE}Forcing dependencies to lowest versions for Airflow.${COLOR_RESET}"
         echo
-        exit 1
+        cd "${AIRFLOW_SOURCES}/airflow-core"
+        # --no-binary  is needed in order to avoid libxml and xmlsec using different version of libxml2
+        # (binary lxml embeds its own libxml2, while xmlsec uses system one).
+        # See https://bugs.launchpad.net/lxml/+bug/2110068
+        uv sync --resolution lowest-direct --no-binary-package lxml --no-binary-package xmlsec --all-extras \
+            --no-python-downloads --no-managed-python
     fi
-fi
-readonly SELECTED_TESTS CLI_TESTS API_TESTS PROVIDERS_TESTS CORE_TESTS WWW_TESTS \
-    ALL_TESTS ALL_PRESELECTED_TESTS
+    reinstall_shared_distributions
+}
 
-if [[ ${TEST_TYPE:=""} == "Long" ]]; then
-    EXTRA_PYTEST_ARGS+=(
-        "-m" "long_running"
-        "--include-long-running"
-    )
-elif [[ ${TEST_TYPE:=""} == "Postgres" ]]; then
-    EXTRA_PYTEST_ARGS+=(
-        "--backend"
-        "postgres"
-    )
-elif [[ ${TEST_TYPE:=""} == "MySQL" ]]; then
-    EXTRA_PYTEST_ARGS+=(
-        "--backend"
-        "mysql"
-    )
-elif [[ ${TEST_TYPE:=""} == "Quarantined" ]]; then
-    EXTRA_PYTEST_ARGS+=(
-        "-m" "quarantined"
-        "--include-quarantined"
-    )
-fi
+function check_airflow_python_client_installation() {
+    if [[ ${INSTALL_AIRFLOW_PYTHON_CLIENT=} != "true" ]]; then
+        return
+    fi
+    python "${IN_CONTAINER_DIR}/install_airflow_python_client.py"
+}
 
-echo
-echo "Running tests ${SELECTED_TESTS[*]}"
-echo
+function initialize_db() {
+    # If we are going to start the api server OR we are a system test (which may or may not start the api server,
+    # depending on the Airflow version being used to run the tests), then migrate the DB.
+    if [[ ${START_API_SERVER_WITH_EXAMPLES=} == "true" || ${TEST_GROUP:=""} == "system" ]]; then
+        echo
+        echo "${COLOR_BLUE}Initializing database${COLOR_RESET}"
+        echo
+        airflow db migrate
+        echo
+        echo "${COLOR_BLUE}Database initialized${COLOR_RESET}"
+    fi
+}
 
-ARGS=("${EXTRA_PYTEST_ARGS[@]}" "${SELECTED_TESTS[@]}")
+function start_api_server_with_examples(){
+    USE_AIRFLOW_VERSION="${USE_AIRFLOW_VERSION:=""}"
+    # Do not start the api server if either START_API_SERVER_WITH_EXAMPLES is false or the TEST_GROUP env var is not
+    # equal to "system".
+    if [[ ${START_API_SERVER_WITH_EXAMPLES=} != "true" && ${TEST_GROUP:=""} != "system" ]]; then
+        return
+    fi
+    # If the use Airflow version is set and it is <= 3.0.0 (which does not have the API server anyway) also return
+    if [[ ${USE_AIRFLOW_VERSION} != "" && ${USE_AIRFLOW_VERSION} < "3.0.0" ]]; then
+        return
+    fi
+    export AIRFLOW__CORE__LOAD_EXAMPLES=True
+    export AIRFLOW__API__EXPOSE_CONFIG=True
+    airflow dags reserialize
+    echo "Example dags parsing finished"
+    if airflow config get-value core auth_manager | grep -q "FabAuthManager"; then
+        echo "Create admin user"
+        airflow users create -u admin -p admin -f Thor -l Administrator -r Admin -e admin@email.domain || true
+        echo "Admin user created"
+    else
+        echo "Skipping user creation as auth manager different from Fab is used"
+    fi
+    echo
+    echo "${COLOR_BLUE}Starting airflow api server${COLOR_RESET}"
+    echo
+    if [[ ${START_API_SERVER_DAEMON:-"true"} == "false" ]]; then
+        airflow api-server --port 8080 &
+    else
+        airflow api-server --port 8080 --daemon
+    fi
+    echo
+    echo "${COLOR_BLUE}Waiting for api-server to start${COLOR_RESET}"
+    echo
+    check_service_connection "Airflow api-server" "run_nc localhost 8080" 100
+    EXIT_CODE=$?
+    if [[ ${EXIT_CODE} != 0 ]]; then
+        echo
+        echo "${COLOR_RED}Api server did not start properly${COLOR_RESET}"
+        echo
+        exit ${EXIT_CODE}
+    fi
+    echo
+    echo "${COLOR_BLUE}Airflow api-server started${COLOR_RESET}"
+}
 
-if [[ ${RUN_SYSTEM_TESTS:="false"} == "true" ]]; then
-    "${IN_CONTAINER_DIR}/run_system_tests.sh" "${ARGS[@]}"
-else
-    "${IN_CONTAINER_DIR}/run_ci_tests.sh" "${ARGS[@]}"
-fi
+handle_mount_sources
+determine_airflow_to_use
+environment_initialization
+check_boto_upgrade
+check_upgrade_sqlalchemy
+check_downgrade_sqlalchemy
+check_downgrade_pendulum
+check_force_lowest_dependencies
+check_airflow_python_client_installation
+initialize_db
+start_api_server_with_examples
+check_run_tests "${@}"
+
+# If we are not running tests - just exec to bash shell
+exec /bin/bash "${@}"

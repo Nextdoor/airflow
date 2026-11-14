@@ -15,19 +15,47 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# https://cwiki.apache.org/confluence/display/INFRA/git+-+.asf.yaml+features
+# `.asf.yaml` is a branch-specific YAML configuration file for Git repositories to control features
+# such as notifications, GitHub settings, etc.
+# See its documentation for details: https://github.com/apache/infrastructure-asfyaml
 ---
+#
+# Additional non-standard features
+#
+meta:
+  environments:
+    - github_rulesets
+
 github:
   description: "Apache Airflow - A platform to programmatically author, schedule, and monitor workflows"
   homepage: https://airflow.apache.org/
+  # Social media preview image is not supported by GitHub API/asf.yaml, need to be uploaded
+  # manually in GitHub repository --> Settings --> click "Edit" in "Social preview"
+  # See also:
+  # https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/customizing-your-repositorys-social-media-preview
+  # social_media_preview: docs/apache-airflow/img/logos/github_repository_social_image.png
   labels:
+    # Note that GitHub only supports <=20 labels/topics per repo! Pipeline will fail if you add more.
     - airflow
     - apache
     - apache-airflow
-    - hacktoberfest
+    - automation
+    - dag
+    - data-engineering
+    - data-integration
+    - data-orchestrator
+    - data-pipelines
+    - data-science
+    - elt
+    - etl
+    - machine-learning
+    - mlops
+    - orchestration
     - python
     - scheduler
     - workflow
+    - workflow-engine
+    - workflow-orchestration
   features:
     # Enable issues management
     issues: true
@@ -35,46 +63,151 @@ github:
     projects: true
     # Enable wiki for documentation
     wiki: false
+    # Enable discussions
+    discussions: true
 
   enabled_merge_buttons:
     squash: true
     merge: false
     rebase: false
 
-  protected_branches:
-    main:
+  pull_requests:
+    # Auto-merge waits for the required "CI passed" check enforced by the "Require CI on main" and
+    # "Require CI on release branches" rulesets. Without a required check it would merge as soon as
+    # the PR is approved, before CI finishes. The setting is repository-wide, so every branch that
+    # PRs target needs one of those rulesets.
+    allow_auto_merge: true
+    # enable updating head branches of pull requests
+    allow_update_branch: true
+    # auto-delete head branches after being merged
+    del_branch_on_merge: true
+    # cap how many PRs a user without write access may have open at once
+    # (committers and other users with write access are not affected)
+    creation_cap:
+      enabled: true
+      max_open_pull_requests: 5
+      # Exempt from the cap. This list replaces GitHub's bypass list on every sync, so users added
+      # by hand in the repository settings are removed. Fork CI pilot participants are exempt
+      # because their CI runs in their own forks; keep them in sync with [pilot] in
+      # .github/fork-ci-gate.toml.
+      bypass_users:
+        - aaron-y-chen
+        - Andrushika
+        - Dev-iL
+        - justinpakzad
+        - meel-ayush
+        - Prab-27
+        - raphaelauv
+        - SameerMesiah97
+        - sreecharan-desu
+        - stephen-bracken
+        - yuseok89
+
+  # Branch protection lives in the "Branch protection" ruleset below. Keep this key set to `~`:
+  # asfyaml then removes any legacy protection rule it finds. Legacy protection on `main` made
+  # every asfyaml run fail on GitHub 502s from `branches/main/protection`, which aborted the
+  # settings that come after it, such as the creation cap bypass list.
+  protected_branches: ~
+
+  # The two CI rulesets use the raw Rulesets API payload, because the convenience syntax can only name
+  # teams as bypass actors and GitHub refuses secret teams such as `airflow-committers`. Instead the
+  # Write repository role (actor_id 4) bypasses them: on this repository only committers hold it,
+  # granted by ASF Infra from the `airflow` LDAP group, so it needs no update when committers change.
+  # Committers can still merge a PR whose CI is red for an unrelated reason, by bypassing the rule.
+  #
+  # The required checks are not pinned to the GitHub Actions app: asfyaml passes raw values to the
+  # API as strings except for a fixed set of keys, and a string `integration_id` is rejected.
+  rulesets:
+    - name: "Require CI on main"
+      target: branch
+      enforcement: active
+      conditions:
+        ref_name:
+          include:
+            - "refs/heads/main"
+          exclude: []
+      bypass_actors:
+        - actor_id: 4
+          actor_type: RepositoryRole
+          bypass_mode: always
+      rules:
+        - type: deletion
+        - type: non_fast_forward
+        - type: required_status_checks
+          parameters:
+            strict_required_status_checks_policy: false
+            required_status_checks:
+              - context: "CI passed"
+              # Reported by the fork CI monitor once the head commit has a CI run, in the
+              # contributor's fork for a gated pull request or in apache/airflow otherwise; until
+              # then GitHub lists it on the pull request as expected and waiting.
+              - context: "CI run started"
+    # The branches `ci-amd.yml` runs pull request CI for, apart from `main`. A release branch gets
+    # the "CI passed" job only when it is backported there; until then its PRs need a committer to
+    # bypass the rule. "CI run started" comes from the fork CI monitor on `main`, for every base.
+    - name: "Require CI on release branches"
+      target: branch
+      enforcement: active
+      conditions:
+        ref_name:
+          include:
+            - "refs/heads/v*-test"
+            - "refs/heads/v*-stable"
+            - "refs/heads/providers-*/v*"
+            - "refs/heads/chart/v*-test"
+            - "refs/heads/chart/v*-stable"
+            - "refs/heads/airflow-ctl/v*-test"
+            - "refs/heads/airflow-ctl/v*-stable"
+          exclude: []
+      bypass_actors:
+        - actor_id: 4
+          actor_type: RepositoryRole
+          bypass_mode: always
+      rules:
+        - type: deletion
+        - type: non_fast_forward
+        - type: required_status_checks
+          parameters:
+            strict_required_status_checks_policy: false
+            required_status_checks:
+              - context: "CI passed"
+              # Reported by the fork CI monitor once the head commit has a CI run, in the
+              # contributor's fork for a gated pull request or in apache/airflow otherwise; until
+              # then GitHub lists it on the pull request as expected and waiting.
+              - context: "CI run started"
+    - name: "Branch protection"
+      type: branch
+      branches:
+        includes:
+          - "~DEFAULT_BRANCH"
+          - "v*-stable"
+          - "providers-fab/v*"
+          - "airflow-ctl/v*-stable"
+          - "chart/v*-stable"
       required_pull_request_reviews:
         required_approving_review_count: 1
-    v1-10-stable:
-      required_pull_request_reviews:
-        required_approving_review_count: 1
-    v2-0-stable:
-      required_pull_request_reviews:
-        required_approving_review_count: 1
-    v2-1-stable:
-      required_pull_request_reviews:
-        required_approving_review_count: 1
-    v2-2-stable:
-      required_pull_request_reviews:
-        required_approving_review_count: 1
-    v2-3-stable:
-      required_pull_request_reviews:
-        required_approving_review_count: 1
-    v2-4-stable:
-      required_pull_request_reviews:
-        required_approving_review_count: 1
-    v2-5-stable:
-      required_pull_request_reviews:
-        required_approving_review_count: 1
+      required_linear_history: true
+      required_conversation_resolution: true
+      required_signatures: false
 
   collaborators:
-    - auvipy
-    - paolaperaza
-    - petedejoy
-    - gmcdonald
-    - mhenc
-    - ferruzzi
-    - norm
+    # Max 10 collaborators allowed
+    # https://github.com/apache/infrastructure-asfyaml/blob/main/README.md#assigning-the-github-triage-role-to-external-collaborators
+    # Procedure for adding new member is listed in
+    # https://github.com/apache/airflow/blob/main/ISSUE_TRIAGE_PROCESS.rst#L97
+    - aritra24
+    - omkar-foss
+    - nathadfield
+    - sunank200
+    - cmarteepants
+    - karenbraganz
+    - gyli
+    - jroachgolf84
+    - Dev-iL
+    - kacpermuda
 
 notifications:
-  jobs: jobs@airflow.apache.org
+  commits: commits@airflow.apache.org
+  issues: commits@airflow.apache.org
+  pullrequests: commits@airflow.apache.org
+  discussions: commits@airflow.apache.org

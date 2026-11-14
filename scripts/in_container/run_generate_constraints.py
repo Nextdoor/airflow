@@ -1,0 +1,935 @@
+#!/usr/bin/env python3
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+import ast
+import json
+import os
+import re
+import sys
+import tomllib
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from datetime import datetime
+from functools import cached_property
+from itertools import repeat
+from pathlib import Path
+from typing import TextIO
+
+import requests
+from click import Choice
+from in_container_utils import AIRFLOW_DIST_PATH, AIRFLOW_ROOT_PATH, click, console, run_command
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
+from packaging.version import InvalidVersion, Version
+
+DEFAULT_BRANCH = os.environ.get("DEFAULT_BRANCH", "main")
+PYTHON_VERSION = os.environ.get("PYTHON_MAJOR_MINOR_VERSION", "3.11")
+GENERATED_PROVIDER_DEPENDENCIES_FILE = AIRFLOW_ROOT_PATH / "generated" / "provider_dependencies.json"
+PYPI_JSON_API_URL = "https://pypi.org/pypi/{distribution}/json"
+PYPI_LOOKUP_PARALLELISM = 8
+
+
+def _read_version_from_pyproject(pyproject_path: Path) -> str:
+    with pyproject_path.open("rb") as f:
+        data = tomllib.load(f)
+    version = data.get("project", {}).get("version")
+    if not version:
+        raise RuntimeError(f"Couldn't find project.version in {pyproject_path}")
+    return str(version)
+
+
+def _read_dynamic_version_from_init(init_path: Path) -> str:
+    ast_obj = ast.parse(init_path.read_text())
+    for node in ast_obj.body:
+        if isinstance(node, ast.Assign) and node.targets[0].id == "__version__":  # type: ignore[attr-defined]
+            return ast.literal_eval(node.value)
+    raise RuntimeError(f"Couldn't find __version__ in {init_path}")
+
+
+AIRFLOW_VERSION = _read_version_from_pyproject(AIRFLOW_ROOT_PATH / "pyproject.toml")
+AIRFLOW_CORE_VERSION = _read_version_from_pyproject(AIRFLOW_ROOT_PATH / "airflow-core" / "pyproject.toml")
+# task-sdk pyproject.toml declares [tool.hatch.version] with a dynamic source — read it there.
+AIRFLOW_TASK_SDK_VERSION = _read_dynamic_version_from_init(
+    AIRFLOW_ROOT_PATH / "task-sdk" / "src" / "airflow" / "sdk" / "__init__.py"
+)
+
+now = datetime.now().isoformat()
+
+NO_PROVIDERS_CONSTRAINTS_PREFIX = f"""
+#
+# This constraints file was automatically generated on {now}
+# via `uv sync --resolution highest` for the "{DEFAULT_BRANCH}" branch of Airflow.
+# This variant of constraints install just the 'bare' 'apache-airflow' package build from the HEAD of
+# the branch, without installing any of the providers.
+#
+# Those constraints represent the "newest" dependencies airflow could use, if providers did not limit
+# Airflow in any way.
+#
+"""
+
+SOURCE_PROVIDERS_CONSTRAINTS_PREFIX = f"""
+#
+# This constraints file was automatically generated on {now}
+# via `uv sync --resolution highest for the "{DEFAULT_BRANCH}" branch of Airflow.
+# This variant of constraints install uses the HEAD of the branch version of both
+# 'apache-airflow' package and all available community provider distributions.
+#
+# Those constraints represent the dependencies that are used by all pull requests when they are build in CI.
+# They represent "latest" and greatest set of constraints that HEAD of the "apache-airflow" package should
+# Install with "HEAD" of providers. Those are the only constraints that are used by our CI builds.
+#
+"""
+
+PYPI_PROVIDERS_CONSTRAINTS_PREFIX = f"""
+#
+# This constraints file was automatically generated on {now}
+# via `uv pip install --resolution highest` for the "{DEFAULT_BRANCH}" branch of Airflow.
+# This variant of constraints install uses the HEAD of the branch version for 'apache-airflow' but installs
+# the providers from PIP-released packages at the moment of the constraint generation.
+#
+# Those constraints are actually those that regular users use to install released version of Airflow.
+# We also use those constraints after "apache-airflow" is released and the constraints are tagged with
+# "constraints-X.Y.Z" tag to build the production image for that version.
+#
+# This constraints file is meant to be used only in the "apache-airflow" installation command and not
+# in all subsequent pip commands. By using a constraints.txt file, we ensure that solely the Airflow
+# installation step is reproducible. Subsequent pip commands may install packages that would have
+# been incompatible with the constraints used in Airflow reproducible installation step. Finally, pip
+# commands that might change the installed version of apache-airflow should include "apache-airflow==X.Y.Z"
+# in the list of install targets to prevent Airflow accidental upgrade or downgrade.
+#
+# Typical installation process of airflow for Python {PYTHON_VERSION} is (with random selection of extras and custom
+# dependencies added), usually consists of two steps:
+#
+# 1. Reproducible installation of airflow with selected providers (note constraints are used):
+#
+# pip install "apache-airflow[celery,cncf.kubernetes,google,amazon,snowflake]==X.Y.Z" \\
+#     --constraint \\
+#    "https://raw.githubusercontent.com/apache/airflow/constraints-X.Y.Z/constraints-{PYTHON_VERSION}.txt"
+#
+# 2. Installing own dependencies that are potentially not matching the constraints (note constraints are not
+#    used, and apache-airflow==X.Y.Z is used to make sure there is no accidental airflow upgrade/downgrade.
+#
+# pip install "apache-airflow==X.Y.Z" "snowflake-connector-python[pandas]=N.M.O"
+#
+"""
+
+
+@dataclass
+class ConfigParams:
+    airflow_constraints_mode: str
+    allow_pre_releases: bool
+    constraints_github_repository: str
+    default_constraints_branch: str
+    fail_on_pending_provider_candidates: bool
+    github_actions: bool
+    python: str
+
+    @cached_property
+    def constraints_dir(self) -> Path:
+        constraints_dir = Path("/files") / f"constraints-{self.python}"
+        constraints_dir.mkdir(parents=True, exist_ok=True)
+        return constraints_dir
+
+    @cached_property
+    def latest_constraints_file(self) -> Path:
+        return self.constraints_dir / f"original-{self.airflow_constraints_mode}-{self.python}.txt"
+
+    @cached_property
+    def constraints_diff_file(self) -> Path:
+        return self.constraints_dir / f"diff-{self.airflow_constraints_mode}-{self.python}.md"
+
+    @cached_property
+    def current_constraints_file(self) -> Path:
+        return self.constraints_dir / f"{self.airflow_constraints_mode}-{self.python}.txt"
+
+
+def install_local_airflow_with_latest_resolution(config_params: ConfigParams) -> None:
+    run_command(
+        [
+            "uv",
+            "sync",
+            "--resolution",
+            "highest",
+            "--no-dev",
+            "--package",
+            "apache-airflow-core",
+        ],
+        github_actions=config_params.github_actions,
+        cwd=AIRFLOW_ROOT_PATH,
+        check=True,
+    )
+
+
+def freeze_distributions_to_file(
+    config_params: ConfigParams,
+    file: TextIO,
+    distributions_to_exclude_from_constraints: list[str] | None = None,
+) -> None:
+    console.print(f"[bright_blue]Freezing constraints to file: {file.name}")
+    if distributions_to_exclude_from_constraints:
+        console.print(
+            "[bright_blue]Excluding distributions from constraints:",
+            distributions_to_exclude_from_constraints,
+        )
+    else:
+        distributions_to_exclude_from_constraints = []
+    result = run_command(
+        # TODO(potiuk): check if we can change this to uv
+        cmd=["pip", "freeze"],
+        github_actions=config_params.github_actions,
+        text=True,
+        check=True,
+        capture_output=True,
+    )
+    stdout = result.stdout
+    if os.environ.get("VERBOSE", "") == "true":
+        if os.environ.get("CI", "") == "true":
+            print("::group::Installed distributions")
+        console.print("[bright_blue]Installed distributions")
+        console.print(stdout)
+        console.print("[bright_blue]End of installed distributions")
+        if os.environ.get("CI", "") == "true":
+            print("::endgroup::")
+    count_lines = 0
+    for line in sorted(stdout.split("\n")):
+        if line.startswith(
+            (
+                "apache_airflow",
+                "apache-airflow==",
+                "apache-airflow-core==",
+                "apache-airflow-task-sdk=",
+                "/opt/airflow",
+                "#",
+                "-e",
+            )
+        ):
+            continue
+        if "@" in line:
+            continue
+        if "file://" in line:
+            continue
+        if line.strip() == "":
+            continue
+        if line in distributions_to_exclude_from_constraints:
+            continue
+        count_lines += 1
+        file.write(line)
+        file.write("\n")
+    file.flush()
+    console.print(f"[green]Constraints generated to file: {file.name}. Wrote {count_lines} lines")
+
+
+def _github_headers(accept: str) -> dict[str, str]:
+    headers = {"Accept": accept}
+    if os.environ.get("GITHUB_TOKEN"):
+        headers["Authorization"] = f"Bearer {os.environ.get('GITHUB_TOKEN')}"
+    else:
+        console.print("[bright_blue]No GITHUB_TOKEN - using non-authenticated request.")
+    return headers
+
+
+def _constraints_branch_has_other_python_files(config_params: ConfigParams) -> bool:
+    """Tell a first publication for a new Python from a baseline that should exist but is missing."""
+    listing_url = (
+        f"https://api.github.com/repos/{config_params.constraints_github_repository}/contents/"
+        f"?ref={config_params.default_constraints_branch}"
+    )
+    r = requests.get(listing_url, timeout=60, headers=_github_headers("application/vnd.github.v3+json"))
+    r.raise_for_status()
+    other_python_file = re.compile(rf"{re.escape(config_params.airflow_constraints_mode)}-3\.\d+\.txt")
+    return any(
+        other_python_file.fullmatch(entry["name"])
+        and entry["name"] != f"{config_params.airflow_constraints_mode}-{config_params.python}.txt"
+        for entry in r.json()
+    )
+
+
+def download_latest_constraint_file(config_params: ConfigParams):
+    constraints_url = (
+        "https://api.github.com/repos/"
+        f"{config_params.constraints_github_repository}/contents/"
+        f"{config_params.airflow_constraints_mode}-{config_params.python}.txt?ref={config_params.default_constraints_branch}"
+    )
+    console.print(f"[bright_blue]Downloading constraints file from {constraints_url}")
+    r = requests.get(constraints_url, timeout=60, headers=_github_headers("application/vnd.github.v3.raw"))
+    if r.status_code == 404 and _constraints_branch_has_other_python_files(config_params):
+        # The first generation for a new Python has no file to compare with: diff against an empty
+        # baseline. A 404 on a branch that carries no file of this mode at all is still an error.
+        console.print(
+            f"[yellow]No {config_params.airflow_constraints_mode} file for Python {config_params.python} on "
+            f"{config_params.default_constraints_branch}, but other Pythons have one - first publication, "
+            "using an empty baseline."
+        )
+        config_params.latest_constraints_file.write_text("")
+        return
+    r.raise_for_status()
+    with config_params.latest_constraints_file.open("w") as constraints_file:
+        constraints_file.write(r.text)
+    console.print(f"[green]Downloaded constraints file from {constraints_url} to {constraints_file.name}")
+
+
+def diff_constraints(config_params: ConfigParams) -> None:
+    """
+    Diffs constraints files and prints the diff to the console.
+    """
+    console.print("[bright_blue]Diffing constraints files")
+    result = run_command(
+        [
+            "diff",
+            "--ignore-matching-lines=#",
+            "--color=always",
+            config_params.latest_constraints_file.as_posix(),
+            config_params.current_constraints_file.as_posix(),
+        ],
+        # always shows output directly in CI without folded group
+        github_actions=False,
+        check=False,
+    )
+    if result.returncode == 0:
+        console.print("[green]No changes in constraints files. exiting")
+        config_params.constraints_diff_file.unlink(missing_ok=True)
+        return
+    result = run_command(
+        [
+            "diff",
+            "--ignore-matching-lines=#",
+            "--color=never",
+            config_params.latest_constraints_file.as_posix(),
+            config_params.current_constraints_file.as_posix(),
+        ],
+        github_actions=config_params.github_actions,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    with config_params.constraints_diff_file.open("w") as diff_file:
+        diff_file.write(
+            f"Dependencies {config_params.airflow_constraints_mode} updated "
+            f"for Python {config_params.python}\n\n"
+        )
+        diff_file.write("```diff\n")
+        diff_file.write(result.stdout)
+        diff_file.write("```\n")
+    console.print(f"[green]Diff generated to file: {config_params.constraints_diff_file}")
+
+
+def _read_provider_versions_from_constraints(constraints_file: Path) -> dict[str, str]:
+    """Extract ``apache-airflow-providers-*`` name -> version pairs from a constraints file."""
+    provider_versions: dict[str, str] = {}
+    for raw_line in constraints_file.read_text().splitlines():
+        line = raw_line.strip()
+        if not line.startswith("apache-airflow-providers-"):
+            continue
+        # Strip any environment marker (e.g. "; python_version < '3.11'") before splitting.
+        spec = line.split(";", 1)[0].strip()
+        if "==" not in spec:
+            continue
+        name, _, version = spec.partition("==")
+        provider_versions[name.strip()] = version.strip()
+    return provider_versions
+
+
+def _is_pre_release(version: str) -> bool:
+    try:
+        return Version(version).is_prerelease
+    except InvalidVersion:
+        return False
+
+
+def find_pre_release_provider_pins(constraints_file: Path) -> dict[str, str]:
+    """Return the providers ``constraints_file`` pins at a pre-release, e.g. by a release candidate."""
+    if not constraints_file.exists():
+        return {}
+    return {
+        provider: version
+        for provider, version in _read_provider_versions_from_constraints(constraints_file).items()
+        if _is_pre_release(version)
+    }
+
+
+def write_provider_downgrade_slack_message(
+    config_params: ConfigParams, downgraded: list[tuple[str, str, str]]
+) -> None:
+    """
+    Write a Slack Block Kit payload describing provider downgrades to the constraints directory.
+
+    The file lives on the mounted ``/files`` volume so the CI runner can pick it up and post it to
+    Slack via the ``slackapi/slack-github-action`` step. The in-container step has no Slack credentials
+    itself - it only produces the payload.
+    """
+    channel = os.environ.get("SLACK_CHANNEL", "internal-airflow-ci-cd")
+    server_url = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+    repository = os.environ.get("GITHUB_REPOSITORY", "apache/airflow")
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    downgrade_lines = "\n".join(
+        f"• *{provider}*: `{latest_version}` → `{current_version}`"
+        for provider, latest_version, current_version in sorted(downgraded)
+    )
+    blocks: list[dict] = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": "⛔ Provider downgrade in constraints"},
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"Regular `constraints` generation for the *{DEFAULT_BRANCH}* branch on "
+                    f"Python *{config_params.python}* would *downgrade* released providers below the "
+                    "versions already published in the constraints. Released providers only ever move "
+                    "forward, so this signals a broken dependency dragging an old provider back in."
+                ),
+            },
+        },
+        {"type": "section", "text": {"type": "mrkdwn", "text": downgrade_lines}},
+    ]
+    if run_id:
+        blocks.append(
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"<{server_url}/{repository}/actions/runs/{run_id}|View the failing run>",
+                    }
+                ],
+            }
+        )
+    payload = {
+        "channel": channel,
+        "text": (
+            f"Provider downgrade in {DEFAULT_BRANCH} constraints "
+            f"(Python {config_params.python}): {len(downgraded)} provider(s)"
+        ),
+        "blocks": blocks,
+    }
+    slack_message_file = config_params.constraints_dir / "provider-downgrade-slack-message.json"
+    slack_message_file.write_text(json.dumps(payload, indent=2))
+    console.print(f"[yellow]Wrote provider downgrade Slack payload to {slack_message_file}")
+
+
+def check_baseline_pre_releases_unchanged(
+    config_params: ConfigParams, kept_pre_releases: dict[str, str]
+) -> None:
+    """
+    Fail if the candidates pinned by the baseline changed while the constraints were being resolved.
+
+    The pins are chosen from the baseline read before the resolution, which takes minutes. A release
+    candidate's constraints published in the meantime would otherwise be overwritten by this run's
+    older pins - and, the baseline now pinning candidates, without the downgrade check noticing.
+    """
+    current_pre_releases = find_pre_release_provider_pins(config_params.latest_constraints_file)
+    if current_pre_releases == kept_pre_releases:
+        return
+    console.print(
+        "[red]The release candidates pinned by the constraints branch changed while the constraints "
+        "were being generated:[/]"
+    )
+    for provider in sorted(kept_pre_releases.keys() | current_pre_releases.keys()):
+        console.print(
+            f"[red]  * {provider}: {kept_pre_releases.get(provider, '-')} -> "
+            f"{current_pre_releases.get(provider, '-')}"
+        )
+    console.print("[yellow]Run the generation again so it starts from the updated constraints.")
+    sys.exit(1)
+
+
+def check_providers_not_downgraded(config_params: ConfigParams) -> None:
+    """
+    Fail generation if any released provider is downgraded compared to the latest constraints.
+
+    Released provider versions only ever move forward on PyPI, so a lower version in the freshly
+    generated constraints means the version we had pinned is no longer installable - yanked, or
+    left without a file for the Python being resolved. We stop here so it is caught instead of
+    being published.
+
+    A release candidate is exempt: it pins the wave being voted on, which sorts below the released
+    versions a constraints branch may already carry, so the comparison says nothing there. So is a
+    provider the baseline pins at a pre-release: the generation keeps that pin while PyPI still
+    serves it, so a lower version means it was yanked - the outcome of a failed vote, not a break.
+    """
+    if config_params.allow_pre_releases:
+        console.print(
+            "[yellow]Pre-releases are allowed - skipping the provider downgrade check, a candidate "
+            "sorts below the releases the constraints branch carries."
+        )
+        return
+    if not config_params.latest_constraints_file.exists():
+        console.print("[yellow]No previous constraints file downloaded - skipping provider downgrade check.")
+        return
+    latest_versions = _read_provider_versions_from_constraints(config_params.latest_constraints_file)
+    current_versions = _read_provider_versions_from_constraints(config_params.current_constraints_file)
+    downgraded: list[tuple[str, str, str]] = []
+    for provider, latest_version in latest_versions.items():
+        current_version = current_versions.get(provider)
+        if current_version is None or _is_pre_release(latest_version):
+            continue
+        try:
+            if Version(current_version) < Version(latest_version):
+                downgraded.append((provider, latest_version, current_version))
+        except InvalidVersion:
+            console.print(
+                f"[yellow]Could not compare versions for {provider} "
+                f"({latest_version!r} vs {current_version!r}) - skipping."
+            )
+    if downgraded:
+        console.print("[red]The following providers would be downgraded in the generated constraints:[/]")
+        for provider, latest_version, current_version in sorted(downgraded):
+            console.print(f"[red]  * {provider}: {latest_version} -> {current_version}")
+        console.print(
+            "[yellow]Released providers should never be downgraded. The providers are pinned at the "
+            "newest version PyPI serves for this Python, so a lower one means the version we had is "
+            "gone - yanked, or no longer offering a file this Python can install. Investigate the "
+            "diff above before publishing.[/]"
+        )
+        write_provider_downgrade_slack_message(config_params, downgraded)
+        sys.exit(1)
+    console.print("[green]No providers were downgraded in the generated constraints.")
+
+
+def uninstall_all_packages(config_params: ConfigParams):
+    console.print("[bright_blue]Uninstall All PIP packages")
+    result = run_command(
+        # TODO(potiuk): check if we can change this to uv
+        cmd=["pip", "freeze"],
+        github_actions=config_params.github_actions,
+        cwd=AIRFLOW_ROOT_PATH,
+        text=True,
+        check=True,
+        capture_output=True,
+    )
+    # do not remove installer!
+    all_installed_packages = [
+        dep.split("==")[0]
+        for dep in result.stdout.strip().split("\n")
+        if not dep.startswith(
+            ("apache-airflow", "apache-airflow==", "/opt/airflow", "#", "-e", "uv==", "pip==")
+        )
+    ]
+    run_command(
+        cmd=["uv", "pip", "uninstall", *all_installed_packages],
+        github_actions=config_params.github_actions,
+        cwd=AIRFLOW_ROOT_PATH,
+        text=True,
+        check=True,
+    )
+
+
+def get_all_active_provider_distributions(python_version: str | None = None) -> list[str]:
+    all_provider_dependencies = json.loads(GENERATED_PROVIDER_DEPENDENCIES_FILE.read_text())
+    return [
+        f"apache-airflow-providers-{provider.replace('.', '-')}"
+        for provider in all_provider_dependencies.keys()
+        if all_provider_dependencies[provider]["state"] == "ready"
+        and (
+            python_version is None
+            or python_version not in all_provider_dependencies[provider]["excluded-python-versions"]
+        )
+    ]
+
+
+def is_file_installable(pypi_file: dict, target_python: Version) -> bool:
+    """Whether a file PyPI lists for a release can be installed on ``target_python``."""
+    if pypi_file.get("yanked"):
+        return False
+    requires_python = pypi_file.get("requires_python")
+    if not requires_python:
+        return True
+    try:
+        return target_python in SpecifierSet(requires_python)
+    except InvalidSpecifier:
+        return True
+
+
+def find_newest_version_in_pypi(
+    distribution: str,
+    python_version: str,
+    allow_pre_releases: bool,
+    kept_pre_release: str | None = None,
+) -> str | None:
+    """Return the newest version of ``distribution`` PyPI can install for ``python_version``.
+
+    A pre-release is only ever considered when ``allow_pre_releases`` is set, and even then it wins
+    only by sorting above every final release - so a provider with a candidate in the wave being
+    voted on resolves to that candidate while one without keeps its last release. The one exception
+    is ``kept_pre_release``, the candidate the baseline constraints already pin: it stays eligible so
+    that a run without pre-releases does not move the provider back below it. Versions PyPI can
+    no longer serve for the Python being resolved - fully yanked, or excluded by ``requires_python``
+    - are passed over, because pinning one leaves the resolution nothing to install. ``None``
+    (nothing installable at all, e.g. a provider whose first release is still in this wave) leaves
+    the distribution unpinned rather than pinned to a version that cannot be had.
+    """
+    response = requests.get(PYPI_JSON_API_URL.format(distribution=distribution), timeout=60)
+    if response.status_code == 404:
+        console.print(f"[yellow]{distribution} is not published in PyPI - leaving it unpinned.")
+        return None
+    response.raise_for_status()
+    target_python = Version(python_version)
+    kept_version = Version(kept_pre_release) if kept_pre_release else None
+    newest_version: Version | None = None
+    for version, files in response.json().get("releases", {}).items():
+        try:
+            parsed_version = Version(version)
+        except InvalidVersion:
+            continue
+        if parsed_version.is_prerelease and not allow_pre_releases and parsed_version != kept_version:
+            continue
+        if not any(is_file_installable(pypi_file, target_python) for pypi_file in files):
+            continue
+        if newest_version is None or parsed_version > newest_version:
+            newest_version = parsed_version
+    if newest_version is None:
+        console.print(f"[yellow]{distribution} has no installable version in PyPI - leaving it unpinned.")
+        return None
+    return str(newest_version)
+
+
+def exit_on_pending_provider_candidates(pending: list[tuple[str, str]]) -> None:
+    """Stop a final release's constraints while a provider candidate is neither released nor yanked."""
+    console.print(
+        "[red]These providers have a release candidate on PyPI that is newer than their latest "
+        "final release:[/]"
+    )
+    for distribution, version in pending:
+        console.print(f"[red]  * {distribution}=={version}")
+    console.print(
+        "[yellow]Constraints for a final Airflow release cannot pin a release candidate, and passing "
+        "over it would publish constraints that silently ignore it. Clear each candidate first, "
+        "then run the release constraints again:[/]\n"
+        "[yellow]  * release it - publish the final version once its vote has passed, or[/]\n"
+        "[yellow]  * yank it on PyPI if it is not going to be released - yanked versions are skipped.[/]"
+    )
+    sys.exit(1)
+
+
+def build_pinned_provider_requirements(
+    python_version: str,
+    allow_pre_releases: bool,
+    kept_pre_releases: dict[str, str] | None = None,
+    fail_on_pending_candidates: bool = False,
+) -> list[str]:
+    """Exact pins for every active provider, at the newest version PyPI holds for it.
+
+    Naming the versions retrieved from PyPI leaves the providers nothing to resolve: the constraints
+    pin what is actually published rather than whatever the resolver settles on. It is what makes a
+    release candidate land on the wave being voted on, whose providers are published only as rc
+    versions - handing uv a pre-release strategy instead left it free to answer with any version
+    satisfying the lower bounds. It also keeps pre-releases confined to the providers: no
+    third-party dependency can answer with one, because no requirement here mentions a pre-release
+    of anything else.
+
+    ``kept_pre_releases`` maps providers to the candidates the baseline constraints pin; those are
+    kept while PyPI serves them. With ``fail_on_pending_candidates`` - the constraints of a final
+    release - the lookup sees candidates too, and any provider whose newest version is one fails the
+    run instead: it must be released or yanked first.
+    """
+    distributions = get_all_active_provider_distributions(python_version)
+    kept_pre_releases = kept_pre_releases or {}
+    console.print(f"[bright_blue]Retrieving the newest PyPI version of {len(distributions)} providers.")
+    with ThreadPoolExecutor(max_workers=PYPI_LOOKUP_PARALLELISM) as executor:
+        newest_versions = list(
+            executor.map(
+                find_newest_version_in_pypi,
+                distributions,
+                repeat(python_version),
+                repeat(allow_pre_releases or fail_on_pending_candidates),
+                [kept_pre_releases.get(distribution) for distribution in distributions],
+            )
+        )
+    if fail_on_pending_candidates:
+        pending = [
+            (distribution, version)
+            for distribution, version in zip(distributions, newest_versions)
+            if version is not None and _is_pre_release(version)
+        ]
+        if pending:
+            exit_on_pending_provider_candidates(pending)
+    return [
+        f"{distribution}=={version}"
+        for distribution, version in zip(distributions, newest_versions)
+        if version is not None
+    ]
+
+
+def generate_constraints_source_providers(config_params: ConfigParams) -> None:
+    """
+    Generates constraints with provider dependencies used from current sources. This might be different
+    from the constraints generated from the latest released version of the providers in PyPI. Those
+    constraints are used in CI builds when we install providers built using current sources and in
+    Breeze CI image builds.
+    """
+    with config_params.current_constraints_file.open("w") as constraints_file:
+        constraints_file.write(SOURCE_PROVIDERS_CONSTRAINTS_PREFIX)
+        freeze_distributions_to_file(config_params, constraints_file)
+    download_latest_constraint_file(config_params)
+    diff_constraints(config_params)
+
+
+def get_locally_build_distribution_specs() -> list[str]:
+    """
+    Get all locally build distribution specification.
+
+    This is used to exclude them from the constraints file.
+    return: list of distributionss (distribution==version) to exclude from the constraints file.
+    """
+    all_distribution_specs = []
+    all_distributions_in_dist = AIRFLOW_DIST_PATH.glob("apache_airflow_providers_*.whl")
+    for dist_file_path in all_distributions_in_dist:
+        version = dist_file_path.name.split("-")[1]
+        distribution_name = dist_file_path.name.split("-")[0].replace("_", "-")
+        all_distribution_specs.append(f"{distribution_name}=={version}")
+    return all_distribution_specs
+
+
+def generate_constraints_pypi_providers(config_params: ConfigParams) -> None:
+    """
+    Generates constraints with provider installed from PyPI. This is the default constraints file
+    used in production/release builds when we install providers from PyPI and when tagged, those
+    providers are used by our users to install Airflow in reproducible way.
+    :return:
+    """
+
+    # In case we have some problems with installing highest resolution of a dependency of one of our
+    # providers in PyPI - we can exclude the buggy version here. For example this happened with
+    # sqlalchemy-spanner==1.12.0 which did not have `whl` file in PyPI and was not installable
+    # and in this case we excluded it by adding ""sqlalchemy-spanner!=1.12.0" to the list below.
+    # In case we add exclusion here we should always link to the issue in the target dependency
+    # repository that tracks the problem with the dependency (we should create one if it does not exist).
+    #
+    # Example exclusion (not needed any more as sqlalchemy-spanner==1.12.0has been yanked in PyPI):
+    #
+    # additional_constraints_for_highest_resolution: list[str] = ["sqlalchemy-spanner!=1.12.0"]
+    #
+    # Current exclusions:
+    #
+    # * pyarrow>=22.0.0 on Python 3.14 — older pyarrow releases have no prebuilt wheels for
+    #   Python 3.14 and uv falls back to building from source, which fails. pyarrow 22.0.0 is
+    #   the first release shipping cp314 wheels.
+    # * gremlinpython>=3.8.0 — older versions of gremlinpython have more relaxed dependencies and
+    #   resolver might choose to downgrade gremlinpython to an older version,
+    #   which in turn might downgrade tinkerpop provider. Having gremlinpython>=3.8.0 ensures
+    #   that the resolver will not downgrade the provider.
+    # * opentelemetry-exporter-prometheus>=0.47b0 — this package only ever publishes beta versions
+    #   (airflow-core requires ``>=0.47b0`` and released constraints already pin a beta, e.g.
+    #   ``==0.65b0``). Marking it as a pre-release here rather than relying on uv's if-necessary
+    #   fallback keeps the choice deliberate and identical across every resolution.
+    # * opentelemetry-semantic-conventions>=0.48b0 — same story: a beta-only package, pulled in as a
+    #   hard dependency of opentelemetry-sdk (via opentelemetry-exporter-otlp and shared/observability).
+    #   The floor only marks it as a pre-release and must stay at the version paired with our
+    #   ``opentelemetry-*>=1.27.0`` floor — opentelemetry-sdk exact-pins the semantic conventions
+    #   version it ships with, so a higher floor here would conflict with any sdk older than that pairing.
+    #
+    # These two are the only pre-releases in the constraints we tag, and removing the need for the
+    # exception is tracked at https://github.com/apache/airflow/issues/71176
+    #
+    additional_constraints_for_highest_resolution: list[str] = [
+        "pyarrow>=22.0.0; python_version >= '3.14'",
+        "gremlinpython>=3.8.0",
+        "opentelemetry-exporter-prometheus>=0.47b0",
+        "opentelemetry-semantic-conventions>=0.48b0",
+    ]
+
+    # Every run pins the providers at the versions PyPI holds when it is generated. Only a run for
+    # a release candidate picks up the rc versions of the wave being voted on. A regular run keeps
+    # the candidates the baseline already pins, so it does not undo a candidate's constraints while
+    # the vote is on. A final fails while any provider still has a candidate that was neither
+    # released nor yanked, so a released constraints file can never carry an rc pin.
+    download_latest_constraint_file(config_params)
+    kept_pre_releases = find_pre_release_provider_pins(config_params.latest_constraints_file)
+    pinned_provider_requirements = build_pinned_provider_requirements(
+        config_params.python,
+        config_params.allow_pre_releases,
+        kept_pre_releases=kept_pre_releases,
+        fail_on_pending_candidates=config_params.fail_on_pending_provider_candidates,
+    )
+    console.print(
+        f"[bright_blue]Pinning {len(pinned_provider_requirements)} provider distributions to the "
+        f"{'newest' if config_params.allow_pre_releases else 'newest final'} versions in PyPI."
+    )
+
+    result = run_command(
+        cmd=[
+            "uv",
+            "pip",
+            "install",
+            "--no-sources",
+            "--exact",
+            "--strict",
+            f"apache-airflow[all]=={AIRFLOW_VERSION}",
+            f"apache-airflow-core[all]=={AIRFLOW_CORE_VERSION}",
+            f"apache-airflow-task-sdk=={AIRFLOW_TASK_SDK_VERSION}",
+            "./airflow-ctl",
+            *additional_constraints_for_highest_resolution,
+            *pinned_provider_requirements,
+            "--reinstall",  # We need to pull the provider distributions from PyPI or dist, not the local ones
+            "--resolution",
+            "highest",
+            "--find-links",
+            "file://" + str(AIRFLOW_DIST_PATH),
+        ],
+        github_actions=config_params.github_actions,
+        check=False,
+    )
+    if result.returncode != 0:
+        console.print(
+            "[red]Failed to install airflow with PyPI providers with highest resolution.[/]\n"
+            "[yellow]Please check the output above for details. The providers are pinned at the newest "
+            "versions PyPI serves, so two of them requiring incompatible dependencies fails here rather "
+            "than quietly settling on an older provider. One of they ways how to resolve it, in "
+            "case it is caused by a specific broken dependency version, is to exclude it above in the "
+            f"`additional_constraints_for_highest_resolution` list in [/] {__file__}"
+        )
+        sys.exit(result.returncode)
+    console.print("[success]Installed airflow with PyPI providers with eager upgrade.")
+    distributions_to_exclude_from_constraints = get_locally_build_distribution_specs()
+    with config_params.current_constraints_file.open("w") as constraints_file:
+        constraints_file.write(PYPI_PROVIDERS_CONSTRAINTS_PREFIX)
+        if distributions_to_exclude_from_constraints:
+            console.print(
+                "[yellow]Excluding some distributions because we install them locally from build .wheels"
+                "- those versions are missing from PyPI, so we need to exclude them from PyPI constraints."
+            )
+            # the command below prints detailed list of excluded distributions
+        freeze_distributions_to_file(
+            config_params, constraints_file, distributions_to_exclude_from_constraints
+        )
+    download_latest_constraint_file(config_params)
+    check_baseline_pre_releases_unchanged(config_params, kept_pre_releases)
+    diff_constraints(config_params)
+    check_providers_not_downgraded(config_params)
+
+
+def generate_constraints_no_providers(config_params: ConfigParams) -> None:
+    """
+    Generates constraints without any provider dependencies. This is used mostly to generate SBOM
+    files - where we generate list of dependencies for Airflow without any provider installed.
+    """
+    uninstall_all_packages(config_params)
+    console.print(
+        "[bright_blue]Installing airflow with `all-core` extras only with eager upgrade in installable mode."
+    )
+    install_local_airflow_with_latest_resolution(config_params)
+    console.print("[success]Installed airflow with [all] extras only with eager upgrade.")
+    with config_params.current_constraints_file.open("w") as constraints_file:
+        constraints_file.write(NO_PROVIDERS_CONSTRAINTS_PREFIX)
+        freeze_distributions_to_file(config_params, constraints_file)
+    download_latest_constraint_file(config_params)
+    diff_constraints(config_params)
+
+
+ALLOWED_CONSTRAINTS_MODES = ["constraints", "constraints-source-providers", "constraints-no-providers"]
+
+
+@click.command()
+@click.option(
+    "--airflow-constraints-mode",
+    type=Choice(ALLOWED_CONSTRAINTS_MODES),
+    required=True,
+    envvar="AIRFLOW_CONSTRAINTS_MODE",
+    help="Mode of constraints to generate",
+)
+@click.option(
+    "--constraints-github-repository",
+    default="apache/airflow",
+    show_default=True,
+    envvar="CONSTRAINTS_GITHUB_REPOSITORY",
+    help="GitHub repository to get constraints from",
+)
+@click.option(
+    "--default-constraints-branch",
+    required=True,
+    envvar="DEFAULT_CONSTRAINTS_BRANCH",
+    help="Branch to get constraints from",
+)
+@click.option(
+    "--github-actions",
+    is_flag=True,
+    default=False,
+    show_default=True,
+    envvar="GITHUB_ACTIONS",
+    help="Running in GitHub Actions",
+)
+@click.option(
+    "--python",
+    required=True,
+    envvar="PYTHON_MAJOR_MINOR_VERSION",
+    help="Python major.minor version",
+)
+@click.option(
+    "--use-uv/--no-use-uv",
+    is_flag=True,
+    default=True,
+    help="Use uv instead of pip as packaging tool.",
+    envvar="USE_UV",
+)
+@click.option(
+    "--allow-pre-releases",
+    is_flag=True,
+    default=False,
+    help="Let the provider pins use pre-release versions when those are newer than any final "
+    "release. Used when constraints are generated for a release candidate, whose providers are "
+    "only on PyPI as rc versions.",
+    envvar="ALLOW_PRE_RELEASES",
+)
+@click.option(
+    "--fail-on-pending-provider-candidates",
+    is_flag=True,
+    default=False,
+    help="Fail when a provider's newest version on PyPI is a release candidate that was neither "
+    "released nor yanked. Used when constraints are generated for a final Airflow release.",
+    envvar="FAIL_ON_PENDING_PROVIDER_CANDIDATES",
+)
+def generate_constraints(
+    airflow_constraints_mode: str,
+    allow_pre_releases: bool,
+    constraints_github_repository: str,
+    default_constraints_branch: str,
+    fail_on_pending_provider_candidates: bool,
+    github_actions: bool,
+    python: str,
+    use_uv: bool,
+) -> None:
+    config_params = ConfigParams(
+        airflow_constraints_mode=airflow_constraints_mode,
+        allow_pre_releases=allow_pre_releases,
+        constraints_github_repository=constraints_github_repository,
+        default_constraints_branch=default_constraints_branch,
+        fail_on_pending_provider_candidates=fail_on_pending_provider_candidates,
+        github_actions=github_actions,
+        python=python,
+    )
+    if airflow_constraints_mode == "constraints-source-providers":
+        generate_constraints_source_providers(config_params)
+    elif airflow_constraints_mode == "constraints":
+        generate_constraints_pypi_providers(config_params)
+    elif airflow_constraints_mode == "constraints-no-providers":
+        generate_constraints_no_providers(config_params)
+    else:
+        console.print(f"[red]Unknown constraints mode: {airflow_constraints_mode}")
+        sys.exit(1)
+    console.print("[green]Generated constraints:")
+    files = config_params.constraints_dir.rglob("*.txt")
+    for file in files:
+        console.print(file.as_posix())
+    console.print()
+
+
+if __name__ == "__main__":
+    generate_constraints()

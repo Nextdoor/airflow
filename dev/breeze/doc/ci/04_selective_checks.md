@@ -1,0 +1,1018 @@
+<!--
+ Licensed to the Apache Software Foundation (ASF) under one
+ or more contributor license agreements.  See the NOTICE file
+ distributed with this work for additional information
+ regarding copyright ownership.  The ASF licenses this file
+ to you under the Apache License, Version 2.0 (the
+ "License"); you may not use this file except in compliance
+ with the License.  You may obtain a copy of the License at
+
+   http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing,
+ software distributed under the License is distributed on an
+ "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ KIND, either express or implied.  See the License for the
+ specific language governing permissions and limitations
+ under the License.
+ -->
+
+<!-- START doctoc generated TOC please keep comment here to allow auto update -->
+<!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
+**Table of Contents**  *generated with [DocToc](https://github.com/thlorenz/doctoc)*
+
+- [Selective CI Checks](#selective-ci-checks)
+  - [Why selective checks exist (the optimisation goal)](#why-selective-checks-exist-the-optimisation-goal)
+  - [Mental model: events, modes, file groups, outputs](#mental-model-events-modes-file-groups-outputs)
+  - [The decision pipeline](#the-decision-pipeline)
+  - [Individually simple rules](#individually-simple-rules)
+  - [Worked examples: pull requests, pushes, and canary runs](#worked-examples-pull-requests-pushes-and-canary-runs)
+  - [Troubleshooting: my CI run does too much](#troubleshooting-my-ci-run-does-too-much)
+  - [Groups of files that selective check make decisions on](#groups-of-files-that-selective-check-make-decisions-on)
+  - [Selective check decision rules](#selective-check-decision-rules)
+  - [Skipping prek hooks (Static checks)](#skipping-prek-hooks-static-checks)
+  - [Suspended providers](#suspended-providers)
+  - [Selective check outputs](#selective-check-outputs)
+  - [Self-hosted (RunsOn) vs. public runners](#self-hosted-runson-vs-public-runners)
+  - [Changing behaviours of the CI runs by setting labels](#changing-behaviours-of-the-ci-runs-by-setting-labels)
+
+<!-- END doctoc generated TOC please keep comment here to allow auto update -->
+
+# Selective CI Checks
+
+In order to optimise our CI jobs, we've implemented optimisations to only run selected checks for some
+kind of changes. The logic implemented reflects the internal architecture of Airflow 2.0 packages,
+and it helps to keep down both the usage of jobs in GitHub Actions and CI feedback time to
+contributors in case of simpler changes.
+
+> [!NOTE]
+> All the logic described here lives in a single file:
+> [`dev/breeze/src/airflow_breeze/utils/selective_checks.py`](../../src/airflow_breeze/utils/selective_checks.py).
+> When you change that file, **update this document in the same PR** so the behaviour and the
+> documentation stay in sync.
+>
+> `breeze verify` maps the `run_*` flags to local commands in
+> [`dev/breeze/src/airflow_breeze/utils/verification_plan.py`](../../src/airflow_breeze/utils/verification_plan.py).
+> Adding a `run_*` flag to `SelectiveChecks` also means classifying it there;
+> `dev/breeze/tests/test_verification_plan.py` fails until you do.
+
+## Why selective checks exist (the optimisation goal)
+
+Airflow's full CI matrix is large: multiple Python versions, multiple databases (Postgres, MySQL,
+SQLite), Kubernetes versions, Helm tests, 100+ provider packages, UI tests, doc builds, image builds
+for two architectures, and dozens of static checks. Running *everything* for *every* change would burn
+an enormous amount of GitHub Actions minutes and make contributors wait an hour or more for feedback on
+a one-line doc fix.
+
+Selective checks exist to answer one question, cheaply and conservatively:
+
+> **Given exactly which files changed (plus the event, the branch and the labels), what is the
+> smallest set of CI work that still gives us confidence the change is correct?**
+
+Three design assumptions drive everything:
+
+1. **The changed file list is a reliable proxy for risk.** A change to `airflow-core/.../scheduler`
+   can break anything, so it must run broadly. A change confined to `providers/amazon` can only
+   plausibly break Amazon (and its direct dependents), so only those need to run. A change to a
+   `.md` file can't break runtime behaviour at all.
+2. **Be conservative when in doubt — never trade correctness for speed.** Every rule is biased toward
+   *running more*. If a change touches something foundational (the environment, the CI scripts, the
+   dependency set, the API contract, core test utilities), selective checks fall back to the **full
+   matrix**. Skipping is only ever done when a rule can *prove* the skipped work is irrelevant.
+3. **Trust must be earned on `main`.** Pull-request runs are optimised aggressively for fast feedback,
+   but the *merge* to `main` (and the nightly **canary** run) always runs the full matrix on all
+   versions. So even if a PR-time optimisation was too aggressive, the canary catches it before a
+   release.
+
+## Mental model: events, modes, file groups, outputs
+
+Selective checks take a handful of **inputs** and produce a set of GitHub Actions **outputs** that the
+workflows read to decide what to run. Everything in between is pure, deterministic computation — same
+inputs always give the same outputs, and you can reproduce it locally (see
+[Troubleshooting](#troubleshooting-my-ci-run-does-too-much)).
+
+```mermaid
+flowchart LR
+    subgraph IN[Inputs]
+        F[changed files]
+        EV[github event<br/>PR / PUSH / SCHEDULE / DISPATCH]
+        BR[target branch<br/>main / v3-x-test]
+        LB[PR labels]
+        RP[repository<br/>apache/airflow or fork]
+    end
+    IN --> SC[SelectiveChecks]
+    SC --> MODE[Run MODE<br/>full_tests_needed?<br/>all_versions?<br/>is_canary_run?]
+    SC --> MATCH[FILE-GROUP matches<br/>regex per area]
+    MODE --> OUT[GitHub Actions outputs]
+    MATCH --> OUT
+    OUT --> JOBS[which jobs run<br/>which versions<br/>which test types<br/>which prek hooks]
+```
+
+The two halves that matter are:
+
+* **The run MODE** — a few booleans (`full_tests_needed`, `all_versions`, `is_canary_run`) computed
+  mostly from the *event*, the *branch* and a handful of high-impact files/labels. The mode decides
+  whether we take the "run everything" shortcut or the "be selective" path.
+* **The FILE-GROUP matches** — every area of the codebase (UI, Helm, docs, Kubernetes, each provider,
+  each mypy target, …) has a list of regexps in `CI_FILE_GROUP_MATCHES`. A group is "active" when at
+  least one changed file matches it. In selective mode, active groups are what turn individual jobs on.
+
+The key helper that ties the two together is `_should_be_run(group)`:
+
+```text
+_should_be_run(group):
+    if full_tests_needed:  return True          # full mode → every area is "on"
+    return (any changed file matches group)     # selective mode → only matched areas are "on"
+```
+
+Almost every `run_*` / `*_build` output is just `_should_be_run(<some group>)`, so once you understand
+those two halves you understand the whole system.
+
+## The decision pipeline
+
+The computation happens in three conceptual stages. Each individual rule is tiny; the apparent
+complexity is only the *number* of rules, not their difficulty.
+
+### Stage 1 — pick the run mode
+
+First selective checks decide whether this run takes the **full-matrix shortcut**. The foundational
+helper is `_should_run_all_tests_and_versions()`, which is driven by the *event* and a few
+high-blast-radius signals:
+
+```mermaid
+flowchart TD
+    A([_should_run_all_tests_and_versions]) --> T{fork push with<br/>truncated change set?}
+    T -->|yes| YES0[True<br/>run everything]
+    T -->|no| FP{fork push?}
+    FP -->|yes - treated as a pull request| E
+    FP -->|no| B{event is<br/>PUSH / SCHEDULE / DISPATCH?}
+    B -->|yes| C{PUSH and only<br/>.txt/.md files changed?}
+    C -->|yes| NO1[False<br/>skip full tests]
+    C -->|no| D{PUSH with<br/>--selective-tests-on-push?}
+    D -->|yes - release branch push in ci-amd.yml| NO2[treated like PULL_REQUEST<br/>selective]
+    NO2 --> E
+    D -->|no| YES1[True<br/>run everything]
+    B -->|no - PULL_REQUEST| E{commit_ref missing?}
+    E -->|yes| YES2[True]
+    E -->|no| Fp{pyproject.toml changed?}
+    Fp -->|yes| YES3[True]
+    Fp -->|no| G{generated provider<br/>dependencies changed?}
+    G -->|yes| YES4[True]
+    G -->|no| NO3[False]
+```
+
+`full_tests_needed` then layers a short-circuit ladder on top: it is `True` if
+`_should_run_all_tests_and_versions()` is true **or** any one of a small list of high-impact file
+groups changed **or** the `full tests needed` label is set. The first matching rule wins — order does
+not matter because any single hit forces the full matrix:
+
+```mermaid
+flowchart TD
+    A([full_tests_needed]) --> M{_should_run_all_tests_and_versions?}
+    M -->|yes| T[TRUE - full matrix]
+    M -->|no| E1{environment files?<br/>test workflows, dev/breeze/src,<br/>Dockerfile, scripts/ci/docker-compose+kubernetes, ...<br/>excl. prek + non-test workflows}
+    E1 -->|yes| T
+    E1 -->|no| E2{API contract / codegen?<br/>generated OpenAPI spec or generator}
+    E2 -->|yes| T
+    E2 -->|no| E3{git or standard<br/>provider files?}
+    E3 -->|yes| T
+    E3 -->|no| E4{test helper loaded by every test run?<br/>tests_common pytest plugin + its imports}
+    E4 -->|yes| T
+    E4 -->|no| E5{'full tests needed' label?}
+    E5 -->|yes| T
+    E5 -->|no| Fa[FALSE - be selective]
+```
+
+Two related booleans share this machinery:
+
+* **`all_versions`** — whether to expand the Python/Kubernetes/DB version axis to *all* supported
+  versions instead of just the defaults. Labels (`default versions only`, `latest versions only`,
+  `all versions`) override; otherwise it follows `_should_run_all_tests_and_versions()`.
+* **`is_canary_run`** — `True` for SCHEDULE/PUSH/DISPATCH events **on `apache/airflow`** (not forks)
+  when more than just `.txt`/`.md` changed, or whenever the `canary` label is set. A PUSH with
+  `--selective-tests-on-push` (env `SELECTIVE_TESTS_ON_PUSH`) is **not** a canary: `ci-amd.yml` passes
+  that flag, so a push to a release branch runs the selective tests of the changes since the last
+  successful run of the branch (`--push-base-commit`), exactly as a pull request would. Workflows that run on push for other reasons (constraints, image cache) do not
+  pass it, and keep getting the full set of Python versions they need. Canary runs always run unit
+  tests even when `full_tests_needed` is `False`.
+
+### Stage 2 — decide which jobs run
+
+In **full mode** every area is "on". In **selective mode**, each job is gated on its file group via
+`_should_be_run`. The image builds are derived (they turn on only because something that needs them
+turned on):
+
+```mermaid
+flowchart TD
+    CB{target branch chart/... or airflow-ctl/...?} -->|yes| COMP[only that component's tests ON,<br/>whatever changed; see below]
+    CB -->|no| FTN
+    FTN{full_tests_needed?} -->|yes| ALL[every run_* area = ON<br/>all versions, all test types]
+    FTN -->|no| SEL[selective: gate each area on its file group]
+    SEL --> RUT{run_unit_tests?}
+    RUT -->|canary OR any source file matched| UNIT[unit tests ON<br/>test types chosen by matched files]
+    RUT -->|only new-UI files, or no source files| NOUNIT[unit tests OFF]
+    SEL --> AREAS[run_ui_tests, run_kubernetes_tests,<br/>run_helm_tests*, docs_build, run_api_tests,<br/>run_python_scans, run_task_sdk_tests, ...]
+    UNIT --> IMG
+    AREAS --> IMG
+    IMG[ci_image_build = unit OR docs OR k8s OR ui<br/>OR pyproject/provider-yaml changed OR prod_image_build]
+    AREAS --> PROD[prod_image_build = k8s OR helm OR<br/>integration/e2e tests]
+    PROD --> IMG
+```
+
+`*` Helm tests only run on the `main` branch and on `chart/` branches.
+
+The release branches of a single component (`chart/vX-Yx-test|stable`, `airflow-ctl/vX-Y-test|stable`)
+only ever get backports of that component, so their runs are scoped to it. The target branch comes from
+the GitHub context (`base_ref` for a pull request, `ref_name` for a push or a dispatched run) and must
+match one of those names: a feature branch named `chart/...` is not a component branch, and neither is
+any push in a fork, which is selected against `main`. On such a branch every
+output decorated with `_scoped_to_component_branch` is off, except those `COMPONENT_BRANCH_OUTPUTS` lists
+for the component: on `chart/`, Helm and Kubernetes tests always run (kustomize overlays as usual) with
+the CI and PROD images they need; on `airflow-ctl/`, only the airflow-ctl tests run, in a local
+virtualenv, so no image is built there: static checks run on the host (`basic-checks-only`), and the
+airflow-ctl integration tests, the docs and the dependency upgrade check, which need an image, do not run. The PROD image is built for
+the chart's tests only, so `run-generic-prod-image-tests` (Docker
+Compose, image-building examples, basic and canary end-to-end tests) is off, and so is
+`run-generic-basic-tests` (the standalone Airflow test), `run-shared-distributions-tests` and
+`run-translation-check`. Provider tests are skipped, and on `chart/` docs, when they changed, build only the
+chart's package. Static checks, scripts and Breeze integration tests, and the CodeQL scans run as usual. A test
+in `test_selective_checks.py` fails when a new `run_*` output is neither scoped nor listed as a general
+check, so a new job does not start running on these branches by accident.
+
+### Stage 3 — choose which test types
+
+When unit tests run, selective checks narrow *which* test types execute, separately for **core** and
+**providers**:
+
+* **Core test types** (`_get_core_test_types_to_run`): `Always` is always included. Each specific type
+  (`API`, `CLI`, `Serialization`, …) is added if its files matched. Then the **escape hatch**: if any
+  changed source file is left over after removing provider files, test files, UI files, etc. — i.e.
+  something "core/other" changed — *all* core test types are added, because a core change can affect
+  anything. In full mode, all core types run unconditionally.
+* **Provider test types** (`_get_providers_test_types_to_run`): empty on non-`main` branches. In full
+  mode (or when dependencies were upgraded) → `Providers` (all). Otherwise selective checks compute the
+  **affected providers** from the changed files and add their **direct upstream and downstream
+  dependents** (not the whole transitive closure). Changes to *common* provider code under
+  `devel-common/` escalate to *all* providers, except a changed `tests_common` helper, which instead
+  selects the test files that import it (directly or through other helpers) as if those files had
+  changed. Suspended providers are excluded (and
+  a PR that touches one fails unless it carries the `allow suspended provider changes` label).
+  Providers whose DB tests leave process-global state behind (`PROVIDERS_WITH_PROCESS_GLOBAL_TEST_SIDE_EFFECTS`,
+  currently `cncf.kubernetes`) are added to the `Providers[...]` test type when a provider whose own files
+  changed sorts after them: on canary the DB tests of `Providers[-amazon,celery,google,standard]` run in
+  one pytest process with provider test folders in sorted order, so the changed provider's tests run after
+  the leaked state is in place. Running them together in the PR surfaces a test that depends on clean
+  state in the PR instead of after merge; a new leak added on the `cncf.kubernetes` side is not caught
+  this way. Dependents pulled in only for coverage do not trigger this. The individually-listed test types
+  run each provider on its own and are not widened, and the job description names the selected providers.
+
+The same matched-file approach drives the **prek hook skip list** (`skip_prek_hooks`): each mypy /
+compile / lint hook is skipped when nothing in its area changed. See
+[Skipping prek hooks](#skipping-prek-hooks-static-checks).
+
+#### The run's platform (`--platform`)
+
+Some integrations and providers only work on one CPU architecture, so the selection above is filtered
+by the platform the run's tests will execute on:
+
+* **Integrations** in `DISABLE_TESTABLE_INTEGRATIONS_FROM_ARM` are dropped on ARM.
+* **Providers** that declare `excluded-platforms` in their `provider.yaml` (e.g. `ibm.mq` and
+  `ibm.db2` exclude `linux/arm64`) are removed from the providers test-type matrix on that platform.
+  Only `linux/*` values can match a run; a provider may also list a non-CI platform such as
+  `darwin/arm64`, which never affects the matrix and exists solely to add an install-time
+  `platform_machine` marker.
+
+## Individually simple rules
+
+The list of rules is long, but each rule is a one-liner you can reason about in isolation. A few
+representative examples (file → effect):
+
+| A change to …                                         | … turns on                                                            | because |
+|-------------------------------------------------------|-----------------------------------------------------------------------|---------|
+| `README.md` only                                      | (almost) nothing                                                      | `.md`/`.txt` are text-non-doc; on a push this even skips full tests |
+| `airflow-core/docs/...rst`                            | `docs_build` (+ CI image)                                             | matches `DOC_FILES`; docs need the CI image to render |
+| `providers/amazon/.../s3.py`                          | unit tests with `Providers[amazon, …dependents]` + `Always`          | a provider file → only that provider and its direct dependents |
+| `airflow-core/src/airflow/jobs/scheduler_job_runner.py` | unit tests with **all** core test types                            | a core/other file → escape hatch runs all core types |
+| `pyproject.toml`                                       | **full matrix, all versions**                                        | dependency surface changed → `_should_run_all_tests_and_versions` |
+| `.github/workflows/ci-amd.yml` or `dev/breeze/src/...` | **full matrix**                                                      | environment files → can change the whole CI environment |
+| `.github/workflows/codeql-analysis.yml` (non-test workflow) | **basic checks only**                                           | non-test workflow → cannot affect tests (env-files carve-out) |
+| `scripts/ci/prek/check_*.py` (static-check hook)       | CI image + static checks, **no full matrix**                         | prek hooks are static checks → `Prek files` carve-out |
+| the generated OpenAPI spec                             | **full matrix**                                                      | the API *contract* ripples to UI codegen + every client |
+| `core_api/openapi/_private_ui.yaml` (UI-only spec)     | UI compile/lint prek hooks, **no full matrix**                       | matches `UI OpenAPI files`; the UI codegen input must be type-checked, but the public contract is unchanged |
+| `chart/templates/...yaml` (on `main`)                  | `run_helm_tests` (+ PROD image)                                      | matches `HELM_FILES`; Helm tests only on `main` |
+| `task-sdk/.../task_runner.py` or `airflow-core/tests/integration/otel/...` | the `otel` core integration                       | matches `OTEL_FILES`; the otel integration tests assert the span hierarchy task_runner emits |
+| `airflow-core/src/airflow/ui/...tsx` only              | `run_ui_tests`, **no** unit tests                                    | "only new-UI files" short-circuit skips Python unit tests |
+
+The "complexity" you feel reading the code is just *many* such rules stacked up — each one on its own
+is simple, conservative, and independently testable (see `dev/breeze/tests/test_selective_checks.py`).
+
+## Worked examples: pull requests, pushes, and canary runs
+
+The same engine produces very different results depending on the **event**, the **branch** and the
+**files**. These four scenarios cover the common cases:
+
+```mermaid
+flowchart TD
+    subgraph PR[Pull request - small provider change]
+        PR1[event=PULL_REQUEST<br/>files=providers/amazon/.../s3.py] --> PR2[full_tests_needed=False<br/>all_versions=False<br/>is_canary_run=False]
+        PR2 --> PR3[unit tests: Providers amazon + Always<br/>default versions only<br/>amazon prek/mypy only]
+    end
+    subgraph RELFULL[Release branch full run, dispatched]
+        RF1[event=WORKFLOW_DISPATCH<br/>branch=v3-x-test] --> RF2[full_tests_needed=True<br/>all_versions=True<br/>is_canary_run=True]
+        RF2 --> RF3[full matrix, all versions,<br/>all canary-only jobs]
+    end
+    subgraph RELPUSH[Push to release branch v3-x-test]
+        RP1[event=PUSH<br/>--selective-tests-on-push] --> RP2[full_tests_needed=False<br/>is_canary_run=False]
+        RP2 --> RP3[same selection as a PR<br/>with the files changed since<br/>the last successful run<br/>default versions]
+    end
+    subgraph CANARY[Scheduled nightly canary]
+        CN1[event=SCHEDULE on apache/airflow] --> CN2[full_tests_needed=True<br/>all_versions=True<br/>is_canary_run=True]
+        CN2 --> CN3[everything, all versions]
+    end
+```
+
+1. **Pull request, small provider change** (`providers/amazon/.../s3.py`). Not an environment/contract
+   file, `commit_ref` present, no special label → `full_tests_needed=False`, `all_versions=False`.
+   Result: unit tests run only `Providers[amazon]` (plus amazon's direct dependents) and `Always`, on
+   default versions only; only the amazon-related prek/mypy hooks run. Fast PR feedback.
+2. **Pull request, core change** (`scheduler_job_runner.py`). Still `full_tests_needed=False`, but the
+   core/other escape hatch adds **all core test types**. Providers are not pulled in (no provider files
+   changed). Default versions.
+3. **Pull request that changes `pyproject.toml`** (or a *test* workflow like `.github/workflows/ci-amd.yml`,
+   or the OpenAPI spec). `full_tests_needed=True` (and for `pyproject.toml` also `all_versions=True`). The
+   PR runs the **full matrix** — same as a canary — because the change can affect everything. (A *non-test*
+   workflow such as `codeql-analysis.yml`, or a `scripts/ci/prek/...` static-check hook, does **not** force
+   the full matrix — see the `Environment files` carve-outs above.)
+4. **Full run of a release branch** (WORKFLOW_DISPATCH on `v3-1-test`, started by
+   `release-branch-ci.yml` a few times a day or by a release manager). `full_tests_needed=True`,
+   `all_versions=True`, `is_canary_run=True`. The full matrix plus all canary-only jobs run, and the
+   branch's constraints and image cache are refreshed. `main` gets the same from the scheduled canary;
+   neither builds the full matrix on push.
+5. **Push to a release branch** (`v3-1-test`). `ci-amd.yml` passes `--selective-tests-on-push` and
+   `--push-base-commit` (the commit of the last successful run of the workflow on the branch), so the
+   push is treated like a pull request whose files are those changed since that commit:
+   `full_tests_needed` and `is_canary_run` follow the PR rules, and the run selects only the tests
+   those changes need, on default versions. If the diff cannot be computed, all tests run.
+6. **Scheduled nightly canary** (SCHEDULE on `apache/airflow`). Full matrix on all versions, every
+   canary-only job. The most thorough run; it is what gives us confidence that the PR-time shortcuts
+   never let a regression through.
+7. **Push in a contributor fork** (AIP-120, see
+   [Fork CI for external contributors](08_fork_ci_for_external_contributors.md)). The changed files
+   come from the cross-repository compare API against `apache/airflow`'s branch line of the pushed
+   code (breeze's default branch at that commit: `main`, or the release branch it was cut from),
+   not from `git diff-tree`, with a renamed file counted under both paths, and the run is selected
+   exactly like a pull request with those files. `is_committer_build` is always `False` because
+   forks have no self-hosted runners. When the file list reaches the compare API's 300-file cap,
+   or the compare fails, everything runs, including the UI E2E tests, which otherwise only follow
+   matching files or the `full tests needed` label. Checks that compare a file with its previous version
+   (`pyproject.toml` and the provider dependency bump check) read the previous version at the
+   compare's merge base in `apache/airflow`, not at the pushed commit's parent, which after a
+   merge of upstream `main` is the contributor's own previous tip. A file missing at the merge
+   base counts as new; any other failure to read it fails the selective checks instead of
+   skipping the check. The labels come from the open
+   `apache/airflow` pull request of the pushed branch, so `full tests needed`,
+   `allow provider dependency bump` and the other labels work as on a pull request; a label
+   added later takes effect on the next fork run.
+
+## Troubleshooting: my CI run does too much
+
+If a CI run is slower or broader than you expect (full matrix on a small change, all providers running,
+all versions), the cause is almost always a single rule that fired. To find it:
+
+1. **Read the `selective-checks` job output.** Selective checks print a `[warning] …` line for every
+   decision, e.g. *"Running full set of tests because env files changed"* or *"Running everything with
+   all versions: changed pyproject.toml"*. That line names the exact rule (and usually the file group)
+   that escalated the run. This is the fastest way to diagnose.
+2. **Reproduce locally** with Breeze, pointing at the squashed commit of your change:
+
+   ```bash
+   breeze ci selective-check --commit-ref <commit_sha>
+   ```
+
+   It prints the same outputs and the same `[warning]` reasons CI uses, so you can iterate without
+   pushing.
+3. **Check the usual escalation triggers** (any one of these forces the full matrix):
+   * an **environment file** changed — `.github/workflows/*`, `dev/breeze/src/*`, `Dockerfile*`,
+     `scripts/ci/*`, `scripts/docker/*`, (often this is the surprise: editing CI/breeze itself runs everything);
+   * **`pyproject.toml`** or generated provider dependencies changed (also forces `all_versions`);
+   * the **generated OpenAPI spec** or the client generator changed (the API contract);
+   * a **`tests_common` helper loaded by every test run** (the pytest plugin, anything it imports,
+     conftest or package `__init__` modules), a helper whose importers cannot be narrowed (it was
+     deleted or renamed, `git grep` failed, or an importer lies outside the known test trees), or
+     **git/standard provider** files changed;
+   * the **`full tests needed`** or **`all versions`** label is set on the PR.
+4. **All providers running?** That means selective checks decided *all* providers are affected — usually
+   because *common* provider code under `devel-common/` changed, or because
+   dependencies were upgraded, or `full_tests_needed` is on. The reason is printed in the
+   provider-selection `[warning]` lines.
+5. **Want to confirm an optimisation is safe?** Remember the canary on `main` always runs everything —
+   the worst case of an over-aggressive *skip* is caught at merge time, not in production.
+
+The authoritative, exhaustive rule list (kept in sync with the code) is in
+[Selective check decision rules](#selective-check-decision-rules) below; the sections above are the
+"why" and the shape, this is the "what" in full detail.
+
+## Groups of files that selective check make decisions on
+
+We have the following Groups of files for CI that determine which tests are run:
+
+* `Environment files` - if any of those changes, that forces 'full tests needed' mode, because changes
+  there might simply change the whole environment of what is going on in CI (Container image, dependencies).
+  Two deliberate carve-outs do **not** force full tests: **static-check hooks** (`scripts/ci/prek/...`)
+  drive prek static checks rather than the test matrix, so they only trigger the CI image build (via the
+  `Prek files` group) — `mypy-scripts` and the image-based static checks still run, but the full test
+  matrix does not; and **non-test workflows** (`.github/workflows/` for security scans, doc publishing,
+  notifications, backporting, calendar/stale bots, …) cannot change test outcomes. Workflows that run or
+  configure the test suite (`ci-amd`, `ci-arm`, `run-unit-tests`, `k8s-tests`, `helm-tests`, image builds,
+  …) still force the full matrix.
+* `Prek files` - `scripts/ci/prek/...` static-check hooks. They do not force full tests, but they trigger
+  the CI image build so `mypy-scripts` and the image-based static checks run for a prek-only change.
+* `Python production files` and `Javascript production files` - this area is useful in CodeQL Security scanning
+  - if any of the python or javascript files for airflow "production" changed, this means that the security
+    scans should run
+* `Always test files` - Files that belong to "Always" run tests.
+* `API tests files` and `Codegen test files` - those are OpenAPI definition files that impact
+  Open API specification and determine that we should run dedicated API tests.
+* `UI OpenAPI files` - the OpenAPI spec yamls under `core_api/openapi/` and under the simple
+  auth manager's `openapi/` that are the inputs of the UI client codegen. Membership in this
+  group does not force full tests (a generated spec still does, via `Codegen test files`); it
+  only keeps the UI compile/lint prek hooks from being skipped
+  (see [Skipping prek hooks](#skipping-prek-hooks-static-checks)).
+* `Helm files` - change in those files impacts helm "rendering" tests - `chart` folder (which contains the chart sources and tests under `chart/tests/`).
+* `Build files` - change in the files indicates that we should run  `upgrade to newer dependencies` -
+  build dependencies in `pyproject.toml` and  generated dependencies files in `generated` folder.
+  The dependencies are automatically generated from the `provider.yaml` files in provider by
+  the `hatch_build.py` build hook. The provider.yaml is a single source of truth for each
+  provider and `hatch_build.py` for all regular dependencies.
+* `DOC files` - change in those files indicate that we should run documentation builds (both airflow sources
+  and airflow documentation)
+* `UI files` - those are files for the new full React UI (useful to determine if UI tests should run)
+* `System test files` - those are the files that are part of system tests (system tests are not automatically
+  run in our CI, but Airflow stakeholders are running the tests and expose dashboards for them at
+  [System Test Dashboards](https://airflow.apache.org/ecosystem/#airflow-provider-system-test-dashboards)
+* `Kubernetes files` - determine if any of Kubernetes related tests should be run
+* `All Python files` - if none of the Python file changed, that indicates that we should not run unit tests
+* `All source files` - if none of the sources change, that indicates that we should probably not build
+  an image and run any image-based static checks
+* `All Airflow Python files` - files that are checked by `mypy-airflow-core` static checks
+* `All Providers Python files` - files that are checked by `mypy-providers` static checks
+* `All Dev Python files` - files that are checked by `mypy-dev` static checks
+* `All Scripts Python files` - files that are checked by `mypy-scripts` static checks
+* `Task SDK files` - files that are checked by `mypy-task-sdk` static checks
+* `All Airflow CTL Python files` - files that are checked by `mypy-airflow-ctl` static checks
+* `All Devel Common Python files` - files that are checked by `mypy-devel-common` static checks
+* `All Helm Tests Python files` / `All Docker Tests Python files` /
+  `All Kubernetes Tests Python files` / `All Airflow E2E Tests Python files` /
+  `Airflow CTL Integration Test files` / `Task SDK Integration Test files` - files that are
+  checked by the respective `mypy-helm-tests` / `mypy-docker-tests` / `mypy-kubernetes-tests` /
+  `mypy-airflow-e2e-tests` / `mypy-airflow-ctl-tests` / `mypy-task-sdk-integration-tests` hooks
+* `shared/<dist>/**/*.py` - each `shared/<dist>` workspace member has its own `mypy-shared-<dist>`
+  hook (selective-checks enumerates them at runtime)
+* `All Provider Yaml files` - all provider yaml files
+
+We have a number of `TEST_TYPES` that can be selectively disabled/enabled based on the
+content of the incoming PR. Usually they are limited to a sub-folder of the "tests" folder but there
+are some exceptions. You can read more about those in `testing.rst <contributing-docs/09_testing.rst>`. Those types
+are determined by selective checks and are used to run `DB` and `Non-DB` tests.
+
+The `DB` tests inside each `TEST_TYPE` are run sequentially (because they use DB as state) while `TEST_TYPES`
+are run in parallel - each within separate docker-compose project. The `Non-DB` tests are all executed
+together using `pytest-xdist` (pytest-xdist distributes the tests among parallel workers).
+
+## Selective check decision rules
+
+* `Full tests` case is enabled when the event is PUSH, SCHEDULE or WORKFLOW_DISPATCH, or we
+  miss commit info, or any of the important environment files (`pyproject.toml`, `Dockerfile`, `scripts`,
+  etc.) changed, or the API *contract* changed (the generated OpenAPI spec or the client generator —
+  plain API source/test edits that leave the committed spec
+  untouched do **not** force full tests), or a `tests_common` helper loaded by every test run or whose
+  importers cannot be narrowed (helper deleted or renamed, `git grep` failed, or an importer outside the
+  known test trees), or git / standard provider files changed, or when the `full tests needed` label is
+  set. Any other changed `tests_common` helper only selects the tests that import it.
+  That enables all matrix combinations of variables (representative) and all possible test type. No further
+  checks are performed. See also [1] note below. Two exceptions narrow this: a PUSH that changed **only**
+  `.txt`/`.md` files skips full tests, and a PUSH with `--selective-tests-on-push` (which `ci-amd.yml`
+  passes for pushes to release branches) is treated like a pull request — selective tests on default
+  versions, not a `canary` run. A PUSH in a contributor fork is not a PUSH for this rule either: it is
+  selected like a pull request against `apache/airflow`, and runs everything only when its change set
+  reaches the compare API's 300-file cap (a list of 300 may be missing files) or the compare fails. The
+  incremental base of a release-branch push (the last successful run of the branch) is only looked up in
+  `apache/airflow`. The high-level flow and worked examples for these cases are in
+  [The decision pipeline](#the-decision-pipeline) and
+  [Worked examples](#worked-examples-pull-requests-pushes-and-canary-runs) above.
+* Python, Kubernetes, Backend, Kind, Helm versions are limited to "defaults" only unless `Full tests` mode
+  is enabled.
+* `Python scans`, `Javascript scans`, `API tests/codegen`, `UI`, `WWW`, `Kubernetes` tests and `DOC builds`
+  are enabled if any of the relevant files have been changed.
+* `Helm` tests are run only if relevant files have been changed and if current branch is `main`.
+* On a component's release branch (`chart/...`, `airflow-ctl/...`) only that component's tests run, always,
+  with the images they need (none for airflow-ctl); other tests do not run, provider tests are skipped,
+  and docs build only the chart's package. Static checks still run. See [Stage 2](#stage-2--decide-which-jobs-run).
+* If no Source files are changed - no tests are run and no further rules below are checked.
+* `CI Image building` is enabled if either test are run, docs are build.
+* Jobs that used to run for every change run only when a file they depend on changed. Full-test runs,
+  which include the scheduled canary runs, still run all of them:
+  * `Shared distributions tests` run when `shared/`, `devel-common/`, `dev/mypy/`, the root `pyproject.toml`
+    or `uv.lock` changed. The
+    standalone Airflow test (`run-generic-basic-tests`) still runs for every change.
+  * `Check translation completeness` runs when a UI translation file under
+    `airflow-core/src/airflow/ui/public/i18n/` changed.
+  * `Check that image builds quickly` runs when the CI image is built and a file the image is built
+    from changed: `Dockerfile*`, `.dockerignore`, `scripts/docker/`, `hatch_build.py`, `generated/`,
+    `uv.lock`, a `pyproject.toml` or the prek script that regenerates the provider dependencies before
+    the build. Any other change reuses the cached layers.
+  * `Publish documentation and validate versions` runs when the docs are built and a documentation
+    tree, a `provider.yaml`, a `pyproject.toml`, a distribution's version file, a changelog, the release
+    notes or the docs tooling changed.
+* The provider compatibility tests (the `Compat` jobs of `Provider distributions tests`) run the selected
+  provider tests against released Airflow versions from PyPI, with `airflow-core/src` and `task-sdk/src`
+  hidden from the container. They are skipped when every changed file is a Python file in those two trees,
+  except the version files `airflow/__init__.py` and `airflow/sdk/__init__.py`, a Python file in
+  `task-sdk/tests/`, a document or image in `airflow-core/docs/` or `task-sdk/docs/`, or an
+  `airflow-core/newsfragments/*.rst` file. Other files in the docs trees, such as a nested prek config, keep
+  the tests: the job installs the prek hooks on the host before the sources are hidden. Such a change cannot change their result: a Task SDK change selects all providers,
+  but the compatibility tests install the released Task SDK. The other provider test jobs still run.
+  Full-test runs and the `upgrade to newer dependencies` case run them as before.
+* `PROD Image building` is enabled when kubernetes tests are run.
+* `Generate constraints` runs when the PROD image is built, because that build reads the
+  `constraints-source-providers` file, or when `generate-pypi-constraints` is on. The PyPI constraints and
+  the distributions they need are generated only when the CI image is built and `pyproject.toml` or `uv.lock`
+  changed, full tests are needed (which covers the job's own workflow and script), the run is a canary, or
+  the `upgrade to newer dependencies` label is set. Any other change leaves nothing for this resolution to
+  check except the state of PyPI, which the canary runs cover.
+* In case of `Providers` test in regular PRs, additional check is done in order to determine which
+  providers are affected and the actual selection is made based on that:
+  * if directly provider code is changed (either in the provider, test or system tests) then this provider
+    is selected.
+  * if there are any providers that depend on the affected providers, they are also included in the list
+    of affected providers (but not recursively - only direct dependencies are added)
+  * if there are any changes to "common" provider code not belonging to any provider (usually system tests
+    or tests), then tests for all Providers are run
+  * if a provider whose own files changed sorts after a provider with process-global DB-test side effects
+    (`PROVIDERS_WITH_PROCESS_GLOBAL_TEST_SIDE_EFFECTS`, currently `cncf.kubernetes`), the side-effect
+    provider is added to the same `Providers[...]` test type, because the two share one pytest process on
+    canary and the changed tests must pass after it
+  * before that, the static import graph (`airflow_breeze/utils/import_graph.py`) can drop the
+    upstream and downstream providers added for a dependency, and `fab` and `openlineage` added for API
+    and asset changes, when none of their test files (with the conftest files and the `tests_common`
+    pytest plugin they load) can import a changed file. It only removes providers, never adds one,
+    and keeps every provider whose own files changed. Changed files outside `airflow-core/`,
+    `task-sdk/`, `providers/`, `devel-common/` and `shared/` do not count. It keeps the whole
+    selection when a changed file:
+    * is not a Python module that the graph can parse (non-Python files, `provider.yaml`,
+      `pyproject.toml`, deleted files, syntax errors),
+    * is under `devel-common/` or `shared/`, or is a `conftest.py`,
+    * is under an `example_dags`, `dags`, `system`, `plugins` or `migrations` directory, which tests
+      load by file path,
+    * is named by its dotted path in a runtime key of a `provider.yaml` (all keys except `operators`,
+      `sensors`, `hooks` and `transfers`), in `config.yml`, in a `pyproject.toml` entry point or
+      script, or as the literal argument of an `import_string`, `import_module`, `getimport` or
+      `__import__` call, or is imported by such a module. Any test can import these through
+      `ProvidersManager` or the configuration. A call with a computed argument is not seen.
+
+    The narrowing applies only to pull requests, with the `import graph narrowing` label or the
+    `IMPORT_GRAPH_NARROWING=true` repository variable. Otherwise it runs in shadow mode: the
+    `Selective checks` step of `Build info` prints the providers it would drop, and the selection
+    stays the same. Integration test selection is not narrowed.
+* `TS SDK unit tests` (the vitest suite run by `pnpm test` in `ts-sdk/`, exposed as the
+  `run-ts-sdk-tests` output) run when `TS SDK files` change: anything under `ts-sdk/` except `.md`
+  files, `ts-sdk/api-docs/`, and `ts-sdk/docs/` (the docs toolchain's own package).
+* `Lang SDK serialization conformance` (the `tests-lang-sdk-conformance` job, which serializes the Dags
+  of `scripts/ci/lang_sdk_serialization/test_dags.yaml` with an SDK and with Airflow and compares the
+  two) runs for each SDK listed in the `lang-sdk-conformance-sdks` output: `go` when `Go SDK
+  conformance files` change, `java` when `Java SDK conformance files` change and `ts` when `TS SDK
+  conformance files` change. Each group is the SDK's own files (as in `Go SDK files`, `Java SDK files`
+  and `TS SDK files`) plus what the check compares the SDK against: Airflow's serializer
+  (`serialized_objects.py`), `airflow-core/src/airflow/serialization/schema.json` and the shared
+  harness under `scripts/ci/lang_sdk_serialization/`. None of those three forces `full_tests_needed`,
+  so a change to any of them runs the check for every SDK. The list is empty on a component branch.
+* `Java SDK E2E tests` (the `java_sdk` mode of the deployed-stack tests, exposed as the
+  `run-java-sdk-e2e-tests` output) run when the Java SDK sources (`java-sdk/`, excluding `.md`), the
+  Java test-fixture and native-Dag bundles (`airflow-e2e-tests/java-test-bundle/`,
+  `airflow-e2e-tests/java-native-bundle/`), the Java e2e suite or its Docker
+  files (`airflow-e2e-tests/tests/airflow_e2e_tests/java_sdk_tests/`,
+  `airflow-e2e-tests/docker/java.yml`, `airflow-e2e-tests/docker/Dockerfile.java`), the Java
+  coordinator (`task-sdk/src/airflow/sdk/coordinators/java/`, `_subprocess.py`), or the native
+  Lang-SDK Dag parsing sources change. Those are the Dag processing files `importer_routing.py` and
+  `lang_sdk_processor.py`, `models/dagcode.py`, `serialization/serialized_objects.py`,
+  the Task SDK importers (`task-sdk/src/airflow/sdk/importers/`), the coordinator registry
+  (`task-sdk/src/airflow/sdk/execution_time/coordinator.py`), and `coordinators/_dag_importer.py`;
+  they trigger the TypeScript SDK E2E tests too. Shared Dag processing files such as `manager.py`
+  are left to `canary` runs. Like the other
+  deployed e2e suites, enabling them forces `PROD Image building`.
+* `YAML Dag E2E tests` (the `yaml_dag` mode of the deployed-stack tests, exposed as the
+  `run-yaml-dag-e2e-tests` output) run when the YAML Dag fixture or its suite change
+  (`airflow-e2e-tests/yaml-dags/`, `airflow-e2e-tests/tests/airflow_e2e_tests/yaml_dag_tests/`,
+  `airflow-e2e-tests/docker/yaml-dag.yml`), when the Go example bundle's handler for that Dag changes
+  (`go-sdk/example/bundle/yamldag/`, `go-sdk/example/bundle/main.go` — the mode runs the Dag's one
+  code task on that bundle, so the rest of the Go SDK is left to the Go SDK E2E tests), when the
+  executable coordinator changes (`task-sdk/src/airflow/sdk/coordinators/executable/`,
+  `_subprocess.py`), or when the native Lang-SDK Dag parsing sources listed above change — the YAML
+  importer itself lives in `task-sdk/src/airflow/sdk/importers/`. Like the other deployed e2e
+  suites, enabling them forces `PROD Image building`.
+* `Language SDK XCom backend E2E tests` (the `lang_sdk_xcom_object_storage` mode of the deployed-stack
+  tests, which runs the configured `[core] xcom_backend` for TypeScript, Go and Java task XComs, exposed
+  as the `run-lang-sdk-xcom-e2e-tests` output) run when the coordinator-side backend
+  (`task-sdk/src/airflow/sdk/coordinators/_xcom_backend.py`), the base XCom class
+  (`task-sdk/src/airflow/sdk/bases/xcom.py`), the object storage backend
+  (`providers/common/io/src/airflow/providers/common/io/xcom/`), or the mode's compose override and suite
+  (`airflow-e2e-tests/docker/lang-sdk-xcom-object-storage.yml`,
+  `airflow-e2e-tests/tests/airflow_e2e_tests/lang_sdk_xcom_object_storage_tests/`) change — the language
+  SDKs themselves are left to their own E2E modes. Like the other deployed e2e suites, enabling them
+  forces `PROD Image building`.
+* `OpenLineage E2E tests` (the `openlineage` mode of the deployed-stack tests under
+  `airflow-e2e-tests/tests/airflow_e2e_tests/openlineage_tests`, exposed as the
+  `run-openlineage-e2e-tests` output) run when the `openlineage` or `common` providers or the
+  openlineage e2e suite change — and always on `canary` runs (where `full tests needed` also
+  covers core/task-sdk changes). Like the other deployed e2e suites, enabling them forces
+  `PROD Image building`.
+* `OpenLineage E2E compat tests` (the same suite rerun against older released Airflow versions with
+  current provider code, exposed as the `run-openlineage-e2e-compat-tests` output) are costly, so
+  they do NOT run on every OpenLineage PR. They run on `canary` runs, when the `full tests needed`
+  label is explicitly set, or when a file that drives the compat setup changes. These files are
+  the compat workflow (`.github/workflows/openlineage-e2e-compat-tests.yml`), the compat Dockerfile
+  (`airflow-e2e-tests/docker/openlineage-compat.Dockerfile`), the compat database override
+  (`airflow-e2e-tests/docker/openlineage-compat-db.yml`) and the shared e2e harness
+  (`airflow-e2e-tests/tests/airflow_e2e_tests/conftest.py` / `constants.py`). Like
+  `run-ui-e2e-tests`, `run-openlineage-e2e-compat-tests` ignores `full_tests_needed`. Many changes
+  that do not touch the compat setup also turn on `full_tests_needed`, for example changes to
+  environment files or the API spec. So a PR that changes only breeze's e2e command does not run
+  the compat tests, and the next `canary` run tests that change.
+* The specific unit test type is enabled only if changed files match the expected patterns for each type
+  (`API`, `CLI`, `WWW`, `Providers` etc.). The `Always` test type is added always if any unit
+  tests are run. `Providers` tests are removed if current branch is different than `main`
+* If there are no files left in sources after matching the test types and Kubernetes files,
+  then apparently some Core/Other files have been changed. This automatically adds all test
+  types to execute. This is done because changes in core might impact all the other test types.
+* if `CI Image building` is disabled, only basic prek hooks are enabled - no 'image-depending` prek hooks
+  are enabled.
+* If there are some build dependencies changed (`hatch_build.py` and updated system dependencies in
+  the `pyproject.toml` - then `upgrade to newer dependencies` is enabled.
+* The `disable image cache` label sets `docker-cache` to `disabled` and `use-pinned-os-deps-images` to
+  `false`, so the CI and PROD images install their OS dependencies from the apt repositories instead of
+  starting from the pinned OS-dependencies images. Only the label does that: the image build's own
+  retry with the cache disabled, after a failed first attempt, keeps using the pinned images.
+* A change to an input that `install_os_dependencies.sh` hashes into its marker - the script itself,
+  `common.sh`, `install_mysql.sh`, `install_mssql.sh`, `install_postgres.sh` or `scripts/docker/keys/` -
+  also sets `use-pinned-os-deps-images` to `false`. Reinstalling on top of a pinned image would only
+  exercise additions: a package or database client the change drops would still be there from the
+  pinned layer.
+* If docs are build, the `docs-list-as-string` will determine which docs packages to build. This is based on
+  several criteria: if any of the airflow core, charts, docker-stack, Apache Airflow Mypy, providers files or
+  docs have changed, then corresponding packages are built (including cross-dependent providers). If any of the core files
+  changed, also providers docs are built because all providers depend on airflow docs. The `apache-airflow`
+  and `task-sdk` packages are always built together, because they release together and their docs can link
+  to each other's pages before those pages are published. If any of the docs
+  build python files changed or when build is "canary" type in main - all docs packages are built.
+
+## Skipping prek hooks (Static checks)
+
+Our CI always run prek checks with `--all-files` flag. This is in order to avoid cases where
+different check results are run when only subset of files is used. This has an effect that the prek
+tests take a long time to run when all of them are run. Selective checks allow to save a lot of time
+for those tests in regular PRs of contributors by smart detection of which prek hooks should be skipped
+when some files are not changed. Those are the rules implemented:
+
+* The `identity` check is always skipped (saves space to display all changed files in CI)
+* The provider specific checks are skipped when builds are running in v2_* branches (we do not build
+  providers from those branches. Those are the checks skipped in this case:
+  * check-airflow-provider-compatibility
+  * check-extra-packages-references
+  * check-provider-yaml-valid
+  * lint-helm-chart
+  * mypy-providers
+* If "full tests" mode is detected, no more prek hooks are skipped - we run all of them
+* The following checks are skipped if those files are not changed:
+  * if no `All Providers Python files` changed - `mypy-providers` check is skipped
+  * if no `All Airflow Python files` changed - `mypy-airflow-core` check is skipped
+  * if no `All Dev Python files` changed - `mypy-dev` check is skipped
+  * if no `All Scripts Python files` changed - `mypy-scripts` check is skipped
+  * if no `Task SDK files` changed - `mypy-task-sdk` check is skipped
+  * if no `All Airflow CTL Python files` changed - `mypy-airflow-ctl` check is skipped
+  * if no `All Devel Common Python files` changed - `mypy-devel-common` check is skipped
+  * if no files under the matching folder changed, the corresponding per-folder mypy hook
+    is skipped (`mypy-airflow-ctl-tests`, `mypy-helm-tests`, `mypy-airflow-e2e-tests`,
+    `mypy-task-sdk-integration-tests`, `mypy-docker-tests`, `mypy-kubernetes-tests`)
+  * for each `shared/<dist>` workspace member, `mypy-shared-<dist>` is skipped when no
+    file under `shared/<dist>/` changed (enumerated at runtime)
+  * if neither `UI files` nor `UI OpenAPI files` changed - the `ts-compile-lint-ui` and
+    `ts-compile-lint-simple-auth-manager-ui` checks are skipped. The `UI OpenAPI files` group
+    covers the union of those hooks' own openapi `files:` triggers, so a spec-only change
+    (e.g. `_private_ui.yaml`) still runs them - otherwise a stale committed client can mask
+    type errors (see #68919)
+  * if no `All Python files` changed - `flynt` check is skipped
+  * if no `Helm files` changed - `lint-helm-chart` check is skipped
+  * if no `Java SDK files` (`java-sdk/`, excluding `.md`) changed - `ktlint`, `spotless` and
+    `regenerate-java-sdk-verification-metadata` checks are skipped. All three run the java-sdk
+    Gradle wrapper, and `regenerate-java-sdk-verification-metadata` also resolves the whole Java
+    SDK dependency graph from Maven Central
+  * if no `Java SDK conformance files` changed - `sync-java-sdk-dag-schema` is skipped (it runs the
+    `:sdk:syncDagSchema` Gradle task). The group is wider than `Java SDK files`: it also covers
+    Airflow's serializer, `airflow-core/src/airflow/serialization/schema.json` and the shared
+    harness under `scripts/ci/lang_sdk_serialization/` (see `Lang SDK serialization conformance`
+    above). Because airflow-core's `schema.json` is in the group, `sync-java-sdk-dag-schema` still
+    runs on a PR that changes only that file. Such a change is what leaves the Java SDK's copy in
+    `java-sdk/sdk/schema/dag-schema.json` out of date
+  * whichever of the four Java SDK hooks above runs first in a job pays for Gradle's cold
+    start, which includes downloading the Gradle distribution. A PR skips the cold start only
+    when it changes none of the `Java SDK conformance files`
+  * neither Java SDK group includes `.pre-commit-config.yaml` or CI setup files. A PR that
+    changes only the definition of one of the five hooks therefore does not run the hooks in
+    its own CI. The same holds for a PR whose only change is CI setup that does not force
+    `full_tests_needed`, for example a composite action under `.github/actions/`. The scheduled
+    canary runs skip none of the five hooks, so they still check such a change
+  * if no `TS SDK files` (`ts-sdk/`) changed - `check-ts-sdk-supervisor-schema` check is
+    skipped (it regenerates and diffs the generated ts-sdk file from the vendored schema). A
+    change to the supervisor wire schema on the Python side is not deferred to a follow-up PR:
+    `sync-ts-sdk-schemas` is triggered by that source, refreshes the vendored copy, and fails
+    on the PR that caused it, so the drift surfaces there rather than shipping unnoticed
+  * `check-provider-yaml-valid` is skipped unless at least one of these changed:
+    `All Providers Python files`, `All Providers Distribution Config files`
+    (which includes `provider.yaml`, `pyproject.toml`, and `providers/.pre-commit-config.yaml`),
+    or `Prek files` (`scripts/ci/prek/`). The last condition ensures the check runs
+    when the check script itself is modified.
+
+## Suspended providers
+
+The selective checks will fail in PR if it contains changes to a suspended provider unless you set the
+label `allow suspended provider changes` in the PR. This is to prevent accidental changes to suspended
+providers.
+
+
+## Selective check outputs
+
+The selective check outputs available are described below. In case of `list-as-string` values,
+empty string means `everything`, where lack of the output means `nothing` and list elements are
+separated by spaces. This is to accommodate for the way how outputs of this kind can be easily used by
+GitHub Actions to pass the list of parameters to a command to execute
+
+
+| Output                                                  | Meaning of the output                                                                                   | Example value                            | List |
+|---------------------------------------------------------|---------------------------------------------------------------------------------------------------------|------------------------------------------|------|
+| all-python-versions                                     | List of all python versions there are available in the form of JSON array                               | \['3.11', '3.12'\]                       |      |
+| all-python-versions-list-as-string                      | List of all python versions there are available in the form of space separated string                   | 3.11 3.12                                | *    |
+| all-versions                                            | If set to true, then all python, k8s, DB versions are used for tests.                                   | false                                    |      |
+| basic-checks-only                                       | Whether to run all static checks ("false") or only basic set of static checks ("true")                  | false                                    |      |
+| ci-image-build                                          | Whether CI image build is needed                                                                        | true                                     |      |
+| core-test-types-list-as-strings-in-json                 | Which test types should be run for unit tests for core (2 slices; 1 on RunsOn)                          | API Always Providers                     | *    |
+| debug-resources                                         | Whether resources usage should be printed during parallel job execution ("true"/ "false")               | false                                    |      |
+| default-branch                                          | Which branch is default for the build ("main" for main branch, "v2-4-test" for 2.4 line etc.)           | main                                     |      |
+| default-constraints-branch                              | Which branch is default for the build ("constraints-main" for main branch, "constraints-2-4" etc.)      | constraints-main                         |      |
+| default-helm-version                                    | Which Helm version to use as default                                                                    | v3.9.4                                   |      |
+| default-kind-version                                    | Which Kind version to use as default                                                                    | v0.16.0                                  |      |
+| default-kubernetes-version                              | Which Kubernetes version to use as default                                                              | v1.25.2                                  |      |
+| default-mysql-version                                   | Which MySQL version to use as default                                                                   | 5.7                                      |      |
+| default-postgres-version                                | Which Postgres version to use as default                                                                | 10                                       |      |
+| default-python-version                                  | Which Python version to use as default                                                                  | 3.11                                     |      |
+| disable-airflow-repo-cache                              | Disables cache of the repo main cache in CI - airflow will be installed without main installation cache | true                                     |      |
+| docker-cache                                            | Which cache should be used for images ("registry", "local" , "disabled")                                | registry                                 |      |
+| docs-build                                              | Whether to build documentation ("true"/"false")                                                         | true                                     |      |
+| docs-list-as-string                                     | What filter to apply to docs building - based on which documentation packages should be built           | apache-airflow helm-chart google         | *    |
+| excluded-providers-as-string                            | List of providers that should be excluded from the build as space-separated string                      | amazon google                            | *    |
+| force-pip                                               | Whether pip should be forced in the image build instead of uv ("true"/"false")                          | false                                    |      |
+| full-tests-needed                                       | Whether this build runs complete set of tests or only subset (for faster PR builds) \[1\]               | false                                    |      |
+| generate-constraints                                    | Whether the Generate constraints job runs                                                               | false                                    |      |
+| generate-pypi-constraints                               | Whether that job also resolves the constraints against PyPI                                             | false                                    |      |
+| generated-dependencies-changed                          | Whether generated dependencies have changed ("true"/"false")                                            | false                                    |      |
+| has-migrations                                          | Whether the PR has migrations ("true"/"false")                                                          | false                                    |      |
+| hatch-build-changed                                     | When hatch build.py changed in the PR.                                                                  | false                                    |      |
+| helm-test-packages                                      | List of helm packages to test as JSON array (`["All"]` on RunsOn: one job runs them all)              | \["airflow_aux", "airflow_core"\]        | *    |
+| helm-version                                            | Which Helm version to use for tests                                                                     | v3.15.3                                  |      |
+| in-memory-runner-type                                   | Like runner-type, but the RunsOn template puts docker in RAM (`extras=tmpfs`) unless disabled           | \["ubuntu-22.04"\]                       |      |
+| include-success-outputs                                 | Whether to include outputs of successful parallel tests ("true"/"false")                                | false                                    |      |
+| individual-providers-test-types-list-as-strings-in-json | Which test types should be run for unit tests for providers (individually listed; 5 slices, 3 on RunsOn)| Providers[\amazon\] Providers\[google\]  | *    |
+| is-committer-build                                      | Whether the build is triggered by a committer                                                           | false                                    |      |
+| is-legacy-ui-api-labeled                                | Whether the PR is labeled as legacy UI/API                                                              | false                                    |      |
+| java-sdk-version                                        | JDK version used to build the lang-SDK Java artifacts natively in CI                                     | 17                                       |      |
+| kind-version                                            | Which Kind version to use for tests                                                                     | v0.24.0                                  |      |
+| kubernetes-combos-list-as-string                        | All combinations of Python version and Kubernetes version to use for tests as space-separated string    | 3.11-v1.25.2 3.12-v1.28.13               | *    |
+| kubernetes-versions                                     | All Kubernetes versions to use for tests as JSON array                                                  | \['v1.25.2'\]                            |      |
+| kubernetes-versions-list-as-string                      | All Kubernetes versions to use for tests as space-separated string                                      | v1.25.2                                  | *    |
+| lang-sdk-conformance-sdks                               | Language SDKs whose serialization conformance check runs, as JSON array                                 | \["go", "java", "ts"\]                   |      |
+| latest-versions-only                                    | If set, the number of Python, Kubernetes, DB versions will be limited to the latest ones.               | false                                    |      |
+| mypy-checks                                             | List of folders to be considered for mypy checks                                                        | \["airflow_aux", "airflow_core"\]        |      |
+| mysql-exclude                                           | Which versions of MySQL to exclude for tests as JSON array                                              | []                                       |      |
+| mysql-versions                                          | Which versions of MySQL to use for tests as JSON array                                                  | \['8.0'\]                                |      |
+| postgres-exclude                                        | Which versions of Postgres to exclude for tests as JSON array                                           | []                                       |      |
+| postgres-versions                                       | Which versions of Postgres to use for tests as JSON array                                               | \['12'\]                                 |      |
+| prod-image-build                                        | Whether PROD image build is needed                                                                      | true                                     |      |
+| providers-compatibility-tests-matrix                    | Matrix of providers compatibility tests: (python_version, airflow_version, removed_providers). Excludes unbuilt python versions and the entry whose airflow_version equals the current branch version (unreleased on a vX-Y-test branch until GA) | \[{}\]                                   |      |
+| providers-test-types-list-as-strings-in-json            | Which test types should be run for unit tests for providers                                             | Providers Providers\[-google\]           | *    |
+| providers-split-test-types-list-as-strings-in-json      | Provider test types for the jobs running them in parallel in the CI image (one per provider on RunsOn)  | Providers Providers\[-google\]           | *    |
+| providers-xdist-test-types-list-as-strings-in-json      | Which test types the Non-DB (xdist) provider tests run, with no provider split out                      | Providers                                | *    |
+| pyproject-toml-changed                                  | When pyproject.toml changed in the PR.                                                                  | false                                    |      |
+| python-versions                                         | List of python versions to use for that build                                                           | \['3.11'\]                               |      |
+| python-versions-list-as-string                          | Which versions of MySQL to use for tests as space-separated string                                      | 3.11                                     | *    |
+| run-agent-framework-tests                               | Whether the common.ai agent framework adapter tests should be run ("true"/"false")                      | true                                     |      |
+| run-amazon-tests                                        | Whether Amazon tests should be run ("true"/"false")                                                     | true                                     |      |
+| run-api-codegen                                         | Whether "api-codegen" are needed to run ("true"/"false")                                                | true                                     |      |
+| run-api-tests                                           | Whether "api-tests" are needed to run ("true"/"false")                                                  | true                                     |      |
+| run-generic-prod-image-tests                            | Whether the PROD image's own tests run (Docker Compose, examples, basic e2e): off on component branches | true                                     |      |
+| run-docs-publish                                        | Whether the built docs are published locally and their versions validated: docs, provider versions or docs tooling changed | true                                     |      |
+| run-generic-basic-tests                                 | Whether the standalone Airflow test runs: off on component branches                                   | true                                     |      |
+| run-helm-tests                                          | Whether Helm tests are needed to run ("true"/"false")                                                   | true                                     |      |
+| run-image-build-time-check                              | Whether `Check that image builds quickly` runs: the CI image is built and a file it is built from changed | true                                     |      |
+| run-kubernetes-tests                                    | Whether Kubernetes tests should be run ("true"/"false")                                                 | true                                     |      |
+| run-lang-sdk-xcom-e2e-tests                             | Whether language SDK XCom backend e2e tests should be run — on coordinator-side XCom backend, base XCom class, object storage backend, or the mode's compose override/suite changes ("true"/"false") | true                                     |      |
+| run-mypy                                                | Whether mypy check is supposed to run in this build                                                     | true                                     |      |
+| run-providers-compatibility-tests                       | Whether the provider tests run against released Airflow versions: false when every changed file is hidden from them (Task SDK or core Python sources, Task SDK tests, their docs); off on component branches | true                                     |      |
+| run-shared-distributions-tests                          | Whether the shared distributions tests run: `shared/`, `devel-common/`, `dev/mypy/`, the root `pyproject.toml` or `uv.lock` changed; off on component branches | true                                     |      |
+| run-system-tests                                        | Whether system tests should be run ("true"/"false")                                                     | true                                     |      |
+| run-task-sdk-tests                                      | Whether Task SDK tests should be run ("true"/"false")                                                   | true                                     |      |
+| run-translation-check                                   | Whether the UI translation completeness check runs: a translation file changed; off on component branches | true                                     |      |
+| run-ts-sdk-docs                                         | Whether the TypeScript SDK API reference should be built — on `ts-sdk/api-docs/`, `ts-sdk/docs/`, or `ts-sdk/src/` changes, including Markdown ("true"/"false")          | true                                     |      |
+| run-ts-sdk-e2e-tests                                    | Whether TypeScript SDK e2e tests should be run — on runtime-affecting `ts-sdk/`, TS e2e test, Node coordinator, or native Lang-SDK Dag parsing changes ("true"/"false") | true                                     |      |
+| run-ts-sdk-tests                                        | Whether TypeScript SDK unit tests should be run — on `ts-sdk/` changes except Markdown, `api-docs/`, and `docs/` ("true"/"false") | true                                     |      |
+| run-ui-tests                                            | Whether UI tests should be run ("true"/"false")                                                         | true                                     |      |
+| run-unit-tests                                          | Whether unit tests should be run ("true"/"false")                                                       | true                                     |      |
+| run-www-tests                                           | Whether Legacy WWW tests should be run ("true"/"false")                                                 | true                                     |      |
+| run-yaml-dag-e2e-tests                                  | Whether YAML Dag e2e tests should be run — on YAML Dag fixture/suite, its Go handler, executable coordinator, or native Lang-SDK Dag parsing changes ("true"/"false") | true                                     |      |
+| amd-runners                                             | List of labels assigned for runners for that build for public AMD runners                               | \["ubuntu-22.04"\]                       |      |
+| arm-runners                                             | List of labels assigned for runners for that build for public ARM runners                               | \["ubuntu-22.04-arm"\]                   |      |
+| runner-type                                             | Runner labels for the CI jobs on this platform: public, or a RunsOn template jobs fill with cpu/ram     | \["ubuntu-22.04"\]                       |      |
+| selected-providers-list-as-string                       | List of providers affected when they are selectively affected.                                          | airbyte http                             | *    |
+| skip-prek-hooks                                         | Which prek hooks should be skipped during the static-checks run                                         | flynt,identity                           |      |
+| skip-providers-tests                                    | When provider tests should be skipped (on non-main branch or when no provider changes detected)         | true                                     |      |
+| sqlite-exclude                                          | Which versions of Sqlite to exclude for tests as JSON array                                             | []                                       |      |
+| testable-core-integrations                              | List of core integrations that are testable in the build as JSON array                                  | \['celery', 'kerberos'\]                 |      |
+| testable-providers-integrations                         | List of core integrations that are testable in the build as JSON array                                  | \['mongo', 'kafka'\]                     |      |
+| upgrade-to-newer-dependencies                           | Whether the image build should attempt to upgrade all dependencies (true/false or commit hash); false when no CI image is built | false                                    |      |
+| use-pinned-os-deps-images                               | Whether the CI and PROD image builds start from the pinned OS-dependencies images; false with the `disable image cache` label or a changed OS-dependencies script | true                                     |      |
+
+
+## Self-hosted (RunsOn) vs. public runners
+
+The `Tests (AMD)` / `Tests (ARM)` jobs run either on GitHub-hosted ("public") runners or on self-hosted
+[RunsOn](https://runs-on.com) EC2 runners in the Airflow AWS account. Selective checks route runs of
+code from `apache/airflow` itself there; this is a routing preference, not what keeps fork code off
+RunsOn (see below). The `runner-type` output is decided as follows, first match wins:
+
+1. Runs in any repository other than `apache/airflow` (forks running their own CI) use public runners.
+2. Any run uses public runners while the repository variable `USE_PUBLIC_RUNNERS` is `true`: the
+   switch for moving `main` off RunsOn without a PR, e.g. when the stack is unavailable.
+3. PRs with the `use public runners` label use public runners.
+4. Any `push`, `schedule` or `workflow_dispatch` in `apache/airflow` (canary runs and the release
+   branch pushes, all triggered by people with write access) uses RunsOn.
+5. Other events than `pull_request` use public runners.
+6. PRs with the `use self-hosted runners` label use RunsOn, if a committer's (`COMMITTERS` in
+   `global_constants.py`) latest review of the PR's head commit is an approval and no committer's
+   request for changes stands. The label outlives the commit it was added for, so on its own it would
+   vouch for every later push: a new push sends the PR back to public runners until the head commit is
+   approved again, and so does a dismissed approval if no other committer's approval of the head commit
+   remains. A committer's request for changes keeps the PR on public runners across pushes, as it blocks
+   a merge on GitHub, until that committer reviews again or the review is dismissed. The label must
+   also still be on the PR: a re-run reuses the labels of its original event, so they are checked
+   against the PR's current ones. If the PR or its reviews cannot be read, the label is ignored as well.
+7. PRs with the `non committer build` label use public runners.
+8. PRs opened by a bot (Dependabot, the `ci-upgrade-*` PRs and the like), or from a `dependabot/` branch,
+   use public runners: they carry code nobody has reviewed yet. The exception is a backport PR: one
+   authored by `github-actions[bot]` (matched on the exact login) from a `backport-*` branch (the name
+   `cherry_picker` gives it) of `apache/airflow`. A committer's merge started it, or a user with write
+   access dispatched it for a commit they chose. It continues with rule 9; the same PR from a fork does not.
+9. PRs from a branch of `apache/airflow` use RunsOn; PRs from forks use public runners.
+
+Labels are read from the event that started the run, and the CI workflows do not run on `labeled`. After
+adding or removing a label, push a commit or close and reopen the PR; re-running an earlier run reuses
+its original labels, and "Re-run failed jobs" also reuses that run's runner decision. A push voids the
+approval `use self-hosted runners` needs, so for that label approve the head commit and then close and
+reopen the PR.
+
+The RunsOn value is a label template such as
+`["runs-on=<run_id>/family=.../image=ubuntu22-full-x64/volume=150gb/spot=co/cpu={0}/ram={1}"]`. Every job
+picks its size class with `format(fromJSON(inputs.runners)[0], <cpu>, <ram>)` (`'4+8', '16+32'`,
+`'8+16', '32+64'` or `'32+64', '128+256'`), or, for a single-job reusable workflow, its caller passes
+`format(<runners>, <cpu>, <ram>)`. Each class is a range up to twice its size, so Spot can come from
+the larger instance types too; xdist follows the host's CPUs, so a larger runner runs more test workers.
+Jobs using `--run-in-parallel` (the DB, lowest-dependencies and special tests) run one serial pytest per
+test type instead, so they never use more CPUs than they have test types, and jobs running a single pytest
+(integration and system tests) use one. The size classes follow that: the xdist jobs and every job
+running provider tests in parallel take `'32+64', '128+256'`, the others `'8+16', '32+64'` or smaller:
+a job running one process (an end-to-end test against one Airflow stack, a Gradle test run) takes
+`'8+16', '32+64'`, and a job with a minute or two of work takes `'4+8', '16+32'`. On RunsOn the Helm unit
+tests run all their packages in one job per Kubernetes version, since each package takes about a minute
+under xdist against two to three minutes of preparing the image.
+On RunsOn `providers-split-test-types-list-as-strings-in-json`, which the provider jobs running in the CI
+image read, lists each provider as its own test type, in one job, instead of the long-running providers
+plus one group of all the others, so the job is not left waiting on that group. The provider
+compatibility tests keep the grouped `providers-test-types-list-as-strings-in-json`, because each of their
+test types installs an Airflow version first. The Non-DB xdist jobs read
+`providers-xdist-test-types-list-as-strings-in-json` instead, which never splits the providers: xdist runs
+them all in one pytest anyway.
+The matrix slices follow it too. On public runners the core test types are split into
+`NUMBER_OF_CORE_SLICES` (2) jobs, to keep the Non-DB xdist collection inside the runner's memory, and
+the individually listed providers into `NUMBER_OF_LOW_DEP_SLICES` (5). On RunsOn the core test types
+stay in one job (`NUMBER_OF_CORE_SLICES_ON_RUNS_ON`), because a core DB job lasts as long as its
+slowest test type whichever slice it is in, and the providers are split into jobs of about 40 test types
+(`LOW_DEP_TEST_TYPES_PER_JOB_ON_RUNS_ON`), which the heaviest-first ordering keeps the 32 CPUs busy with:
+3 jobs for all providers, one for a change touching a few. On RunsOn the longest-running providers
+(`PROVIDER_TEST_SPLITS`: amazon, google and standard) are also split into several test types such as
+`Providers[amazon:hooks]`, with `Providers[amazon:other]` running the rest of the provider's tests, so
+none of them leaves the job waiting on one long serial pytest.
+`spot=co` takes Spot from the pools with the most capacity regardless of price, which is cheaper than
+the on-demand launch and whole-job rerun a capacity miss or interruption costs;
+on a public label the same call returns the label unchanged. Steps that only make sense on RunsOn are
+gated on `runner.environment == 'self-hosted'`:
+
+* The EC2 cost summary of each job, with charts of the job's CPU and memory use (`metrics: cpu,memory` of
+  `runs-on/action`), the measurements to size a job's runner class by.
+* The runner settings for parallel tests (`scripts/ci/configure_runner_for_parallel_tests.sh`). Every test
+  type of a parallel run is a docker compose project with a network and a database of its own. Docker's
+  default address pools fit about 30 networks, fewer than a RunsOn runner runs test types at once, so the
+  script splits the same range into `/24` subnets; and it raises `fs.aio-max-nr`, which a few dozen MySQL
+  servers exhaust.
+* The image stashes (`.github/actions/stash-restore` / `stash-save`). On RunsOn the image tarballs go to
+  the stack's S3 cache bucket, named by their sha256, and only the digest is stashed as a GitHub artifact.
+  Any RunsOn job can write to the bucket, so a tarball is used only if it matches the digest stashed by
+  the same run, branch and repository (or, for a PR, its base branch). The smaller caches (mount cache, prek, docs inventory) use
+  the ASF stash action on both kinds of runners, so PRs on public runners keep the ones canary runs save;
+  the price is that every RunsOn canary uploads the mount cache from AWS to GitHub.
+
+The `in-memory-runner-type` output is the same decision with a second RunsOn template, used by the
+jobs whose databases wait on disk syncs: the Postgres, MySQL and Sqlite test jobs, the lowest-dependencies
+core tests and the SQLAlchemy, Boto and Pendulum special tests. Its label adds
+[`extras=tmpfs`](https://runs-on.com/docs/runners/capabilities/yolo-mode/), which puts
+`/var/lib/docker`, `/tmp` and `/home/runner` on a RAM disk, and also accepts the memory-optimized
+r-family. The jobs ask for 8 to 16 CPUs and 32 to 128 GB (`cpu=8+16/ram=32+128`), as the RAM disk
+is capped at the runner's memory before RunsOn v3.5.0. On public runners the output equals `runner-type`, and so it does
+on RunsOn while the repository variable `USE_IN_MEMORY_DOCKER` is `false`: the switch for moving docker
+back to disk without a PR.
+
+The decision above is not a security boundary. Under the `pull_request` event the code that
+evaluates it is the PR's own: a fork PR runs its own workflow files and breeze sources, and can name
+RunsOn labels in `runs-on:` directly. RunsOn launches a runner for any job of a repository its GitHub
+App is installed on, so nothing in this repository can prevent that. Keeping untrusted code away from
+anything that matters has to be enforced outside the repository, by:
+
+* The repository's Actions setting "Approval for running fork pull request workflows from
+  contributors", which must be "Require approval for all external contributors". That still exempts
+  members of the `apache` GitHub organization (ASF committers of any project who linked their GitHub
+  account) and repository collaborators, but every exempt person is identifiable.
+* The RunsOn stack, which must be dedicated to this repository and give the runners an instance role
+  that reaches nothing beyond the stack's own cache bucket (whose contents are never trusted, see the
+  stash actions), no EBS permissions, no SSH, network isolation between runners and a maximum run
+  time. RunsOn has no cap on instance sizes or counts and its budget only alerts, so the AWS account's
+  EC2 vCPU quotas are the cost ceiling.
+
+Pushes in a contributor fork are never committer builds, whoever pushes, because forks have no
+self-hosted runners.
+
+## Changing behaviours of the CI runs by setting labels
+
+PRs from `apache/airflow` branches run on self-hosted RunsOn runners and PRs from forks run on public
+runners (see above). Set `use public runners` to move a PR to public runners; a committer can set
+`use self-hosted runners` and approve the PR's head commit to move a fork PR to RunsOn, provided no
+committer's request for changes stands, then close and reopen the PR (a push would need a fresh
+approval; a committer should do the reopen, since an external author's reopen still needs a maintainer
+to approve the workflow run).
+
+If you are testing CI workflow changes and want to test it for more complete matrix combinations generated by
+the jobs - you can set `all versions` label in the PR. This will run the PRs with the same combinations
+of versions as the `canary` main build. Using `all versions` is automatically set when build dependencies
+change in `pyproject.toml`.
+
+If you are running an `apache` PR, you can also set `canary` label for such PR and in this case the
+canary-specific jobs run there. The label alone does not turn on `full tests needed` or `all versions`;
+set those labels too for a complete canary build. You can modify this behaviour of the `canary` run by
+applying `use public runners`, and `default versions only` labels to the PR as well which will still run
+a `canary` equivalent build but with public runners an default Python/K8S versions only - respectively.
+
+If you are testing CI workflow changes and change `pyproject.toml`
+and you want to limit the number of matrix combinations generated by
+the jobs - you can set `default versions only` label in the PR. This will limit the number of versions
+used in the matrix to the default ones (default Python version and default Kubernetes version).
+
+If you are testing CI workflow changes and want to limit the number of matrix combinations generated by
+the jobs - you can also set `latest versions only` label in the PR. This will limit the number of versions
+used in the matrix to the latest ones (latest Python version and latest Kubernetes version).
+
+You can also disable cache if you want to make sure your tests will run with image that does not have
+left-over package installed from the past cached image - by setting `disable image cache` label in the PR.
+
+By default, all outputs of successful parallel tests are not shown. You can enable them by setting
+`include success outputs` label in the PR. This makes the logs of mostly successful tests a lot longer
+and more difficult to sift through, but it might be useful in case you want to compare successful and
+unsuccessful runs of the tests.
+
+This table summarizes the labels you can use on PRs to control the selective checks and the CI runs:
+
+| Label                            | Affected outputs                 | Meaning                                                                                   |
+|----------------------------------|----------------------------------|-------------------------------------------------------------------------------------------|
+| all versions                     | all-versions, *-versions-*       | Run tests for all python and k8s versions.                                                |
+| allow suspended provider changes | allow-suspended-provider-changes | Allow changes to suspended providers.                                                     |
+| area:e2e-tests                   | prod-image-build                 | If set, the Airflow E2E tests are run regardless of changed files (does not force the full test matrix). |
+| area:kubernetes-tests            | run-kubernetes-tests             | If set, the Kubernetes tests job is run regardless of changed files (does not force the full test matrix). |
+| canary                           | is-canary-run                    | If set, the PR run from apache/airflow repo behaves as `canary` run.                      |
+| debug ci resources               | debug-ci-resources               | If set, then debugging resources is enabled during parallel tests and you can see them.   |
+| default versions only            | all-versions, *-versions-*       | If set, the number of Python and Kubernetes, DB versions are limited to the default ones. |
+| disable image cache              | docker-cache, use-pinned-os-deps-images | If set, the image cache is disabled and the OS dependencies are installed from scratch when building the image. |
+| force pip                        | force-pip                        | If set, the image build uses pip instead of uv.                                           |
+| full tests needed                | full-tests-needed                | If set, complete set of tests are run                                                     |
+| import graph narrowing           | providers-test-types-list-as-strings-in-json, and the other provider test type lists | If set, providers whose tests cannot import a changed file are not tested (see the `Providers` rules). |
+| include success outputs          | include-success-outputs          | If set, outputs of successful parallel tests are shown not only failed outputs.           |
+| latest versions only             | *-versions-*, *-versions-*       | If set, the number of Python, Kubernetes, DB versions will be limited to the latest ones. |
+| non committer build              | is-committer-build               | If set, the scripts used for images are used from target branch for committers.           |
+| upgrade to newer dependencies    | upgrade-to-newer-dependencies    | If set to true (default false) then dependencies in the CI image build are upgraded.      |
+
+-----
+
+Read next about [Workflows](05_workflows.md)

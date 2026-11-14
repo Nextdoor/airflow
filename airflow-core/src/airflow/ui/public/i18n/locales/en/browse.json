@@ -1,0 +1,98 @@
+{
+  "auditLog": {
+    "columns": {
+      "event": "Event",
+      "extra": "Extra",
+      "user": "User",
+      "when": "When"
+    },
+    "filters": {
+      "eventType": "Event Type"
+    }
+  },
+  "dagBundles": {
+    "active": "Active",
+    "columns": {
+      "active": "Active",
+      "importErrors": "Import Errors",
+      "lastRefreshed": "Last Refreshed",
+      "name": "Name",
+      "version": "Version"
+    },
+    "detail": {
+      "status": "Status"
+    },
+    "files": {
+      "columns": {
+        "file": "File",
+        "lastParsed": "Last Parsed",
+        "parseDuration": "Parse Duration"
+      },
+      "importErrorForbidden": "You don't have permission to read this import error.",
+      "importErrorGone": "This import error is no longer recorded. It was probably fixed by a reparse.",
+      "neverParsed": "Never",
+      "parsedFile_one": "Parsed File",
+      "parsedFile_other": "Parsed Files",
+      "parsedFilesNote": "Only files that define a Dag or failed to import are listed.",
+      "showImportError_one": "View error",
+      "showImportError_other": "View {{count, number}} errors"
+    },
+    "inactive": "Inactive",
+    "neverRefreshed": "Never",
+    "notRefreshedYet": "Not refreshed yet",
+    "notVersioned": "Not versioned"
+  },
+  "deadlines": {
+    "columns": {
+      "alertName": "Alert Name",
+      "deadlineTime": "Deadline Time",
+      "status": "Status"
+    },
+    "deadline_one": "Deadline",
+    "deadline_other": "Deadlines",
+    "filters": {
+      "status": "Status",
+      "statusOptions": {
+        "all": "All",
+        "missed": "Missed",
+        "pending": "Pending"
+      }
+    },
+    "title": "Deadlines"
+  },
+  "xcom": {
+    "add": {
+      "error": "Failed to add XCom",
+      "errorTitle": "Error",
+      "success": "XCom added successfully",
+      "successTitle": "XCom Added",
+      "title": "Add XCom"
+    },
+    "columns": {
+      "dag": "Dag",
+      "key": "Key",
+      "timestamp": "Timestamp",
+      "value": "Value"
+    },
+    "delete": {
+      "error": "Failed to delete XCom",
+      "errorTitle": "Error",
+      "success": "XCom deleted successfully",
+      "successTitle": "XCom Deleted",
+      "title": "Delete XCom",
+      "warning": "Are you sure you want to delete this XCom? This action cannot be undone."
+    },
+    "edit": {
+      "error": "Failed to update XCom",
+      "errorTitle": "Error",
+      "success": "XCom updated successfully",
+      "successTitle": "XCom Updated",
+      "title": "Edit XCom"
+    },
+    "entry_one": "XCom Entry",
+    "entry_other": "XCom Entries",
+    "key": "Key",
+    "title": "XCom",
+    "value": "Value"
+  }
+}

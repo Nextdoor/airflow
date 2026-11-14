@@ -15,23 +15,39 @@
 # specific language governing permissions and limitations
 # under the License.
 """Various utils to prepare docker and docker compose commands."""
+
 from __future__ import annotations
 
+import copy
+import json
 import os
+import platform
 import re
+import shlex
+import socket
+import subprocess
 import sys
-from copy import deepcopy
-from random import randint
-from subprocess import CalledProcessError, CompletedProcess
+import time
+from functools import lru_cache
+from pathlib import Path
+from subprocess import DEVNULL, CompletedProcess
+from typing import TYPE_CHECKING
 
-from airflow_breeze.params.build_ci_params import BuildCiParams
 from airflow_breeze.params.build_prod_params import BuildProdParams
-from airflow_breeze.params.common_build_params import CommonBuildParams
-from airflow_breeze.params.shell_params import ShellParams
+from airflow_breeze.utils.cache import read_from_cache_file
 from airflow_breeze.utils.host_info_utils import get_host_group_id, get_host_os, get_host_user_id
-from airflow_breeze.utils.image import find_available_ci_image
-from airflow_breeze.utils.path_utils import AIRFLOW_SOURCES_ROOT
-from airflow_breeze.utils.shared_options import get_forced_answer
+from airflow_breeze.utils.path_utils import (
+    AIRFLOW_ROOT_PATH,
+    SCRIPTS_DOCKER_PATH,
+    cleanup_python_generated_files,
+    create_mypy_volume_if_needed,
+    create_pycache_volume_if_needed,
+    get_host_id,
+    get_isolated_worktree_path,
+    get_main_git_dir_for_worktree,
+)
+from airflow_breeze.utils.shared_options import get_dry_run, get_verbose
+from airflow_breeze.utils.visuals import ASCIIART, ASCIIART_STYLE, CHEATSHEET, CHEATSHEET_STYLE
 
 try:
     from packaging import version
@@ -39,34 +55,35 @@ except ImportError:
     # We handle the ImportError so that autocomplete works with just click installed
     version = None  # type: ignore[assignment]
 
-from airflow_breeze.branch_defaults import AIRFLOW_BRANCH
 from airflow_breeze.global_constants import (
-    ALLOWED_PACKAGE_FORMATS,
-    APACHE_AIRFLOW_GITHUB_REPOSITORY,
-    FLOWER_HOST_PORT,
+    ALLOWED_CELERY_BROKERS,
+    ALLOWED_DEBIAN_VERSIONS,
+    CI_IMAGE_SOURCES_HASH_LABEL,
+    CURRENT_POSTGRES_VERSIONS,
+    DEFAULT_PYTHON_MAJOR_MINOR_VERSION,
+    DOCKER_DEFAULT_PLATFORM,
+    KNOWN_DOCKER_COMPOSE_PROJECT_NAMES,
+    KNOWN_DOCKER_COMPOSE_PROJECT_PREFIXES,
     MIN_DOCKER_COMPOSE_VERSION,
     MIN_DOCKER_VERSION,
-    MOUNT_ALL,
-    MOUNT_REMOVE,
-    MOUNT_SELECTED,
-    MSSQL_HOST_PORT,
-    MYSQL_HOST_PORT,
-    POSTGRES_HOST_PORT,
-    REDIS_HOST_PORT,
-    SSH_PORT,
-    WEBSERVER_HOST_PORT,
 )
-from airflow_breeze.utils.console import Output, get_console
+from airflow_breeze.utils import worktree_watcher
+from airflow_breeze.utils.console import Output, console_print, get_console
+from airflow_breeze.utils.environment_check import check_uv_version
+from airflow_breeze.utils.md5_build_check import calculate_ci_sources_hash
 from airflow_breeze.utils.run_utils import (
     RunCommandResult,
     check_if_buildx_plugin_installed,
-    commit_sha,
     run_command,
 )
 
+if TYPE_CHECKING:
+    from airflow_breeze.params.common_build_params import CommonBuildParams
+    from airflow_breeze.params.shell_params import ShellParams
+
 # Those are volumes that are mounted when MOUNT_SELECTED is chosen (which is the default when
 # entering Breeze. MOUNT_SELECTED prevents to mount the files that you can have accidentally added
-# in your sources (or they were added automatically by setup.py etc.) to be mounted to container.
+# in your sources (or they were added automatically by pyproject.toml) to be mounted to container.
 # This is important to get a "clean" environment for different python versions and to avoid
 # unnecessary slow-downs when you are mounting files on MacOS (which has very slow filesystem)
 # Any time you add a top-level folder in airflow that should also be added to container you should
@@ -75,70 +92,44 @@ VOLUMES_FOR_SELECTED_MOUNTS = [
     (".bash_aliases", "/root/.bash_aliases"),
     (".bash_history", "/root/.bash_history"),
     (".build", "/opt/airflow/.build"),
-    (".coveragerc", "/opt/airflow/.coveragerc"),
     (".dockerignore", "/opt/airflow/.dockerignore"),
     (".github", "/opt/airflow/.github"),
     (".inputrc", "/root/.inputrc"),
     (".rat-excludes", "/opt/airflow/.rat-excludes"),
-    ("BREEZE.rst", "/opt/airflow/BREEZE.rst"),
     ("LICENSE", "/opt/airflow/LICENSE"),
-    ("MANIFEST.in", "/opt/airflow/MANIFEST.in"),
-    ("NOTICE", "/opt/airflow/NOTICE"),
     ("RELEASE_NOTES.rst", "/opt/airflow/RELEASE_NOTES.rst"),
-    ("airflow", "/opt/airflow/airflow"),
-    ("provider_packages", "/opt/airflow/provider_packages"),
+    ("airflow-core", "/opt/airflow/airflow-core"),
+    ("airflow-ctl", "/opt/airflow/airflow-ctl"),
+    ("chart", "/opt/airflow/chart"),
+    ("clients", "/opt/airflow/clients"),
+    ("constraints", "/opt/airflow/constraints"),
     ("dags", "/opt/airflow/dags"),
     ("dev", "/opt/airflow/dev"),
+    ("devel-common", "/opt/airflow/devel-common"),
+    ("docker-stack-docs", "/opt/airflow/docker-stack-docs"),
+    ("docker-tests", "/opt/airflow/docker-tests"),
     ("docs", "/opt/airflow/docs"),
     ("generated", "/opt/airflow/generated"),
-    ("hooks", "/opt/airflow/hooks"),
-    ("images", "/opt/airflow/images"),
+    ("go-sdk", "/opt/airflow/go-sdk"),
+    ("java-sdk", "/opt/airflow/java-sdk"),
+    ("kubernetes-tests", "/opt/airflow/kubernetes-tests"),
     ("logs", "/root/airflow/logs"),
+    ("providers", "/opt/airflow/providers"),
+    ("providers-summary-docs", "/opt/airflow/providers-summary-docs"),
+    ("registry", "/opt/airflow/registry"),
     ("pyproject.toml", "/opt/airflow/pyproject.toml"),
-    ("pytest.ini", "/opt/airflow/pytest.ini"),
     ("scripts", "/opt/airflow/scripts"),
     ("scripts/docker/entrypoint_ci.sh", "/entrypoint"),
-    ("setup.cfg", "/opt/airflow/setup.cfg"),
-    ("setup.py", "/opt/airflow/setup.py"),
-    ("tests", "/opt/airflow/tests"),
-    ("kubernetes_tests", "/opt/airflow/kubernetes_tests"),
-    ("docker_tests", "/opt/airflow/docker_tests"),
-    ("chart", "/opt/airflow/chart"),
+    ("shared", "/opt/airflow/shared"),
+    ("task-sdk", "/opt/airflow/task-sdk"),
+    ("ts-sdk", "/opt/airflow/ts-sdk"),
 ]
 
+# ``uv.lock`` is deliberately absent above: it is mounted from ``mount-uv-lock.yml``, which
+# ShellParams skips for ``--force-lowest-dependencies`` so that the lowest-direct ``uv sync``
+# run in the container cannot write its re-resolved lock back over the host's.
 
-def get_extra_docker_flags(mount_sources: str, include_mypy_volume: bool = False) -> list[str]:
-    """
-    Returns extra docker flags based on the type of mounting we want to do for sources.
-
-    :param mount_sources: type of mounting we want to have
-    :param include_mypy_volume: include mypy_volume
-    :return: extra flag as list of strings
-    """
-    extra_docker_flags = []
-    if mount_sources == MOUNT_ALL:
-        extra_docker_flags.extend(["--mount", f"type=bind,src={AIRFLOW_SOURCES_ROOT},dst=/opt/airflow/"])
-    elif mount_sources == MOUNT_SELECTED:
-        for (src, dst) in VOLUMES_FOR_SELECTED_MOUNTS:
-            if (AIRFLOW_SOURCES_ROOT / src).exists():
-                extra_docker_flags.extend(
-                    ["--mount", f"type=bind,src={AIRFLOW_SOURCES_ROOT / src},dst={dst}"]
-                )
-        if include_mypy_volume:
-            extra_docker_flags.extend(
-                ["--mount", "type=volume,src=mypy-cache-volume,dst=/opt/airflow/.mypy_cache"]
-            )
-    elif mount_sources == MOUNT_REMOVE:
-        extra_docker_flags.extend(
-            ["--mount", f"type=bind,src={AIRFLOW_SOURCES_ROOT / 'empty'},dst=/opt/airflow/airflow"]
-        )
-    extra_docker_flags.extend(["--mount", f"type=bind,src={AIRFLOW_SOURCES_ROOT / 'files'},dst=/files"])
-    extra_docker_flags.extend(["--mount", f"type=bind,src={AIRFLOW_SOURCES_ROOT / 'dist'},dst=/dist"])
-    extra_docker_flags.extend(["--rm"])
-    extra_docker_flags.extend(
-        ["--env-file", f"{AIRFLOW_SOURCES_ROOT / 'scripts' / 'ci' / 'docker-compose' / '_docker.env' }"]
-    )
-    return extra_docker_flags
+DOCKER_INFO_TIMEOUT = 30
 
 
 def check_docker_resources(airflow_image_name: str) -> RunCommandResult:
@@ -165,6 +156,30 @@ def check_docker_resources(airflow_image_name: str) -> RunCommandResult:
     )
 
 
+def _run_docker_info_or_exit(command: list[str]) -> RunCommandResult:
+    try:
+        return run_command(
+            command,
+            no_output_dump_on_exception=True,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=DOCKER_INFO_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        console_print(
+            f"[error]Docker did not respond within {DOCKER_INFO_TIMEOUT} seconds.[/]\n"
+            "[warning]Please make sure Docker is running and responsive.[/]"
+        )
+        sys.exit(1)
+    except FileNotFoundError:
+        console_print(
+            "[error]Docker executable was not found.[/]\n"
+            "[warning]Please install Docker and ensure `docker` is available on PATH.[/]"
+        )
+        sys.exit(1)
+
+
 def check_docker_permission_denied() -> bool:
     """
     Checks if we have permission to write to docker socket. By default, on Linux you need to add your user
@@ -175,21 +190,12 @@ def check_docker_permission_denied() -> bool:
     :return: True if permission is denied
     """
     permission_denied = False
-    docker_permission_command = ["docker", "info"]
-    command_result = run_command(
-        docker_permission_command,
-        no_output_dump_on_exception=True,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    command_result = _run_docker_info_or_exit(["docker", "info"])
     if command_result.returncode != 0:
         permission_denied = True
         if command_result.stdout and "Got permission denied while trying to connect" in command_result.stdout:
-            get_console().print(
-                "ERROR: You have `permission denied` error when trying to communicate with docker."
-            )
-            get_console().print(
+            console_print("ERROR: You have `permission denied` error when trying to communicate with docker.")
+            console_print(
                 "Most likely you need to add your user to `docker` group: \
                 https://docs.docker.com/ engine/install/linux-postinstall/ ."
             )
@@ -205,22 +211,28 @@ def check_docker_is_running():
     Checks if docker is running. Suppressed Dockers stdout and stderr output.
 
     """
-    response = run_command(
-        ["docker", "info"],
-        no_output_dump_on_exception=True,
-        text=False,
-        capture_output=True,
-        check=False,
-    )
+    response = _run_docker_info_or_exit(["docker", "info"])
     if response.returncode != 0:
-        get_console().print(
-            "[error]Docker is not running.[/]\n"
-            "[warning]Please make sure Docker is installed and running.[/]"
+        console_print(
+            "[error]Docker is not running.[/]\n[warning]Please make sure Docker is installed and running.[/]"
         )
+        if response.stderr:
+            console_print(f"\n[warning]Command attempted:[/]\n{shlex.join(response.args)}")
+            console_print(f"\n[warning]Docker error output:[/]\n{response.stderr.strip()}")
+        if os.environ.get("CODESPACES", "").lower() == "true":
+            console_print(
+                "\n[info]It looks like you are running in a GitHub Codespace.[/]\n"
+                "[info]Try the following troubleshooting steps:[/]\n"
+                "  1. Check if the Docker socket exists: ls -la /var/run/docker.sock\n"
+                "  2. Check Docker socket permissions: groups $USER\n"
+                "  3. Try restarting the Codespace from the GitHub Codespaces dashboard\n"
+                "  4. If the issue persists, rebuild the devcontainer "
+                "(Command Palette -> 'Codespaces: Rebuild Container')\n"
+            )
         sys.exit(1)
 
 
-def check_docker_version():
+def check_docker_version(quiet: bool = False):
     """
     Checks if the docker compose version is as expected. including some specific modifications done by
     some vendors such as Microsoft. They might have modified version of docker-compose/docker in their
@@ -240,33 +252,70 @@ def check_docker_version():
             dry_run_override=False,
         )
         if docker_version_result.returncode == 0:
-            docker_version = docker_version_result.stdout.strip()
+            regex = re.compile(r"^(" + version.VERSION_PATTERN + r").*$", re.VERBOSE | re.IGNORECASE)
+            docker_version = re.sub(regex, r"\1", docker_version_result.stdout.strip())
         if docker_version == "":
-            get_console().print(
+            console_print(
                 f"""
 [warning]Your version of docker is unknown. If the scripts fail, please make sure to[/]
 [warning]install docker at least: {MIN_DOCKER_VERSION} version.[/]
 """
             )
+            sys.exit(1)
         else:
             good_version = compare_version(docker_version, MIN_DOCKER_VERSION)
             if good_version:
-                get_console().print(f"[success]Good version of Docker: {docker_version}.[/]")
+                if not quiet:
+                    console_print(f"[success]Good version of Docker: {docker_version}.[/]")
             else:
-                get_console().print(
+                console_print(
                     f"""
-[warning]Your version of docker is too old:{docker_version}.
-Please upgrade to at least {MIN_DOCKER_VERSION}[/]
+[error]Your version of docker is too old: {docker_version}.\n[/]
+[warning]Please upgrade to at least {MIN_DOCKER_VERSION}.\n[/]
+You can find installation instructions here: https://docs.docker.com/engine/install/
 """
                 )
+                sys.exit(1)
+
+
+def check_container_engine_is_docker(quiet: bool = False) -> bool:
+    """Checks if the container engine is Docker or podman."""
+    response = run_command(
+        ["docker", "version"],
+        no_output_dump_on_exception=True,
+        capture_output=True,
+        text=True,
+        check=False,
+        dry_run_override=False,
+    )
+    if response.returncode != 0:
+        console_print(
+            "[error]Could not determine the container engine.[/]\n"
+            "[warning]Please ensure that Docker is installed and running.[/]"
+        )
+        sys.exit(1)
+    run_command_output = "\n".join(
+        " ".join(line.split()) for line in response.stdout.strip().lower().splitlines()
+    )
+    podman_engine_enabled = any(
+        "client: podman engine" in line or "podman" in line for line in run_command_output.splitlines()
+    )
+    if podman_engine_enabled:
+        console_print(
+            "[warning]Podman container engine detected.[/]\n"
+            "[warning]Podman container engine has not become fully supported in breeze yet.[/]"
+        )
+        return False
+    console_print("[success]Docker container engine detected.[/]")
+    return True
 
 
 def check_remote_ghcr_io_commands():
-    """
-    Checks if you have permissions to pull an empty image from ghcr.io. Unfortunately, GitHub packages
-    treat expired login as "no-access" even on public repos. We need to detect that situation and suggest
-    user to log-out.
-    :return:
+    """Checks if you have permissions to pull an empty image from ghcr.io.
+
+    Unfortunately, GitHub packages treat expired login as "no-access" even on
+    public repos. We need to detect that situation and suggest user to log-out
+    or if they are in CI environment to re-push their PR/close or reopen the PR.
     """
     response = run_command(
         ["docker", "pull", "ghcr.io/apache/airflow-hello-world"],
@@ -277,31 +326,41 @@ def check_remote_ghcr_io_commands():
     )
     if response.returncode != 0:
         if "no such host" in response.stderr.decode("utf-8"):
-            get_console().print(
-                "[error]\nYou seem to be offline. This command requires access to network.[/]\n"
-            )
+            console_print("[error]\nYou seem to be offline. This command requires access to network.[/]\n")
             sys.exit(2)
-        get_console().print(
-            "[error]\nYou seem to have expired permissions on ghcr.io.[/]\n"
-            "[warning]Please logout. Run this command:[/]\n\n"
-            "   docker logout ghcr.io\n\n"
-        )
-        sys.exit(1)
+        console_print("[error]Response:[/]\n")
+        console_print(response.stdout.decode("utf-8"))
+        console_print(response.stderr.decode("utf-8"))
+        if os.environ.get("CI"):
+            console_print(
+                "\n[error]We are extremely sorry but you've hit the rare case that the "
+                "credentials you got from GitHub Actions to run are expired, and we cannot do much.[/]"
+                "\n¯\\_(ツ)_/¯\n\n"
+                "[warning]You have the following options now:\n\n"
+                "  * Close and reopen the Pull Request of yours\n"
+                "  * Rebase or amend your commit and push your branch again\n"
+                "  * Ask in the PR to re-run the failed job\n\n"
+            )
+            sys.exit(1)
+        else:
+            console_print(
+                "[error]\nYou seem to have expired permissions on ghcr.io.[/]\n"
+                "[warning]Please logout. Run this command:[/]\n\n"
+                "   docker logout ghcr.io\n\n"
+            )
+            sys.exit(1)
 
 
-DOCKER_COMPOSE_COMMAND = ["docker-compose"]
+def check_docker_compose_version(quiet: bool = False):
+    """Checks if the docker compose version is as expected.
 
-
-def check_docker_compose_version():
-    """
-    Checks if the docker compose version is as expected, including some specific modifications done by
-    some vendors such as Microsoft. They might have modified version of docker-compose/docker in their
-    cloud. In case docker compose version is wrong we continue but print warning for the user.
-
-
+    This includes specific modifications done by some vendors such as Microsoft.
+    They might have modified version of docker-compose/docker in their cloud. In
+    the case the docker compose version is wrong, we continue but print a
+    warning for the user.
     """
     version_pattern = re.compile(r"(\d+)\.(\d+)\.(\d+)")
-    docker_compose_version_command = ["docker-compose", "--version"]
+    docker_compose_version_command = ["docker", "compose", "version"]
     try:
         docker_compose_version_result = run_command(
             docker_compose_version_command,
@@ -310,118 +369,42 @@ def check_docker_compose_version():
             text=True,
             dry_run_override=False,
         )
-    except FileNotFoundError:
-        docker_compose_version_command = ["docker", "compose", "version"]
-        docker_compose_version_result = run_command(
-            docker_compose_version_command,
-            no_output_dump_on_exception=True,
-            capture_output=True,
-            text=True,
-            dry_run_override=False,
+    except Exception:
+        console_print(
+            "[error]You either do not have docker-composer or have docker-compose v1 installed.[/]\n"
+            "[warning]Breeze does not support docker-compose v1 any more as it has been replaced by v2.[/]\n"
+            "Follow https://docs.docker.com/compose/migrate/ to migrate to v2"
         )
-        DOCKER_COMPOSE_COMMAND.clear()
-        DOCKER_COMPOSE_COMMAND.extend(["docker", "compose"])
+        sys.exit(1)
     if docker_compose_version_result.returncode == 0:
         docker_compose_version = docker_compose_version_result.stdout
         version_extracted = version_pattern.search(docker_compose_version)
         if version_extracted is not None:
-            docker_version = ".".join(version_extracted.groups())
-            good_version = compare_version(docker_version, MIN_DOCKER_COMPOSE_VERSION)
+            docker_compose_version = ".".join(version_extracted.groups())
+            good_version = compare_version(docker_compose_version, MIN_DOCKER_COMPOSE_VERSION)
             if good_version:
-                get_console().print(f"[success]Good version of docker-compose: {docker_version}[/]")
+                if not quiet:
+                    console_print(f"[success]Good version of docker-compose: {docker_compose_version}[/]")
             else:
-                get_console().print(
+                console_print(
                     f"""
-[warning]You have too old version of docker-compose: {docker_version}! At least 1.29 needed! Please upgrade!
+[error]You have too old version of docker-compose: {docker_compose_version}!\n[/]
+[warning]At least {MIN_DOCKER_COMPOSE_VERSION} needed! Please upgrade!\n[/]
+See https://docs.docker.com/compose/install/ for installation instructions.\n
+Make sure docker-compose you install is first on the PATH variable of yours.\n
 """
                 )
-                get_console().print(
-                    """
-See https://docs.docker.com/compose/install/ for instructions.
-Make sure docker-compose you install is first on the PATH variable of yours.
-"""
-                )
+                sys.exit(1)
     else:
-        get_console().print(
-            """
-[warning]Unknown docker-compose version. At least 1.29 is needed![/]
-[warning]If Breeze fails upgrade to latest available docker-compose version.[/]
+        console_print(
+            f"""
+[error]Unknown docker-compose version.[/]
+[warning]At least {MIN_DOCKER_COMPOSE_VERSION} needed! Please upgrade!\n[/]
+See https://docs.docker.com/compose/install/ for installation instructions.\n
+Make sure docker-compose you install is first on the PATH variable of yours.\n
 """
-        )
-
-
-def check_docker_context():
-    """
-    Checks whether Docker is using the expected context
-
-    """
-    expected_docker_context = "default"
-    response = run_command(
-        ["docker", "info", "--format", "{{json .ClientInfo.Context}}"],
-        no_output_dump_on_exception=False,
-        text=True,
-        capture_output=True,
-        dry_run_override=False,
-    )
-    if response.returncode != 0:
-        get_console().print(
-            "[warning]Could not check for Docker context.[/]\n"
-            '[warning]Please make sure that Docker is using the right context by running "docker info" and '
-            "checking the active Context.[/]"
-        )
-        return
-
-    used_docker_context = response.stdout.strip().replace('"', "")
-
-    if used_docker_context == expected_docker_context:
-        get_console().print(f"[success]Good Docker context used: {used_docker_context}.[/]")
-    else:
-        get_console().print(
-            f"[error]Docker is not using the default context, used context is: {used_docker_context}[/]\n"
-            f"[warning]Please make sure Docker is using the {expected_docker_context} context.[/]\n"
-            f'[warning]You can try switching contexts by running: "docker context use '
-            f'{expected_docker_context}"[/]'
         )
         sys.exit(1)
-
-
-def get_env_variable_value(arg_name: str, params: CommonBuildParams | ShellParams):
-    raw_value = getattr(params, arg_name, None)
-    value = str(raw_value) if raw_value is not None else ""
-    value = "true" if raw_value is True else value
-    value = "false" if raw_value is False else value
-    if arg_name == "upgrade_to_newer_dependencies" and value == "true":
-        value = f"{randint(0, 2**32):x}"
-    return value
-
-
-def prepare_arguments_for_docker_build_command(image_params: CommonBuildParams) -> list[str]:
-    """
-    Constructs docker compose command arguments list based on parameters passed. Maps arguments to
-    argument values.
-
-    It maps:
-    * all the truthy/falsy values are converted to "true" / "false" respectively
-    * if upgrade_to_newer_dependencies is set to True, it is replaced by a random string to account
-      for the need of always triggering upgrade for docker build.
-
-    :param image_params: parameters of the image
-    :return: list of `--build-arg` commands to use for the parameters passed
-    """
-
-    args_command = []
-    for required_arg in image_params.required_image_args:
-        args_command.append("--build-arg")
-        args_command.append(
-            required_arg.upper() + "=" + get_env_variable_value(arg_name=required_arg, params=image_params)
-        )
-    for optional_arg in image_params.optional_image_args:
-        param_value = get_env_variable_value(optional_arg, params=image_params)
-        if len(param_value) > 0:
-            args_command.append("--build-arg")
-            args_command.append(optional_arg.upper() + "=" + param_value)
-    args_command.extend(image_params.docker_cache_directive)
-    return args_command
 
 
 def prepare_docker_build_cache_command(
@@ -434,14 +417,14 @@ def prepare_docker_build_cache_command(
 
     :return: Command to run as list of string
     """
-    arguments = prepare_arguments_for_docker_build_command(image_params)
-    build_flags = image_params.extra_docker_build_flags
     final_command = []
     final_command.extend(["docker"])
-    final_command.extend(["buildx", "build", "--builder", image_params.builder, "--progress=tty"])
-    final_command.extend(build_flags)
+    final_command.extend(
+        ["buildx", "build", "--builder", get_and_use_docker_context(image_params.builder), "--progress=auto"]
+    )
+    final_command.extend(image_params.common_docker_build_flags)
     final_command.extend(["--pull"])
-    final_command.extend(arguments)
+    final_command.extend(image_params.prepare_arguments_for_docker_build_command())
     final_command.extend(["--target", "main", "."])
     final_command.extend(
         ["-f", "Dockerfile" if isinstance(image_params, BuildProdParams) else "Dockerfile.ci"]
@@ -473,12 +456,19 @@ def prepare_base_build_command(image_params: CommonBuildParams) -> list[str]:
             [
                 "buildx",
                 "build",
-                "--builder",
-                image_params.builder,
-                "--progress=tty",
                 "--push" if image_params.push else "--load",
             ]
         )
+        if not image_params.docker_host:
+            builder = get_and_use_docker_context(image_params.builder)
+            build_command_param.extend(
+                [
+                    "--builder",
+                    builder,
+                ]
+            )
+            if builder != "default":
+                build_command_param.append("--load")
     else:
         build_command_param.append("build")
     return build_command_param
@@ -493,22 +483,22 @@ def prepare_docker_build_command(
 
     :return: Command to run as list of string
     """
-    arguments = prepare_arguments_for_docker_build_command(image_params)
     build_command = prepare_base_build_command(
         image_params=image_params,
     )
-    build_flags = image_params.extra_docker_build_flags
     final_command = []
     final_command.extend(["docker"])
     final_command.extend(build_command)
-    final_command.extend(build_flags)
+    final_command.extend(image_params.common_docker_build_flags)
     final_command.extend(["--pull"])
-    final_command.extend(arguments)
-    final_command.extend(["-t", image_params.airflow_image_name_with_tag, "--target", "main", "."])
+    final_command.extend(image_params.prepare_arguments_for_docker_build_command())
+    final_command.extend(["-t", image_params.airflow_image_name, "--target", "main", "."])
     final_command.extend(
         ["-f", "Dockerfile" if isinstance(image_params, BuildProdParams) else "Dockerfile.ci"]
     )
     final_command.extend(["--platform", image_params.platform])
+    if not isinstance(image_params, BuildProdParams):
+        final_command.extend(["--label", f"{CI_IMAGE_SOURCES_HASH_LABEL}={calculate_ci_sources_hash()}"])
     return final_command
 
 
@@ -520,31 +510,20 @@ def construct_docker_push_command(
     :param image_params: parameters of the image
     :return: Command to run as list of string
     """
-    return ["docker", "push", image_params.airflow_image_name_with_tag]
-
-
-def prepare_docker_build_from_input(
-    image_params: CommonBuildParams,
-) -> list[str]:
-    """
-    Constructs docker build empty image command based on the parameters passed.
-    :param image_params: parameters of the image
-    :return: Command to run as list of string
-    """
-    return ["docker", "build", "-t", image_params.airflow_image_name_with_tag, "-"]
+    return ["docker", "push", image_params.airflow_image_name]
 
 
 def build_cache(image_params: CommonBuildParams, output: Output | None) -> RunCommandResult:
-    build_command_result: CompletedProcess | CalledProcessError = CompletedProcess(args=[], returncode=0)
-    for platform in image_params.platforms:
-        platform_image_params = deepcopy(image_params)
+    build_command_result: RunCommandResult = CompletedProcess(args=[], returncode=0)
+    for build_platform in image_params.platforms:
+        platform_image_params = copy.deepcopy(image_params)
         # override the platform in the copied params to only be single platform per run
         # as a workaround to https://github.com/docker/buildx/issues/1044
-        platform_image_params.platform = platform
+        platform_image_params.platform = build_platform
         cmd = prepare_docker_build_cache_command(image_params=platform_image_params)
         build_command_result = run_command(
             cmd,
-            cwd=AIRFLOW_SOURCES_ROOT,
+            cwd=AIRFLOW_ROOT_PATH,
             output=output,
             check=False,
             text=True,
@@ -555,7 +534,7 @@ def build_cache(image_params: CommonBuildParams, output: Output | None) -> RunCo
 
 
 def make_sure_builder_configured(params: CommonBuildParams):
-    if params.builder != "default":
+    if params.builder != "autodetect":
         cmd = ["docker", "buildx", "inspect", params.builder]
         buildx_command_result = run_command(cmd, text=True, check=False, dry_run_override=False)
         if buildx_command_result and buildx_command_result.returncode != 0:
@@ -564,203 +543,894 @@ def make_sure_builder_configured(params: CommonBuildParams):
 
 
 def set_value_to_default_if_not_set(env: dict[str, str], name: str, default: str):
-    """
-    Set value of name parameter to default (indexed by name) if not set.
+    """Set value of name parameter to default (indexed by name) if not set.
+
     :param env: dictionary where to set the parameter
     :param name: name of parameter
     :param default: default value
-    :return:
     """
     if env.get(name) is None:
         env[name] = os.environ.get(name, default)
 
 
-def update_expected_environment_variables(env: dict[str, str]) -> None:
+def prepare_broker_url(params, env_variables):
+    """Prepare broker url for celery executor"""
+    urls = env_variables["CELERY_BROKER_URLS"].split(",")
+    url_map = {
+        ALLOWED_CELERY_BROKERS[0]: urls[0],
+        ALLOWED_CELERY_BROKERS[1]: urls[1],
+    }
+    if getattr(params, "celery_broker", None) and params.celery_broker in params.celery_broker in url_map:
+        env_variables["AIRFLOW__CELERY__BROKER_URL"] = url_map[params.celery_broker]
+
+
+def check_windows_filesystem_mount(quiet: bool = False):
     """
-    Updates default values for unset environment variables.
+    Checks if Airflow sources are on a Windows (NTFS) filesystem mounted via WSL2.
 
-    :param env: environment variables to update with missing values if not set.
+    Airflow only works with POSIX-compliant filesystems. When sources are checked out on Windows
+    and accessed via /mnt/c (or similar) in WSL2, Docker bind mounts inherit the NTFS limitations:
+    broken permissions, missing executable bits, symlink issues, etc.
+
+    This check uses ``stat -f -c %T`` on the host to detect the filesystem type. On WSL2,
+    Windows drives mounted via Plan 9 (9p) protocol report as ``v9fs``, while native Linux
+    filesystems report as ``ext2/ext3``. This detection only works on the host side - inside
+    Docker containers, the 9p layer is abstracted away by Docker Desktop.
     """
-    answer = get_forced_answer()
-    set_value_to_default_if_not_set(env, "AIRFLOW_CONSTRAINTS_MODE", "constraints-source-providers")
-    set_value_to_default_if_not_set(env, "AIRFLOW_CONSTRAINTS_REFERENCE", "constraints-source-providers")
-    set_value_to_default_if_not_set(env, "AIRFLOW_EXTRAS", "")
-    set_value_to_default_if_not_set(env, "ANSWER", answer if answer is not None else "")
-    set_value_to_default_if_not_set(env, "BASE_BRANCH", "main")
-    set_value_to_default_if_not_set(env, "BREEZE", "true")
-    set_value_to_default_if_not_set(env, "BREEZE_INIT_COMMAND", "")
-    set_value_to_default_if_not_set(env, "CI", "false")
-    set_value_to_default_if_not_set(env, "CI_BUILD_ID", "0")
-    set_value_to_default_if_not_set(env, "CI_EVENT_TYPE", "pull_request")
-    set_value_to_default_if_not_set(env, "CI_JOB_ID", "0")
-    set_value_to_default_if_not_set(env, "CI_TARGET_BRANCH", AIRFLOW_BRANCH)
-    set_value_to_default_if_not_set(env, "CI_TARGET_REPO", APACHE_AIRFLOW_GITHUB_REPOSITORY)
-    set_value_to_default_if_not_set(env, "COMMIT_SHA", commit_sha())
-    set_value_to_default_if_not_set(env, "DB_RESET", "false")
-    set_value_to_default_if_not_set(env, "DEFAULT_BRANCH", AIRFLOW_BRANCH)
-    set_value_to_default_if_not_set(env, "ENABLED_SYSTEMS", "")
-    set_value_to_default_if_not_set(env, "ENABLE_TEST_COVERAGE", "false")
-    set_value_to_default_if_not_set(env, "HOST_GROUP_ID", get_host_group_id())
-    set_value_to_default_if_not_set(env, "HOST_OS", get_host_os())
-    set_value_to_default_if_not_set(env, "HOST_USER_ID", get_host_user_id())
-    set_value_to_default_if_not_set(env, "INIT_SCRIPT_FILE", "init.sh")
-    set_value_to_default_if_not_set(env, "INSTALL_PACKAGES_FROM_CONTEXT", "false")
-    set_value_to_default_if_not_set(env, "INSTALL_PROVIDERS_FROM_SOURCES", "true")
-    set_value_to_default_if_not_set(env, "LOAD_DEFAULT_CONNECTIONS", "false")
-    set_value_to_default_if_not_set(env, "LOAD_EXAMPLES", "false")
-    set_value_to_default_if_not_set(env, "PACKAGE_FORMAT", ALLOWED_PACKAGE_FORMATS[0])
-    set_value_to_default_if_not_set(env, "PYTHONDONTWRITEBYTECODE", "true")
-    set_value_to_default_if_not_set(env, "RUN_SYSTEM_TESTS", "false")
-    set_value_to_default_if_not_set(env, "RUN_TESTS", "false")
-    set_value_to_default_if_not_set(env, "SKIP_ENVIRONMENT_INITIALIZATION", "false")
-    set_value_to_default_if_not_set(env, "SKIP_SSH_SETUP", "false")
-    set_value_to_default_if_not_set(env, "TEST_TYPE", "")
-    set_value_to_default_if_not_set(env, "TEST_TIMEOUT", "60")
-    set_value_to_default_if_not_set(env, "UPGRADE_TO_NEWER_DEPENDENCIES", "false")
-    set_value_to_default_if_not_set(env, "USE_PACKAGES_FROM_DIST", "false")
-    set_value_to_default_if_not_set(env, "VERBOSE", "false")
-    set_value_to_default_if_not_set(env, "VERBOSE_COMMANDS", "false")
-    set_value_to_default_if_not_set(env, "VERSION_SUFFIX_FOR_PYPI", "")
-    set_value_to_default_if_not_set(env, "WHEEL_VERSION", "0.36.2")
-
-
-DERIVE_ENV_VARIABLES_FROM_ATTRIBUTES = {
-    "AIRFLOW_CI_IMAGE": "airflow_image_name",
-    "AIRFLOW_CI_IMAGE_WITH_TAG": "airflow_image_name_with_tag",
-    "AIRFLOW_CONSTRAINTS_MODE": "airflow_constraints_mode",
-    "AIRFLOW_CONSTRAINTS_REFERENCE": "airflow_constraints_reference",
-    "AIRFLOW_EXTRAS": "airflow_extras",
-    "AIRFLOW_IMAGE_KUBERNETES": "airflow_image_kubernetes",
-    "AIRFLOW_PROD_IMAGE": "airflow_image_name",
-    "AIRFLOW_SOURCES": "airflow_sources",
-    "AIRFLOW_VERSION": "airflow_version",
-    "BACKEND": "backend",
-    "BASE_BRANCH": "base_branch",
-    "COMPOSE_FILE": "compose_file",
-    "DB_RESET": "db_reset",
-    "DEV_MODE": "dev_mode",
-    "DEFAULT_CONSTRAINTS_BRANCH": "default_constraints_branch",
-    "GITHUB_ACTIONS": "github_actions",
-    "INSTALL_AIRFLOW_VERSION": "install_airflow_version",
-    "INSTALL_PROVIDERS_FROM_SOURCES": "install_providers_from_sources",
-    "ISSUE_ID": "issue_id",
-    "LOAD_DEFAULT_CONNECTIONS": "load_default_connections",
-    "LOAD_EXAMPLES": "load_example_dags",
-    "MSSQL_DATA_VOLUME": "mssql_data_volume",
-    "MSSQL_VERSION": "mssql_version",
-    "MYSQL_VERSION": "mysql_version",
-    "NUM_RUNS": "num_runs",
-    "PACKAGE_FORMAT": "package_format",
-    "POSTGRES_VERSION": "postgres_version",
-    "PYTHON_MAJOR_MINOR_VERSION": "python",
-    "SKIP_CONSTRAINTS": "skip_constraints",
-    "SKIP_ENVIRONMENT_INITIALIZATION": "skip_environment_initialization",
-    "SQLITE_URL": "sqlite_url",
-    "START_AIRFLOW": "start_airflow",
-    "USE_AIRFLOW_VERSION": "use_airflow_version",
-    "USE_PACKAGES_FROM_DIST": "use_packages_from_dist",
-    "VERSION_SUFFIX_FOR_PYPI": "version_suffix_for_pypi",
-}
-
-DOCKER_VARIABLE_CONSTANTS = {
-    "FLOWER_HOST_PORT": FLOWER_HOST_PORT,
-    "MSSQL_HOST_PORT": MSSQL_HOST_PORT,
-    "MYSQL_HOST_PORT": MYSQL_HOST_PORT,
-    "POSTGRES_HOST_PORT": POSTGRES_HOST_PORT,
-    "REDIS_HOST_PORT": REDIS_HOST_PORT,
-    "SSH_PORT": SSH_PORT,
-    "WEBSERVER_HOST_PORT": WEBSERVER_HOST_PORT,
-}
-
-
-def get_env_variables_for_docker_commands(params: ShellParams | BuildCiParams) -> dict[str, str]:
-    """
-    Constructs environment variables needed by the docker-compose command, based on Shell parameters
-    passed to it.
-
-    * It checks if appropriate params are defined for all the needed docker compose environment variables
-    * It sets the environment values from the parameters passed
-    * For the constant parameters that we do not have parameters for, we only override the constant values
-      if the env variable that we run with does not have it.
-    * Updates all other environment variables that docker-compose expects with default values if missing
-
-    :param params: shell parameters passed.
-    :return: dictionary of env variables to set
-    """
-    env_variables: dict[str, str] = os.environ.copy()
-    for variable in DERIVE_ENV_VARIABLES_FROM_ATTRIBUTES:
-        param_name = DERIVE_ENV_VARIABLES_FROM_ATTRIBUTES[variable]
-        param_value = get_env_variable_value(param_name, params=params)
-        env_variables[variable] = str(param_value) if param_value is not None else ""
-    # Set constant defaults if not defined
-    for variable in DOCKER_VARIABLE_CONSTANTS:
-        constant_param_value = DOCKER_VARIABLE_CONSTANTS[variable]
-        if not env_variables.get(variable):
-            env_variables[variable] = str(constant_param_value)
-    update_expected_environment_variables(env_variables)
-    return env_variables
-
-
-def perform_environment_checks():
-    check_docker_is_running()
-    check_docker_version()
-    check_docker_compose_version()
-    check_docker_context()
-
-
-def get_docker_syntax_version() -> str:
-    from airflow_breeze.utils.path_utils import AIRFLOW_SOURCES_ROOT
-
-    return (AIRFLOW_SOURCES_ROOT / "Dockerfile").read_text().splitlines()[0]
-
-
-def warm_up_docker_builder(image_params: CommonBuildParams):
-    from airflow_breeze.utils.path_utils import AIRFLOW_SOURCES_ROOT
-
-    if image_params.builder == "default":
+    if platform.system().lower() != "linux":
         return
-    docker_syntax = get_docker_syntax_version()
-    get_console().print(f"[info]Warming up the {image_params.builder} builder for syntax: {docker_syntax}")
-    warm_up_image_param = deepcopy(image_params)
-    warm_up_image_param.image_tag = "warmup"
-    warm_up_image_param.push = False
-    build_command = prepare_base_build_command(image_params=warm_up_image_param)
-    warm_up_command = []
-    warm_up_command.extend(["docker"])
-    warm_up_command.extend(build_command)
-    warm_up_command.extend(["--platform", image_params.platform, "-"])
-    warm_up_command_result = run_command(
-        warm_up_command,
-        input=f"""{docker_syntax}
-FROM scratch
-LABEL description="test warmup image"
-""",
-        cwd=AIRFLOW_SOURCES_ROOT,
+    try:
+        with open("/proc/version") as f:
+            if "microsoft" not in f.read().lower():
+                return
+    except FileNotFoundError:
+        return
+    result = subprocess.run(
+        ["stat", "-f", "-c", "%T", str(AIRFLOW_ROOT_PATH)],
+        capture_output=True,
         text=True,
+        timeout=5,
         check=False,
     )
-    if warm_up_command_result.returncode != 0:
-        get_console().print(
-            f"[warning]Warning {warm_up_command_result.returncode} when warming up builder:"
-            f" {warm_up_command_result.stdout} {warm_up_command_result.stderr}"
+    fs_type = result.stdout.strip()
+    if fs_type in ("v9fs", "9p"):
+        console_print(
+            f"[error]Airflow sources are on a Windows filesystem ({AIRFLOW_ROOT_PATH})![/]\n\n"
+            f"Airflow requires a POSIX-compliant filesystem. Running Breeze with sources on\n"
+            f"Windows (NTFS) mounted via WSL2 will cause permission errors, broken executable\n"
+            f"bits, and other issues with Docker bind mounts.\n\n"
+            f"Clone the repository inside WSL2 on a Linux filesystem instead:\n\n"
+            f"    git clone https://github.com/apache/airflow.git ~/airflow\n"
+            f"    cd ~/airflow\n"
+            f"    breeze\n"
+        )
+        sys.exit(1)
+    if get_verbose() and not quiet:
+        console_print(f"[success]Filesystem check passed (type: {fs_type})[/]")
+
+
+def check_executable_entrypoint_permissions(quiet: bool = False):
+    """
+    Checks if the user has executable permissions on the entrypoints in checked-out airflow repository..
+    """
+    for entrypoint in SCRIPTS_DOCKER_PATH.glob("entrypoint*.sh"):
+        if get_verbose() and not quiet:
+            console_print(f"[info]Checking executable permissions on {entrypoint.as_posix()}[/]")
+        if not os.access(entrypoint.as_posix(), os.X_OK):
+            console_print(
+                f"[error]You do not have executable permissions on {entrypoint}[/]\n"
+                f"You likely checked out airflow repo on a filesystem that does not support executable "
+                f"permissions (for example on a Windows filesystem that is mapped to Linux VM). Airflow "
+                f"repository should only be checked out on a filesystem that is POSIX compliant."
+            )
+            sys.exit(1)
+    if get_verbose() and not quiet:
+        console_print("[success]Executable permissions on entrypoints are OK[/]")
+
+
+@lru_cache
+def perform_environment_checks(quiet: bool = False, *, cleanup_stale_worktrees: bool = True):
+    check_docker_is_running()
+    container_engine_is_docker = check_container_engine_is_docker(quiet)
+    if not container_engine_is_docker:
+        console_print("[error]Unsupported container engine detected.[/]")
+        console_print("[error]Install and enable Docker to continue.[/]")
+        sys.exit(1)
+    else:
+        check_docker_version(quiet)
+        check_docker_compose_version(quiet)
+        check_windows_filesystem_mount(quiet)
+        check_executable_entrypoint_permissions(quiet)
+    check_uv_version(quiet)
+    if not quiet:
+        console_print(f"[success]Host python version is {sys.version}[/]")
+    if cleanup_stale_worktrees:
+        projects = bring_compose_projects_down(stale_only=True)
+        if projects:
+            action = "Would clean up" if get_dry_run() else "Cleaned up"
+            console_print(f"[info]{action} projects from deleted worktrees: {projects}[/]")
+        start_worktree_watcher_if_needed()
+
+
+WORKTREE_WATCHER_LOCK_FILE = "worktree-watcher.lock"
+
+
+def start_worktree_watcher_if_needed() -> None:
+    """
+    Start the detached watcher that removes this worktree's Docker resources once it is deleted.
+
+    It runs on the host rather than in CI, where checkouts are not removed while their containers run.
+    """
+    worktree = get_isolated_worktree_path()
+    if worktree is None or get_dry_run() or os.environ.get("CI") == "true":
+        return
+    lock_file = worktree / ".build" / WORKTREE_WATCHER_LOCK_FILE
+    try:
+        if worktree_watcher.is_watcher_running(lock_file):
+            return
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-I",
+                worktree_watcher.__file__,
+                "--worktree",
+                str(worktree),
+                "--host",
+                get_host_id(),
+                "--lock-file",
+                str(lock_file),
+            ],
+            # Keep the watcher out of the worktree it watches, and detached from this terminal session.
+            cwd="/",
+            stdin=DEVNULL,
+            stdout=DEVNULL,
+            stderr=DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as error:
+        console_print(
+            f"[warning]Cannot start the worktree watcher: {error}. "
+            "Resources of this worktree will be removed by the next Breeze command after it is deleted.[/]"
         )
 
 
-def fix_ownership_using_docker():
-    perform_environment_checks()
-    shell_params = find_available_ci_image(
-        github_repository=APACHE_AIRFLOW_GITHUB_REPOSITORY,
-    )
-    extra_docker_flags = get_extra_docker_flags(MOUNT_ALL)
-    env = get_env_variables_for_docker_commands(shell_params)
+def get_docker_syntax_version() -> str:
+    from airflow_breeze.utils.path_utils import AIRFLOW_ROOT_PATH
+
+    return (AIRFLOW_ROOT_PATH / "Dockerfile").read_text().splitlines()[0]
+
+
+def warm_up_docker_builder(image_params_list: list[CommonBuildParams]):
+    from airflow_breeze.utils.path_utils import AIRFLOW_ROOT_PATH
+
+    platforms: set[str] = set()
+    for image_params in image_params_list:
+        platforms.add(image_params.platform)
+    console_print(f"[info]Warming up the builder for platforms: {platforms}")
+    for build_platform in platforms:
+        docker_context = get_and_use_docker_context(image_params.builder)
+        if docker_context == "default":
+            return
+        docker_syntax = get_docker_syntax_version()
+        console_print(f"[info]Warming up the {docker_context} builder for syntax: {docker_syntax}")
+        warm_up_image_param = copy.deepcopy(image_params_list[0])
+        warm_up_image_param.push = False
+        warm_up_image_param.platform = build_platform
+        build_command = prepare_base_build_command(image_params=warm_up_image_param)
+        warm_up_command = []
+        warm_up_command.extend(["docker"])
+        warm_up_command.extend(build_command)
+        warm_up_command.extend(["--platform", build_platform, "-"])
+        warm_up_command_result = run_command(
+            warm_up_command,
+            input=f"""{docker_syntax}
+    FROM scratch
+    LABEL description="test warmup image"
+    """,
+            cwd=AIRFLOW_ROOT_PATH,
+            text=True,
+            check=False,
+        )
+        if warm_up_command_result.returncode != 0:
+            console_print(
+                f"[warning]Warning {warm_up_command_result.returncode} when warming up builder:"
+                f" {warm_up_command_result.stdout} {warm_up_command_result.stderr}"
+            )
+
+
+OWNERSHIP_CLEANUP_DOCKER_TAG = (
+    f"python:{DEFAULT_PYTHON_MAJOR_MINOR_VERSION}-slim-{ALLOWED_DEBIAN_VERSIONS[0]}"
+)
+
+
+def fix_ownership_using_docker(quiet: bool = True):
+    if get_host_os() != "linux":
+        # no need to even attempt fixing ownership on MacOS/Windows
+        return
     cmd = [
         "docker",
         "run",
-        "-t",
-        *extra_docker_flags,
-        "--pull",
-        "never",
-        shell_params.airflow_image_name_with_tag,
-        "/opt/airflow/scripts/in_container/run_fix_ownership.sh",
+        "-v",
+        f"{AIRFLOW_ROOT_PATH}:/opt/airflow/",
     ]
-    run_command(cmd, text=True, env=env, check=False)
+    main_git_directory = get_main_git_dir_for_worktree()
+    if main_git_directory:
+        cmd.extend(["-v", f"{main_git_directory}:{main_git_directory}:ro"])
+    cmd.extend(
+        [
+            "-e",
+            f"HOST_OS={get_host_os()}",
+            "-e",
+            f"HOST_USER_ID={get_host_user_id()}",
+            "-e",
+            f"HOST_GROUP_ID={get_host_group_id()}",
+            "-e",
+            f"VERBOSE={str(get_verbose()).lower()}",
+            "-e",
+            f"DOCKER_IS_ROOTLESS={str(is_docker_rootless()).lower()}",
+            "--rm",
+            "-t",
+            OWNERSHIP_CLEANUP_DOCKER_TAG,
+            "/opt/airflow/scripts/in_container/run_fix_ownership.py",
+        ]
+    )
+    run_command(cmd, text=True, check=False, quiet=quiet)
+
+
+IMAGE_PULL_ATTEMPTS = 5
+IMAGE_PULL_BACKOFF_SECONDS = 15
+
+
+def get_images_to_pull(compose_project_name: str, env: dict[str, str], skip_images: set[str]) -> list[str]:
+    """
+    Returns third-party images of the compose project that are not available locally yet.
+
+    :param compose_project_name: name of the docker compose project
+    :param env: environment variables to resolve the compose files with
+    :param skip_images: images that should never be pulled (the locally built CI/PROD image)
+    """
+    result = run_command(
+        ["docker", "compose", "--project-name", compose_project_name, "config", "--images"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+    images_to_pull = []
+    for image in dict.fromkeys(line.strip() for line in result.stdout.splitlines() if line.strip()):
+        if image in skip_images:
+            continue
+        image_present = run_command(
+            ["docker", "image", "inspect", image],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if image_present.returncode != 0:
+            images_to_pull.append(image)
+    return images_to_pull
+
+
+def pull_images_with_retries(
+    compose_project_name: str,
+    env: dict[str, str],
+    skip_images: set[str] | None = None,
+    attempts: int = IMAGE_PULL_ATTEMPTS,
+) -> bool:
+    """
+    Pulls the third-party images the compose project needs, retrying with a growing backoff.
+
+    Registries (Docker Hub in particular) regularly time out or throttle CI runners. Left to
+    `docker compose run`, a single such blip fails the whole test job before any test executes,
+    and recovering from it costs a full re-run of the suite. Pulling up front instead retries
+    the operation that actually failed.
+
+    :param compose_project_name: name of the docker compose project
+    :param env: environment variables to resolve the compose files with
+    :param skip_images: images that should never be pulled (the locally built CI/PROD image)
+    :param attempts: how many times to attempt pulling each image
+
+    :return: True if every image needed is available locally
+    """
+    images = get_images_to_pull(compose_project_name, env, skip_images or set())
+    if not images:
+        return True
+    console_print(f"[info]Pulling {len(images)} image(s) before running the tests: {' '.join(images)}[/]")
+    all_pulled = True
+    for image in images:
+        for attempt in range(1, attempts + 1):
+            if run_command(["docker", "pull", image], env=env, check=False).returncode == 0:
+                break
+            if attempt == attempts:
+                console_print(f"[warning]Could not pull {image} in {attempts} attempts.[/]")
+                all_pulled = False
+                break
+            backoff = IMAGE_PULL_BACKOFF_SECONDS * attempt
+            console_print(
+                f"[warning]Failed to pull {image} (attempt {attempt}/{attempts}). Retrying in {backoff}s.[/]"
+            )
+            time.sleep(backoff)
+    return all_pulled
+
+
+def remove_stale_worktree_containers() -> None:
+    result = run_command(
+        [
+            "docker",
+            "ps",
+            "--all",
+            "--filter",
+            "label=org.apache.airflow.breeze=true",
+            "--format",
+            '{{.ID}}\t{{.Label "org.apache.airflow.breeze.worktree"}}\t{{.Label "org.apache.airflow.breeze.host"}}',
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        console_print("[error]Unable to discover containers belonging to deleted worktrees.[/]")
+        return
+    for line in result.stdout.splitlines():
+        container_id, worktree, host = (line.split("\t") + ["", ""])[:3]
+        # `docker ps` prints "<no value>" for containers created before the host label existed.
+        if _belongs_to_deleted_worktree(worktree, "" if host == "<no value>" else host):
+            console_print(f"Removing container {container_id} for deleted worktree {worktree}")
+            run_command(["docker", "rm", "--force", "--volumes", container_id], check=False)
+
+
+def _belongs_to_deleted_worktree(worktree: str, host: str) -> bool:
+    # Another host's paths cannot be checked here. Resources created before the host label existed
+    # have no host and keep the local-path check.
+    # Resources created when the host id could not be stored carry the host name instead.
+    if host and host not in (get_host_id(), socket.gethostname()):
+        return False
+    return _worktree_is_missing(worktree)
+
+
+def _worktree_is_missing(worktree: str) -> bool:
+    path = Path(worktree)
+    if not path.is_absolute():
+        return False
+    try:
+        return worktree_watcher.is_worktree_missing(path)
+    except OSError as error:
+        console_print(f"[warning]Cannot check worktree {worktree}: {error}. Keeping its resources.[/]")
+    return False
+
+
+def remove_docker_networks(networks: list[str] | None = None) -> None:
+    """
+    Removes specified docker networks. If no networks are specified, it removes all networks created by breeze.
+    Prunes unused Breeze-labelled networks, including the legacy default project.
+    Errors are ignored (not even printed in the output), so you can safely call it without checking
+    if the networks exist.
+
+    :param networks: list of networks to remove
+    """
+    if networks is None:
+        for label in ("org.apache.airflow.breeze=true", "com.docker.compose.project=breeze"):
+            run_command(
+                ["docker", "network", "prune", "-f", "--filter", f"label={label}"],
+                check=False,
+                stderr=DEVNULL,
+                quiet=True,
+            )
+    else:
+        for network in networks:
+            run_command(
+                ["docker", "network", "rm", network],
+                check=False,
+                stderr=DEVNULL,
+                quiet=True,
+            )
+
+
+def remove_docker_volumes(volumes: list[str] | None = None) -> None:
+    """
+    Removes specified docker volumes. If no volumes are specified, it removes all volumes created by breeze.
+    Prunes unused Breeze-labelled volumes, including the legacy default project.
+    Errors are ignored (not even printed in the output), so you can safely call it without checking
+    if the volumes exist.
+
+    :param volumes: list of volumes to remove
+    """
+    if volumes is None:
+        for label in ("org.apache.airflow.breeze=true", "com.docker.compose.project=breeze"):
+            run_command(
+                ["docker", "volume", "prune", "-f", "-a", "--filter", f"label={label}"],
+                check=False,
+                stderr=DEVNULL,
+            )
+    else:
+        for volume in volumes:
+            run_command(
+                ["docker", "volume", "rm", volume],
+                check=False,
+                stderr=DEVNULL,
+            )
+
+
+# When you are using Docker Desktop (specifically on MacOS). the preferred context is "desktop-linux"
+# because the docker socket to use is created in the .docker/ directory in the user's home directory
+# and it does not require the user to belong to the "docker" group.
+# The "rancher-desktop" context is the preferred context for the Rancher dockerd (moby) Container Engine.
+# The "default" context is the traditional one that requires "/var/run/docker.sock" to be writeable by the
+# user running the docker command.
+PREFERRED_CONTEXTS = ["orbstack", "desktop-linux", "rancher-desktop", "default"]
+
+
+def autodetect_docker_context():
+    """
+    Auto-detects which docker context to use.
+
+    :return: name of the docker context to use
+    """
+    result = run_command(
+        ["docker", "context", "ls", "--format=json"],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if result.returncode != 0:
+        console_print("[warning]Could not detect docker builder. Using default.[/]")
+        return "default"
+    try:
+        context_dicts = json.loads(result.stdout)
+        if isinstance(context_dicts, dict):
+            context_dicts = [context_dicts]
+    except json.decoder.JSONDecodeError:
+        context_dicts = (json.loads(line) for line in result.stdout.splitlines() if line.strip())
+    known_contexts = {info["Name"]: info for info in context_dicts}
+    if not known_contexts:
+        console_print("[warning]Could not detect docker builder. Using default.[/]")
+        return "default"
+    for preferred_context_name in PREFERRED_CONTEXTS:
+        try:
+            context = known_contexts[preferred_context_name]
+        except KeyError:
+            continue
+        # On Windows, some contexts are used for WSL2. We don't want to use those.
+        if context["DockerEndpoint"] == "npipe:////./pipe/dockerDesktopLinuxEngine":
+            continue
+        console_print(f"[info]Using {preferred_context_name!r} as context.[/]")
+        return preferred_context_name
+    fallback_context = next(iter(known_contexts))
+    console_print(
+        f"[warning]Could not use any of the preferred docker contexts {PREFERRED_CONTEXTS}.\n"
+        f"Using {fallback_context} as context.[/]"
+    )
+    return fallback_context
+
+
+def get_and_use_docker_context(context: str):
+    if context == "autodetect":
+        context = autodetect_docker_context()
+    run_command(["docker", "context", "create", context], check=False)
+    output = run_command(["docker", "context", "use", context], check=False, stdout=DEVNULL, stderr=DEVNULL)
+    if output.returncode:
+        console_print(f"[warning]Could no use context {context!r}. Continuing with current context[/]")
+    return context
+
+
+def get_docker_build_env(image_params: CommonBuildParams) -> dict[str, str]:
+    env = os.environ.copy()
+    env["DOCKER_BUILDKIT"] = "1"
+    if image_params.docker_host:
+        env["DOCKER_HOST"] = image_params.docker_host
+    return env
+
+
+def bring_compose_project_down(preserve_volumes: bool, shell_params: ShellParams):
+    down_command_to_execute = ["docker", "compose"]
+    if shell_params.project_name:
+        down_command_to_execute.extend(["--project-name", shell_params.project_name])
+    down_command_to_execute.extend(["down", "--remove-orphans"])
+    if not preserve_volumes:
+        down_command_to_execute.append("--volumes")
+    run_command(
+        down_command_to_execute,
+        text=True,
+        check=False,
+        capture_output=shell_params.quiet,
+        env=shell_params.env_variables_for_docker_commands,
+    )
+
+
+def _get_compose_resources(
+    kind: str, *, stale_only: bool = False
+) -> tuple[list[tuple[str, dict[str, str]]], bool]:
+    cmd = ["docker", kind, "ls", "--quiet", "--filter", "label=com.docker.compose.project"]
+    if stale_only:
+        cmd.extend(
+            [
+                "--filter",
+                "label=org.apache.airflow.breeze=true",
+                "--filter",
+                "label=org.apache.airflow.breeze.worktree",
+            ]
+        )
+    if kind == "container":
+        cmd.append("--all")
+    result = run_command(cmd, capture_output=True, text=True, check=not stale_only, dry_run_override=False)
+    if result.returncode != 0:
+        return [], True
+    identifiers = result.stdout.split()
+    if not identifiers:
+        return [], False
+    result = run_command(
+        ["docker", kind, "inspect", *identifiers],
+        capture_output=True,
+        text=True,
+        check=not stale_only,
+        dry_run_override=False,
+    )
+    return [
+        (
+            resource["Name"] if kind == "volume" else resource["Id"],
+            resource["Config"]["Labels"] if kind == "container" else resource["Labels"],
+        )
+        for resource in json.loads(result.stdout or "[]")
+    ], result.returncode != 0
+
+
+def bring_compose_projects_down(
+    *,
+    preserve_volumes: bool = False,
+    all_worktrees: bool = False,
+    only_project: str | None = None,
+    current_worktree: str = "",
+    stale_only: bool = False,
+) -> list[str]:
+    targets: dict[str, list[str]] = {"container": [], "volume": [], "network": []}
+    projects: set[str] = set()
+    failed = False
+    for kind in targets:
+        if kind == "volume" and preserve_volumes:
+            continue
+        resources, discovery_failed = _get_compose_resources(kind, stale_only=stale_only)
+        failed |= discovery_failed
+        for identifier, labels in resources:
+            project = labels["com.docker.compose.project"]
+            breeze_owned = labels.get("org.apache.airflow.breeze") == "true"
+            legacy = (
+                "org.apache.airflow.breeze" not in labels
+                and "org.apache.airflow.breeze.worktree" not in labels
+                and (
+                    project in KNOWN_DOCKER_COMPOSE_PROJECT_NAMES
+                    or any(project.startswith(prefix) for prefix in KNOWN_DOCKER_COMPOSE_PROJECT_PREFIXES)
+                )
+            )
+            if only_project:
+                selected = project == only_project
+            elif all_worktrees:
+                selected = breeze_owned or legacy
+            else:
+                worktree = labels.get("org.apache.airflow.breeze.worktree", "")
+                selected = breeze_owned and (
+                    (not stale_only and worktree in ("", current_worktree))
+                    or _belongs_to_deleted_worktree(
+                        worktree, labels.get("org.apache.airflow.breeze.host", "")
+                    )
+                )
+                if not stale_only and legacy:
+                    selected = True
+            if selected:
+                targets[kind].append(identifier)
+                projects.add(project)
+
+    if targets["container"]:
+        # A `breeze shell` or `breeze start-airflow` container can exit later than `docker container stop`
+        # waits for, and it removes itself once it exits. So the exit is awaited separately, and only the
+        # containers that are still there afterwards are removed.
+        console_print("[info]Stopping Breeze containers, this can take a while.[/]")
+        for action in ("stop", "wait"):
+            run_command(
+                ["docker", "container", action, *targets["container"]], check=False, capture_output=True
+            )
+        remaining, discovery_failed = _get_compose_resources("container", stale_only=stale_only)
+        failed |= discovery_failed
+        remaining_ids = {identifier for identifier, _ in remaining}
+        targets["container"] = [
+            identifier for identifier in targets["container"] if identifier in remaining_ids
+        ]
+    for kind, identifiers in targets.items():
+        if not identifiers:
+            continue
+        cmd = ["docker", kind, "rm"]
+        if kind == "container":
+            cmd.append("--force")
+            if not preserve_volumes:
+                cmd.append("--volumes")
+        result = run_command(
+            [*cmd, *identifiers],
+            check=not stale_only,
+            capture_output=stale_only,
+        )
+        failed |= result.returncode != 0
+    if failed:
+        console_print(
+            "[warning]Unable to clean up some deleted-worktree resources; continuing. Breeze will retry on the next Docker command.[/]"
+        )
+        return []
+    return sorted(projects)
+
+
+def find_other_worktree_projects(current_worktree: str) -> dict[str, list[str]]:
+    """Map other existing worktrees to the Compose projects that still have containers or volumes."""
+    found: dict[str, set[str]] = {}
+    for kind in ("container", "volume"):
+        resources, _ = _get_compose_resources(kind, stale_only=True)
+        for _, labels in resources:
+            worktree = labels.get("org.apache.airflow.breeze.worktree", "")
+            if (
+                labels.get("org.apache.airflow.breeze") != "true"
+                or worktree in ("", current_worktree)
+                or _belongs_to_deleted_worktree(worktree, labels.get("org.apache.airflow.breeze.host", ""))
+            ):
+                continue
+            found.setdefault(worktree, set()).add(labels["com.docker.compose.project"])
+    return {worktree: sorted(projects) for worktree, projects in sorted(found.items())}
+
+
+def execute_command_in_shell(
+    shell_params: ShellParams,
+    project_name: str,
+    command: str | None = None,
+    output: Output | None = None,
+    signal_error: bool = True,
+    preserve_backend: bool = False,
+    forward_ports: bool = False,
+) -> RunCommandResult:
+    """Executes command in shell.
+
+    When you want to execute a script/bash command inside the CI container and want to use `enter_shell`
+    for this purpose, the helper methods sets the following parameters of shell_params:
+
+    * backend - to force sqlite backend (unless preserve_backend=True)
+    * clean_sql_db=True - to clean the sqlite DB
+    * forward_ports=False - to avoid forwarding ports from the container to the host - again that will
+      allow to avoid clashes with other commands and opened breeze shell (unless forward_ports=True is passed)
+    * project_name - to avoid name clashes with default "breeze" project name used
+    * quiet=True - avoid displaying all "interactive" parts of Breeze: ASCIIART, CHEATSHEET, some diagnostics
+    * skip_environment_initialization - to avoid initializing interactive environment
+    * skip_image_upgrade_check - to avoid checking if the image is up to date
+
+    if command is passed as parameter, extra_args - to pass the command to execute in the shell
+
+    :param shell_params: shell parameters to use
+    :param project_name: Name of the project to use. This avoids name clashes with default 'breeze"
+        project name used - this way you will be able to run the command in parallel to regular
+        "breeze" shell opened in parallel
+    :param command: command to execute in the shell
+    :param output: output configuration
+    :param signal_error: whether to signal error
+    :param preserve_backend: if True, preserve the backend specified in shell_params instead of forcing sqlite
+    :param forward_ports: if True, keep port forwarding enabled (for accessing services from host)
+    """
+    if not preserve_backend:
+        shell_params.backend = "sqlite"
+    if not forward_ports:
+        shell_params.forward_ports = False
+    shell_params.project_name = project_name
+    shell_params.quiet = True
+    shell_params.skip_environment_initialization = True
+    shell_params.skip_image_upgrade_check = True
+    if get_verbose():
+        if not preserve_backend:
+            console_print("[warning]Sqlite DB is cleaned[/]")
+        else:
+            console_print(f"[info]Using backend: {shell_params.backend}[/]")
+        if forward_ports:
+            console_print("[info]Port forwarding enabled[/]")
+        else:
+            console_print("[warning]Disabled port forwarding[/]")
+        console_print(f"[warning]Project name set to: {project_name}[/]")
+        console_print("[warning]Forced quiet mode[/]")
+        console_print("[warning]Forced skipping environment initialization[/]")
+        console_print("[warning]Forced skipping upgrade check[/]")
+    if command:
+        shell_params.extra_args = (command,)
+        if get_verbose():
+            console_print(f"[info]Command to execute: '{command}'[/]")
+    perform_environment_checks(quiet=shell_params.quiet)
+    return enter_shell(shell_params, output=output, signal_error=signal_error)
+
+
+def enter_shell(
+    shell_params: ShellParams, output: Output | None = None, signal_error: bool = True
+) -> RunCommandResult:
+    """
+    Executes entering shell using the parameters passed as kwargs:
+
+    * checks if docker version is good
+    * checks if docker-compose version is good
+    * updates kwargs with cached parameters
+    * displays ASCIIART and CHEATSHEET unless disabled
+    * build ShellParams from the updated kwargs
+    * shuts down existing project
+    * executes the command to drop the user to Breeze shell
+    """
+    fix_ownership_using_docker(quiet=shell_params.quiet)
+    cleanup_python_generated_files()
+    if read_from_cache_file("suppress_asciiart") is None and not shell_params.quiet:
+        console_print(ASCIIART, style=ASCIIART_STYLE)
+    if read_from_cache_file("suppress_cheatsheet") is None and not shell_params.quiet:
+        console_print(CHEATSHEET, style=CHEATSHEET_STYLE)
+    if shell_params.use_airflow_version:
+        # in case you use specific version of Airflow, you want to bring airflow down automatically before
+        # using it. This prevents the problem that if you have newer DB, airflow will not know how
+        # to migrate to it and fail with "Can't locate revision identified by 'xxxx'".
+        console_print(
+            f"[warning]Bringing the project down as {shell_params.use_airflow_version} "
+            f"airflow version is used[/]"
+        )
+        bring_compose_project_down(preserve_volumes=False, shell_params=shell_params)
+
+    if shell_params.restart:
+        bring_compose_project_down(preserve_volumes=False, shell_params=shell_params)
+    if shell_params.include_mypy_volume:
+        create_mypy_volume_if_needed()
+    if shell_params.include_pycache_volume:
+        create_pycache_volume_if_needed()
+    shell_params.print_badge_info()
+    cmd = ["docker", "compose"]
+    if shell_params.quiet:
+        cmd.extend(["--progress", "quiet"])
+    if shell_params.project_name:
+        cmd.extend(["--project-name", shell_params.project_name])
+    cmd.extend(["run", "--service-ports", "--rm"])
+    if shell_params.tty == "disabled":
+        cmd.append("--no-TTY")
+    cmd.append("airflow")
+    cmd_added = shell_params.command_passed
+    if cmd_added is not None:
+        cmd.extend(["-c", cmd_added])
+    if "arm64" in DOCKER_DEFAULT_PLATFORM:
+        if shell_params.backend == "mysql":
+            console_print("\n[warn]MySQL use MariaDB client binaries on ARM architecture.[/]\n")
+
+    if "openlineage" in shell_params.integration or "all" in shell_params.integration:
+        if (
+            shell_params.backend != "postgres"
+            or shell_params.postgres_version not in CURRENT_POSTGRES_VERSIONS
+        ):
+            console_print(
+                f"\n[error]Only PostgreSQL {', '.join(CURRENT_POSTGRES_VERSIONS)} are supported "
+                "as a backend with OpenLineage integration via Breeze[/]\n"
+            )
+            sys.exit(1)
+
+    command_result = run_command(
+        cmd,
+        text=True,
+        check=False,
+        env=shell_params.env_variables_for_docker_commands,
+        output=output,
+        output_outside_the_group=True,
+    )
+    if command_result.returncode == 0:
+        return command_result
+    if signal_error:
+        console_print(f"[red]Error {command_result.returncode} returned[/]")
+    if get_verbose():
+        console_print(command_result.stderr)
+    notify_on_unhealthy_backend_container(shell_params.project_name, shell_params.backend, output)
+    return command_result
+
+
+def notify_on_unhealthy_backend_container(project_name: str, backend: str, output: Output | None = None):
+    """Put emphasis on unhealthy backend container and `breeze down` command for user."""
+    if backend not in ["postgres", "mysql"] or os.environ.get("CI") == "true":
+        return
+
+    if _is_backend_container_unhealthy(project_name, backend):
+        get_console(output=output).print(
+            "[warning]The backend container is unhealthy. You might need to run `down` "
+            "command to clean up:\n\n"
+            "\tbreeze down[/]\n"
+        )
+
+
+def _is_backend_container_unhealthy(project_name: str, backend: str) -> bool:
+    try:
+        filter = f"name={project_name}-{backend}"
+        search_response = run_command(
+            ["docker", "ps", "--filter", filter, "--format={{.Names}}"],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        container_name = search_response.stdout.strip()
+
+        # Skip the check if not found or multiple containers found
+        if len(container_name.strip().splitlines()) != 1:
+            return False
+
+        inspect_response = run_command(
+            ["docker", "inspect", "--format={{.State.Health.Status}}", container_name],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        if inspect_response.returncode == 0:
+            return inspect_response.stdout.strip() == "unhealthy"
+    # We don't want to misguide the user, so in case of any error we skip the check
+    except Exception:
+        pass
+
+    return False
+
+
+def is_docker_rootless() -> bool:
+    try:
+        response = run_command(
+            ["docker", "info", "-f", "{{println .SecurityOptions}}"],
+            capture_output=True,
+            check=False,
+            text=True,
+            quiet=True,
+        )
+        if response.returncode == 0 and "rootless" in response.stdout.strip():
+            console_print("[info]Docker is running in rootless mode.[/]\n")
+            return True
+    except FileNotFoundError:
+        # we ignore if docker is missing
+        pass
+    return False
+
+
+def check_airflow_cache_builder_configured():
+    result_inspect_builder = run_command(["docker", "buildx", "inspect", "airflow_cache"], check=False)
+    if result_inspect_builder.returncode != 0:
+        console_print(
+            "[error]Airflow Cache builder must be configured to "
+            "build multi-platform images with multiple builders[/]"
+        )
+        console_print()
+        console_print(
+            "See https://github.com/apache/airflow/blob/main/dev/MANUALLY_BUILDING_IMAGES.md"
+            " for instructions on setting it up."
+        )
+        sys.exit(1)
+
+
+def check_regctl_installed():
+    result_regctl = run_command(["regctl", "version"], check=False)
+    if result_regctl.returncode != 0:
+        console_print("[error]Regctl must be installed and on PATH to release the images[/]")
+        console_print()
+        console_print(
+            "See https://github.com/regclient/regclient/blob/main/docs/regctl.md for installation info."
+        )
+        sys.exit(1)
+
+
+def check_docker_buildx_plugin():
+    result_docker_buildx = run_command(
+        ["docker", "buildx", "version"],
+        check=False,
+        text=True,
+        capture_output=True,
+        dry_run_override=False,
+    )
+    if result_docker_buildx.returncode != 0:
+        console_print("[error]Docker buildx plugin must be installed to release the images[/]")
+        console_print()
+        console_print("See https://docs.docker.com/buildx/working-with-buildx/ for installation info.")
+        sys.exit(1)
+    from packaging.version import Version
+
+    version = result_docker_buildx.stdout.splitlines()[0].split(" ")[1].lstrip("v").split("-")[0]
+    packaging_version = Version(version)
+    if packaging_version < Version("0.13.0"):
+        console_print("[error]Docker buildx plugin must be at least 0.13.0 to release the images[/]")
+        console_print()
+        console_print(
+            "See https://github.com/docker/buildx?tab=readme-ov-file#installing for installation info."
+        )
+        sys.exit(1)
+    else:
+        console_print(f"[success]Docker buildx plugin is installed and in good version: {version}[/]")

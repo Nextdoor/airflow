@@ -1,0 +1,381 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+from typing import TYPE_CHECKING, Any, cast
+
+import svcs
+from cadwyn import (
+    Cadwyn,
+    current_dependency_solver,
+    generate_versioned_models,
+)
+from fastapi import Depends, FastAPI, Request, Response
+from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute, iter_route_contexts
+from opentelemetry import context as otel_context, propagate as otel_propagate
+from starlette.middleware.base import BaseHTTPMiddleware
+
+from airflow.api_fastapi.auth.tokens import (
+    JWTGenerator,
+    JWTValidator,
+    get_sig_validation_args,
+    get_signing_args,
+)
+from airflow.api_fastapi.common.telemetry import NATIVE_TELEMETRY_DISABLED
+from airflow.api_fastapi.execution_api.in_process import InProcessExecutionAPI
+from airflow.api_fastapi.execution_api.security import _REQUEST_SCOPE_TOKEN_KEY, require_auth
+
+if TYPE_CHECKING:
+    from airflow.models.dagbag import DBDagBag
+
+import structlog
+from structlog.contextvars import bind_contextvars
+
+logger = structlog.get_logger(logger_name=__name__)
+
+__all__ = [
+    "InProcessExecutionAPI",
+    "create_task_execution_api_app",
+    "create_jwt_generator",
+    "lifespan",
+    "CorrelationIdMiddleware",
+]
+
+
+def _jwt_validator():
+    from airflow.configuration import conf
+
+    required_claims = frozenset(["aud", "exp", "iat"])
+
+    if issuer := conf.get("api_auth", "jwt_issuer", fallback=None):
+        required_claims = required_claims | {"iss"}
+    validator = JWTValidator(
+        required_claims=required_claims,
+        issuer=issuer,
+        audience=conf.get_mandatory_list_value("execution_api", "jwt_audience"),
+        **get_sig_validation_args(make_secret_key_if_needed=False),
+    )
+    return validator
+
+
+def create_jwt_generator() -> JWTGenerator:
+    """Create a signer using the Execution API's configured key, audience, and lifetime."""
+    from airflow.configuration import conf
+
+    generator = JWTGenerator(
+        valid_for=conf.getint("execution_api", "jwt_expiration_time"),
+        audience=conf.get_mandatory_list_value("execution_api", "jwt_audience")[0],
+        issuer=conf.get("api_auth", "jwt_issuer", fallback=None),
+        # Since this one is used across components/server, there is no point trying to generate one, error
+        # instead
+        **get_signing_args(make_secret_key_if_needed=False),
+    )
+    return generator
+
+
+@svcs.fastapi.lifespan
+async def lifespan(app: FastAPI, registry: svcs.Registry):
+    app.state.lifespan_called = True
+
+    # According to svcs's docs this shouldn't be needed, but something about SubApps is odd, and we need to
+    # record this here
+    app.state.svcs_registry = registry
+
+    registry.register_factory(JWTGenerator, create_jwt_generator)
+
+    # InProcessExecutionAPI stubs out JWTValidator: don't re-register in that case.
+    if JWTValidator not in registry:
+        # Create an app scoped validator, so that we don't have to fetch it every time
+        registry.register_value(JWTValidator, _jwt_validator(), ping=JWTValidator.status)
+
+    yield
+
+
+class CorrelationIdMiddleware(BaseHTTPMiddleware):
+    """
+    Middleware to handle correlation-id for request tracing.
+
+    This middleware:
+    1. Extracts correlation-id from request headers
+    2. Binds it to structlog context for all logs within the request
+    3. Echoes correlation-id back in response headers for tracing
+
+    Note: Context variables are automatically isolated per async task in Python,
+    so manual cleanup is not necessary. Each request gets its own context copy.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        correlation_id = request.headers.get("correlation-id")
+
+        if correlation_id:
+            bind_contextvars(correlation_id=correlation_id)
+
+        response: Response = await call_next(request)
+
+        if correlation_id:
+            response.headers["correlation-id"] = correlation_id
+
+        return response
+
+
+class JWTReissueMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response: Response = await call_next(request)
+
+        refreshed_token: str | None = None
+        token = request.scope.get(_REQUEST_SCOPE_TOKEN_KEY)
+        if token:
+            try:
+                claims = token.claims.model_dump()
+
+                # Only short-lived execution tokens are renewed here. Any other type has a
+                # lifetime set by its issuer (workload and callback tokens outlive queue waits,
+                # the dag_processor_session token is rotated by provisioning, and Job and parsing
+                # tokens are renewed by re-registering and re-exchanging), so a new type must
+                # not become renewable by default. Tokens without a scope are legacy execution tokens.
+                if claims.get("scope", "execution") != "execution":
+                    return response
+
+                now = int(time.time())
+                token_lifetime = int(claims.get("exp", 0)) - int(claims.get("iat", 0))
+                refresh_when_less_than = max(int(token_lifetime * 0.20), 30)
+                valid_left = int(claims.get("exp", 0)) - now
+                if valid_left <= refresh_when_less_than:
+                    async with svcs.Container(request.app.state.svcs_registry) as services:
+                        generator: JWTGenerator = await services.aget(JWTGenerator)
+                        refreshed_token = generator.generate(claims)
+            except Exception as err:
+                # Do not block the response if refreshing fails; log a warning for visibility
+                logger.warning(
+                    "JWT reissue middleware failed to refresh token", error=str(err), exc_info=True
+                )
+
+        if refreshed_token:
+            response.headers["Refreshed-API-Token"] = refreshed_token
+        return response
+
+
+class CadwynWithOpenAPICustomization(Cadwyn):
+    # Workaround lack of customzation https://github.com/zmievsa/cadwyn/issues/255
+    async def openapi_jsons(self, req: Request) -> JSONResponse:
+        resp = await super().openapi_jsons(req)
+        open_apischema = json.loads(cast("bytes", resp.body))
+        open_apischema = self.customize_openapi(open_apischema)
+
+        resp.body = resp.render(open_apischema)
+
+        return resp
+
+    def customize_openapi(self, openapi_schema: dict[str, Any]) -> dict[str, Any]:
+        """
+        Customize the OpenAPI schema to include additional schemas not tied to specific endpoints.
+
+        This is particularly useful for client SDKs that require models for types
+        not directly exposed in any endpoint's request or response schema.
+
+        We also replace ``anyOf`` with ``oneOf`` in the API spec as this produces better results for the code
+        generators. This is because anyOf can technically be more than of the given schemas, but 99.9% of the
+        time (perhaps 100% in this API) the types are mutually exclusive, so oneOf is more correct
+
+        References:
+            - https://fastapi.tiangolo.com/how-to/extending-openapi/#modify-the-openapi-schema
+        """
+        extra_schemas = get_extra_schemas(openapi_schema["info"]["version"])
+        for schema_name, schema in extra_schemas.items():
+            if schema_name not in openapi_schema["components"]["schemas"]:
+                openapi_schema["components"]["schemas"][schema_name] = schema
+
+        # The `JsonValue` component is missing any info. causes issues when generating models
+        openapi_schema["components"]["schemas"]["JsonValue"] = {
+            "title": "Any valid JSON value",
+            "oneOf": [
+                {"type": t} for t in ("string", "number", "integer", "object", "array", "boolean", "null")
+            ],
+        }
+
+        def replace_any_of_with_one_of(spec):
+            if isinstance(spec, dict):
+                return {
+                    ("oneOf" if key == "anyOf" else key): replace_any_of_with_one_of(value)
+                    for key, value in spec.items()
+                }
+            if isinstance(spec, list):
+                return [replace_any_of_with_one_of(item) for item in spec]
+            return spec
+
+        openapi_schema = replace_any_of_with_one_of(openapi_schema)
+
+        for comp in openapi_schema["components"]["schemas"].values():
+            for prop in comp.get("properties", {}).values():
+                # {"type": "string", "const": "deferred"}
+                # to
+                # {"type": "string", "enum": ["deferred"]}
+                #
+                # this produces better results in the code generator
+                if prop.get("type") == "string" and (const := prop.pop("const", None)):
+                    prop["enum"] = [const]
+
+        # Remove internal x-airflow-* extension fields from OpenAPI spec
+        # These are used for runtime validation but shouldn't be exposed in the public API
+        for path_item in openapi_schema.get("paths", {}).values():
+            for operation in path_item.values():
+                if isinstance(operation, dict):
+                    keys_to_remove = [key for key in operation.keys() if key.startswith("x-airflow-")]
+                    for key in keys_to_remove:
+                        del operation[key]
+
+        return openapi_schema
+
+
+async def _extract_w3c_trace_context(
+    request: Request,
+    dependency_solver=Depends(current_dependency_solver),
+):
+    # Cadwyn solves dependencies twice (the real request, then again to migrate the
+    # request body). Only act in the real "fastapi" pass so we attach/detach exactly
+    # once, in the context the endpoint runs in.
+    if dependency_solver != "fastapi":
+        yield
+        return
+    ctx = otel_propagate.extract(request.headers)
+    attached_in = asyncio.current_task()
+    token = otel_context.attach(ctx)
+    try:
+        yield
+    finally:
+        if asyncio.current_task() is attached_in:
+            otel_context.detach(token)
+
+
+def _is_trace_context_dep(dependency) -> bool:
+    return getattr(dependency, "dependency", None) is _extract_w3c_trace_context
+
+
+def _inject_trace_context_dep(routes, mode: str) -> None:
+    """
+    Add trace-context extraction to the authenticated routes in ``only-authenticated`` mode.
+
+    ``unsafe-always`` mode is handled with an app-level dependency instead, so extraction runs
+    before authentication declared on any enclosing router.
+    """
+    for context in iter_route_contexts(routes):
+        route = context.original_route
+        if not isinstance(route, APIRoute):
+            continue
+        # Idempotent: create_task_execution_api_app() runs more than once per process
+        # (cached_app + InProcessExecutionAPI), and execution_api_router is shared
+        # module state, so strip any prior injection first.
+        route.dependencies[:] = [d for d in route.dependencies if not _is_trace_context_dep(d)]
+        if mode != "only-authenticated":
+            continue
+        # context.dependencies also holds those of the enclosing routers and include_router() calls.
+        if any(getattr(d, "dependency", None) is require_auth for d in context.dependencies):
+            route.dependencies.append(Depends(_extract_w3c_trace_context))
+
+
+def create_task_execution_api_app(
+    lifespan: svcs.fastapi.lifespan = lifespan,
+    *,
+    dag_bag: DBDagBag | None = None,
+) -> FastAPI:
+    """
+    Create the Execution API app.
+
+    :param lifespan: Lifespan manager that registers the app's services.
+    :param dag_bag: Dag bag to use; a new one is created when omitted.
+    """
+    from airflow.api_fastapi.common.dagbag import create_dag_bag
+    from airflow.api_fastapi.common.exceptions import init_error_handlers
+    from airflow.api_fastapi.execution_api.routes import execution_api_router
+    from airflow.api_fastapi.execution_api.versions import bundle
+    from airflow.configuration import conf
+
+    def custom_generate_unique_id(route: APIRoute):
+        # This is called only if the route doesn't provide an explicit operation ID
+        return route.name
+
+    # See https://docs.cadwyn.dev/concepts/version_changes/ for info about API versions
+    mode = conf.get("execution_api", "otel_trace_propagation", fallback="only-authenticated")
+    app = CadwynWithOpenAPICustomization(
+        title="Airflow Task Execution API",
+        description="The private Airflow Task Execution API.",
+        lifespan=lifespan,
+        generate_unique_id_function=custom_generate_unique_id,
+        api_version_parameter_name="Airflow-API-Version",
+        api_version_default_value=bundle.versions[0].value,
+        versions=bundle,
+        changelog_url=None,
+        dependencies=[Depends(_extract_w3c_trace_context)] if mode == "unsafe-always" else None,
+        telemetry=NATIVE_TELEMETRY_DISABLED,
+    )
+
+    # Add correlation-id middleware for request tracing
+    app.add_middleware(CorrelationIdMiddleware)
+    app.add_middleware(JWTReissueMiddleware)
+
+    _inject_trace_context_dep(execution_api_router.routes, mode)
+
+    app.generate_and_include_versioned_routers(execution_api_router)
+    init_error_handlers(app)
+
+    # As we are mounted as a sub app, we don't get any logs for unhandled exceptions without this!
+    @app.exception_handler(Exception)
+    def handle_exceptions(request: Request, exc: Exception):
+        logger.exception("Handle died with an error", exc_info=(type(exc), exc, exc.__traceback__))
+        content = {"message": "Internal server error"}
+        if correlation_id := request.headers.get("correlation-id"):
+            content["correlation-id"] = correlation_id
+        return JSONResponse(status_code=500, content=content)
+
+    app.state.dag_bag = dag_bag if dag_bag is not None else create_dag_bag()
+    return app
+
+
+def get_extra_schemas(version: str) -> dict[str, dict]:
+    """Get all the extra schemas that are not part of the main FastAPI app."""
+    from airflow.api_fastapi.execution_api.datamodels.taskinstance import TaskInstance
+    from airflow.api_fastapi.execution_api.versions import bundle
+    from airflow.executors.workloads import BundleInfo
+    from airflow.serialization.enums import DagAttributeTypes
+    from airflow.task.trigger_rule import TriggerRule
+    from airflow.task.weight_rule import WeightRule
+    from airflow.utils.state import TaskInstanceState, TerminalTIState
+
+    return {
+        "TaskInstance": (
+            TaskInstance
+            if version == "unversioned"
+            else generate_versioned_models(bundle)[version][TaskInstance]
+        ).model_json_schema(),
+        "BundleInfo": BundleInfo.model_json_schema(),
+        # Include the combined state enum too. In the datamodels we separate out SUCCESS from the other states
+        # as that has different payload requirements
+        "TerminalTIState": {"type": "string", "enum": list(TerminalTIState)},
+        "TaskInstanceState": {"type": "string", "enum": list(TaskInstanceState)},
+        "WeightRule": {"type": "string", "enum": list(WeightRule)},
+        "TriggerRule": {"type": "string", "enum": list(TriggerRule)},
+        "DagAttributeTypes": {
+            "type": "string",
+            "enum": [DagAttributeTypes.OP.value, DagAttributeTypes.TASK_GROUP.value],
+            "x-enum-varnames": [DagAttributeTypes.OP.name, DagAttributeTypes.TASK_GROUP.name],
+        },
+    }

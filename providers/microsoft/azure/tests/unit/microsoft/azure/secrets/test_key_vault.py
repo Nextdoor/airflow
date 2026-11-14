@@ -1,0 +1,326 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+import logging
+from unittest import mock
+
+from azure.core.exceptions import ResourceNotFoundError
+
+from airflow.providers.microsoft.azure.secrets.key_vault import AzureKeyVaultBackend
+
+from tests_common.test_utils.config import conf_vars
+
+KEY_VAULT_MODULE = "airflow.providers.microsoft.azure.secrets.key_vault"
+multi_team_enabled = conf_vars({("core", "multi_team"): "True"})
+
+
+class TestAzureKeyVaultBackend:
+    @mock.patch(f"{KEY_VAULT_MODULE}.AzureKeyVaultBackend.get_conn_value")
+    def test_get_connection(self, mock_get_value):
+        mock_get_value.return_value = "scheme://user:pass@host:100"
+        conn = AzureKeyVaultBackend().get_connection("fake_conn")
+        assert conn.host == "host"
+
+    @mock.patch(f"{KEY_VAULT_MODULE}.AzureKeyVaultBackend.client")
+    def test_get_variable(self, mock_client):
+        mock_client.get_secret.return_value = mock.Mock(value="world")
+        backend = AzureKeyVaultBackend()
+        returned_uri = backend.get_variable("hello")
+        mock_client.get_secret.assert_called_with(name="airflow-variables-hello")
+        assert returned_uri == "world"
+
+    @mock.patch(f"{KEY_VAULT_MODULE}.AzureKeyVaultBackend.client")
+    def test_get_variable_non_existent_key(self, mock_client):
+        """
+        Test that if Variable key is not present,
+        AzureKeyVaultBackend.get_variables should return None
+        """
+        mock_client.get_secret.side_effect = ResourceNotFoundError
+        backend = AzureKeyVaultBackend()
+        assert backend.get_variable("test_mysql") is None
+
+    @mock.patch(f"{KEY_VAULT_MODULE}.AzureKeyVaultBackend.client")
+    def test_get_secret_value_not_found(self, mock_client):
+        """
+        Test that if a non-existent secret returns None
+        """
+        mock_client.get_secret.side_effect = ResourceNotFoundError
+        backend = AzureKeyVaultBackend()
+        assert (
+            backend._get_secret(path_prefix=backend.connections_prefix, secret_id="test_non_existent") is None
+        )
+
+    @mock.patch(f"{KEY_VAULT_MODULE}.AzureKeyVaultBackend.client")
+    def test_get_secret_value(self, mock_client):
+        """
+        Test that get_secret returns the secret value
+        """
+        mock_client.get_secret.return_value = mock.Mock(value="super-secret")
+        backend = AzureKeyVaultBackend()
+        secret_val = backend._get_secret("af-secrets", "test_mysql_password")
+        mock_client.get_secret.assert_called_with(name="af-secrets-test-mysql-password")
+        assert secret_val == "super-secret"
+
+    @mock.patch(f"{KEY_VAULT_MODULE}.AzureKeyVaultBackend.client")
+    def test_get_conn_value_uses_team_specific_secret_first(self, mock_client):
+        mock_client.get_secret.return_value = mock.Mock(value="team-secret")
+
+        backend = AzureKeyVaultBackend()
+        secret_val = backend.get_conn_value("my_db", team_name="team_a")
+
+        assert secret_val == "team-secret"
+        mock_client.get_secret.assert_called_once_with(name="airflow-connections-team-a--my-db")
+
+    @mock.patch(f"{KEY_VAULT_MODULE}.AzureKeyVaultBackend.client")
+    def test_get_variable_falls_back_to_global_secret_when_team_secret_is_missing(self, mock_client):
+        mock_client.get_secret.side_effect = [ResourceNotFoundError, mock.Mock(value="global-value")]
+
+        backend = AzureKeyVaultBackend()
+        secret_val = backend.get_variable("hello", team_name="team_a")
+
+        assert secret_val == "global-value"
+        assert mock_client.get_secret.call_args_list == [
+            mock.call(name="airflow-variables-team-a--hello"),
+            mock.call(name="airflow-variables-hello"),
+        ]
+
+    @mock.patch(f"{KEY_VAULT_MODULE}.AzureKeyVaultBackend.client")
+    def test_get_variable_uses_team_secret_with_custom_prefix(self, mock_client):
+        mock_client.get_secret.return_value = mock.Mock(value="team-value")
+
+        backend = AzureKeyVaultBackend(variables_prefix="custom-variables")
+        secret_val = backend.get_variable("hello", team_name="team_a")
+
+        assert secret_val == "team-value"
+        mock_client.get_secret.assert_called_once_with(name="custom-variables-team-a--hello")
+
+    @multi_team_enabled
+    @mock.patch(f"{KEY_VAULT_MODULE}.AzureKeyVaultBackend.client")
+    def test_get_variable_returns_none_for_team_scoped_key_without_team_name(self, mock_client):
+        backend = AzureKeyVaultBackend()
+
+        assert backend.get_variable("teama--hello") is None
+        mock_client.get_secret.assert_not_called()
+
+    @multi_team_enabled
+    @mock.patch(f"{KEY_VAULT_MODULE}.AzureKeyVaultBackend.client")
+    def test_another_teams_secret_is_not_reachable(self, mock_client):
+        """A caller scoped to one team must not reach another team's secret by naming it.
+
+        The target secret is resolvable, so a backend that falls through to the team agnostic
+        name returns it. Only a backend that refuses that fall-through returns None.
+        """
+
+        def only_the_target_exists(name):
+            if name == "airflow-connections-teama--my-db":
+                return mock.Mock(value="teama-secret")
+            raise ResourceNotFoundError
+
+        mock_client.get_secret.side_effect = only_the_target_exists
+
+        backend = AzureKeyVaultBackend()
+
+        assert backend.get_conn_value("teama--my_db", team_name="teamb") is None
+
+    @multi_team_enabled
+    @mock.patch(f"{KEY_VAULT_MODULE}.AzureKeyVaultBackend.client")
+    def test_team_whose_name_extends_the_callers_is_not_reachable(self, mock_client):
+        """A prefix match on the caller's own namespace is not proof of ownership.
+
+        Team names may contain the separator, so ``teama--prod`` is a distinct team whose
+        namespace starts with ``teama``'s. Treating that prefix as ownership would hand one
+        team the secrets of every team whose name extends it.
+        """
+
+        def only_the_target_exists(name):
+            if name == "airflow-connections-teama--prod--my-db":
+                return mock.Mock(value="teama-prod-secret")
+            raise ResourceNotFoundError
+
+        mock_client.get_secret.side_effect = only_the_target_exists
+
+        backend = AzureKeyVaultBackend()
+
+        assert backend.get_conn_value("teama--prod--my_db", team_name="teama") is None
+
+    @multi_team_enabled
+    @mock.patch(f"{KEY_VAULT_MODULE}.AzureKeyVaultBackend.client")
+    def test_team_scoped_lookup_cannot_reach_a_longer_teams_namespace(self, mock_client):
+        """The team scoped name is not safe by construction -- the id can extend it.
+
+        Team ``teama`` asking for ``prod--my_db`` builds exactly the name team ``teama--prod``
+        builds for ``my_db``, so the team scoped probe *hits* another team's secret. Refusing
+        only the team agnostic fall-through leaves this open, because the fall-through is
+        never reached.
+        """
+
+        def only_the_target_exists(name):
+            if name == "airflow-connections-teama--prod--my-db":
+                return mock.Mock(value="teama-prod-secret")
+            raise ResourceNotFoundError
+
+        mock_client.get_secret.side_effect = only_the_target_exists
+
+        backend = AzureKeyVaultBackend()
+
+        assert backend.get_conn_value("prod--my_db", team_name="teama") is None
+
+    @multi_team_enabled
+    @mock.patch(f"{KEY_VAULT_MODULE}.AzureKeyVaultBackend.client")
+    def test_underscores_cannot_manufacture_a_team_namespace(self, mock_client):
+        """``build_path`` maps ``_`` onto the separator, so ``__`` becomes the team separator.
+
+        An id that contains no separator as written still names another team's namespace once
+        normalised, so the guard has to run on the normalised form.
+        """
+
+        def only_the_target_exists(name):
+            if name == "airflow-connections-teama--prod--my-db":
+                return mock.Mock(value="teama-prod-secret")
+            raise ResourceNotFoundError
+
+        mock_client.get_secret.side_effect = only_the_target_exists
+
+        backend = AzureKeyVaultBackend()
+
+        assert backend.get_conn_value("prod__my_db", team_name="teama") is None
+
+    @multi_team_enabled
+    @mock.patch(f"{KEY_VAULT_MODULE}.AzureKeyVaultBackend.client")
+    def test_refusing_an_ambiguous_id_is_logged(self, mock_client, caplog):
+        """A silent ``None`` is indistinguishable from a missing secret, so the refusal is logged."""
+        backend = AzureKeyVaultBackend()
+
+        assert backend.get_conn_value("prod--my_db") is None
+        assert backend.get_variable("prod__hello") is None
+        assert backend.get_config("prod--sql_alchemy_conn") is None
+
+        # Airflow logs through structlog, which renders the format args into ``msg`` before the
+        # stdlib record is built, so ``record.args`` is empty and there is nothing structured to
+        # assert on. Assert on level, logger and the refused id rather than the wording.
+        refusals = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING and r.name.endswith(type(backend).__name__)
+        ]
+        assert len(refusals) == 3
+        for refused_id in ("prod--my_db", "prod__hello", "prod--sql_alchemy_conn"):
+            assert sum(refused_id in r.getMessage() for r in refusals) == 1
+        mock_client.get_secret.assert_not_called()
+
+    @mock.patch(f"{KEY_VAULT_MODULE}.AzureKeyVaultBackend.client")
+    def test_ambiguous_id_resolves_when_multi_team_is_disabled(self, mock_client):
+        """No team scoped secret can exist without multi-team mode, so there is no ambiguity
+        to refuse -- an ordinary id containing the separator must resolve normally."""
+        mock_client.get_secret.return_value = mock.Mock(value="world")
+        backend = AzureKeyVaultBackend()
+
+        assert backend.get_conn_value("prod--my_db") == "world"
+        assert backend.get_variable("prod__hello") == "world"
+        assert backend.get_config("prod--sql_alchemy_conn") == "world"
+
+        mock_client.get_secret.assert_any_call(name="airflow-connections-prod--my-db")
+        mock_client.get_secret.assert_any_call(name="airflow-variables-prod--hello")
+        mock_client.get_secret.assert_any_call(name="airflow-config-prod--sql-alchemy-conn")
+
+    @mock.patch(f"{KEY_VAULT_MODULE}.AzureKeyVaultBackend._get_secret")
+    def test_variable_prefix_none_value(self, mock_get_secret):
+        """
+        Test that if Variables prefix is None,
+        AzureKeyVaultBackend.get_variables should return None
+        AzureKeyVaultBackend._get_secret should not be called
+        """
+        kwargs = {"variables_prefix": None}
+
+        backend = AzureKeyVaultBackend(**kwargs)
+        assert backend.get_variable("hello") is None
+        mock_get_secret.assert_not_called()
+
+    @mock.patch(f"{KEY_VAULT_MODULE}.AzureKeyVaultBackend._get_secret")
+    def test_config_prefix_none_value(self, mock_get_secret):
+        """
+        Test that if Config prefix is None,
+        AzureKeyVaultBackend.get_config should return None
+        AzureKeyVaultBackend._get_secret should not be called
+        """
+        kwargs = {"config_prefix": None}
+
+        backend = AzureKeyVaultBackend(**kwargs)
+        assert backend.get_config("test_mysql") is None
+        mock_get_secret.assert_not_called()
+
+    @mock.patch(f"{KEY_VAULT_MODULE}.get_sync_default_azure_credential")
+    @mock.patch(f"{KEY_VAULT_MODULE}.ClientSecretCredential")
+    @mock.patch(f"{KEY_VAULT_MODULE}.SecretClient")
+    def test_client_authenticate_with_default_azure_credential(
+        self, mock_client, mock_client_secret_credential, mock_defaul_azure_credential
+    ):
+        """
+        Test that if AzureKeyValueBackend is authenticated with DefaultAzureCredential
+        tenant_id, client_id and client_secret are not provided
+
+        """
+        backend = AzureKeyVaultBackend(vault_url="https://example-akv-resource-name.vault.azure.net/")
+        backend.client
+        assert not mock_client_secret_credential.called
+        mock_defaul_azure_credential.assert_called_once()
+
+    @mock.patch(f"{KEY_VAULT_MODULE}.get_sync_default_azure_credential")
+    @mock.patch(f"{KEY_VAULT_MODULE}.ClientSecretCredential")
+    @mock.patch(f"{KEY_VAULT_MODULE}.SecretClient")
+    def test_client_authenticate_with_default_azure_credential_and_customized_configuration(
+        self, mock_client, mock_client_secret_credential, mock_defaul_azure_credential
+    ):
+        backend = AzureKeyVaultBackend(
+            vault_url="https://example-akv-resource-name.vault.azure.net/",
+            managed_identity_client_id="managed_identity_client_id",
+            workload_identity_tenant_id="workload_identity_tenant_id",
+        )
+        backend.client
+        assert not mock_client_secret_credential.called
+        mock_defaul_azure_credential.assert_called_once_with(
+            managed_identity_client_id="managed_identity_client_id",
+            workload_identity_tenant_id="workload_identity_tenant_id",
+        )
+
+    @mock.patch(f"{KEY_VAULT_MODULE}.get_sync_default_azure_credential")
+    @mock.patch(f"{KEY_VAULT_MODULE}.ClientSecretCredential")
+    @mock.patch(f"{KEY_VAULT_MODULE}.SecretClient")
+    def test_client_authenticate_with_client_secret_credential(
+        self, mock_client, mock_client_secret_credential, mock_defaul_azure_credential
+    ):
+        backend = AzureKeyVaultBackend(
+            vault_url="https://example-akv-resource-name.vault.azure.net/",
+            tenant_id="tenant_id",
+            client_id="client_id",
+            client_secret="client_secret",
+        )
+        backend.client
+        assert not mock_defaul_azure_credential.called
+        mock_client_secret_credential.assert_called_once()
+
+    @mock.patch(f"{KEY_VAULT_MODULE}.AzureKeyVaultBackend.client")
+    def test_get_variable_returns_none_for_invalid_secret_name(self, mock_client):
+        """
+        Test that if the variable key produces an invalid Azure Key Vault secret name
+        (e.g. contains dots), the backend returns None without calling the API.
+        """
+        backend = AzureKeyVaultBackend()
+        assert backend.get_variable("SomeOperator.cache_key") is None
+        mock_client.get_secret.assert_not_called()

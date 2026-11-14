@@ -17,19 +17,27 @@
 """
 Utilities to check - with MD5 - whether files have been modified since the last successful build.
 """
+
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from airflow_breeze.global_constants import FILES_FOR_REBUILD_CHECK
-from airflow_breeze.utils.console import get_console
-from airflow_breeze.utils.path_utils import AIRFLOW_SOURCES_ROOT
+from airflow_breeze.global_constants import ALL_PYPROJECT_TOML_FILES, FILES_FOR_REBUILD_CHECK
+from airflow_breeze.utils.console import console_print
+from airflow_breeze.utils.path_utils import AIRFLOW_ROOT_PATH
+from airflow_breeze.utils.provider_dependencies import regenerate_provider_dependencies_once
+from airflow_breeze.utils.shared_options import get_verbose
+
+if TYPE_CHECKING:
+    from airflow_breeze.params.build_ci_params import BuildCiParams
 
 
 def check_md5checksum_in_cache_modified(file_hash: str, cache_path: Path, update: bool) -> bool:
     """
-    Check if the file hash is present in cache and it's content has been modified. Optionally updates
+    Check if the file hash is present in cache and its content has been modified. Optionally updates
     the hash.
 
     :param file_hash: hash of the current version of the file
@@ -59,8 +67,32 @@ def generate_md5(filename, file_size: int = 65536):
     return hash_md5.hexdigest()
 
 
+def check_md5_sum_for_file(file_to_check: str, md5sum_cache_dir: Path, update: bool):
+    file_to_get_md5 = AIRFLOW_ROOT_PATH / file_to_check
+    md5_checksum = generate_md5(file_to_get_md5)
+    sub_dir_name = file_to_get_md5.parts[-2]
+    actual_file_name = file_to_get_md5.parts[-1]
+    cache_file_name = Path(md5sum_cache_dir, sub_dir_name + "-" + actual_file_name + ".md5sum")
+    file_content = md5_checksum + "  " + str(file_to_get_md5) + "\n"
+    is_modified = check_md5checksum_in_cache_modified(file_content, cache_file_name, update=update)
+    return is_modified
+
+
+def calculate_ci_sources_hash() -> str:
+    """
+    Calculates aggregated hash of all the files that trigger CI image rebuild when changed.
+
+    Only relative paths and file contents are hashed, so the result is stable across
+    checkouts/worktrees of the same sources.
+    """
+    hash_md5 = hashlib.md5()
+    for file in FILES_FOR_REBUILD_CHECK:
+        hash_md5.update(f"{file}:{generate_md5(AIRFLOW_ROOT_PATH / file)}\n".encode())
+    return hash_md5.hexdigest()
+
+
 def calculate_md5_checksum_for_files(
-    md5sum_cache_dir: Path, update: bool = False
+    md5sum_cache_dir: Path, update: bool = False, skip_provider_dependencies_check: bool = False
 ) -> tuple[list[str], list[str]]:
     """
     Calculates checksums for all interesting files and stores the hashes in the md5sum_cache_dir.
@@ -68,50 +100,81 @@ def calculate_md5_checksum_for_files(
 
     :param md5sum_cache_dir: directory where to store cached information
     :param update: whether to update the hashes
+    :param skip_provider_dependencies_check: whether to skip regeneration of the provider dependencies
     :return: Tuple of two lists: modified and not-modified files
     """
     not_modified_files = []
     modified_files = []
-    for calculate_md5_file in FILES_FOR_REBUILD_CHECK:
-        file_to_get_md5 = AIRFLOW_SOURCES_ROOT / calculate_md5_file
-        md5_checksum = generate_md5(file_to_get_md5)
-        sub_dir_name = file_to_get_md5.parts[-2]
-        actual_file_name = file_to_get_md5.parts[-1]
-        cache_file_name = Path(md5sum_cache_dir, sub_dir_name + "-" + actual_file_name + ".md5sum")
-        file_content = md5_checksum + "  " + str(file_to_get_md5) + "\n"
-        is_modified = check_md5checksum_in_cache_modified(file_content, cache_file_name, update=update)
+    if not skip_provider_dependencies_check:
+        modified_pyproject_toml_files = []
+        for file in ALL_PYPROJECT_TOML_FILES:
+            # Only check provider yaml files once and save the result immediately.
+            # If we need to regenerate the dependencies and they are not modified then
+            # all is fine and we can save checksums for the new files
+            if check_md5_sum_for_file(file, md5sum_cache_dir, True):
+                modified_pyproject_toml_files.append(file)
+        if modified_pyproject_toml_files:
+            console_print(
+                "[info]Attempting to generate provider dependencies. "
+                f"{len(modified_pyproject_toml_files)} pyproject.toml file(s) changed since last check."
+            )
+            if get_verbose():
+                console_print(
+                    [os.fspath(file.relative_to(AIRFLOW_ROOT_PATH)) for file in modified_pyproject_toml_files]
+                )
+            # Delegate to the shared helper that ensures regeneration runs only once
+            regenerate_provider_dependencies_once()
+    for file in FILES_FOR_REBUILD_CHECK:
+        is_modified = check_md5_sum_for_file(file, md5sum_cache_dir, update)
         if is_modified:
-            modified_files.append(calculate_md5_file)
+            modified_files.append(file)
         else:
-            not_modified_files.append(calculate_md5_file)
+            not_modified_files.append(file)
     return modified_files, not_modified_files
 
 
-def md5sum_check_if_build_is_needed(md5sum_cache_dir: Path) -> bool:
+def md5sum_check_if_build_is_needed(
+    build_ci_params: BuildCiParams, md5sum_cache_dir: Path, skip_provider_dependencies_check: bool
+) -> bool:
     """
     Checks if build is needed based on whether important files were modified.
 
+    :param build_ci_params: parameters for the build
     :param md5sum_cache_dir: directory where cached md5 sums are stored
+    :param skip_provider_dependencies_check: whether to skip regeneration of the provider dependencies
 
     :return: True if build is needed.
     """
-    build_needed = False
-    modified_files, not_modified_files = calculate_md5_checksum_for_files(md5sum_cache_dir, update=False)
-    if len(modified_files) > 0:
-        get_console().print(
-            f"[warning]The following important files are modified in {AIRFLOW_SOURCES_ROOT} "
+    modified_files, not_modified_files = calculate_md5_checksum_for_files(
+        md5sum_cache_dir, update=False, skip_provider_dependencies_check=skip_provider_dependencies_check
+    )
+    if modified_files:
+        if build_ci_params.skip_image_upgrade_check:
+            if build_ci_params.warn_image_upgrade_needed:
+                console_print(
+                    "\n[warning]You are skipping the image upgrade check, but the image needs an upgrade. "
+                    "This might lead to out-dated results of the check![/]"
+                )
+                console_print(
+                    f"[info]Consider running `breeze ci-image build --python {build_ci_params.python}` "
+                    f"at earliest convenience![/]\n"
+                )
+            return False
+        console_print(
+            f"[warning]The following important files are modified in {AIRFLOW_ROOT_PATH} "
             f"since last time image was built: [/]\n\n"
         )
         for file in modified_files:
-            get_console().print(f" * [info]{file}[/]")
-        get_console().print("\n[warning]Likely CI image needs rebuild[/]\n")
-        build_needed = True
-    else:
-        get_console().print(
-            "[info]Docker image build is not needed for CI build as no important files are changed! "
-            "You can add --force-build to force it[/]"
-        )
-    return build_needed
+            console_print(f" * [info]{file}[/]")
+        console_print("\n[warning]Likely CI image needs rebuild[/]\n")
+        return True
+    if build_ci_params.skip_image_upgrade_check:
+        return False
+    console_print(
+        "[info]Docker image build is not needed for CI build as no important files are changed! "
+        "You can add --force-build to force it[/]"
+    )
+    return False
 
 
 def save_md5_file(cache_path: Path, file_content: str) -> None:

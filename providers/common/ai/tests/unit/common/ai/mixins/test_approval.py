@@ -1,0 +1,794 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+import pytest
+
+from tests_common.test_utils.version_compat import AIRFLOW_V_3_1_PLUS, AIRFLOW_V_3_3_PLUS
+
+if not AIRFLOW_V_3_1_PLUS:
+    pytest.skip("Human in the loop is only compatible with Airflow >= 3.1.0", allow_module_level=True)
+
+from collections.abc import Sequence
+from datetime import timedelta
+from unittest.mock import MagicMock, patch
+from uuid import uuid4
+
+from jinja2 import TemplateError
+from pydantic import BaseModel, ConfigDict, Field, computed_field
+from pydantic_ai.messages import BinaryContent, UserContent
+
+from airflow.providers.common.ai.mixins.approval import (
+    LLMApprovalMixin,
+)
+from airflow.providers.common.compat.notifier import BaseNotifier
+from airflow.providers.common.compat.sdk import DAG
+from airflow.providers.standard.exceptions import HITLRejectException, HITLTriggerEventError
+
+if AIRFLOW_V_3_3_PLUS:
+    from airflow.sdk.exceptions import TaskAwaitingInput
+
+HITL_TRIGGER_PATH = "airflow.providers.standard.triggers.hitl.HITLTrigger"
+UPSERT_HITL_PATH = "airflow.sdk.execution_time.hitl.upsert_hitl_detail"
+UTCNOW_PATH = "airflow.sdk.timezone.utcnow"
+AWAIT_INPUT_FLAG_PATH = "airflow.providers.common.ai.mixins.approval.AIRFLOW_V_3_3_PLUS"
+
+
+class RecordingNotifier(BaseNotifier):
+    template_fields: Sequence[str] = ("subject", "message")
+
+    def __init__(self, *, subject: str | None = None, message: str = "{{ task.subject }}: {{ task.body }}"):
+        super().__init__()
+        self.subject = subject
+        self.message = message
+        self.sent: list[str] = []
+
+    def notify(self, context):
+        self.sent.append(self.message)
+
+
+class FakeOperator(LLMApprovalMixin):
+    """Minimal concrete class satisfying both mixin protocols."""
+
+    def __init__(
+        self,
+        *,
+        prompt: str | Sequence[UserContent] = "Summarize this",
+        task_id: str = "test_task",
+        approval_timeout: timedelta | None = None,
+        on_approval_timeout: str = "fail",
+        allow_modifications: bool = False,
+        approval_notifiers: Sequence[BaseNotifier] = (),
+        approval_assigned_users: list[dict[str, str]] | None = None,
+    ):
+        self.prompt = prompt
+        self.task_id = task_id
+        self.approval_timeout = approval_timeout
+        self.on_approval_timeout = on_approval_timeout
+        self.allow_modifications = allow_modifications
+        self.approval_notifiers = approval_notifiers
+        self.approval_assigned_users = list(approval_assigned_users or [])
+
+        self.defer = MagicMock()
+        self.log = MagicMock()
+
+
+@pytest.fixture
+def approval_op():
+    return FakeOperator()
+
+
+@pytest.fixture
+def approval_op_with_modifications():
+    return FakeOperator(allow_modifications=True)
+
+
+@pytest.fixture
+def context():
+    ti = MagicMock()
+    ti.id = uuid4()
+    return {"task_instance": ti, "dag": DAG("test_dag")}
+
+
+class _SerializedByAlias(BaseModel):
+    model_config = ConfigDict(serialize_by_alias=True)
+    user_name: str = Field(serialization_alias="userName")
+
+
+class _NoSchema:
+    def __repr__(self):
+        return "no-schema"
+
+
+class _Doubled(BaseModel):
+    a: int
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def double(self) -> int:
+        return self.a * 2
+
+
+# The legacy trigger path is taken on Airflow versions < 3.3; pin the flag so these tests keep
+# exercising the defer() fallback when run against newer Airflow versions.
+@patch(AWAIT_INPUT_FLAG_PATH, False)
+class TestDeferForApproval:
+    @patch(HITL_TRIGGER_PATH, autospec=True)
+    @patch(UPSERT_HITL_PATH)
+    def test_defers_with_string_output(self, mock_upsert, mock_trigger_cls, approval_op, context):
+        ti_id = context["task_instance"].id
+
+        approval_op.defer_for_approval(context, "some LLM output")
+
+        mock_upsert.assert_called_once()
+        call_kwargs = mock_upsert.call_args[1]
+        assert call_kwargs["ti_id"] == ti_id
+        assert call_kwargs["options"] == ["Approve", "Reject"]
+        assert call_kwargs["subject"] == "Review output for task `test_task`"
+        assert "some LLM output" in call_kwargs["body"]
+        assert call_kwargs["params"] == {}
+
+        approval_op.defer.assert_called_once()
+        defer_kwargs = approval_op.defer.call_args[1]
+        assert defer_kwargs["method_name"] == "execute_complete"
+        assert defer_kwargs["kwargs"]["generated_output"] == "some LLM output"
+
+    @patch(HITL_TRIGGER_PATH, autospec=True)
+    @patch(UPSERT_HITL_PATH)
+    def test_defers_with_pydantic_output(self, mock_upsert, mock_trigger_cls, approval_op, context):
+        class Answer(BaseModel):
+            text: str
+            confidence: float
+
+        output = Answer(text="Paris", confidence=0.95)
+
+        approval_op.defer_for_approval(context, output)
+
+        defer_kwargs = approval_op.defer.call_args[1]
+        assert defer_kwargs["kwargs"]["generated_output"] == '{"text":"Paris","confidence":0.95}'
+
+    @pytest.mark.parametrize(
+        ("output", "expected"),
+        [
+            (42, "42"),
+            (True, "true"),
+            ([1, "a"], '[1,"a"]'),
+            ({"k": "v"}, '{"k":"v"}'),
+            (_Doubled(a=1), '{"a":1}'),
+            ([_Doubled(a=1)], '[{"a":1}]'),
+            (_SerializedByAlias(user_name="kax"), '{"user_name":"kax"}'),
+            ([_SerializedByAlias(user_name="kax")], '[{"user_name":"kax"}]'),
+            (_NoSchema(), "no-schema"),
+        ],
+        ids=[
+            "int",
+            "bool",
+            "list",
+            "dict",
+            "model-without-computed-fields",
+            "list-of-models-without-computed-fields",
+            "model-serialized-by-alias",
+            "list-of-models-serialized-by-alias",
+            "no-schema-falls-back-to-str",
+        ],
+    )
+    @patch(HITL_TRIGGER_PATH, autospec=True)
+    @patch(UPSERT_HITL_PATH)
+    def test_non_string_output_is_dumped_for_review(
+        self, mock_upsert, mock_trigger_cls, approval_op, context, output, expected
+    ):
+        approval_op.defer_for_approval(context, output)
+
+        defer_kwargs = approval_op.defer.call_args[1]
+        assert defer_kwargs["kwargs"]["generated_output"] == expected
+
+    @patch(HITL_TRIGGER_PATH, autospec=True)
+    @patch(UPSERT_HITL_PATH)
+    def test_allow_modifications_creates_default_output_param(
+        self, mock_upsert, mock_trigger_cls, approval_op_with_modifications, context
+    ):
+        approval_op_with_modifications.defer_for_approval(context, "draft text")
+
+        call_kwargs = mock_upsert.call_args[1]
+        assert "output" in call_kwargs["params"]
+        param = call_kwargs["params"]["output"]
+        assert param["value"] == "draft text"
+        assert param["schema"] == {"type": "string"}
+
+    @patch(HITL_TRIGGER_PATH, autospec=True)
+    @patch(UPSERT_HITL_PATH)
+    def test_modification_schema_overrides_output_param_schema(
+        self, mock_upsert, mock_trigger_cls, approval_op_with_modifications, context
+    ):
+        schema = {"type": "string", "enum": ["task_a", "task_b"]}
+
+        approval_op_with_modifications.defer_for_approval(context, "task_a", modification_schema=schema)
+
+        param = mock_upsert.call_args[1]["params"]["output"]
+        assert param["schema"] == schema
+
+    @patch(HITL_TRIGGER_PATH, autospec=True)
+    @patch(UPSERT_HITL_PATH)
+    def test_array_schema_passes_list_param_value(
+        self, mock_upsert, mock_trigger_cls, approval_op_with_modifications, context
+    ):
+        choices = ["task_a", "task_b"]
+        schema = {"type": "array", "items": {"type": "string", "enum": choices}, "examples": choices}
+
+        approval_op_with_modifications.defer_for_approval(context, ["task_a"], modification_schema=schema)
+
+        param = mock_upsert.call_args[1]["params"]["output"]
+        assert param["value"] == ["task_a"]
+        assert param["schema"] == schema
+        defer_kwargs = approval_op_with_modifications.defer.call_args[1]
+        assert defer_kwargs["kwargs"]["generated_output"] == '["task_a"]'
+
+    @patch(HITL_TRIGGER_PATH, autospec=True)
+    @patch(UPSERT_HITL_PATH)
+    def test_notifiers_fire_once_the_review_is_open(self, mock_upsert, mock_trigger_cls, context):
+        notifier = MagicMock(spec=BaseNotifier)
+        order = MagicMock()
+        order.attach_mock(mock_upsert, "open_review")
+        order.attach_mock(notifier, "notify")
+        op = FakeOperator(approval_notifiers=[notifier])
+
+        op.defer_for_approval(context, "output")
+
+        notifier.assert_called_once_with(context)
+        assert [call[0] for call in order.mock_calls] == ["open_review", "notify"]
+
+    @patch(HITL_TRIGGER_PATH, autospec=True)
+    @patch(UPSERT_HITL_PATH)
+    def test_notifier_renders_review_subject_and_body_despite_own_template_fields(
+        self, mock_upsert, mock_trigger_cls, context
+    ):
+        notifier = RecordingNotifier()
+        op = FakeOperator(approval_notifiers=[notifier])
+        context["task"] = op
+
+        op.defer_for_approval(context, "output")
+
+        assert notifier.sent == [
+            "Review output for task `test_task`: ```\nPrompt: Summarize this\n\noutput\n```"
+        ]
+        assert set(context) == {"task_instance", "dag", "task"}
+
+    @pytest.mark.parametrize("message", ["{{ 'x' | no_such_filter }}", "{{ task.bodyy }}"])
+    @patch(HITL_TRIGGER_PATH, autospec=True)
+    @patch(UPSERT_HITL_PATH)
+    def test_notifier_template_error_fails_the_task(self, mock_upsert, mock_trigger_cls, context, message):
+        notifier = RecordingNotifier(message=message)
+        op = FakeOperator(approval_notifiers=[notifier])
+
+        with pytest.raises(TemplateError):
+            op.defer_for_approval(context, "output")
+
+        op.defer.assert_not_called()
+
+    @patch(HITL_TRIGGER_PATH, autospec=True)
+    @patch(UPSERT_HITL_PATH)
+    @patch("airflow.providers.common.ai.mixins.approval.log", autospec=True)
+    def test_notifier_failure_does_not_stop_the_review(
+        self, mock_log, mock_upsert, mock_trigger_cls, context
+    ):
+        failing = MagicMock(spec=BaseNotifier, side_effect=RuntimeError("smtp down"))
+        healthy = MagicMock(spec=BaseNotifier)
+        op = FakeOperator(approval_notifiers=[failing, healthy])
+
+        op.defer_for_approval(context, "output")
+
+        mock_log.exception.assert_called_once_with(
+            "Approval notifier %s failed; the review stays open", failing
+        )
+        healthy.assert_called_once_with(context)
+        op.defer.assert_called_once()
+
+    @patch(HITL_TRIGGER_PATH, autospec=True)
+    @patch(UPSERT_HITL_PATH)
+    def test_assigned_users_are_forwarded(self, mock_upsert, mock_trigger_cls, context):
+        users = [{"id": "u1", "name": "alice"}]
+        op = FakeOperator(approval_assigned_users=users)
+
+        op.defer_for_approval(context, "output")
+
+        assert mock_upsert.call_args[1]["assigned_users"] == users
+
+    @patch(HITL_TRIGGER_PATH, autospec=True)
+    @patch(UPSERT_HITL_PATH)
+    def test_assigned_users_empty_when_unset(self, mock_upsert, mock_trigger_cls, approval_op, context):
+        approval_op.defer_for_approval(context, "output")
+
+        assert mock_upsert.call_args[1]["assigned_users"] == []
+
+    @patch(HITL_TRIGGER_PATH, autospec=True)
+    @patch(UPSERT_HITL_PATH)
+    def test_no_modifications_params_empty(self, mock_upsert, mock_trigger_cls, approval_op, context):
+        approval_op.defer_for_approval(context, "output")
+
+        call_kwargs = mock_upsert.call_args[1]
+        assert call_kwargs["params"] == {}
+
+    @patch(HITL_TRIGGER_PATH, autospec=True)
+    @patch(UPSERT_HITL_PATH)
+    def test_body_renders_a_sequence_prompt(self, mock_upsert, mock_trigger_cls, context):
+        op = FakeOperator(prompt=["Describe this:", BinaryContent(data=b"\x89PNG", media_type="image/png")])
+
+        op.defer_for_approval(context, "output")
+
+        assert (
+            mock_upsert.call_args[1]["body"]
+            == "```\nPrompt: Describe this:\n[image/png, 4 bytes]\n\noutput\n```"
+        )
+
+    def test_calls_validate_approval_prompt_override(self, context):
+        class StrictOperator(FakeOperator):
+            def validate_approval_prompt(self):
+                raise TypeError("custom prompt check")
+
+        with pytest.raises(TypeError, match="custom prompt check"):
+            StrictOperator().defer_for_approval(context, "output")
+
+    @patch(UTCNOW_PATH)
+    @patch(HITL_TRIGGER_PATH, autospec=True)
+    @patch(UPSERT_HITL_PATH)
+    def test_timeout_sets_timeout_datetime(self, mock_upsert, mock_trigger_cls, mock_utcnow, context):
+        from datetime import datetime
+
+        fake_now = datetime(2025, 1, 1, 12, 0, 0)
+        mock_utcnow.return_value = fake_now
+        timeout = timedelta(hours=2)
+        op = FakeOperator(approval_timeout=timeout)
+
+        op.defer_for_approval(context, "output")
+
+        trigger_call_kwargs = mock_trigger_cls.call_args[1]
+        assert trigger_call_kwargs["timeout_datetime"] == fake_now + timeout
+
+        assert "timeout" not in op.defer.call_args[1]
+
+    @patch(UTCNOW_PATH)
+    @patch(HITL_TRIGGER_PATH, autospec=True)
+    @patch(UPSERT_HITL_PATH)
+    def test_zero_timeout_sets_timeout_datetime_to_now(
+        self, mock_upsert, mock_trigger_cls, mock_utcnow, context
+    ):
+        from datetime import datetime
+
+        fake_now = datetime(2025, 1, 1, 12, 0, 0)
+        mock_utcnow.return_value = fake_now
+        op = FakeOperator(approval_timeout=timedelta(0))
+
+        op.defer_for_approval(context, "output")
+
+        assert mock_trigger_cls.call_args[1]["timeout_datetime"] == fake_now
+
+    @pytest.mark.parametrize(
+        ("on_approval_timeout", "expected_defaults"),
+        [("fail", None), ("approve", ["Approve"]), ("reject", ["Reject"])],
+    )
+    @patch(HITL_TRIGGER_PATH, autospec=True)
+    @patch(UPSERT_HITL_PATH)
+    def test_on_approval_timeout_sets_hitl_defaults(
+        self, mock_upsert, mock_trigger_cls, context, on_approval_timeout, expected_defaults
+    ):
+        op = FakeOperator(approval_timeout=timedelta(hours=1), on_approval_timeout=on_approval_timeout)
+
+        op.defer_for_approval(context, "output")
+
+        assert mock_upsert.call_args[1]["defaults"] == expected_defaults
+        assert mock_trigger_cls.call_args[1]["defaults"] == expected_defaults
+
+    @patch(HITL_TRIGGER_PATH, autospec=True)
+    @patch(UPSERT_HITL_PATH)
+    def test_no_timeout_passes_none(self, mock_upsert, mock_trigger_cls, approval_op, context):
+        approval_op.defer_for_approval(context, "output")
+
+        trigger_call_kwargs = mock_trigger_cls.call_args[1]
+        assert trigger_call_kwargs["timeout_datetime"] is None
+        assert "timeout" not in approval_op.defer.call_args[1]
+
+    @patch(HITL_TRIGGER_PATH, autospec=True)
+    @patch(UPSERT_HITL_PATH)
+    def test_custom_subject_and_body(self, mock_upsert, mock_trigger_cls, approval_op, context):
+        approval_op.defer_for_approval(context, "output", subject="Custom Subject", body="Custom **body**")
+
+        call_kwargs = mock_upsert.call_args[1]
+        assert call_kwargs["subject"] == "Custom Subject"
+        assert call_kwargs["body"] == "Custom **body**"
+
+    @patch(HITL_TRIGGER_PATH, autospec=True)
+    @patch(UPSERT_HITL_PATH)
+    def test_default_subject_includes_task_id(self, mock_upsert, mock_trigger_cls, context):
+        op = FakeOperator(task_id="my_fancy_task")
+
+        op.defer_for_approval(context, "output")
+
+        call_kwargs = mock_upsert.call_args[1]
+        assert "my_fancy_task" in call_kwargs["subject"]
+
+    @patch(HITL_TRIGGER_PATH, autospec=True)
+    @patch(UPSERT_HITL_PATH)
+    def test_default_body_includes_prompt_and_output(self, mock_upsert, mock_trigger_cls, context):
+        op = FakeOperator(prompt="Tell me about Paris")
+
+        op.defer_for_approval(context, "Paris is the capital of France.")
+
+        call_kwargs = mock_upsert.call_args[1]
+        assert "Tell me about Paris" in call_kwargs["body"]
+        assert "Paris is the capital of France." in call_kwargs["body"]
+
+    def test_approved_returns_generated_output(self, approval_op):
+        event = {"chosen_options": ["Approve"], "responded_by_user": {"id": "u1", "name": "admin"}}
+
+        result = approval_op.execute_complete({}, generated_output="hello world", event=event)
+
+        assert result == "hello world"
+
+    def test_rejected_raises_rejection_exception(self, approval_op):
+        event = {"chosen_options": ["Reject"], "responded_by_user": {"id": "u1", "name": "admin"}}
+
+        with pytest.raises(HITLRejectException, match="Output was rejected by the reviewer admin."):
+            approval_op.execute_complete({}, generated_output="output", event=event)
+
+    def test_empty_chosen_options_raises_rejection(self, approval_op):
+        event = {"chosen_options": [], "responded_by_user": {"id": "u1", "name": "admin"}}
+
+        with pytest.raises(HITLRejectException, match="Output was rejected by the reviewer admin."):
+            approval_op.execute_complete({}, generated_output="output", event=event)
+
+    def test_error_in_event_raises_approval_failed(self, approval_op):
+        event = {"error": "something went wrong", "error_type": "unknown"}
+
+        with pytest.raises(HITLTriggerEventError, match="something went wrong"):
+            approval_op.execute_complete({}, generated_output="output", event=event)
+
+    def test_timeout_error_raises_hitl_timeout(self, approval_op):
+        from airflow.providers.standard.exceptions import HITLTimeoutError
+
+        event = {"error": "timed out waiting", "error_type": "timeout"}
+
+        with pytest.raises(HITLTimeoutError, match="timed out waiting"):
+            approval_op.execute_complete({}, generated_output="output", event=event)
+
+    def test_approved_with_modified_output(self, approval_op_with_modifications):
+        event = {
+            "chosen_options": ["Approve"],
+            "responded_by_user": {"id": "u1", "name": "editor"},
+            "params_input": {"output": "modified output"},
+        }
+
+        result = approval_op_with_modifications.execute_complete(
+            {}, generated_output="original output", event=event
+        )
+
+        assert result == "modified output"
+
+    def test_approved_with_non_string_modified_output_raises(self, approval_op_with_modifications):
+        # On the awaiting_input path nothing upstream schema-validates params_input
+        # (HITLTrigger did on the legacy path), so execute_complete must enforce the
+        # string contract instead of returning another type as the task's output.
+        event = {
+            "chosen_options": ["Approve"],
+            "responded_by_user": {"id": "u1", "name": "editor"},
+            "params_input": {"output": 42},
+        }
+
+        with pytest.raises(HITLTriggerEventError, match="must be a string"):
+            approval_op_with_modifications.execute_complete(
+                {}, generated_output="original output", event=event
+            )
+
+    @pytest.mark.parametrize(
+        ("generated_output", "modified"),
+        [
+            ('{"title":"a","priority":0}', {"title": "a", "priority": 0}),
+            ('{"id":9007199254740993}', {"id": 9007199254740992}),
+            ('{"score":2.0}', {"score": 2}),
+            ('{"b":1,"10":2}', {"10": 2, "b": 1}),
+            ('{\n  "a": 1\n}', {"a": 1}),
+            ('{"ids":[9007199254740993]}', {"ids": [9007199254740992]}),
+        ],
+        ids=[
+            "same",
+            "int-rounded-by-javascript",
+            "integral-float",
+            "reordered-keys",
+            "pretty-printed",
+            "int-rounded-in-a-list",
+        ],
+    )
+    def test_approved_with_untouched_object_from_the_form_returns_the_generated_output(
+        self, approval_op_with_modifications, generated_output, modified
+    ):
+        # The HITL form parses a JSON-object value into an object with JavaScript numbers.
+        event = {
+            "chosen_options": ["Approve"],
+            "responded_by_user": {"id": "u1", "name": "editor"},
+            "params_input": {"output": modified},
+        }
+
+        result = approval_op_with_modifications.execute_complete(
+            {}, generated_output=generated_output, event=event
+        )
+
+        assert result == generated_output
+
+    @pytest.mark.parametrize(
+        ("generated_output", "modified", "expected"),
+        [
+            ('{"amount":0}', {"amount": False}, '{"amount":false}'),
+            ('{"flags":[0]}', {"flags": [False]}, '{"flags":[false]}'),
+        ],
+        ids=["field", "in-a-list"],
+    )
+    def test_approved_with_a_bool_in_place_of_a_number_counts_as_an_edit(
+        self, approval_op_with_modifications, generated_output, modified, expected
+    ):
+        # Python treats ``False == 0``, but the reviewer changed the value's JSON type.
+        event = {
+            "chosen_options": ["Approve"],
+            "responded_by_user": {"id": "u1", "name": "editor"},
+            "params_input": {"output": modified},
+        }
+
+        result = approval_op_with_modifications.execute_complete(
+            {}, generated_output=generated_output, event=event
+        )
+
+        assert result == expected
+
+    @pytest.mark.parametrize(
+        ("modified", "expected"),
+        [
+            ({"title": "b", "priority": 3}, '{"title":"b","priority":3}'),
+            ({"title": "café", "priority": 0}, '{"title":"café","priority":0}'),
+        ],
+        ids=["edited", "non-ascii"],
+    )
+    def test_approved_with_edited_object_from_the_form_is_dumped_as_json(
+        self, approval_op_with_modifications, modified, expected
+    ):
+        event = {
+            "chosen_options": ["Approve"],
+            "responded_by_user": {"id": "u1", "name": "editor"},
+            "params_input": {"output": modified},
+        }
+
+        result = approval_op_with_modifications.execute_complete(
+            {}, generated_output='{"title":"a","priority":0}', event=event
+        )
+
+        assert result == expected
+
+    def test_approved_with_list_modified_output_is_serialized(self, approval_op_with_modifications):
+        event = {
+            "chosen_options": ["Approve"],
+            "responded_by_user": {"id": "u1", "name": "editor"},
+            "params_input": {"output": ["task_b", "task_c"]},
+        }
+
+        result = approval_op_with_modifications.execute_complete(
+            {}, generated_output='["task_a"]', event=event
+        )
+
+        assert result == '["task_b","task_c"]'
+
+    def test_approved_with_unmodified_list_output_returns_original(self, approval_op_with_modifications):
+        event = {
+            "chosen_options": ["Approve"],
+            "responded_by_user": {"id": "u1", "name": "editor"},
+            "params_input": {"output": ["task_a"]},
+        }
+
+        result = approval_op_with_modifications.execute_complete(
+            {}, generated_output='["task_a"]', event=event
+        )
+
+        assert result == '["task_a"]'
+
+    def test_approved_with_non_string_list_items_raises(self, approval_op_with_modifications):
+        event = {
+            "chosen_options": ["Approve"],
+            "responded_by_user": {"id": "u1", "name": "editor"},
+            "params_input": {"output": ["task_a", 2]},
+        }
+
+        with pytest.raises(HITLTriggerEventError, match="items must be strings, got int"):
+            approval_op_with_modifications.execute_complete({}, generated_output='["task_a"]', event=event)
+
+    def test_approved_with_cleared_output_raises(self, approval_op_with_modifications):
+        event = {
+            "chosen_options": ["Approve"],
+            "responded_by_user": {"id": "u1", "name": "editor"},
+            "params_input": {"output": None},
+        }
+
+        with pytest.raises(HITLTriggerEventError, match="must not be empty"):
+            approval_op_with_modifications.execute_complete({}, generated_output='["task_a"]', event=event)
+
+    def test_approved_with_unmodified_output(self, approval_op_with_modifications):
+        event = {
+            "chosen_options": ["Approve"],
+            "responded_by_user": {"id": "u1", "name": "editor"},
+            "params_input": {"output": "same output"},
+        }
+
+        result = approval_op_with_modifications.execute_complete(
+            {}, generated_output="same output", event=event
+        )
+
+        assert result == "same output"
+
+    def test_approved_modifications_allowed_but_no_params_input(self, approval_op_with_modifications):
+        event = {
+            "chosen_options": ["Approve"],
+            "responded_by_user": {"id": "u1", "name": "editor"},
+            "params_input": None,
+        }
+
+        result = approval_op_with_modifications.execute_complete({}, generated_output="original", event=event)
+
+        assert result == "original"
+
+    def test_approved_modifications_allowed_empty_output_key(self, approval_op_with_modifications):
+        event = {
+            "chosen_options": ["Approve"],
+            "responded_by_user": {"id": "u1", "name": "editor"},
+            "params_input": {"output": "original"},
+        }
+
+        result = approval_op_with_modifications.execute_complete({}, generated_output="original", event=event)
+
+        assert result == "original"
+
+    def test_approved_no_modifications_ignores_params_input(self, approval_op):
+        """When allow_modifications=False, params will be empty so params_input is empty too."""
+        event = {
+            "chosen_options": ["Approve"],
+            "responded_by_user": {"id": "u1", "name": "editor"},
+            "params_input": {},
+        }
+
+        result = approval_op.execute_complete({}, generated_output="original", event=event)
+
+        assert result == "original"
+
+    def test_approved_no_modifications_rejects_tampered_params_input(self, approval_op):
+        """When allow_modifications=False, tampered params_input with output must be ignored."""
+        event = {
+            "chosen_options": ["Approve"],
+            "responded_by_user": {"id": "u1", "name": "reviewer"},
+            "params_input": {"output": "tampered output"},
+        }
+
+        result = approval_op.execute_complete({}, generated_output="original", event=event)
+
+        assert result == "original"
+
+    def test_event_missing_responded_by_user(self, approval_op):
+        event = {"chosen_options": ["Approve"]}
+
+        result = approval_op.execute_complete({}, generated_output="output", event=event)
+
+        assert result == "output"
+
+    def test_timed_out_rejection_names_the_timeout_default(self, approval_op):
+        event = {"chosen_options": ["Reject"], "responded_by_user": None, "timedout": True}
+
+        with pytest.raises(
+            HITLRejectException,
+            match="Output was rejected automatically: approval_timeout expired with on_approval_timeout='reject'.",
+        ):
+            approval_op.execute_complete({}, generated_output="output", event=event)
+
+    @pytest.mark.parametrize(
+        ("event", "expected_approver"),
+        [
+            ({"chosen_options": ["Approve"], "responded_by_user": {"id": "u1", "name": "admin"}}, "admin"),
+            (
+                {"chosen_options": ["Approve"], "responded_by_user": None, "timedout": True},
+                "the approval timeout default",
+            ),
+        ],
+        ids=["reviewer", "timeout_default"],
+    )
+    @patch("airflow.providers.common.ai.mixins.approval.log", autospec=True)
+    def test_approval_logs_who_approved(self, mock_log, approval_op, event, expected_approver):
+        approval_op.execute_complete({}, generated_output="output", event=event)
+
+        mock_log.info.assert_called_once_with("Output approved by %s.", expected_approver)
+
+    def test_timed_out_approval_ignores_stale_params_input(self, approval_op_with_modifications):
+        event = {
+            "chosen_options": ["Approve"],
+            "params_input": {"output": "stale output"},
+            "responded_by_user": None,
+            "timedout": True,
+        }
+
+        result = approval_op_with_modifications.execute_complete({}, generated_output="output", event=event)
+
+        assert result == "output"
+
+    def test_rejection_message_includes_username(self, approval_op):
+        event = {"chosen_options": ["Reject"], "responded_by_user": {"id": "u1", "name": "alice"}}
+
+        with pytest.raises(HITLRejectException, match="alice"):
+            approval_op.execute_complete({}, generated_output="output", event=event)
+
+
+@pytest.mark.skipif(not AIRFLOW_V_3_3_PLUS, reason="awaiting_input path requires Airflow 3.3+")
+class TestAwaitInputForApproval:
+    """On Airflow 3.3+ the review parks the task in AWAITING_INPUT instead of deferring."""
+
+    @patch(UPSERT_HITL_PATH)
+    def test_parks_task_in_awaiting_input(self, mock_upsert, approval_op, context):
+        with pytest.raises(TaskAwaitingInput) as exc_info:
+            approval_op.defer_for_approval(context, "some LLM output")
+
+        assert exc_info.value.method_name == "execute_complete"
+        assert exc_info.value.kwargs == {"generated_output": "some LLM output"}
+        assert exc_info.value.timeout is None
+        mock_upsert.assert_called_once()
+        assert mock_upsert.call_args[1]["options"] == ["Approve", "Reject"]
+        approval_op.defer.assert_not_called()
+
+    @patch(UPSERT_HITL_PATH)
+    def test_notifiers_fire_before_awaiting_input(self, mock_upsert, context):
+        notifier = MagicMock(spec=BaseNotifier)
+        op = FakeOperator(approval_notifiers=[notifier])
+
+        with pytest.raises(TaskAwaitingInput):
+            op.defer_for_approval(context, "output")
+
+        notifier.assert_called_once()
+
+    @patch(UPSERT_HITL_PATH)
+    def test_approval_timeout_carried_on_await(self, mock_upsert, context):
+        timeout = timedelta(hours=2)
+        op = FakeOperator(approval_timeout=timeout)
+
+        with pytest.raises(TaskAwaitingInput) as exc_info:
+            op.defer_for_approval(context, "output")
+
+        assert exc_info.value.timeout == timeout
+
+    @pytest.mark.parametrize(
+        ("on_approval_timeout", "expected_defaults"),
+        [("fail", None), ("approve", ["Approve"]), ("reject", ["Reject"])],
+    )
+    @patch(UPSERT_HITL_PATH)
+    def test_on_approval_timeout_sets_hitl_defaults_on_await(
+        self, mock_upsert, context, on_approval_timeout, expected_defaults
+    ):
+        op = FakeOperator(approval_timeout=timedelta(hours=1), on_approval_timeout=on_approval_timeout)
+
+        with pytest.raises(TaskAwaitingInput):
+            op.defer_for_approval(context, "output")
+
+        assert mock_upsert.call_args[1]["defaults"] == expected_defaults
+
+    @patch(UPSERT_HITL_PATH)
+    def test_pydantic_output_stringified_on_await(self, mock_upsert, approval_op, context):
+        class Answer(BaseModel):
+            text: str
+            confidence: float
+
+        with pytest.raises(TaskAwaitingInput) as exc_info:
+            approval_op.defer_for_approval(context, Answer(text="Paris", confidence=0.95))
+
+        assert exc_info.value.kwargs == {"generated_output": '{"text":"Paris","confidence":0.95}'}

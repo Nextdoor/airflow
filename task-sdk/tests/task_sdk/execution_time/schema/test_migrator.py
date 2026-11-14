@@ -1,0 +1,744 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+"""
+Unit tests for :mod:`airflow.sdk.execution_time.schema.migrator`.
+
+These pin the in-process supervisor schema migration path -- both
+directions: ``downgrade`` (supervisor head -> foreign-runtime client
+version) and ``upgrade`` (foreign-runtime client version -> supervisor
+head). The downgrade direction is what coordinators use to hand a
+runtime a body shaped for its build; the upgrade direction is what the
+supervisor will use to decode runtime-originated frames once the wire
+schema diverges from head.
+"""
+
+from __future__ import annotations
+
+import datetime
+import subprocess
+import sys
+import uuid
+from typing import Literal
+from uuid import UUID
+
+import pytest
+from cadwyn import (
+    HeadVersion,
+    Version,
+    VersionBundle,
+    VersionChange,
+    convert_request_to_next_version_for,
+    generate_versioned_models,
+    schema,
+)
+from pydantic import BaseModel, ValidationError
+from task_sdk.execution_time.schema._mock_version_bundle import (
+    MOCK_REGISTRY,
+    _LangSdkRequest,
+    _SupervisorResponse,
+)
+
+from airflow.sdk import TaskInstanceState
+from airflow.sdk.api.datamodels._generated import (
+    BundleInfo,
+    DagRun,
+    DagRunState,
+    DagRunType,
+    LoopContext,
+    PreviousTIResponse,
+    TaskInstance,
+    TIRunContext,
+)
+from airflow.sdk.exceptions import ErrorType
+from airflow.sdk.execution_time.comms import (
+    ErrorResponse,
+    GetXCom,
+    GetXComCount,
+    GetXComSequenceItem,
+    GetXComSequenceSlice,
+    PreviousTIResult,
+    PutVariable,
+    StartupDetails,
+    TaskState,
+    VariableResult,
+)
+from airflow.sdk.execution_time.schema import (
+    SchemaVersionMigrator,
+    get_schema_version_migrator,
+    resolve_body_class,
+)
+
+
+class _MockBody(BaseModel):
+    """Mock body class used to drive bundle-level migration tests."""
+
+    type: Literal["MockBody"] = "MockBody"
+    ti_id: str
+    queue_capacity: int | None = None
+    sentry_trace_id: str | None = None
+
+
+@pytest.mark.parametrize("version", ["2026-06-16", "2026-10-30"])
+def test_previous_ti_response_coordinates_follow_supervisor_version(version):
+    message = PreviousTIResult(
+        task_instance=PreviousTIResponse(
+            dag_id="dag",
+            task_id="task",
+            run_id="run",
+            try_number=1,
+            map_index=-1,
+            region_id=UUID(int=1),
+            region_index=3,
+        )
+    )
+    result = get_schema_version_migrator().downgrade(message, version).model_dump()["task_instance"]
+    assert result["map_index"] == -1
+    if version == "2026-06-16":
+        assert "region_id" not in result
+        assert "region_index" not in result
+    else:
+        assert result["region_id"] == UUID(int=1)
+        assert result["region_index"] == 3
+
+
+@pytest.mark.parametrize(
+    ("model", "extra", "field"),
+    [
+        (GetXCom, {}, "previous_iteration"),
+        (GetXComCount, {}, "previous_iteration"),
+        (GetXComSequenceItem, {"offset": 0}, "previous_iteration"),
+        (GetXComSequenceSlice, {"start": None, "stop": None, "step": None}, "previous_iteration"),
+    ],
+)
+def test_loop_selectors_follow_supervisor_version(model, extra, field):
+    message = model(dag_id="dag", run_id="run", task_id="task", key="key", **extra, **{field: True})
+    migrator = get_schema_version_migrator()
+
+    assert field not in migrator.downgrade(message, "2026-06-16").model_dump()
+    assert migrator.downgrade(message, "2026-10-30").model_dump()[field] is True
+
+
+def test_put_variable_null_from_older_runtime_is_stored_as_none_string():
+    body = {"type": "PutVariable", "key": "key", "value": None, "description": None}
+
+    upgraded = get_schema_version_migrator().upgrade(body, PutVariable, "2026-10-30")
+
+    assert upgraded["value"] == "None"
+
+
+def test_put_variable_without_value_from_older_runtime_is_rejected():
+    body = {"type": "PutVariable", "key": "key", "description": None}
+
+    with pytest.raises(ValidationError):
+        get_schema_version_migrator().upgrade(body, PutVariable, "2026-10-30")
+
+
+def test_put_variable_null_from_current_runtime_is_rejected():
+    body = {"type": "PutVariable", "key": "key", "value": None, "description": None}
+
+    with pytest.raises(ValidationError):
+        get_schema_version_migrator().upgrade(body, PutVariable, "2027-02-28")
+
+
+def test_put_variable_value_from_older_runtime_is_kept():
+    body = {"type": "PutVariable", "key": "key", "value": "x", "description": None}
+
+    upgraded = get_schema_version_migrator().upgrade(body, PutVariable, "2026-10-30")
+
+    assert upgraded["value"] == "x"
+
+
+@pytest.mark.parametrize(
+    ("model", "extra"),
+    [
+        pytest.param(PutVariable, {"description": None}, id="PutVariable"),
+        pytest.param(VariableResult, {}, id="VariableResult"),
+    ],
+)
+def test_variable_value_is_nullable_only_before_2027_02_28(model, extra):
+    from airflow.sdk.execution_time.schema.versions import bundle
+
+    versioned = generate_versioned_models(bundle)
+
+    assert versioned["2026-10-30"][model](key="key", value=None, **extra).value is None
+    with pytest.raises(ValidationError):
+        versioned["2027-02-28"][model](key="key", value=None, **extra)
+
+
+class _IntroduceQueueCapacity(VersionChange):
+    """3026-04-17: introduce queue_capacity."""
+
+    description = __doc__
+    instructions_to_migrate_to_previous_version = (schema(_MockBody).field("queue_capacity").didnt_exist,)
+
+    # Upgrade direction: a client on the pre-04-17 wire shape sends no
+    # ``queue_capacity``; once the body crosses into 04-17 we backfill
+    # the field with a sentinel so the head Pydantic class can validate.
+    @convert_request_to_next_version_for(_MockBody)  # type: ignore[arg-type]
+    def _backfill_queue_capacity(request):
+        request.body.setdefault("queue_capacity", 0)
+
+
+class _IntroduceSentryTrace(VersionChange):
+    """3026-06-16: introduce sentry_trace_id."""
+
+    description = __doc__
+    instructions_to_migrate_to_previous_version = (schema(_MockBody).field("sentry_trace_id").didnt_exist,)
+
+    @convert_request_to_next_version_for(_MockBody)  # type: ignore[arg-type]
+    def _backfill_sentry_trace(request):
+        request.body.setdefault("sentry_trace_id", "")
+
+
+_BUNDLE = VersionBundle(
+    HeadVersion(),
+    Version("3026-06-16", _IntroduceSentryTrace),
+    Version("3026-04-17", _IntroduceQueueCapacity),
+    Version("3025-01-01"),
+)
+
+# The latest *dated* entry (Cadwyn puts HeadVersion first but its value
+# is not a date string; the first dated entry is at index 0 of the
+# non-head versions).
+_LATEST_VERSION = "3026-06-16"
+
+
+class TestSchemaVersionMigratorDowngrade:
+    """
+    Drive the downgrade direction against a mock bundle so we can pin
+    *field-level* migration behaviour independent of the real bundle's
+    contents. The real bundle's ``arg_bindings`` migration is covered by
+    :class:`TestRealBundleArgBindingsDowngrade` below.
+    """
+
+    @pytest.fixture
+    def migrator(self) -> SchemaVersionMigrator:
+        # ``supervisor_version`` must be supplied explicitly; we pin it
+        # to the latest dated entry in the test bundle, mirroring how
+        # ``get_schema_version_migrator`` builds the real instance.
+        return SchemaVersionMigrator(bundle=_BUNDLE, supervisor_version=_LATEST_VERSION)
+
+    def _body(self) -> _MockBody:
+        return _MockBody(
+            ti_id="t1",
+            queue_capacity=8,
+            sentry_trace_id="00-trace-span-00",
+        )
+
+    def test_supervisor_version_is_latest_dated_entry(self, migrator):
+        # ``_supervisor_version`` is the private attrs attribute; the
+        # reimplementation does not expose a public ``supervisor_version``
+        # property.
+        assert migrator._supervisor_version == _LATEST_VERSION
+
+    def test_head_version_returns_every_field(self, migrator):
+        out = migrator.downgrade(self._body(), _LATEST_VERSION).model_dump()
+        assert out["ti_id"] == "t1"
+        assert out["queue_capacity"] == 8
+        assert out["sentry_trace_id"] == "00-trace-span-00"
+
+    def test_middle_version_strips_only_later_fields(self, migrator):
+        # 3026-04-17 predates sentry_trace_id but knows about queue_capacity.
+        out = migrator.downgrade(self._body(), "3026-04-17").model_dump()
+        assert out["queue_capacity"] == 8
+        assert "sentry_trace_id" not in out
+
+    def test_baseline_strips_every_later_field(self, migrator):
+        out = migrator.downgrade(self._body(), "3025-01-01").model_dump()
+        assert out["ti_id"] == "t1"
+        assert "queue_capacity" not in out
+        assert "sentry_trace_id" not in out
+
+    def test_downgrade_returns_pydantic_model_instance(self, migrator):
+        # The reimplementation returns the Cadwyn-versioned Pydantic
+        # model, not a plain dict.  Callers (e.g. _serialize_response)
+        # call ``.model_dump()`` on the result themselves.
+        result = migrator.downgrade(self._body(), "3025-01-01")
+        assert isinstance(result, BaseModel)
+
+
+class TestSchemaVersionMigratorUpgrade:
+    """
+    Mirror of the downgrade suite for the upgrade direction. The mock
+    bundle's ``convert_request_to_next_version_for`` hooks backfill the
+    new field at the version that introduces it, so a body off an
+    older wire reaches the head with every field present.
+
+    ``upgrade`` returns a plain dict (the result of
+    ``versioned_class.model_validate(info.body).model_dump()``).
+    """
+
+    @pytest.fixture
+    def migrator(self) -> SchemaVersionMigrator:
+        return SchemaVersionMigrator(bundle=_BUNDLE, supervisor_version=_LATEST_VERSION)
+
+    def test_baseline_client_payload_is_filled_up_to_head(self, migrator):
+        # A client on the very first defined version sends only the
+        # always-present field. Both 04-17 and 06-16 must run, each
+        # backfilling its own newly-introduced field.
+        out = migrator.upgrade({"ti_id": "t1"}, _MockBody, "3025-01-01")
+        assert out["ti_id"] == "t1"
+        assert out["queue_capacity"] == 0
+        assert out["sentry_trace_id"] == ""
+
+    def test_middle_client_payload_only_runs_later_versions(self, migrator):
+        # Client built against 04-17 already provides queue_capacity;
+        # only the 06-16 backfill should run on top.
+        out = migrator.upgrade(
+            {"ti_id": "t1", "queue_capacity": 8},
+            _MockBody,
+            "3026-04-17",
+        )
+        assert out["queue_capacity"] == 8  # the existing value is preserved
+        assert out["sentry_trace_id"] == ""  # backfilled by 06-16
+
+    def test_head_client_payload_is_returned_verbatim(self, migrator):
+        # A client already on head needs no upgrade; the only diff from
+        # *original* is the discriminator filled in by the final
+        # ``model_validate`` round-trip (mirroring ``downgrade``).
+        original = {"ti_id": "t1", "queue_capacity": 8, "sentry_trace_id": "00"}
+        out = migrator.upgrade(dict(original), _MockBody, _LATEST_VERSION)
+        assert out == {**original, "type": "MockBody"}
+
+    def test_upgrade_returns_dict(self, migrator):
+        # Unlike ``downgrade``, ``upgrade`` returns a plain dict (the
+        # head shape ready for ``model_validate`` by the real decoder).
+        out = migrator.upgrade({"ti_id": "t1"}, _MockBody, "3025-01-01")
+        assert isinstance(out, dict)
+
+
+class TestSchemaVersionMigratorVersionStringValidation:
+    """``_resolve_version`` requires the version string to be present in the bundle."""
+
+    @pytest.fixture
+    def migrator(self) -> SchemaVersionMigrator:
+        return SchemaVersionMigrator(bundle=_BUNDLE, supervisor_version=_LATEST_VERSION)
+
+    @pytest.mark.parametrize(
+        "bad_version",
+        [
+            pytest.param("not-a-date", id="freeform-text"),
+            pytest.param("2026/04/17", id="slash-separator"),
+            pytest.param("26-04-17", id="two-digit-year"),
+            pytest.param("2026-4-17", id="single-digit-month"),
+            pytest.param("", id="empty-string"),
+        ],
+    )
+    def test_rejects_versions_not_in_bundle(self, migrator, bad_version):
+        # The reimplementation validates only bundle membership; there is
+        # no regex format check.  Any string absent from the bundle raises
+        # ValueError with "not found in supervisor schema bundle".
+        with pytest.raises(ValueError, match="not found in supervisor schema bundle"):
+            migrator.downgrade(_MockBody(ti_id="t1"), bad_version)
+
+    def test_rejects_well_formed_date_not_in_bundle(self, migrator):
+        with pytest.raises(ValueError, match="not found in supervisor schema bundle"):
+            migrator.downgrade(_MockBody(ti_id="t1"), "2999-01-01")
+
+    def test_rejects_version_not_in_bundle_for_upgrade(self, migrator):
+        with pytest.raises(ValueError, match="not found in supervisor schema bundle"):
+            migrator.upgrade({"ti_id": "t1"}, _MockBody, "2999-01-01")
+
+
+class TestSchemaVersionMigratorConstructorValidation:
+    """The ``supervisor_version`` constructor arg must be present in the bundle."""
+
+    def test_rejects_supervisor_version_not_in_bundle(self):
+        with pytest.raises(ValueError, match="not found in supervisor schema bundle"):
+            SchemaVersionMigrator(bundle=_BUNDLE, supervisor_version="2999-01-01")
+
+    def test_accepts_any_dated_version_in_bundle(self):
+        for version in ("3025-01-01", "3026-04-17", _LATEST_VERSION):
+            migrator = SchemaVersionMigrator(bundle=_BUNDLE, supervisor_version=version)
+            assert migrator._supervisor_version == version
+
+
+class TestSchemaVersionMigratorRespectsExplicitSupervisorVersion:
+    """
+    A migrator pinned to an older ``supervisor_version`` must stop walking
+    once the chain reaches that anchor. This is the knob a coordinator
+    on a non-head build would use to clamp the upgrade walk so that
+    transformers above its own version are not applied.
+
+    Only the upgrade direction is asserted here: the downgrade walk
+    delegates the final field-shape to ``generate_versioned_models``
+    keyed by *target_schema_version*, which is independent of the
+    supervisor anchor, so the anchor has no observable effect when the
+    inbound body is already shaped for *supervisor_version*.
+    """
+
+    def test_upgrade_does_not_apply_changes_above_supervisor_anchor(self):
+        migrator = SchemaVersionMigrator(bundle=_BUNDLE, supervisor_version="3026-04-17")
+        out = migrator.upgrade({"ti_id": "t1"}, _MockBody, "3025-01-01")
+        # The 04-17 backfill ran; the 06-16 backfill did not.
+        assert out["queue_capacity"] == 0
+        assert "sentry_trace_id" not in out
+
+
+class TestGetSchemaVersionMigrator:
+    def test_returns_singleton(self):
+        # The cached factory must return the same instance across calls
+        # so callers can share state-free migrator instances cheaply.
+        assert get_schema_version_migrator() is get_schema_version_migrator()
+
+    def test_is_bound_to_supervisor_bundle(self):
+        # Sanity check: the singleton uses the real supervisor schema
+        # bundle, not a mock one and not the execution-API HTTP bundle.
+        # A regression here would silently detach the supervisor from
+        # its versioning source of truth.
+        from airflow.sdk.execution_time.schema.versions import bundle
+
+        assert get_schema_version_migrator()._bundle is bundle
+
+    def test_supervisor_version_defaults_to_real_bundle_head(self):
+        # The supervisor anchor must be the latest dated entry in the
+        # real bundle -- never the head sentinel, never silently older.
+        from airflow.sdk.execution_time.schema.versions import bundle
+
+        assert get_schema_version_migrator()._supervisor_version == bundle.versions[0].value
+
+
+class TestResolveBodyClass:
+    """All branches of :func:`resolve_body_class` with the mock registry."""
+
+    @pytest.fixture
+    def mock_registry(self, monkeypatch):
+        """Swap the real ``registered_models_by_name`` for the mock registry."""
+        monkeypatch.setattr(
+            "airflow.sdk.execution_time.schema.registered_models_by_name",
+            lambda: MOCK_REGISTRY,
+        )
+
+    def test_non_dict_returns_none(self, mock_registry):
+        assert resolve_body_class("not a dict") is None
+        assert resolve_body_class(42) is None
+        assert resolve_body_class(None) is None
+        assert resolve_body_class(["type", "Foo"]) is None
+
+    def test_missing_type_key_returns_none(self, mock_registry):
+        assert resolve_body_class({}) is None
+        assert resolve_body_class({"ti_id": "x"}) is None
+
+    def test_non_string_type_value_returns_none(self, mock_registry):
+        assert resolve_body_class({"type": 123}) is None
+        assert resolve_body_class({"type": None}) is None
+        assert resolve_body_class({"type": ["_LangSdkRequest"]}) is None
+
+    def test_unknown_discriminator_returns_none(self, mock_registry):
+        assert resolve_body_class({"type": "NoSuchModel"}) is None
+
+    def test_known_discriminator_returns_head_class(self, mock_registry):
+        assert resolve_body_class({"type": "_LangSdkRequest"}) is _LangSdkRequest
+        assert resolve_body_class({"type": "_SupervisorResponse"}) is _SupervisorResponse
+
+    def test_extra_fields_in_body_do_not_affect_resolution(self, mock_registry):
+        body = {"type": "_LangSdkRequest", "ti_id": "t1", "field_a": 7}
+        assert resolve_body_class(body) is _LangSdkRequest
+
+
+class TestLazyCadwynImport:
+    """``cadwyn`` (which imports FastAPI/Starlette/Jinja2) must stay off the worker import path.
+
+    The Task SDK supervisor imports the schema package on every Celery pool worker, but ``cadwyn`` is
+    only needed on the foreign-language-SDK migration path, so its import is deferred. Each check runs
+    in a fresh interpreter because ``sys.modules`` is process-global and other tests import cadwyn.
+    """
+
+    @pytest.mark.parametrize(
+        "module",
+        [
+            "airflow.sdk.execution_time.schema",
+            "airflow.sdk.execution_time.supervisor",
+        ],
+    )
+    def test_importing_worker_path_does_not_load_cadwyn(self, module):
+        code = (
+            f"import sys; import {module}; "
+            "assert 'cadwyn' not in sys.modules, sorted(m for m in sys.modules if 'cadwyn' in m); "
+            "assert 'fastapi' not in sys.modules, 'fastapi was imported'"
+        )
+        subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
+
+    def test_accessing_bundle_loads_cadwyn(self):
+        # The foreign-SDK migration path does need cadwyn; accessing the bundle is where it loads.
+        code = (
+            "import sys; from airflow.sdk.execution_time.schema import bundle; "
+            "assert bundle.versions, 'bundle should be built'; "
+            "assert 'cadwyn' in sys.modules, 'cadwyn should load when the bundle is accessed'"
+        )
+        subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
+
+
+class TestRealBundleArgBindingsDowngrade:
+    """
+    Drive the *real* supervisor bundle through the ``arg_bindings`` migration.
+
+    ``AddArgBindingsToSupervisorTIRunContext`` is the bundle's first ``schema(...)``
+    instruction on a model *nested* inside a registered body
+    (``StartupDetails.ti_context``); this pins that the downgrade
+    re-validation strips the nested field on the wire for a runtime
+    pinned to the previous version, and keeps it at head.
+    """
+
+    @pytest.fixture
+    def startup_details(self):
+        import datetime
+        import uuid
+
+        from airflow.sdk.api.datamodels._generated import (
+            BundleInfo,
+            DagRun,
+            DagRunState,
+            DagRunType,
+            TaskInstance,
+            TIRunContext,
+        )
+        from airflow.sdk.execution_time.comms import StartupDetails
+
+        now = datetime.datetime.now(datetime.UTC)
+        return StartupDetails(
+            ti=TaskInstance(
+                id=uuid.uuid4(),
+                task_id="transform",
+                dag_id="d",
+                run_id="r",
+                try_number=1,
+                dag_version_id=uuid.uuid4(),
+                region_id=uuid.uuid4(),
+                region_index=7,
+                map_index=-1,
+            ),
+            dag_rel_path="d.py",
+            bundle_info=BundleInfo(name="b", version=None),
+            start_date=now,
+            ti_context=TIRunContext(
+                dag_run=DagRun(
+                    dag_id="d",
+                    run_id="r",
+                    logical_date=now,
+                    data_interval_start=None,
+                    data_interval_end=None,
+                    start_date=now,
+                    end_date=None,
+                    run_type=DagRunType.MANUAL,
+                    state=DagRunState.RUNNING,
+                    run_after=now,
+                    consumed_asset_events=[],
+                    partition_key=None,
+                ),
+                max_tries=1,
+                arg_bindings=[
+                    # No value_schema: the unconstrained ("any") case rides through the migrator too.
+                    {"name": "country", "kind": "literal", "value": "uk"},
+                    {
+                        "name": "extracted",
+                        "kind": "xcom",
+                        "value_schema": {"type": "object"},
+                        "task_id": "extract",
+                    },
+                    {
+                        "name": "limit",
+                        "kind": "literal",
+                        "value_schema": {"type": "integer", "format": "int64"},
+                        "value": 10,
+                        "from_default": True,
+                    },
+                ],
+            ),
+            sentry_integration="",
+        )
+
+    @pytest.fixture
+    def real_migrator(self) -> SchemaVersionMigrator:
+        return get_schema_version_migrator()
+
+    def test_downgrade_strips_arg_bindings_for_previous_version(self, real_migrator, startup_details):
+        out = real_migrator.downgrade(startup_details, "2026-06-16").model_dump()
+        assert "arg_bindings" not in out["ti_context"]
+
+    @pytest.mark.parametrize("version", ["2026-06-16", "2026-10-30"])
+    def test_loop_context_follows_supervisor_version(self, real_migrator, startup_details, version):
+        startup_details.ti_context.loop = LoopContext(
+            node_id="body",
+            index=2,
+            max_iterations=4,
+            terminal_task_id="body.terminal",
+            terminal_is_mapped=True,
+            region_id=UUID("0199a8c0-0000-7000-8000-000000000001"),
+            trajectory=1,
+        )
+        startup_details.ti_context.expanded_ti_count = 2
+        context = real_migrator.downgrade(startup_details, version).model_dump()["ti_context"]
+
+        if version == "2026-06-16":
+            assert "loop" not in context
+            assert "expanded_ti_count" not in context
+        else:
+            assert context["loop"] == startup_details.ti_context.loop.model_dump()
+            assert context["expanded_ti_count"] == 2
+
+    @pytest.mark.parametrize("version", ["2026-06-16", "2026-10-30"])
+    def test_task_coordinates_follow_supervisor_version(self, real_migrator, startup_details, version):
+        ti = real_migrator.downgrade(startup_details, version).model_dump()["ti"]
+        assert ti["map_index"] == -1
+        if version == "2026-06-16":
+            assert "region_id" not in ti
+            assert "region_index" not in ti
+        else:
+            assert ti["region_id"] == startup_details.ti.region_id
+            assert ti["region_index"] == 7
+
+    @pytest.mark.parametrize("version", ["2026-06-16", "2026-10-30", "2027-02-28"])
+    def test_execution_timeout_follows_supervisor_version(self, real_migrator, startup_details, version):
+        startup_details.ti_context.execution_timeout = 90.0
+        context = real_migrator.downgrade(startup_details, version).model_dump()["ti_context"]
+
+        if version == "2027-02-28":
+            assert context["execution_timeout"] == 90.0
+        else:
+            assert "execution_timeout" not in context
+
+    @pytest.mark.parametrize("version", ["2026-10-30", "2027-02-28"])
+    def test_arg_bindings_kept_from_version_that_added_them(self, real_migrator, startup_details, version):
+        out = real_migrator.downgrade(startup_details, version)
+        assert out.ti_context.arg_bindings is not None
+        literal, xcom, defaulted = (a.root for a in out.ti_context.arg_bindings)
+        assert literal.kind == "literal"
+        assert literal.value == "uk"
+        assert literal.name == "country"
+        assert literal.from_default is False
+        assert literal.value_schema is None
+        assert xcom.kind == "xcom"
+        assert xcom.task_id == "extract"
+        assert xcom.name == "extracted"
+        assert xcom.value_schema.root == {"type": "object"}
+        assert defaulted.kind == "literal"
+        assert defaulted.from_default is True
+        assert defaulted.value_schema.root == {"type": "integer", "format": "int64"}
+
+
+class TestRealBundleRetryReason:
+    """
+    Drive the *real* supervisor bundle through the ``retry_reason`` migration.
+
+    ``TaskState`` flows foreign-runtime -> supervisor, so ``upgrade`` is the direction a
+    pinned runtime travels. Only ``downgrade`` re-validates against the versioned class,
+    so that is the direction that fails if ``AddRetryReasonToTaskState`` is dropped.
+    """
+
+    @pytest.fixture
+    def real_migrator(self) -> SchemaVersionMigrator:
+        return get_schema_version_migrator()
+
+    def test_downgrade_strips_retry_reason_for_previous_version(self, real_migrator):
+        msg = TaskState(state=TaskInstanceState.FAILED, retry_reason="auth error, do not retry")
+        out = real_migrator.downgrade(msg, "2026-06-16").model_dump()
+        assert "retry_reason" not in out
+
+    def test_downgrade_keeps_retry_reason_at_head(self, real_migrator):
+        msg = TaskState(state=TaskInstanceState.FAILED, retry_reason="auth error, do not retry")
+        out = real_migrator.downgrade(msg, "2026-10-30").model_dump()
+        assert out["retry_reason"] == "auth error, do not retry"
+
+    def test_upgrade_fills_missing_retry_reason_with_none(self, real_migrator):
+        body = {"type": "TaskState", "state": "failed", "end_date": None, "rendered_map_index": None}
+        out = real_migrator.upgrade(body, TaskState, "2026-06-16")
+        assert out["retry_reason"] is None
+
+
+class TestRealBundleXComBackendError:
+    """A runtime whose version has no type for an XCom backend failure gets a generic one."""
+
+    @pytest.fixture
+    def real_migrator(self) -> SchemaVersionMigrator:
+        return get_schema_version_migrator()
+
+    @pytest.mark.parametrize(
+        ("version", "expected"),
+        [
+            pytest.param("2027-02-28", ErrorType.XCOM_BACKEND_ERROR, id="head"),
+            pytest.param("2026-10-30", ErrorType.GENERIC_ERROR, id="3.4.0"),
+            pytest.param("2026-06-16", ErrorType.GENERIC_ERROR, id="oldest"),
+        ],
+    )
+    def test_downgrade_reports_the_error_the_version_knows(self, real_migrator, version, expected):
+        msg = ErrorResponse(error=ErrorType.XCOM_BACKEND_ERROR, detail={"message": "backend refused"})
+
+        out = real_migrator.downgrade(msg, version)
+
+        assert out.error.value == expected.value
+        assert out.detail == {"message": "backend refused"}
+
+
+class TestRealBundleFirstTaskRescheduleStartDate:
+    """
+    Drive the *real* supervisor bundle through the ``first_task_reschedule_start_date`` migration.
+
+    ``AddFirstTaskRescheduleStartDateToSupervisorTIRunContext`` is ``didnt_exist``-only, so the
+    downgrade re-validation is the only place it is visible: dropping it from the bundle, or
+    registering it under the wrong version, leaves the field on the wire for a pinned runtime.
+    """
+
+    FIRST_RESCHEDULE = datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC)
+
+    @pytest.fixture
+    def startup_details(self):
+        now = datetime.datetime.now(datetime.UTC)
+        return StartupDetails(
+            ti=TaskInstance(
+                id=uuid.uuid4(),
+                task_id="wait",
+                dag_id="d",
+                run_id="r",
+                try_number=1,
+                dag_version_id=uuid.uuid4(),
+            ),
+            dag_rel_path="d.py",
+            bundle_info=BundleInfo(name="b", version=None),
+            start_date=now,
+            ti_context=TIRunContext(
+                dag_run=DagRun(
+                    dag_id="d",
+                    run_id="r",
+                    logical_date=now,
+                    data_interval_start=None,
+                    data_interval_end=None,
+                    start_date=now,
+                    end_date=None,
+                    run_type=DagRunType.MANUAL,
+                    state=DagRunState.RUNNING,
+                    run_after=now,
+                    consumed_asset_events=[],
+                    partition_key=None,
+                ),
+                max_tries=1,
+                first_task_reschedule_start_date=self.FIRST_RESCHEDULE,
+            ),
+            sentry_integration="",
+        )
+
+    @pytest.fixture
+    def real_migrator(self) -> SchemaVersionMigrator:
+        return get_schema_version_migrator()
+
+    def test_downgrade_strips_field_for_previous_version(self, real_migrator, startup_details):
+        out = real_migrator.downgrade(startup_details, "2026-06-16").model_dump()
+        assert "first_task_reschedule_start_date" not in out["ti_context"]
+
+    def test_head_version_keeps_field(self, real_migrator, startup_details):
+        out = real_migrator.downgrade(startup_details, "2026-10-30")
+        assert out.ti_context.first_task_reschedule_start_date == self.FIRST_RESCHEDULE

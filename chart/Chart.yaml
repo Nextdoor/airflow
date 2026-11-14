@@ -19,8 +19,8 @@
 ---
 apiVersion: v2
 name: airflow
-version: 1.8.0-dev
-appVersion: 2.5.0
+version: 2.0.0
+appVersion: 3.4.0
 description: The official Helm chart to deploy Apache Airflow, a platform to
   programmatically author, schedule, and monitor workflows
 home: https://airflow.apache.org/
@@ -34,7 +34,8 @@ keywords:
   - scheduler
 dependencies:
   - name: postgresql
-    version: 10.5.3
+    version: 13.2.24
+    repository: https://charts.bitnami.com/bitnami
     condition: postgresql.enabled
 maintainers:
   - email: dev@airflow.apache.org
@@ -43,210 +44,131 @@ type: application
 annotations:
   artifacthub.io/links: |
     - name: Documentation
-      url: https://airflow.apache.org/docs/helm-chart/1.6.0/
+      url: https://airflow.apache.org/docs/helm-chart/1.21.0/
   artifacthub.io/screenshots: |
-    - title: DAGs View
-      url: https://airflow.apache.org/docs/apache-airflow/2.5.0/_images/dags.png
-    - title: Datasets View
-      url: https://airflow.apache.org/docs/apache-airflow/2.5.0/_images/datasets.png
+    - title: Home Page
+      url: https://airflow.apache.org/docs/apache-airflow/3.4.0/_images/home_dark.png
+    - title: Dag Overview Dashboard
+      url: https://airflow.apache.org/docs/apache-airflow/3.4.0/_images/dag_overview_dashboard.png
+    - title: Dags View
+      url: https://airflow.apache.org/docs/apache-airflow/3.4.0/_images/dags.png
+    - title: Assets View
+      url: https://airflow.apache.org/docs/apache-airflow/3.4.0/_images/asset_view.png
     - title: Grid View
-      url: https://airflow.apache.org/docs/apache-airflow/2.5.0/_images/grid.png
+      url: https://airflow.apache.org/docs/apache-airflow/3.4.0/_images/dag_overview_grid.png
     - title: Graph View
-      url: https://airflow.apache.org/docs/apache-airflow/2.5.0/_images/graph.png
-    - title: Calendar View
-      url: https://airflow.apache.org/docs/apache-airflow/2.5.0/_images/calendar.png
+      url: https://airflow.apache.org/docs/apache-airflow/3.4.0/_images/dag_overview_graph.png
     - title: Variable View
-      url: https://airflow.apache.org/docs/apache-airflow/2.5.0/_images/variable_hidden.png
-    - title: Gantt Chart
-      url: https://airflow.apache.org/docs/apache-airflow/2.5.0/_images/gantt.png
-    - title: Task Duration
-      url: https://airflow.apache.org/docs/apache-airflow/2.5.0/_images/duration.png
+      url: https://airflow.apache.org/docs/apache-airflow/3.4.0/_images/variable_hidden.png
     - title: Code View
-      url: https://airflow.apache.org/docs/apache-airflow/2.5.0/_images/code.png
-    - title: Task Instance Context Menu
-      url: https://airflow.apache.org/docs/apache-airflow/2.5.0/_images/context.png
+      url: https://airflow.apache.org/docs/apache-airflow/3.4.0/_images/dag_overview_code.png
   artifacthub.io/changes: |
-    - description: Make cleanup job history configurable
-      kind: added
-      links:
-      - name: '#26838'
-        url: https://github.com/apache/airflow/pull/26838
-    - description: Added labels to specific Airflow components
-      kind: added
-      links:
-      - name: '#25031'
-        url: https://github.com/apache/airflow/pull/25031
-    - description: Add StatsD ``overrideMappings`` in Helm chart values
-      kind: added
-      links:
-      - name: '#26598'
-        url: https://github.com/apache/airflow/pull/26598
-    - description: Adding ``podAnnotations`` to StatsD deployment template
-      kind: added
-      links:
-      - name: '#25732'
-        url: https://github.com/apache/airflow/pull/25732
-    - description: Container specific extra environment variables
-      kind: added
-      links:
-      - name: '#24784'
-        url: https://github.com/apache/airflow/pull/24784
-    - description: Custom labels for extrasecrets/configmaps
-      kind: added
-      links:
-      - name: '#25283'
-        url: https://github.com/apache/airflow/pull/25283
-    - description: Add ``revisionHistoryLimit`` to all deployments
-      kind: added
-      links:
-      - name: '#25059'
-        url: https://github.com/apache/airflow/pull/25059
-    - description: Adding ``podAnnotations`` to Redis StatefulSet
-      kind: added
-      links:
-      - name: '#23708'
-        url: https://github.com/apache/airflow/pull/23708
-    - description: Provision Standalone Dag Processor
-      kind: added
-      links:
-      - name: '#23711'
-        url: https://github.com/apache/airflow/pull/23711
-    - description: Add configurable scheme for webserver probes
-      kind: added
-      links:
-      - name: '#22815'
-        url: https://github.com/apache/airflow/pull/22815
-    - description: Add support for KEDA HPA config to Helm chart
-      kind: added
-      links:
-      - name: '#24220'
-        url: https://github.com/apache/airflow/pull/24220
-    - description: Add 'executor' label to Airflow scheduler deployment
+    - description: >
+        Workers config options have been moved under workers.celery.* and workers.kubernetes.*:
+        safeToEvict, hostAliases, priorityClassName, runtimeClassName, schedulerName,
+        serviceAccount, extraContainers, extraInitContainers, extraVolumes, affinity,
+        tolerations, topologySpreadConstraints, podAnnotations, labels, env, extraVolumeMounts
+        are moved to both; extraPorts, volumeClaimTemplates, waitForMigrations, hpa,
+        annotations, logGroomerSidecar are Celery-specific and moved under workers.celery.*
       kind: changed
       links:
-      - name: '#25684'
-        url: https://github.com/apache/airflow/pull/25684
-    - description: Add default ``flower_url_prefix`` in Helm chart values
+      - name: '#61915'
+        url: https://github.com/apache/airflow/pull/61915
+      - name: '#61919'
+        url: https://github.com/apache/airflow/pull/61919
+      - name: '#61960'
+        url: https://github.com/apache/airflow/pull/61960
+      - name: '#61961'
+        url: https://github.com/apache/airflow/pull/61961
+      - name: '#61962'
+        url: https://github.com/apache/airflow/pull/61962
+      - name: '#62030'
+        url: https://github.com/apache/airflow/pull/62030
+      - name: '#62048'
+        url: https://github.com/apache/airflow/pull/62048
+      - name: '#62054'
+        url: https://github.com/apache/airflow/pull/62054
+      - name: '#64730'
+        url: https://github.com/apache/airflow/pull/64730
+      - name: '#64734'
+        url: https://github.com/apache/airflow/pull/64734
+      - name: '#64739'
+        url: https://github.com/apache/airflow/pull/64739
+      - name: '#64741'
+        url: https://github.com/apache/airflow/pull/64741
+      - name: '#64746'
+        url: https://github.com/apache/airflow/pull/64746
+      - name: '#64860'
+        url: https://github.com/apache/airflow/pull/64860
+      - name: '#64976'
+        url: https://github.com/apache/airflow/pull/64976
+      - name: '#64980'
+        url: https://github.com/apache/airflow/pull/64980
+      - name: '#64982'
+        url: https://github.com/apache/airflow/pull/64982
+      - name: '#65027'
+        url: https://github.com/apache/airflow/pull/65027
+      - name: '#65030'
+        url: https://github.com/apache/airflow/pull/65030
+      - name: '#65033'
+        url: https://github.com/apache/airflow/pull/65033
+      - name: '#65056'
+        url: https://github.com/apache/airflow/pull/65056
+      - name: '#65059'
+        url: https://github.com/apache/airflow/pull/65059
+    - description: Default Airflow image updated to 3.4.0
       kind: changed
       links:
-      - name: '#26415'
-        url: https://github.com/apache/airflow/pull/26415
-    - description: Add liveness probe to Celery workers
-      kind: changed
-      links:
-      - name: '#25561'
-        url: https://github.com/apache/airflow/pull/25561
-    - description: Use ``sql_alchemy_conn`` for celery result backend when ``result_backend``
-        is not set
-      kind: changed
-      links:
-      - name: '#24496'
-        url: https://github.com/apache/airflow/pull/24496
-    - description: Fix pod template ``imagePullPolicy``
+      - name: '#64841'
+        url: https://github.com/apache/airflow/pull/64841
+    - description: Fix wrong broker URL secret ref
       kind: fixed
       links:
-      - name: '#26423'
-        url: https://github.com/apache/airflow/pull/26423
-    - description: Do not declare a volume for ``sshKeySecret`` if dag persistence is
-        enabled
+      - name: '#65006'
+        url: https://github.com/apache/airflow/pull/65006
+    - description: Add ttlSecondsAfterFinished to database cleanup job
+      kind: added
+      links:
+      - name: '#64164'
+        url: https://github.com/apache/airflow/pull/64164
+    - description: >
+        Support tpl rendering in ServiceAccount annotations, metadataConnection, and config ConfigMap names
+      kind: added
+      links:
+      - name: '#64763'
+        url: https://github.com/apache/airflow/pull/64763
+    - description: Generate JWT Secret of recommended length
+      kind: changed
+      links:
+      - name: '#65082'
+        url: https://github.com/apache/airflow/pull/65082
+    - description: Fix Helm chart image volume schema validation
       kind: fixed
       links:
-      - name: '#22913'
-        url: https://github.com/apache/airflow/pull/22913
-    - description: Pass worker annotations to generated pod template
+      - name: '#65409'
+        url: https://github.com/apache/airflow/pull/65409
+    - description: Remove duplicate fallback branch in airflowPodSecurityContextsIds helper
       kind: fixed
       links:
-      - name: '#24647'
-        url: https://github.com/apache/airflow/pull/24647
-    - description: Fix semver compare number for ``jobs check`` command
+      - name: '#65558'
+        url: https://github.com/apache/airflow/pull/65558
+    - description: Render cleanup RBAC only for KubernetesExecutor
       kind: fixed
       links:
-      - name: '#24480'
-        url: https://github.com/apache/airflow/pull/24480
-    - description: Use ``--local`` flag for liveness probes in Airflow 2.5+
+      - name: '#65539'
+        url: https://github.com/apache/airflow/pull/65539
+    - description: Fix default args/command for database cleanup
       kind: fixed
       links:
-      - name: '#24999'
-        url: https://github.com/apache/airflow/pull/24999
-    - description: 'Docs: Improve documentation on helm hooks disabling'
-      kind: changed
+      - name: '#63821'
+        url: https://github.com/apache/airflow/pull/63821
+    - description: Fix invalid deprecation warning in NOTES.txt
+      kind: fixed
       links:
-      - name: '#26747'
-        url: https://github.com/apache/airflow/pull/26747
-    - description: 'Docs: Remove ``ssh://`` prefix from git repo value'
-      kind: changed
+      - name: '#64296'
+        url: https://github.com/apache/airflow/pull/64296
+    - description: Add missing fields in schema file
+      kind: fixed
       links:
-      - name: '#26632'
-        url: https://github.com/apache/airflow/pull/26632
-    - description: 'Docs: Update docs when not to use Helm hooks for starting jobs'
-      kind: changed
-      links:
-      - name: '#26604'
-        url: https://github.com/apache/airflow/pull/26604
-    - description: 'Docs: Fix ``defaultAirflowRepository`` comment'
-      kind: changed
-      links:
-      - name: '#26428'
-        url: https://github.com/apache/airflow/pull/26428
-    - description: 'Docs: Baking DAGs into Docker image'
-      kind: changed
-      links:
-      - name: '#26401'
-        url: https://github.com/apache/airflow/pull/26401
-    - description: 'Docs: Reload pods when using the same DAG tag'
-      kind: changed
-      links:
-      - name: '#24576'
-        url: https://github.com/apache/airflow/pull/24576
-    - description: 'Docs: Minor clarifications about ``result_backend``, dag processor,
-        and ``helm uninstall``'
-      kind: changed
-      links:
-      - name: '#24929'
-        url: https://github.com/apache/airflow/pull/24929
-    - description: 'Docs: Add hyperlinks to Github PRs for Release Notes'
-      kind: changed
-      links:
-      - name: '#24532'
-        url: https://github.com/apache/airflow/pull/24532
-    - description: 'Docs: Add Flux to chart gitops docs'
-      kind: changed
-      links:
-      - name: '#24288'
-        url: https://github.com/apache/airflow/pull/24288
-    - description: 'Docs: Provide details on how to pull Airflow image from a private
-        repository'
-      kind: changed
-      links:
-      - name: '#24394'
-        url: https://github.com/apache/airflow/pull/24394
-    - description: 'Docs: Helm logo no longer a link'
-      kind: changed
-      links:
-      - name: '#23977'
-        url: https://github.com/apache/airflow/pull/23977
-    - description: 'Docs: Document LocalKubernetesExecutor support in chart'
-      kind: changed
-      links:
-      - name: '#23876'
-        url: https://github.com/apache/airflow/pull/23876
-    - description: 'Docs: Update Production Guide'
-      kind: changed
-      links:
-      - name: '#23836'
-        url: https://github.com/apache/airflow/pull/23836
-    - description: 'Misc: Default Airflow version to 2.5.0'
-      kind: changed
-      links:
-      - name: '#26485'
-        url: https://github.com/apache/airflow/pull/26485
-    - description: 'Misc: Vendor in the bitnami chart'
-      kind: changed
-      links:
-      - name: '#24395'
-        url: https://github.com/apache/airflow/pull/24395
-    - description: 'Misc: Remove kubernetes 1.20 support'
-      kind: changed
-      links:
-      - name: '#25871'
-        url: https://github.com/apache/airflow/pull/25871
+      - name: '#64339'
+        url: https://github.com/apache/airflow/pull/64339

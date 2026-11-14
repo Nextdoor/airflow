@@ -1,0 +1,262 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+from unittest.mock import ANY, MagicMock, patch
+
+import pytest
+from pydantic import BaseModel
+from pydantic_ai.capabilities import Thinking
+from pydantic_ai.messages import ImageUrl
+from pydantic_ai.toolsets.function import FunctionToolset
+
+from airflow.providers.common.ai.decorators.agent import _AgentDecoratedOperator
+from airflow.providers.common.ai.toolsets.logging import ToolLoggingCapability
+from airflow.providers.common.ai.toolsets.sql import SQLToolset
+from airflow.providers.common.ai.utils.prompt_cache import PromptCaching
+from airflow.providers.common.ai.utils.toolset_base import MaskingToolset
+
+try:
+    from airflow.sdk.serde import SUPPORTS_OPERATOR_DESERIALIZATION_WALKER as _CORE_WALKER
+except ImportError:
+    _CORE_WALKER = False
+
+requires_typed_xcom = pytest.mark.skipif(
+    not _CORE_WALKER,
+    reason="Requires an ``apache-airflow-task-sdk`` version with the worker-side deserialization-class walk.",
+)
+
+
+class Summary(BaseModel):
+    text: str
+
+
+def _make_context():
+    """A context whose ``task_instance`` carries a stable id for run-identity stamping.
+
+    A real dict (not a mock) so the decorator's ``context_merge`` of ``op_kwargs`` works.
+    """
+    ti = MagicMock()
+    ti.configure_mock(id="ti-1", dag_id="dag", task_id="task", run_id="run", map_index=-1, try_number=1)
+    return {"task_instance": ti}
+
+
+class TestAgentDecoratedOperator:
+    def test_custom_operator_name(self):
+        assert _AgentDecoratedOperator.custom_operator_name == "@task.agent"
+
+    @patch("airflow.providers.common.ai.operators.agent.PydanticAIHook", autospec=True)
+    def test_execute_calls_callable_and_returns_output(self, mock_hook_cls, make_mock_run_result):
+        """The callable's return value becomes the agent prompt."""
+        mock_agent = MagicMock(spec=["run_sync", "instrument"])
+        mock_agent.run_sync.return_value = make_mock_run_result("The top customer is Acme Corp.")
+        mock_hook_cls.get_hook.return_value.create_agent.return_value = mock_agent
+
+        def my_prompt():
+            return "Who is our top customer?"
+
+        op = _AgentDecoratedOperator(task_id="test", python_callable=my_prompt, llm_conn_id="my_llm")
+        result = op.execute(context=_make_context())
+
+        assert result == "The top customer is Acme Corp."
+        assert op.prompt == "Who is our top customer?"
+        mock_agent.run_sync.assert_called_once_with(
+            "Who is our top customer?", usage_limits=None, run_id="ti-1", cancellation_token=ANY, usage=ANY
+        )
+
+    @pytest.mark.parametrize(
+        "return_value",
+        [42, "", "   ", None, b"bytes", bytearray(b"x"), [], ()],
+        ids=["non-string", "empty", "whitespace", "none", "bytes", "bytearray", "empty-list", "empty-tuple"],
+    )
+    def test_execute_raises_on_invalid_prompt(self, return_value):
+        """TypeError when the callable returns an unsupported prompt shape."""
+        op = _AgentDecoratedOperator(
+            task_id="test",
+            python_callable=lambda: return_value,
+            llm_conn_id="my_llm",
+        )
+        with pytest.raises(TypeError, match="must be"):
+            op.execute(context={})
+
+    @patch("airflow.providers.common.ai.operators.agent.PydanticAIHook", autospec=True)
+    def test_execute_accepts_sequence_prompt(self, mock_hook_cls, make_mock_run_result):
+        """A non-empty Sequence[UserContent] return value is forwarded to run_sync as-is."""
+        mock_agent = MagicMock(spec=["run_sync", "instrument"])
+        mock_agent.run_sync.return_value = make_mock_run_result("ok")
+        mock_hook_cls.get_hook.return_value.create_agent.return_value = mock_agent
+
+        image = ImageUrl(url="https://example.com/x.png")
+        prompt = ["Describe this:", image]
+
+        def my_prompt():
+            return prompt
+
+        op = _AgentDecoratedOperator(task_id="test", python_callable=my_prompt, llm_conn_id="my_llm")
+        op.execute(context=_make_context())
+
+        assert op.prompt == prompt
+        mock_agent.run_sync.assert_called_once_with(
+            prompt, usage_limits=None, run_id="ti-1", cancellation_token=ANY, usage=ANY
+        )
+
+    @patch("airflow.providers.common.ai.operators.agent.AgentOperator.run_hitl_review", autospec=True)
+    @patch("airflow.providers.common.ai.operators.agent.PydanticAIHook", autospec=True)
+    def test_sequence_prompt_with_hitl_review_reaches_the_review(
+        self, mock_hook_cls, mock_run_hitl, make_mock_run_result
+    ):
+        from tests_common.test_utils.version_compat import AIRFLOW_V_3_1_PLUS
+
+        if not AIRFLOW_V_3_1_PLUS:
+            pytest.skip("enable_hitl_review requires Airflow >= 3.1.0")
+
+        mock_agent = MagicMock(spec=["run_sync", "instrument"])
+        mock_agent.run_sync.return_value = make_mock_run_result("Initial output")
+        mock_hook_cls.get_hook.return_value.create_agent.return_value = mock_agent
+        prompt = ["x", ImageUrl(url="https://example.com/x.png")]
+
+        op = _AgentDecoratedOperator(
+            task_id="test",
+            python_callable=lambda: prompt,
+            llm_conn_id="my_llm",
+            enable_hitl_review=True,
+        )
+
+        assert op.execute(context=_make_context()) == "Initial output"
+        mock_run_hitl.assert_called_once()
+        assert mock_agent.run_sync.call_args.args[0] == prompt
+
+    @patch("airflow.providers.common.ai.operators.agent.PydanticAIHook", autospec=True)
+    def test_execute_merges_op_kwargs_into_callable(self, mock_hook_cls, make_mock_run_result):
+        """op_kwargs are resolved by the callable to build the prompt."""
+        mock_agent = MagicMock(spec=["run_sync", "instrument"])
+        mock_agent.run_sync.return_value = make_mock_run_result("done")
+        mock_hook_cls.get_hook.return_value.create_agent.return_value = mock_agent
+
+        def my_prompt(topic):
+            return f"Analyze {topic}"
+
+        op = _AgentDecoratedOperator(
+            task_id="test",
+            python_callable=my_prompt,
+            llm_conn_id="my_llm",
+            op_kwargs={"topic": "revenue trends"},
+        )
+        op.execute(context=_make_context())
+
+        assert op.prompt == "Analyze revenue trends"
+        mock_agent.run_sync.assert_called_once_with(
+            "Analyze revenue trends", usage_limits=None, run_id="ti-1", cancellation_token=ANY, usage=ANY
+        )
+
+    @patch("airflow.providers.common.ai.operators.agent.AgentOperator.execute", autospec=True)
+    def test_execute_renders_only_the_returned_prompt(self, mock_execute):
+        """Fields rendered before execute() are not rendered again; only the returned value is."""
+        op = _AgentDecoratedOperator(
+            task_id="test",
+            python_callable=lambda: "Summarize {{ topic }}",
+            llm_conn_id="my_llm",
+            system_prompt="{{ note }}",
+            toolsets=[SQLToolset(db_conn_id="{{ note }}")],
+        )
+        context = {"topic": "logs", "note": "{{ other }}", "other": "rendered twice"}
+
+        op.render_template_fields(context)
+        op.execute(context=context)
+
+        assert op.prompt == "Summarize logs"
+        assert op.system_prompt == "{{ other }}"
+        assert op.toolsets[0].id == "sql-{{ other }}"
+
+    @patch("airflow.providers.common.ai.operators.agent.PydanticAIHook", autospec=True)
+    def test_execute_passes_toolsets_through(self, mock_hook_cls, make_mock_run_result):
+        """Toolsets passed to the decorator are forwarded to the agent."""
+        mock_agent = MagicMock(spec=["run_sync", "instrument"])
+        mock_agent.run_sync.return_value = make_mock_run_result("result")
+        mock_hook_cls.get_hook.return_value.create_agent.return_value = mock_agent
+
+        toolset = FunctionToolset()
+
+        op = _AgentDecoratedOperator(
+            task_id="test",
+            python_callable=lambda: "Do something",
+            llm_conn_id="my_llm",
+            toolsets=[toolset],
+        )
+        op.execute(context=_make_context())
+
+        create_call = mock_hook_cls.get_hook.return_value.create_agent.call_args
+        assert create_call[1]["toolsets"] == [MaskingToolset(wrapped=toolset)]
+        assert create_call[1]["capabilities"][0] == PromptCaching()
+        assert isinstance(create_call[1]["capabilities"][1], ToolLoggingCapability)
+
+    @patch("airflow.providers.common.ai.operators.agent.PydanticAIHook", autospec=True)
+    def test_execute_passes_capabilities_through(self, mock_hook_cls, make_mock_run_result):
+        mock_agent = MagicMock(spec=["run_sync", "instrument"])
+        mock_agent.run_sync.return_value = make_mock_run_result("result")
+        mock_hook_cls.get_hook.return_value.create_agent.return_value = mock_agent
+        thinking = Thinking(effort="high")
+
+        op = _AgentDecoratedOperator(
+            task_id="test",
+            python_callable=lambda: "Do something",
+            llm_conn_id="my_llm",
+            capabilities=[thinking],
+        )
+        op.execute(context=_make_context())
+
+        create_call = mock_hook_cls.get_hook.return_value.create_agent.call_args
+        assert create_call.kwargs["capabilities"][:2] == [thinking, PromptCaching()]
+        assert isinstance(create_call.kwargs["capabilities"][2], ToolLoggingCapability)
+
+    @requires_typed_xcom
+    @patch("airflow.providers.common.ai.operators.agent.PydanticAIHook", autospec=True)
+    def test_execute_structured_output(self, mock_hook_cls, make_mock_run_result):
+        """BaseModel output flows through XCom as the Pydantic instance."""
+        mock_agent = MagicMock(spec=["run_sync", "instrument"])
+        mock_agent.run_sync.return_value = make_mock_run_result(Summary(text="Great results"))
+        mock_hook_cls.get_hook.return_value.create_agent.return_value = mock_agent
+
+        op = _AgentDecoratedOperator(
+            task_id="test",
+            python_callable=lambda: "Summarize",
+            llm_conn_id="my_llm",
+            output_type=Summary,
+        )
+        result = op.execute(context=_make_context())
+
+        assert isinstance(result, Summary)
+        assert result.text == "Great results"
+
+    def test_durable_kwarg_passes_through_to_operator(self):
+        """durable=True is forwarded to AgentOperator via **kwargs."""
+        op = _AgentDecoratedOperator(
+            task_id="test",
+            python_callable=lambda: "prompt",
+            llm_conn_id="my_llm",
+            durable=True,
+        )
+        assert op.durable is True
+
+    def test_durable_default_false_through_decorator(self):
+        """durable defaults to False when not specified."""
+        op = _AgentDecoratedOperator(
+            task_id="test",
+            python_callable=lambda: "prompt",
+            llm_conn_id="my_llm",
+        )
+        assert op.durable is False

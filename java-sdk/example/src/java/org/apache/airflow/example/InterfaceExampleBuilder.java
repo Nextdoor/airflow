@@ -1,0 +1,91 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.apache.airflow.example;
+
+import static java.lang.System.Logger.Level.INFO;
+
+import java.util.Date;
+import org.apache.airflow.sdk.*;
+import org.jetbrains.annotations.NotNull;
+
+@SuppressWarnings("DuplicatedCode")
+public class InterfaceExampleBuilder {
+  private static final System.Logger log =
+      System.getLogger(InterfaceExampleBuilder.class.getName());
+
+  public static class Extract implements Task {
+    public void execute(@NotNull Context context, Client client) throws Exception {
+      log.log(INFO, "Hello from task");
+
+      var pythonInput = client.getXCom("python_task_1");
+      log.log(INFO, "Got XCom from python_task_1: {0}", pythonInput);
+
+      var connection = client.getConnection("test_http");
+      log.log(INFO, "Got connection: {0}", connection);
+
+      for (var i = 0; i < 3; i++) {
+        log.log(INFO, "Beep {0}, next time will be {1}", i, new Date());
+        Thread.sleep(2 * 1000);
+      }
+
+      client.setXCom(new Date().getTime());
+      log.log(INFO, "Goodbye from task");
+    }
+  }
+
+  public static class TransformInput implements TaskInput {
+    public long extracted;
+  }
+
+  // The Python Dag file calls transform(extracted), so the field of that name
+  // receives the extract task's XCom.
+  public static class Transform implements InputTask<TransformInput> {
+    public void execute(@NotNull Context context, Client client, TransformInput input) {
+      log.log(INFO, "Got extracted value from the bound argument: {0}", input.extracted);
+
+      var variable = client.getVariable("my_variable");
+      log.log(INFO, "Got variable: {0}", variable);
+
+      log.log(INFO, "Push XCom to python task 2");
+      client.setXCom(new Date().getTime());
+    }
+  }
+
+  public static class SummarizeInput implements TaskInput {
+    // Pinned so the field can be called region rather than regionCode. Or drop
+    // it: public String regionCode; binds region_code with nothing declared.
+    @ArgName("region_code")
+    public String region;
+
+    public long transformed;
+  }
+
+  // summarize(region_code=..., transformed=...) is called with keyword
+  // arguments, which bind to the fields by name.
+  public static class Summarize implements InputTask<SummarizeInput> {
+    public void execute(@NotNull Context context, Client client, SummarizeInput input) {
+      log.log(
+          INFO, "Summarize region {0} for transformed value {1}", input.region, input.transformed);
+      if (!"emea".equals(input.region)) {
+        throw new RuntimeException("expected region 'emea' but got " + input.region);
+      }
+    }
+  }
+}

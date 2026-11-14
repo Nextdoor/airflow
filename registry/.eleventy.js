@@ -1,0 +1,190 @@
+/*!
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+const { collectExternalServices } = require("./src/_data/providerExternalServices");
+
+module.exports = function(eleventyConfig) {
+  // Copy static assets
+  eleventyConfig.addPassthroughCopy("src/assets");
+  eleventyConfig.addPassthroughCopy("src/css");
+  eleventyConfig.addPassthroughCopy("src/js");
+
+  // Copy public directory contents to root of output
+  eleventyConfig.addPassthroughCopy({ "public": "/" });
+
+  // Vendor swagger-ui from node_modules (external CDN blocked by Apache Infra CSP)
+  eleventyConfig.addPassthroughCopy({
+    "node_modules/swagger-ui-dist/swagger-ui.css": "vendor/swagger-ui/swagger-ui.css",
+  });
+  eleventyConfig.addPassthroughCopy({
+    "node_modules/swagger-ui-dist/swagger-ui-bundle.js": "vendor/swagger-ui/swagger-ui-bundle.js",
+  });
+
+  // Watch CSS and JS for changes
+  eleventyConfig.addWatchTarget("src/css/");
+  eleventyConfig.addWatchTarget("src/js/");
+
+  // Add filters
+  eleventyConfig.addFilter("slice", (array, start, end) => {
+    return array.slice(start, end);
+  });
+
+  eleventyConfig.addFilter("formatDownloads", (num) => {
+    if (!num) return "0";
+
+    // For billions
+    if (num >= 1_000_000_000) {
+      const billions = num / 1_000_000_000;
+      return billions >= 10 ? `${Math.round(billions)}B` : `${billions.toFixed(1)}B`;
+    }
+
+    // For millions
+    if (num >= 1_000_000) {
+      const millions = num / 1_000_000;
+      return millions >= 10 ? `${Math.round(millions)}M` : `${millions.toFixed(1)}M`;
+    }
+
+    // For thousands
+    if (num >= 1_000) {
+      const thousands = num / 1_000;
+      return thousands >= 10 ? `${Math.round(thousands)}K` : `${thousands.toFixed(1)}K`;
+    }
+
+    return num.toString();
+  });
+
+  eleventyConfig.addFilter("formatLargeNumber", (num) => {
+    if (!num) return "0";
+    if (num >= 1_000_000_000) return `${(num / 1_000_000_000).toFixed(1)}B`;
+    if (num >= 1_000_000) return `${Math.round(num / 1_000_000)}M`;
+    if (num >= 1_000) return `${(num / 1_000).toFixed(1)}K`;
+    return num.toLocaleString();
+  });
+
+  eleventyConfig.addFilter("thousands", (num) => {
+    if (!num && num !== 0) return "0";
+    return num.toLocaleString();
+  });
+
+  eleventyConfig.addFilter("capitalize", (str) => {
+    if (!str) return "";
+    return str.charAt(0).toUpperCase() + str.slice(1);
+  });
+
+  eleventyConfig.addFilter("first", (str) => {
+    if (!str) return "";
+    return str.charAt(0);
+  });
+
+  eleventyConfig.addFilter("keys", (obj) => {
+    if (!obj || typeof obj !== "object") return [];
+    return Object.keys(obj);
+  });
+
+  eleventyConfig.addFilter("dump", (obj) => {
+    return JSON.stringify(obj);
+  });
+
+  // Attaches each type's module count and drops zero-count types, sorted by
+  // count descending -- used to render the provider-page module tabs with the
+  // busiest categories first.
+  eleventyConfig.addFilter("sortTypesByCount", (types, moduleCounts) => {
+    if (!Array.isArray(types)) return [];
+    const counts = moduleCounts || {};
+    return types
+      .filter((t) => (counts[t.id] || 0) > 0)
+      .map((t) => Object.assign({}, t, { count: counts[t.id] || 0 }))
+      .sort((a, b) => b.count - a.count);
+  });
+
+  // Looks up the curated single-letter icon for a type id from types.json, instead of
+  // deriving it from the id's first character at each render site (which reintroduces
+  // the letter collisions types.json's `icon` field was curated to avoid).
+  eleventyConfig.addFilter("typeIcon", (types, typeId) => {
+    if (!Array.isArray(types) || !typeId) return "";
+    const match = types.find((t) => t.id === typeId);
+    if (match && match.icon) return match.icon;
+    return typeId.charAt(0).toUpperCase();
+  });
+
+  // Flattens a provider's per-connection external services into one deduped
+  // list, so the /providers/ filter box can match them the way the pagefind
+  // index already does.
+  eleventyConfig.addFilter("externalServices", (provider) => {
+    if (!provider || typeof provider !== "object") return [];
+    return collectExternalServices(provider);
+  });
+
+  // Connection types that declare at least one external service, unchanged.
+  eleventyConfig.addFilter("getExternalServiceConnections", (conns) =>
+    (conns || []).filter((conn) => conn.external_services && conn.external_services.length > 0),
+  );
+
+  // Groups a provider's uri_schemes by the Airflow feature that routes them to
+  // the provider. Listing only registered schemes per feature avoids a matrix
+  // whose empty cells read as "unsupported" when the feature just doesn't apply
+  // (redshift:// is never an object store). Features with no schemes are dropped.
+  eleventyConfig.addFilter("uriSchemeGroups", (uriSchemes) => {
+    const docs = "https://airflow.apache.org/docs/apache-airflow/stable";
+    const features = [
+      {
+        label: "ObjectStoragePath",
+        docsUrl: `${docs}/core-concepts/objectstorage.html`,
+        detail: (s) => s.filesystem,
+      },
+      {
+        label: "Asset URIs",
+        docsUrl: `${docs}/authoring-and-scheduling/assets.html#what-is-valid-uri`,
+        detail: (s) =>
+          s.asset &&
+          ([s.asset.handler, s.asset.factory, s.asset.to_openlineage_converter].filter(Boolean).join(", ") ||
+            "No-op handler"),
+      },
+      {
+        label: "Remote logging",
+        docsUrl: `${docs}/administration-and-deployment/logging-monitoring/logging-tasks.html`,
+        detail: (s) => s.remote_logging,
+      },
+    ];
+    return features
+      .map(({ label, docsUrl, detail }) => ({
+        label,
+        docsUrl,
+        schemes: (uriSchemes || [])
+          .filter((s) => detail(s))
+          .map((s) => ({ scheme: s.scheme, detail: detail(s) })),
+      }))
+      .filter((group) => group.schemes.length > 0);
+  });
+
+  eleventyConfig.addShortcode("year", () => `${new Date().getFullYear()}`);
+
+  return {
+    pathPrefix: process.env.REGISTRY_PATH_PREFIX || "/registry/",
+    dir: {
+      input: "src",
+      output: "_site",
+      includes: "_includes",
+      data: "_data"
+    },
+    templateFormats: ["njk", "md", "html"],
+    htmlTemplateEngine: "njk",
+    markdownTemplateEngine: "njk"
+  };
+};

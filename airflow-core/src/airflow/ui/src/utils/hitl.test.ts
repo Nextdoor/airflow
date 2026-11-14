@@ -1,0 +1,215 @@
+/*!
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import type { TFunction } from "i18next";
+import { describe, it, expect, vi } from "vitest";
+
+import type { HITLDetail, TaskInstanceState } from "openapi/requests/types.gen";
+
+import { getHITLFormData, getHITLParamsDict, getHITLState, isHITLPending } from "./hitl";
+
+const mockTranslate = vi.fn((key: string) => key) as unknown as TFunction;
+
+const DEFAULT_OUTPUT = '{"title": "Login broken", "priority": 2}';
+
+const createMockHITLDetail = (overrides?: Partial<HITLDetail>): HITLDetail =>
+  ({
+    assigned_users: [],
+    body: "Test Body",
+    chosen_options: [],
+    created_at: new Date().toISOString(),
+    defaults: ["Option1"],
+    multiple: false,
+    options: ["Option1", "Option2"],
+    params: {},
+    params_input: {},
+    response_received: false,
+    subject: "Test Subject",
+    task_instance: {
+      dag_id: "test_dag",
+      dag_run_id: "test_run",
+      map_index: -1,
+      state: "deferred",
+      task_id: "test_task",
+    },
+    ...overrides,
+  }) as HITLDetail;
+
+describe("isHITLPending", () => {
+  it.each<TaskInstanceState>(["deferred", "awaiting_input", "running"])(
+    "treats a %s task as pending",
+    (state) => {
+      expect(isHITLPending(state)).toBe(true);
+    },
+  );
+
+  it("treats a finished/cleared task as not pending", () => {
+    expect(isHITLPending("success")).toBe(false);
+    expect(isHITLPending(undefined)).toBe(false);
+    expect(isHITLPending(null)).toBe(false);
+  });
+});
+
+describe("getHITLState", () => {
+  it.each<TaskInstanceState>(["awaiting_input", "running"])(
+    "reports a 'required' state for a %s task without a response",
+    (state) => {
+      const hitlDetail = createMockHITLDetail({
+        response_received: false,
+        task_instance: {
+          dag_id: "test_dag",
+          dag_run_id: "test_run",
+          map_index: -1,
+          state,
+          task_id: "test_task",
+        },
+      } as Partial<HITLDetail>);
+
+      // Empty params + non-approval options -> choice task; the point is that a task still
+      // waiting for its answer is "required", not "noResponseReceived".
+      expect(getHITLState(mockTranslate, hitlDetail)).toBe("state.choiceRequired");
+    },
+  );
+
+  it("reports no response received for a finished task without a response", () => {
+    const hitlDetail = createMockHITLDetail({
+      response_received: false,
+      task_instance: {
+        dag_id: "test_dag",
+        dag_run_id: "test_run",
+        map_index: -1,
+        state: "success",
+        task_id: "test_task",
+      },
+    } as Partial<HITLDetail>);
+
+    expect(getHITLState(mockTranslate, hitlDetail)).toBe("state.noResponseReceived");
+  });
+});
+
+describe("getHITLParamsDict", () => {
+  it("correctly types object parameters as 'object' instead of 'string'", () => {
+    const hitlDetail = createMockHITLDetail({
+      params: {
+        objectParam: { key: "value", nested: { data: 123 } },
+      },
+    });
+
+    const searchParams = new URLSearchParams();
+    const paramsDict = getHITLParamsDict(hitlDetail, mockTranslate, searchParams);
+
+    expect(paramsDict.objectParam?.schema.type).toBe("object");
+    expect(paramsDict.objectParam?.value).toEqual({ key: "value", nested: { data: 123 } });
+  });
+
+  it("resolves a serialized param whose default is null to null, not the wrapper object", () => {
+    const hitlDetail = createMockHITLDetail({
+      params: {
+        freeze_until: {
+          description: null,
+          schema: { format: "date", title: "Code freeze until", type: ["string", "null"] },
+          value: null,
+        },
+      },
+    });
+
+    const paramsDict = getHITLParamsDict(hitlDetail, mockTranslate, new URLSearchParams());
+
+    expect(paramsDict.freeze_until?.value).toBeNull();
+    expect(paramsDict.freeze_until?.schema.format).toBe("date");
+    expect(paramsDict.freeze_until?.schema.type).toEqual(["string", "null"]);
+  });
+
+  it("keeps a serialized param's non-null default", () => {
+    const hitlDetail = createMockHITLDetail({
+      params: {
+        health_check_at: {
+          description: null,
+          schema: { format: "time", type: "string" },
+          value: "09:00:00",
+        },
+      },
+    });
+
+    const paramsDict = getHITLParamsDict(hitlDetail, mockTranslate, new URLSearchParams());
+
+    expect(paramsDict.health_check_at?.value).toBe("09:00:00");
+  });
+
+  it("prefers a submitted value over the serialized default", () => {
+    const hitlDetail = createMockHITLDetail({
+      params: {
+        freeze_until: {
+          description: null,
+          schema: { format: "date", type: ["string", "null"] },
+          value: null,
+        },
+      },
+      params_input: { freeze_until: "2026-09-03" },
+      response_received: true,
+    });
+
+    const paramsDict = getHITLParamsDict(hitlDetail, mockTranslate, new URLSearchParams());
+
+    expect(paramsDict.freeze_until?.value).toBe("2026-09-03");
+  });
+
+  it.each([
+    { expectedType: "string", label: "string", schema: { type: "string" } },
+    { expectedType: ["string", "null"], label: "nullable string", schema: { type: ["string", "null"] } },
+    { expectedType: "string", label: "untyped", schema: {} },
+    {
+      expectedType: "string",
+      label: "string holding an integer beyond 2**53",
+      output: '{"id": 12345678901234567890}',
+      schema: { type: "string" },
+    },
+  ])(
+    "keeps a JSON-looking value of a $label param as text",
+    ({ expectedType, output = DEFAULT_OUTPUT, schema }) => {
+      const hitlDetail = createMockHITLDetail({
+        params: {
+          output: { description: null, schema, value: output },
+        },
+      });
+
+      const paramsDict = getHITLParamsDict(hitlDetail, mockTranslate, new URLSearchParams());
+
+      expect(paramsDict.output?.value).toBe(output);
+      expect(paramsDict.output?.schema.type).toEqual(expectedType);
+      expect(getHITLFormData(paramsDict).params_input).toEqual({ output });
+    },
+  );
+
+  it.each([
+    { label: "an object", type: "object" },
+    { label: "a nullable object", type: ["object", "null"] },
+  ])("returns the object value of $label param as an object", ({ type }) => {
+    const objectValue = { key: "value", nested: { data: 123 } };
+    const hitlDetail = createMockHITLDetail({
+      params: {
+        objectParam: { description: null, schema: { type }, value: objectValue },
+      },
+    });
+
+    const paramsDict = getHITLParamsDict(hitlDetail, mockTranslate, new URLSearchParams());
+
+    expect(paramsDict.objectParam?.schema.type).toEqual(type);
+    expect(getHITLFormData(paramsDict).params_input).toEqual({ objectParam: objectValue });
+  });
+});

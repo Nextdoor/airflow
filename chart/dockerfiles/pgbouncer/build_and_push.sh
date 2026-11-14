@@ -22,10 +22,18 @@ readonly DOCKERHUB_USER
 DOCKERHUB_REPO=${DOCKERHUB_REPO:="airflow"}
 readonly DOCKERHUB_REPO
 
-PGBOUNCER_VERSION="1.14.0"
+# Sometimes the pgbouncer tag does not reliably correspond with the version name
+# For example, it may have a `-fixed` suffix
+PGBOUNCER_TAG="pgbouncer_1_25_2"
+readonly PGBOUNCER_TAG
+
+PGBOUNCER_VERSION="1.25.2"
 readonly PGBOUNCER_VERSION
 
-AIRFLOW_PGBOUNCER_VERSION="2021.04.28"
+PGBOUNCER_SHA256="924ad35113fd0a71c8e2dbe85b5d03445532e2b7b37a9f8a48983beea238b332"
+readonly PGBOUNCER_SHA256
+
+AIRFLOW_PGBOUNCER_VERSION="2026.10.13"
 readonly AIRFLOW_PGBOUNCER_VERSION
 
 COMMIT_SHA=$(git rev-parse HEAD)
@@ -43,19 +51,25 @@ cd "$( dirname "${BASH_SOURCE[0]}" )" || exit 1
 
 center_text "Building image"
 
-docker build . \
+# Note, you need buildx and qemu installed for your docker. They come pre-installed with docker-desktop, but
+# as described in:
+# * https://docs.docker.com/build/install-buildx/
+# * https://docs.docker.com/build/building/multi-platform/
+# You can also install them easily on all docker-based systems
+# You might also need to create a different builder to build multi-platform images
+# For example by running `docker buildx create --use`
+
+docker buildx build . \
+    --platform linux/amd64,linux/arm64 \
     --pull \
+    --push \
+    --build-arg "PGBOUNCER_TAG=${PGBOUNCER_TAG}" \
     --build-arg "PGBOUNCER_VERSION=${PGBOUNCER_VERSION}" \
     --build-arg "AIRFLOW_PGBOUNCER_VERSION=${AIRFLOW_PGBOUNCER_VERSION}"\
+    --build-arg "PGBOUNCER_SHA256=${PGBOUNCER_SHA256}"\
     --build-arg "COMMIT_SHA=${COMMIT_SHA}" \
     --tag "${TAG}"
 
 center_text "Checking image"
 
 docker run --rm "${TAG}" pgbouncer --version
-
-echo Image labels:
-docker inspect "${TAG}" --format '{{ json .ContainerConfig.Labels }}' | python3 -m json.tool
-
-center_text "Pushing image"
-docker push "${TAG}"

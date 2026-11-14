@@ -1,0 +1,150 @@
+ .. Licensed to the Apache Software Foundation (ASF) under one
+    or more contributor license agreements.  See the NOTICE file
+    distributed with this work for additional information
+    regarding copyright ownership.  The ASF licenses this file
+    to you under the Apache License, Version 2.0 (the
+    "License"); you may not use this file except in compliance
+    with the License.  You may obtain a copy of the License at
+
+ ..   http://www.apache.org/licenses/LICENSE-2.0
+
+ .. Unless required by applicable law or agreed to in writing,
+    software distributed under the License is distributed on an
+    "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+    KIND, either express or implied.  See the License for the
+    specific language governing permissions and limitations
+    under the License.
+
+.. _howto/hook:llamaindex:
+
+Using LlamaIndex directly: ``LlamaIndexHook``
+=============================================
+
+.. note::
+
+    Experimental: this can change or be removed in a minor release of this provider.
+    See :ref:`howto/stability`.
+
+Use :class:`~airflow.providers.common.ai.hooks.llamaindex.LlamaIndexHook` to
+bridge an Airflow connection to `LlamaIndex <https://docs.llamaindex.ai/>`__
+chat and embedding models. The hook reads credentials (API key, optional
+base URL) from a connection of type ``llamaindex`` and returns native
+LlamaIndex objects ready to pass to ``VectorStoreIndex(..., embed_model=...)``,
+``load_index_from_storage(..., embed_model=...)``, or
+``index.as_retriever(..., llm=...)``.
+
+The hook deliberately does **not** mutate LlamaIndex's global ``Settings``
+singleton. Operators pass the resolved model directly to LlamaIndex
+constructors, so concurrent tasks in the same worker don't race on shared
+state.
+
+``get_llm()`` and ``get_embedding_model()`` return LlamaIndex's ``OpenAI`` /
+``OpenAIEmbedding`` classes, which validate ``model=`` client-side against
+LlamaIndex's OpenAI-only model-name allowlists before any request is sent.
+Pointing **host** at an Ollama or vLLM endpoint does not add support for
+those backends: their model names (e.g. ``llama3.2``) are never in the
+OpenAI allowlist, so the call fails on the model name, not on connectivity.
+``get_embedding_model()`` raises immediately at construction;
+``get_llm()`` defers the error until the first call that reads
+``.metadata`` (``.chat()`` / ``.complete()``). Neither class has a constructor
+argument that skips the check.
+
+OpenAI by default, BYO for other vendors
+----------------------------------------
+
+LlamaIndex does not ship a universal ``init_chat_model`` /
+``init_embedding_model`` equivalent (each vendor is a separate package
+under ``llama-index-llms-*`` / ``llama-index-embeddings-*`` with its own
+constructor kwargs). The hook therefore covers the OpenAI-compatible
+surface that matches LlamaIndex's own ``resolve_embed_model("default")``
+behaviour:
+
+- ``hook.get_embedding_model()`` returns an ``OpenAIEmbedding`` configured
+  from the connection.
+- ``hook.get_llm()`` returns an ``OpenAI`` LLM configured from the
+  connection.
+
+For other vendors (Cohere, Bedrock, Vertex AI, HuggingFace, ...),
+instantiate the LlamaIndex class directly in a ``@task`` and pass it to
+the operator's ``embed_model=`` / ``llm=`` parameter -- both
+:class:`~airflow.providers.common.ai.operators.llamaindex_embedding.LlamaIndexEmbeddingOperator`
+and
+:class:`~airflow.providers.common.ai.operators.llamaindex_retrieval.LlamaIndexRetrievalOperator`
+accept a pre-built ``BaseEmbedding`` / ``LLM`` instance and bypass the
+hook:
+
+.. exampleinclude:: /../../ai/src/airflow/providers/common/ai/example_dags/example_llamaindex_hook.py
+    :language: python
+    :start-after: [START howto_hook_llamaindex_byo_embed_model]
+    :end-before: [END howto_hook_llamaindex_byo_embed_model]
+
+Install the per-vendor LlamaIndex integration package separately:
+``pip install llama-index-embeddings-cohere``, ``...-bedrock``,
+``...-huggingface``, ``llama-index-llms-anthropic``, etc.
+
+Connection Configuration
+------------------------
+
+The hook reads credentials from the Airflow connection of type ``llamaindex``:
+
+- **password** -- API key (passed as ``api_key`` to ``OpenAIEmbedding`` /
+  ``OpenAI``).
+- **host** -- Optional base URL (passed as ``api_base``). Only useful for
+  an OpenAI-compatible proxy that accepts OpenAI's exact model names (e.g.
+  an internal gateway) -- not Ollama or vLLM (see above).
+- **extra** JSON --
+  ``{"embed_model": "text-embedding-3-small", "llm_model": "gpt-5"}`` --
+  default model identifiers stored on the connection.
+
+Parameters
+----------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 25 50
+
+   * - Parameter
+     - Default
+     - Description
+   * - ``llm_conn_id``
+     - ``llamaindex_default``
+     - Airflow connection ID for the LLM/embedding provider.
+   * - ``embed_conn_id``
+     - ``None`` (falls back to ``llm_conn_id``)
+     - Optional separate Airflow connection ID for the embedding provider.
+   * - ``embed_model``
+     - ``None`` (falls back to ``extra["embed_model"]``)
+     - Embedding model name, e.g. ``text-embedding-3-small``.
+   * - ``embedding_kwargs``
+     - ``None``
+     - Additional keyword arguments passed to ``OpenAIEmbedding``, for example
+       ``{"dimensions": 128}``. Values are forwarded without filtering.
+       Connection ``api_key`` and ``api_base`` values take precedence at the top
+       level, but nested options supported by the underlying library can override
+       hook-provided request values, including credentials, the model, and the
+       input. Only pass trusted values.
+   * - ``llm_model``
+     - ``None`` (falls back to ``extra["llm_model"]``)
+     - LLM model name, e.g. ``gpt-5``. Required when calling ``get_llm()``.
+
+.. seealso::
+   `llama_index.embeddings.openai.OpenAIEmbedding <https://developers.llamaindex.ai/python/framework-api-reference/embeddings/openai/>`__
+   for valid ``embedding_kwargs`` keys.
+
+Dependencies
+------------
+
+Install the ``llamaindex`` extra::
+
+    pip install "apache-airflow-providers-common-ai[llamaindex]"
+
+That extra installs ``llama-index-core``, ``llama-index-embeddings-openai``,
+and ``llama-index-llms-openai`` -- enough to back the hook's default
+OpenAI return values. For other LlamaIndex vendor packages, install
+their integration package separately.
+
+``llama-index-llms-openai`` caps ``openai`` below 3, while this provider's ``openai`` extra
+needs ``openai`` 3, so the two extras cannot be installed in one environment. For the same
+reason the ``llamaindex`` extra fails to install with a constraints file that pins
+``openai`` 3 or later: build the worker image without the constraints file for this step,
+or with a copy of it that pins ``openai`` below 3.

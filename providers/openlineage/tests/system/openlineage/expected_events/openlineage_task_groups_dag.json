@@ -1,0 +1,127 @@
+[
+    {"eventType": "START", "job": {"name": "openlineage_task_groups_dag"}},
+    {
+        "eventType": "START",
+        "run": {
+            "facets": {
+                "airflow": {
+                    "task": {
+                        "task_group": {
+                            "downstream_group_ids": "['tg2']",
+                            "downstream_task_ids": "[]",
+                            "group_id": "tg1",
+                            "unique_group_id": "tg1",
+                            "prefix_group_id": true,
+                            "tooltip": "",
+                            "upstream_group_ids": "[]",
+                            "upstream_task_ids": "['task_0']"
+                        }
+                    },
+                    "taskInstance": {
+                        "try_number": 1,
+                        "max_tries": 0,
+                        "state": "running",
+                        "id": "{{ is_uuid(result) }}",
+                        "map_index": null
+                    }
+                }
+            }
+        },
+        "job": {
+            "name": "openlineage_task_groups_dag.tg1.task_1"
+        }
+    },
+    {
+        "eventType": "COMPLETE",
+        "run": {
+            "facets": {
+                "airflow": {
+                    "task": {
+                        "task_group": {
+                            "downstream_group_ids": "['tg2']",
+                            "downstream_task_ids": "[]",
+                            "group_id": "tg1",
+                            "unique_group_id": "tg1",
+                            "prefix_group_id": true,
+                            "tooltip": "",
+                            "upstream_group_ids": "[]",
+                            "upstream_task_ids": "['task_0']"
+                        }
+                    },
+                    "taskInstance": {
+                        "try_number": 1,
+                        "max_tries": 0,
+                        "state": "success",
+                        "id": "{{ is_uuid(result) }}",
+                        "map_index": null
+                    }
+                }
+            }
+        },
+        "job": {
+            "name": "openlineage_task_groups_dag.tg1.task_1"
+        }
+    },
+    {
+        "eventType": "START",
+        "run": {
+            "facets": {
+                "airflow": {
+                    "task": {
+                        "task_group": {
+                            "downstream_group_ids": "[]",
+                            "downstream_task_ids": "['check_events']",
+                            "group_id": "tg2",
+                            "unique_group_id": "tg2",
+                            "prefix_group_id": true,
+                            "tooltip": "",
+                            "upstream_group_ids": "['tg1']",
+                            "upstream_task_ids": "['tg1.task_1']"
+                        }
+                    },
+                    "taskInstance": {
+                        "try_number": 1,
+                        "max_tries": 0,
+                        "state": "running",
+                        "id": "{{ is_uuid(result) }}",
+                        "map_index": null
+                    }
+                }
+            }
+        },
+        "job": {
+            "name": "openlineage_task_groups_dag.tg2.task_2"
+        }
+    },
+    {
+        "eventType": "COMPLETE",
+        "run": {
+            "facets": {
+                "airflow": {
+                    "task": {
+                        "task_group": {
+                            "downstream_group_ids": "[]",
+                            "downstream_task_ids": "['check_events']",
+                            "group_id": "tg2",
+                            "unique_group_id": "tg2",
+                            "prefix_group_id": true,
+                            "tooltip": "",
+                            "upstream_group_ids": "['tg1']",
+                            "upstream_task_ids": "['tg1.task_1']"
+                        }
+                    },
+                    "taskInstance": {
+                        "try_number": 1,
+                        "max_tries": 0,
+                        "state": "success",
+                        "id": "{{ is_uuid(result) }}",
+                        "map_index": null
+                    }
+                }
+            }
+        },
+        "job": {
+            "name": "openlineage_task_groups_dag.tg2.task_2"
+        }
+    }
+]

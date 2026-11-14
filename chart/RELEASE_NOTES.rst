@@ -23,15 +23,1174 @@ Run ``helm repo update`` before upgrading the chart to the latest version.
 
 .. towncrier release notes start
 
+Airflow Helm Chart 1.21.0 (2026-04-21)
+--------------------------------------
+
+Significant Changes
+^^^^^^^^^^^^^^^^^^^
+
+
+Workers config options have been moved under ``workers.celery.*`` and ``workers.kubernetes.*``
+""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+Please update your configuration accordingly:
+
+* ``workers.safeToEvict`` is now deprecated in favor of ``workers.celery.safeToEvict``/``workers.kubernetes.safeToEvict`` (#61915).
+* ``workers.hostAliases`` is now deprecated in favor of ``workers.celery.hostAliases``/``workers.kubernetes.hostAliases`` (#61960).
+* ``workers.priorityClassName`` is now deprecated in favor of ``workers.celery.priorityClassName``/``workers.kubernetes.priorityClassName`` (#61961).
+* ``workers.runtimeClassName`` is now deprecated in favor of ``workers.celery.runtimeClassName``/``workers.kubernetes.runtimeClassName`` (#61962).
+* ``workers.schedulerName`` is now deprecated in favor of ``workers.celery.schedulerName``/``workers.kubernetes.schedulerName`` (#62030).
+* ``workers.serviceAccount`` is now deprecated in favor of ``workers.celery.serviceAccount``/``workers.kubernetes.serviceAccount`` (#64730).
+* ``workers.extraContainers`` is now deprecated in favor of ``workers.celery.extraContainers``/``workers.kubernetes.extraContainers`` (#64739).
+* ``workers.extraInitContainers`` is now deprecated in favor of ``workers.celery.extraInitContainers``/``workers.kubernetes.extraInitContainers`` (#64741).
+* ``workers.extraVolumes`` is now deprecated in favor of ``workers.celery.extraVolumes``/``workers.kubernetes.extraVolumes`` (#64746).
+* ``workers.affinity`` is now deprecated in favor of ``workers.celery.affinity``/``workers.kubernetes.affinity`` (#64860).
+* ``workers.tolerations`` is now deprecated in favor of ``workers.celery.tolerations``/``workers.kubernetes.tolerations`` (#64976).
+* ``workers.topologySpreadConstraints`` is now deprecated in favor of ``workers.celery.topologySpreadConstraints``/``workers.kubernetes.topologySpreadConstraints`` (#64980).
+* ``workers.podAnnotations`` is now deprecated in favor of ``workers.celery.podAnnotations``/``workers.kubernetes.podAnnotations`` (#65027).
+* ``workers.labels`` is now deprecated in favor of ``workers.celery.labels``/``workers.kubernetes.labels`` (#65030).
+* ``workers.env`` is now deprecated in favor of ``workers.celery.env``/``workers.kubernetes.env`` (#65056).
+* ``workers.extraVolumeMounts`` is now deprecated in favor of ``workers.celery.extraVolumeMounts``/``workers.kubernetes.extraVolumeMounts`` (#65059).
+* ``workers.extraPorts`` is now deprecated in favor of ``workers.celery.extraPorts`` (#61919).
+* ``workers.volumeClaimTemplates`` is now deprecated in favor of ``workers.celery.volumeClaimTemplates`` (#62048).
+* ``workers.waitForMigrations`` is now deprecated in favor of ``workers.celery.waitForMigrations`` (#62054).
+* ``workers.hpa`` is now deprecated in favor of ``workers.celery.hpa`` (#64734).
+* ``workers.annotations`` is now deprecated in favor of ``workers.celery.annotations`` (#64982).
+* ``workers.logGroomerSidecar`` is now deprecated in favor of ``workers.celery.logGroomerSidecar`` (#65033).
+
+The previous configuration options are still working but are deprecated and will be removed in a future version.
+
+Default Airflow image is updated to ``3.2.0`` (#64841)
+""""""""""""""""""""""""""""""""""""""""""""""""""""""
+The default Airflow image that is used with the Chart is now ``3.2.0``, previously it was ``3.1.8``.
+
+New Features
+^^^^^^^^^^^^
+
+- Add ``ttlSecondsAfterFinished`` to database cleanup job (#64164)
+- Support ``tpl`` rendering in ServiceAccount annotations, ``metadataConnection``, and config ConfigMap names (#64763)
+
+Improvements
+^^^^^^^^^^^^
+
+- Generate JWT Secret of recommended length (#65082)
+
+Bug Fixes
+^^^^^^^^^
+
+- Fix wrong broker URL secret ref (#65006)
+- Fix Helm chart image volume schema validation (#65409)
+- Remove duplicate fallback branch in ``airflowPodSecurityContextsIds`` helper (#65558)
+- Render cleanup RBAC only for ``KubernetesExecutor`` (#65539)
+- Fix default args/command for database cleanup (#63821)
+- Fix invalid deprecation warning in NOTES.txt (#64296)
+- Add missing fields in schema file (#64339)
+
+Doc only changes
+^^^^^^^^^^^^^^^^
+
+- Document secret key names for Helm chart ``secretName`` options (#64136)
+- Update customizing-labels documentation (#64170)
+- Fix documentation link (#64355)
+
+Misc
+^^^^
+
+- Simplify Helm Chart Logic & Misc (#63957)
+- Improve consistency of ``values.yaml`` & misc (#64559)
+- Align ``log_id_template`` with current default in Elasticsearch provider (#64332)
+- Update alpine version in pgbouncer and pgbouncer-exporter (#65413)
+- Add default ``GO_VERSION`` for pgbouncer-exporter Dockerfile (#65446)
+
+
+Airflow Helm Chart 1.20.0 (2026-03-16)
+--------------------------------------
+
+Significant Changes
+^^^^^^^^^^^^^^^^^^^
+
+Support for old versions of Apache Airflow <2.11 has been dropped (#61018)
+""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+Minimum supported version of Apache Airflow is now 2.11.0. If you want to deploy an
+old version of Apache Airflow, please use the last released version of the chart 1.19.0.
+
+``workers`` specific sections have been moved to ``workers.celery`` / ``workers.kubernetes`` sections
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+Please update your configuration accordingly:
+
+* ``workers.command`` command is now deprecated in favor of ``workers.celery.command``/``workers.kubernetes.command`` (#60067).
+* ``workers.securityContexts`` command is now deprecated in favor of ``workers.celery.securityContexts``/``workers.kubernetes.securityContexts`` (#60396).
+* ``workers.containerLifecycleHooks`` command is now deprecated in favor of ``workers.celery.containerLifecycleHooks``/``workers.kubernetes.containerLifecycleHooks`` (#61369).
+* ``workers.kerberosSidecar`` section is now deprecated in favor of ``workers.celery.kerberosSidecar``/``workers.kubernetes.kerberosSidecar`` (#61881).
+* ``workers.kerberosInitContainer`` section is now deprecated in favor of ``workers.celery.kerberosInitContainer``/``workers.kubernetes.kerberosInitContainer`` (#60751).
+* ``workers.terminationGracePeriodSeconds`` command is now deprecated in favor of ``workers.celery.terminationGracePeriodSeconds``/``workers.kubernetes.terminationGracePeriodSeconds`` (#61892).
+* ``workers.nodeSelector`` command is now deprecated in favor of ``workers.celery.nodeSelector``/``workers.kubernetes.nodeSelector`` (#61957).
+* ``workers.podDisruptionBudget`` section is now deprecated in favor of ``workers.celery.podDisruptionBudget``. Please update your configuration accordingly. (#61414)
+* ``workers.keda`` section is now deprecated in favor of ``workers.celery.keda``. Please update your configuration accordingly. (#61820)
+* ``workers.resources`` section is now deprecated in favor of ``workers.celery.resources`` and ``workers.kubernetes.resources``. Please update your configuration accordingly. (#61890)
+
+The previous configuration options are still working, but are deprecated and will be removed in a future version.
+
+
+As Git-Sync is not service-type object, the readiness probe will be removed. (#62334)
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+To enable feature behaviour set ``dags.gitSync.recommendedProbeSetting`` to ``true``. Section itself will be removed in future release as to not break setups during upgrades.
+
+As Git-Sync has dedicated liveness service, the liveness probe behaviour will be changed. To enable feature behaviour set ``dags.gitSync.recommendedProbeSetting`` to ``true``.
+
+Please update your configuration accordingly.
+
+
+Automatic env variables removed from ``container_extra_envs`` and ``custom_airflow_environment`` (#60750)
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The automatic prefix addition for Kubernetes Executor environment variables and secrets has been removed from both the ``container_extra_envs`` and ``custom_airflow_environment`` helper functions.
+
+**What changed:**
+
+Previously, when you added environment variables to component-specific configurations (e.g., ``.Values.scheduler.env``), the chart automatically created an additional environment variable (to specified in the ``env`` section) with the ``AIRFLOW__KUBERNETES_ENVIRONMENT_VARIABLES__`` prefix for Kubernetes Executor worker pods. After this change, only the variable specified in ``env`` section will be created.
+Furthermore, for values specified under ``.Values.secret`` section, the ``AIRFLOW__KUBERNETES_SECRETS__`` prefix is no longer automatically added. Secrets are now passed as-is via ``secretKeyRef`` without the prefixed copy for worker pods.
+
+**Why this change:**
+
+* Prevent unintended exposure of sensitive data like ``client_secret`` information. Previously, due to prefix, it was recognized as internal Airflow configuration leading to unintended exposure in Airflow UI (under Admin -> Configuration), even when ``AIRFLOW__API__EXPOSE_CONFIG`` is set to ``non-sensitive-only``.
+* Avoid unintended environment propagation to workers: component-specific env configurations are intended strictly for specific components. Previous behaviour caused these variables to be passed to worker pods, which could result in configuration conflicts and unexpected side effects.
+
+**Migration Required:**
+
+If you need to pass environment variables specifically to Kubernetes Executor worker pods, use one of the following approaches:
+
+**Option 1: Use ``.Values.env``**
+
+.. code-block:: yaml
+
+    env:
+      - name: my_var
+        value: "my_value"
+
+Environment variables specified under ``.Values.env`` are now passed as-is without the automatic prefix (same behaviour as component-specific env).
+
+**Option 2: Use ``.Values.config.kubernetes_environment_variables``**
+
+.. code-block:: yaml
+
+    config:
+      kubernetes_environment_variables:
+        my_var: "my_value"
+
+
+Default Airflow image is updated to ``3.1.8`` (#63392)
+""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The default Airflow image that is used with the Chart is now ``3.1.8``, previously it was ``3.1.7``.
+
+
+Features
+^^^^^^^^
+
+- Support Helm template expressions in ``podAnnotations`` and ``airflowPodAnnotations`` values (#63019)
+- Add minute-level log retention to clean-logs script (#61855)
+- Add LOG_MAX_SIZE environment variables to log groomer (#61559)
+
+Improvements
+^^^^^^^^^^^^
+
+- Remove automatic ``KUBERNETES_ENVIRONMENT_VARIABLES`` and ``KUBERNETES_SECRETS`` prefixes from chart helpers (#60750)
+- Remove JWT secrets from triggerer, worker and dag-processor (#63204)
+- Add ``workers.celery.nodeSelector`` & ``workers.kubernetes.nodeSelector`` (#61957)
+- Add ``workers.celery.terminationGracePeriodSeconds`` & ``workers.kubernetes.terminationGracePeriodSeconds`` (#61892)
+- Add ``workers.celery.resources`` & ``workers.kubernetes.resources`` (#61890)
+- Add ``workers.celery.keda`` section (#61820)
+- Add ``workers.celery.podDisruptionBudget`` (#61414)
+- Add ``workers.celery.containerLifecycleHooks`` & ``workers.kubernetes.containerLifecycleHooks`` (#61369)
+- Refactor Git-Sync ``livenessProbe`` & deprecate ``readinessProbe`` & add ``startupProbe`` (#62334)
+- Warn on deprecated per-component ``securityContext`` values (#62729)
+- Add ingress deprecation warnings for ``apiServer``, ``statsd``, and ``pgbouncer`` (#62490)
+- Add missing support for: ``securityContexts`` and ``containerLifecycleHook`` (#60677)
+
+Bug Fixes
+^^^^^^^^^
+
+- More restrictive chart rendering logic (#63464)
+- Omit api-server ``spec.replicas`` when HPA is enabled (#63187)
+- Add ``workers.celery.kerberosSidecar`` & ``workers.kubernetes.kerberosSidecar`` sections (#61881)
+- Fix chart NOTES.txt showing deprecation warnings only without secret key (#62722)
+- Fix ``tpl`` rendering for TLS hosts in ingress templates #62358 (#62548)
+- Fix ``webserver.defaultUser.enabled=false`` not honored (#62143)
+
+Doc only changes
+^^^^^^^^^^^^^^^^
+
+- Cleanup Helm Chart documentation (#62544)
+- Add missing deprecation warnings for workers section (#63659)
+
+Misc
+^^^^
+
+- Drop support for all Airflow versions below 2.11 in Helm Chart (#61018)
+- Default airflow version to 3.1.8 (#63392)
+- Add ``*.iml`` to .gitignore in all distributions (#63636)
+- Upgrade important CI environment (#62792, #62610)
+- Allow to use short SPDX license identifier for selected files (#62073)
+- Fix all build-system/requires including transitive dependencies (#62570)
+
+
+Airflow Helm Chart 1.19.0 (2026-02-17)
+--------------------------------------
+
+Significant Changes
+^^^^^^^^^^^^^^^^^^^
+
+StatsD metrics aggregation now supports configurable TTL-enabled LRU cache to prevent memory growth in long-running daemons (#60933)
+""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The Helm Chart now includes new configuration options for StatsD aggregation management:
+
+* ``statsd.cache.type`` - Enable TTL-enabled ``lru`` cache or ``random`` cache for metrics aggregation (default: ``lru``)
+* ``statsd.cache.size`` - Maximum number of metrics to cache (default: 1000)
+* ``statsd.cache.ttl`` - Time-to-live for cached metrics in seconds (``0s`` is TTL disabled) (default: ``0s``)
+
+This feature addresses uncontrolled memory growth in StatsD daemons by automatically cleaning up stale or unused metric entries. When enabled, the cache uses both LRU (Least Recently Used) eviction and TTL (Time To Live) expiration to manage memory usage effectively.
+
+To maintain backward compatibility, the default behaviour remains unchanged. Users experiencing memory growth issues with StatsD can enable this feature by setting ``statsd.cache.ttl`` to value higher than ``0`` in their Helm values.
+
+Support for Multiple Celery Worker Sets in the Helm Chart (#58547)
+""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+This change introduces support for advanced Celery Workers topologies to Apache Airflow Helm Chart, enabling more flexible resource allocation and precise autoscaling configurations.
+
+**Flexible Worker Topologies**: The new ``workers.celery.enableDefault`` flag allows users to configure a deployment consisting only of specialized worker sets defined in ``workers.celery.sets`` section.
+
+**Multi-Queue Autoscaling Support**: Updates the KEDA ScaledObject generation to support comma-separated queue lists. By using the ``SQL IN (...)`` clause, we ensure that KEDA scales worker sets based on the precise aggregate workload of all their assigned queues.
+
+**Granular Configuration Overrides**: This change allows for overwrite of any currently available workers configuration per worker set. For example, a user can enable KEDA globally, but explicitly disable it for a specific worker set that requires a static number of replicas.
+
+Options to create a default user have been moved under the ``createUserJob`` section
+""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+Please update your configuration accordingly:
+
+* ``webserver.defaultUser`` section is now deprecated in favor of ``createUserJob`` (#59767)
+
+The previous configuration options are still working but are deprecated and will be removed in a future version.
+
+Note that the previous documentation described also the option ``apiServer.defaultUser``, which was never implemented in the chart. The only supported option is now ``createUserJob``. Using ``apiServer.defaultUser`` will raise an error.
+
+Celery specific config options have been moved under the ``celery`` section in ``workers``
+""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+Please update your configuration accordingly:
+
+* ``workers.replicas`` command is now deprecated in favor of ``workers.celery.replicas`` (#59730)
+* ``workers.revisionHistoryLimit`` command is now deprecated in favor of ``workers.celery.revisionHistoryLimit`` (#60056)
+* ``workers.args`` command is now deprecated in favor of ``workers.celery.args`` (#60163)
+* ``workers.livenessProbe`` section is now deprecated in favor of ``workers.celery.livenessProbe`` (#60186)
+* ``workers.updateStrategy`` section is now deprecated in favor of ``workers.celery.updateStrategy`` (#60351)
+* ``workers.strategy`` section is now deprecated in favor of ``workers.celery.strategy`` (#60354)
+* ``workers.podManagementPolicy`` section is now deprecated in favor of ``workers.celery.podManagementPolicy`` (#60359)
+* ``workers.persistence`` section is now deprecated in favor of ``workers.celery.persistence`` (#60238)
+
+The previous configuration options are still working but are deprecated and will be removed in a future version.
+
+Manual Service Account Token Volume configuration for pod-launching executors (#59156)
+""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+Added support for manual Service Account Token Volume configuration when using pod-launching executors
+(``CeleryExecutor``, ``CeleryKubernetesExecutor``, ``KubernetesExecutor``, ``LocalKubernetesExecutor``).
+This implements defense-in-depth security with both ServiceAccount and Pod-level controls, providing
+compatibility with security policies like Kyverno and enabling container-specific privilege assignment
+following the Principle of Least Privilege.
+
+
+Add ``imagePullSecrets`` option (#58094)
+""""""""""""""""""""""""""""""""""""""""
+
+Add ``.Values.imagePullSecrets`` as the new mechanism for configuring registry credentials,
+deprecating both ``.Values.registry.secretName`` and the automatic creation of the ``<RELEASE_NAME>-registry`` secret from ``.Values.registry.connection``.
+
+
+Default Airflow image is updated to ``3.1.7`` (#61447)
+""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The default Airflow image that is used with the Chart is now ``3.1.7``, previously it was ``3.0.2``.
+
+Default git-sync image is updated to ``4.4.2`` (#54085)
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The default git-sync image that is used with the Chart is now ``4.4.2``, previously it was ``4.3.0``.
+
+New Features
+^^^^^^^^^^^^
+
+- Add ``PodDisruptionBudget`` for Dag Processor (#60294)
+- Add ``PodDisruptionBudget`` for Triggerer and Workers (#59068)
+- Add ``HorizontalPodAutoscaler`` (HPA) for API Server (#52392)
+- Add support for launching jobs with ``KubernetesJobOperator`` (#52024)
+- Add ``CronJob`` to clean old records in the database (#58155)
+
+
+Improvements
+^^^^^^^^^^^^
+
+- Improve dag_bundle_config_list Configuration (#60645)
+- Add ``workers.celery.kerberosInitContainer`` & ``workers.kubernetes.kerberosInitContainer`` (#60751, #60427)
+- Add ``workers.celery.securityContexts`` & ``workers.kubernetes.securityContexts`` (#60396)
+- Add ``workers.celery.podManagementPolicy`` field (#60359)
+- Add ``workers.celery.strategy`` field (#60354)
+- Add ``workers.celery.updateStrategy`` field (#60351)
+- Add ``workers.celery.persistence`` section (#60238)
+- Add ``workers.celery.livenessProbe`` section (#60186)
+- Add ``workers.celery.args`` field (#60163)
+- Add ``workers.celery.command`` & ``workers.kubernetes.command`` (#60067)
+- Allow custom ``volumeClaimTemplates`` when ``logs.persistence.enabled`` is true (#60118)
+- Add checksum for JWT secret in API server and scheduler deployments (#60111)
+- Add ``workers.celery.revisionHistoryLimit`` field (#60056)
+- Add Redis StatefulSet ``persistentVolumeClaimRetentionPolicy`` support (#59955)
+- Add ``workers.celery.replicas`` field (#59730)
+- Add custom envs to database cleanup (#59804)
+- Extend ``airflow_ti_running`` metrics by scheduled, queued and deferred (#58819)
+- Create an explicit control for ``createUserJob`` (#56057)
+- Make cleanup cronjob conditional on kubernetes executor (#58695)
+- Add database cleanup options and remove deprecated ``securityContext`` field (#58663)
+- Add ability to disable API Server (#56493)
+- Add ``registry.secretNames`` and ``registry.connections`` options (#58094)
+- Allow custom labels in StatsD, redis and Dag Processor (#55832)
+- Allow setting ``restartPolicy`` for batch jobs in chart (#54354)
+- Add readiness and liveliness support for git sync relay sidecars (#50218)
+- Allow overriding ``schedulerName`` on worker/tasks pods (#53983)
+- Allow additional ``PodDisruptionBudget`` config properties (#58864)
+- Add EdgeExecutor to KEDA query (#55560)
+- Allow ``revisionHistoryLimit`` to be set to 0 (#60340)
+- Allow optional ``subPath`` for logs volume mount (#52350)
+- Move triggerer from ``pod-log-reader-role`` to ``pod-launcher-role`` (#56872)
+
+Bug Fixes
+^^^^^^^^^
+
+- Remove ``kedaNetworkPolicySelector`` from helpers (#61564)
+- Use the ``bitnamilegacy/postgresql`` image (#61156)
+- Fix Compatibility of Celery Worker Sets with Workers Separation (#60420)
+- Fix database cleanup cronjob ImagePullSecrets (#58626)
+- Remove ``workers.celery`` breaking change (#61049)
+- Fix missing templating in API Server ``extraInitContainers`` (#60812)
+- Fix ``securityContext.containers``/``ingress.apiServer`` in values.schema.json (#60575)
+- Remove unused ``containerLifecycleHooks`` field (#60239)
+- Remove unneeded logic in api-server (#60147)
+- Remove ``defaultUser`` from API Server in values.schema.json (#59762)
+- Isolate ``defaultUser`` handling in ``createUserJob`` (#59767)
+- Fix rendering condition of ``git_sync_ssh_key_volume`` (#59418)
+- Add watch for events to the Pod launcher role (#59080)
+- Ensure that git-sync actually runs when ``dags.gitSync.enabled=true`` and ``dags.persistence.enabled=true`` (#59123)
+- Don't add labels to non-existent configuration options (#59213)
+- Add log volume to init container for scheduler, triggerer and worker (#56418)
+- Correctly derive celery sync_parallelism from scheduler CPU limits (#58733)
+- Fix ingress notes (#59122)
+- Fix Liveness / Readiness / Startup probe path for Airflow 3.x (#58734)
+- Fix flower network policy condition when multiple executors (#58635)
+- Missing SCC Role bindings for redis and api-server (#57985)
+- Ensure graceful Redis shutdown(#58432)
+- Start Redis directly, not via shell (#58790)
+- Add missing ``airflow.fullname`` on kubernetes objects (#52953)
+- StatsD deployment volume mount without subpath for live reloading (#54986)
+- Fix KEDA query for Kubernetes Executor (#55559)
+- Add API Server config in k8s pod template (#53533)
+- Fix helm schema validation for executor value (#54682)
+- Correct watch verb quoting in Airflow Job Launcher Role (#53822)
+- Trim non-alphanumeric characters from the executor label (#53534)
+- Fix KEDA Query to Use executor Field Instead of queue for Multiple Executors (#52840)
+
+Doc only changes
+^^^^^^^^^^^^^^^^
+
+- Document how to run the API server behind a reverse proxy (#61095)
+- Clarify ingress settings for Airflow 2 vs 3 in values.yaml (#60434)
+- Add database cleanup docs to Helm productions docs (#58707)
+- KEDA best practices + better documentation (#58246)
+- Update chart info about built-in secrets and environment variables (#58317)
+- Fix typo in PgBouncer section of the Production Guide (#56754)
+- Update webserver secret note in NOTES.txt and Production Guide (#55106)
+- Make term Dag consistent in docs v2 (#55099)
+- Add API Server to container resources docs (#54698)
+- Fix YAML block scalar when providing SSH key for git-sync (#56716)
+
+
+Airflow Helm Chart 1.18.0 (2025-07-12)
+--------------------------------------
+
+Significant Changes
+^^^^^^^^^^^^^^^^^^^
+
+No significant changes.
+
+Improvements
+^^^^^^^^^^^^
+- Allow ConfigMap and Secret references in ``apiServer.env`` (#51191)
+- Add custom annotations to JWT Secret (#52166)
+- Allow ``valuesFrom`` in ``gitSync.env`` (#50228)
+
+Bug Fixes
+^^^^^^^^^
+- Fix JWT secret name (#52268)
+- Use ``api-server`` instead of ``webserver`` in NOTES.txt for Airflow 3.0+ (#52194)
+- Change default executor in pod template to support executor parameter in task (#49433)
+- Use ``merged`` to render airflow.cfg and include computed defaults (#51828)
+- Use ``[api] secret_key`` for Airflow 3.0+ instead of ``[webserver] secret_key`` (#52269)
+- Fix for ``fernetkey`` and add test of its value (#52977)
+
+Doc only changes
+^^^^^^^^^^^^^^^^
+- Update supported executors in docs (#52132)
+- Update service name for port-forward of Airflow UI (#51945)
+
+Airflow Helm Chart 1.17.0 (2025-06-21)
+--------------------------------------
+
+Significant Changes
+^^^^^^^^^^^^^^^^^^^
+
+Default Airflow image is updated to ``3.0.2`` (#51594)
+""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The default Airflow image that is used with the Chart is now ``3.0.2``, previously it was ``2.10.5``.
+
+New Features
+^^^^^^^^^^^^
+- Add extra secret annotations to most secrets (#48890)
+- Add support for EdgeExecutor (#50897)
+
+Improvements
+^^^^^^^^^^^^
+- Unify k8s labels & add some missing k8s labels (#49522)
+
+Bug Fixes
+^^^^^^^^^
+- Fix missing api server ingress (#49727)
+- Replace break function in ``pod-launcher-rolebinding`` template (#49219)
+- Add ``webserver_config.py`` file to api-server (#50108)
+- Declare missing API server properties (#51012)
+- Add missing api server replicas parameter (#50814)
+- Fix FAB ``enable_proxy_fix`` default for Airflow 3 (#50056)
+- Add the dag processor ServiceAccount to SecurityContextConstraints role binding (#51080)
+- Generate JWT secret during HELM install (#49923)
+- Always deploy JWT secret (#51799)
+- Add missing ``workers.kerberosInitContainer`` configuration in values (#51405)
+- Truncate the executor label length (#51817)
+- Fix execution_api_server_url when base_url has a subpath (#51454)
+
+Doc only changes
+^^^^^^^^^^^^^^^^
+- Bump minimum helm version in docs (#48700)
+- Clarify which worker fields apply to Celery and Kubernetes worker pods (#50458)
+- Capitalize the term airflow (#49450)
+- Add EdgeExecutor to readme (#51017)
+- Add 3.X/2.X clarification for CeleryKubernetesExecutor (#49916)
+
+Misc
+^^^^
+- Default Airflow image is updated to ``3.0.2`` (#51594)
+- Bump minimal Kubernetes version to 1.30 (#51515)
+- Delete unneeded ``and`` operator (#51114)
+
+Airflow Helm Chart 1.16.0 (2025-04-01)
+--------------------------------------
+
+Significant Changes
+^^^^^^^^^^^^^^^^^^^
+
+Default git-sync image is updated to ``4.3.0`` (#41411)
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The default git-sync image that is used with the Chart is now ``4.3.0``, previously it was ``4.1.0``.
+
+
+Default Airflow image is updated to ``2.10.5`` (#46624)
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The default Airflow image that is used with the Chart is now ``2.10.5``, previously it was ``2.9.3``.
+
+Default PgBouncer image is updated to ``1.23.1`` (#47416)
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The default PgBouncer image that is used with the chart is now ``airflow-pgbouncer-2025.03.05-1.23.1``, previously it was ``airflow-pgbouncer-2024.01.19-1.21.0``.
+
+Default PgBouncer Exporter image is updated to ``v0.18.0`` (#47416)
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The default PgBouncer Exporter image that is used with the chart is now ``airflow-pgbouncer-exporter-2025.03.05-0.18.0``, previously it was ``airflow-pgbouncer-exporter-2024.06.18-0.17.0``.
+
+Default StatsD exporter image is updated to ``v0.28.0`` (#43393)
+""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The default StatsD exporter image that is used with the chart is now ``v0.28.0``, previously it was ``v0.26.1``.
+
+New Features
+^^^^^^^^^^^^
+- Allow passing custom env to log groomer sidecar containers (#46003)
+- Allow using existing persistence claim in Redis StatefulSet (#41619)
+- Add ``hostAliases`` support in Triggerer (#41725)
+- Enable HPA for Airflow Webserver (#41955)
+- Add env support for database migration job (#42345)
+- Support NodePort on Redis Service (#41811)
+- Add heartbeat metric for DAG processor  (#42398)
+- Option to enable ipv6 ipaddress resolve support for StatsD host (#42625)
+- Allow customizing ``podManagementPolicy`` in worker (#42673)
+- Support multiple executors in chart (#43606, #44424)
+- Swap internal RPC server for API server in the helm chart (#44463)
+- Add OpenSearch remote logging options (#45082)
+- Add ``startupProbe`` to flower deployment (#45012)
+- Add PgBouncer and StatsD ingress (#41759)
+- Add environment variable controlling the log grooming frequency (#46237)
+
+Improvements
+^^^^^^^^^^^^
+- Update metrics names to allow multiple executors to report metrics (#40778)
+- Add a specific internal IP address for the ClusterIP service (#40912)
+- Remove scheduler automate ServiceAccount token (#44173)
+- More controls for PgBouncer secrets configuration (#45248)
+- Add ``ti.running`` metric export (#47773)
+- Add optional configuration for ``startupProbe`` ``initialDelaySeconds`` (#47094)
+- Introduce ``worker.extraPorts`` to expose additional ports to worker container (#46679)
+
+Bug Fixes
+^^^^^^^^^
+- Enable ``AIRFLOW__CELERY__BROKER_URL_CMD`` when ``passwordSecretName`` is true (#40270)
+- Properly implement termination grace period seconds (#41374)
+- Add kerberos env to base container env, add webserver-config volume (#41645)
+- Fix ``volumeClaimTemplates`` missing ``apiVersion`` and ``kind`` (#41771)
+- Render global volumes and volume mounts into cleanup job (#40191) (#42268)
+- Fix flower ingress service reference (#41179)
+- Fix ``volumeClaimTemplate`` for scheduler in local and persistent mode (#42946)
+- Fix role binding for multiple executors (#44424)
+- Set container name to ``envSourceContainerName`` in KEDA ScaledObject (#44963)
+- Update scheduler-deployment to cope with multiple executors (#46039)
+- Replace disallowed characters in metadata label (#46811)
+- Grant Airflow API Server Permission to Read Pod Logs (#47212)
+- Fix scheduler ServiceAccount auto-mount for multi-executor (#46486)
+
+Doc only changes
+^^^^^^^^^^^^^^^^
+- Reflect in docs that ``extraInitContainers`` is supported for jobs (#41674)
+- Add guide how to PgBouncer with Kubernetes Secret (#42460)
+- Update descriptions private registry params (#43721)
+- Change description for kerberos ``reinitFrequency`` (#45343)
+- Update Helm eviction configuration guide to reflect ``workers.safeToEvict`` default value (#44852)
+- Add info that ``storageClassName`` can be templated (#45176)
+- Fix broker-url secret name in production guide (#45863)
+- Replace DAGs with dags in docs (#47959)
+- Enhance ``airflowLocalSettings`` value description (#47855)
+- Be consistent with denoting templated params (#46481)
+
+Misc
+^^^^
+- Support templated hostname in NOTES (#41423)
+- Default airflow version to 2.10.5 (#46624)
+- Changing triggerer config option ``default_capacity`` to ``capacity`` (#48032)
+- AIP-84 Move public api under /api/v2 (#47760)
+- Default to the FabAuthManager in the chart (#47976)
+- Update PgBouncer to ``1.23.1`` and PgBouncer exporter to ``0.18.0`` (#47416)
+- Move api-server to port 8080 (#47310)
+- Start the api-server in Airflow 3, webserver in Airflow 2 (#47085)
+- Move ``fastapi-api`` command to ``api-server`` (#47076)
+- Move execution_api_server_url config to the core section (#46969)
+- Use standalone dag processor for Airflow 3 (#45659)
+- Update ``quay.io/prometheus/statsd-exporter`` from ``v0.26.1`` to ``v0.28.0`` (#43393)
+
+Airflow Helm Chart 1.15.0 (2024-07-24)
+--------------------------------------
+
+Significant Changes
+^^^^^^^^^^^^^^^^^^^
+
+Default Airflow image is updated to ``2.9.3`` (#40816)
+""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The default Airflow image that is used with the Chart is now ``2.9.3``, previously it was ``2.9.2``.
+
+Default PgBouncer Exporter image has been updated (#40318)
+""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The PgBouncer Exporter image has been updated to ``airflow-pgbouncer-exporter-2024.06.18-0.17.0``, which addresses CVE-2024-24786.
+
+New Features
+^^^^^^^^^^^^
+
+- Add git-sync container lifecycle hooks (#40369)
+- Add init containers for jobs (#40454)
+- Add persistent volume claim retention policy (#40271)
+- Add annotations for Redis StatefulSet (#40281)
+- Add ``dags.gitSync.sshKey``, which allows the git-sync private key to be configured in the values file directly (#39936)
+- Add ``extraEnvFrom`` to git-sync containers (#39031)
+
+Improvements
+^^^^^^^^^^^^
+
+- Link in ``UIAlert`` to production guide when a dynamic webserver secret is used now opens in a new tab (#40635)
+- Support disabling helm hooks on ``extraConfigMaps`` and ``extraSecrets`` (#40294)
+
+Bug Fixes
+^^^^^^^^^
+
+- Add git-sync ssh secret to DAG processor (#40691)
+- Fix duplicated ``safeToEvict`` annotations (#40554)
+- Add missing ``triggerer.keda.usePgbouncer`` to values.yaml (#40614)
+- Trim leading ``//`` character using mysql backend (#40401)
+
+Doc only changes
+^^^^^^^^^^^^^^^^
+
+- Updating chart download link to use the Apache download CDN (#40618)
+
+Misc
+^^^^
+
+- Update PgBouncer exporter image to ``airflow-pgbouncer-exporter-2024.06.18-0.17.0`` (#40318)
+- Default airflow version to 2.9.3 (#40816)
+- Fix ``startupProbe`` timing comment (#40412)
+
+Airflow Helm Chart 1.14.0 (2024-06-18)
+--------------------------------------
+
+Significant Changes
+^^^^^^^^^^^^^^^^^^^
+
+``ClusterRole`` and ``ClusterRoleBinding`` names have been updated to be unique (#37197)
+""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+``ClusterRole``s and ``ClusterRoleBinding``s created when ``multiNamespaceMode`` is enabled have been renamed to ensure unique names:
+
+  * ``{{ include "airflow.fullname" . }}-pod-launcher-role`` has been renamed to ``{{ .Release.Namespace }}-{{ include "airflow.fullname" . }}-pod-launcher-role``
+  * ``{{ include "airflow.fullname" . }}-pod-launcher-rolebinding`` has been renamed to ``{{ .Release.Namespace }}-{{ include "airflow.fullname" . }}-pod-launcher-rolebinding``
+  * ``{{ include "airflow.fullname" . }}-pod-log-reader-role`` has been renamed to ``{{ .Release.Namespace }}-{{ include "airflow.fullname" . }}-pod-log-reader-role``
+  * ``{{ include "airflow.fullname" . }}-pod-log-reader-rolebinding`` has been renamed to ``{{ .Release.Namespace }}-{{ include "airflow.fullname" . }}-pod-log-reader-rolebinding``
+  * ``{{ include "airflow.fullname" . }}-scc-rolebinding`` has been renamed to ``{{ .Release.Namespace }}-{{ include "airflow.fullname" . }}-scc-rolebinding``
+
+``workers.safeToEvict`` default changed to False (#40229)
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The default for ``workers.safeToEvict`` now defaults to False. This is a safer default
+as it prevents the nodes workers are running on from being scaled down by the
+`K8s Cluster Autoscaler <https://kubernetes.io/docs/concepts/cluster-administration/cluster-autoscaling/#cluster-autoscaler>`_.
+If you would like to retain the previous behavior, you can set this config to True.
+
+Default Airflow image is updated to ``2.9.2`` (#40160)
+""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The default Airflow image that is used with the Chart is now ``2.9.2``, previously it was ``2.8.3``.
+
+Default StatsD image is updated to ``v0.26.1`` (#38416)
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The default StatsD image that is used with the Chart is now ``v0.26.1``, previously it was ``v0.26.0``.
+
+New Features
+^^^^^^^^^^^^
+
+- Enable MySQL KEDA support for triggerer (#37365)
+- Allow AWS Executors (#38524)
+
+Improvements
+^^^^^^^^^^^^
+
+- Allow ``valueFrom`` in env config of components (#40135)
+- Enable templating in ``extraContainers`` and ``extraInitContainers`` (#38507)
+- Add safe-to-evict annotation to pod-template-file (#37352)
+- Support ``workers.command`` for KubernetesExecutor (#39132)
+- Add ``priorityClassName`` to Jobs (#39133)
+- Add Kerberos sidecar to pod-template-file (#38815)
+- Add templated field support for extra containers (#38510)
+
+Bug Fixes
+^^^^^^^^^
+
+- Set ``workers.safeToEvict`` default to False (#40229)
+
+Doc only changes
+^^^^^^^^^^^^^^^^
+
+- Document ``extraContainers`` and ``extraInitContainers`` that are templated (#40033)
+- Fix typo in HorizontalPodAutoscaling documentation (#39307)
+- Fix supported k8s versions in docs (#39172)
+- Fix typo in YAML path for ``brokerUrlSecretName`` (#39115)
+
+Misc
+^^^^
+- Default Airflow version to 2.9.2 (#40160)
+- Limit Redis image to 7.2 (#38928)
+- Build Helm values schemas with Kubernetes 1.29 resources (#38460)
+- Add missing containers to resources docs (#38534)
+- Upgrade StatsD Exporter image to 0.26.1 (#38416)
+- Remove K8S 1.25 support (#38367)
+
+Airflow Helm Chart 1.13.1 (2024-03-25)
+--------------------------------------
+
+Significant Changes
+^^^^^^^^^^^^^^^^^^^
+
+Default Airflow image is updated to ``2.8.3`` (#38036)
+""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The default Airflow image that is used with the Chart is now ``2.8.3``, previously it was ``2.8.2``.
+
+Bug Fixes
+^^^^^^^^^
+- Don't overwrite ``.Values.airflowPodAnnotations`` (#37917)
+- Fix cluster-wide RBAC naming clash when using multiple ``multiNamespace`` releases with the same name (#37197)
+
+Misc
+^^^^
+- Chart: Default airflow version to 2.8.3 (#38036)
+
+Airflow Helm Chart 1.13.0 (2024-03-05)
+--------------------------------------
+
+Significant Changes
+^^^^^^^^^^^^^^^^^^^
+
+Default Airflow image is updated to ``2.8.2`` (#37704)
+""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The default Airflow image that is used with the Chart is now ``2.8.2``, previously it was ``2.8.1``.
+
+
+New Features
+^^^^^^^^^^^^
+
+- Support labels specific to the database migration objects and pods (#37490)
+
+Improvements
+^^^^^^^^^^^^
+
+- Flower K8s Probe config (#37528)
+
+Bug Fixes
+^^^^^^^^^
+- Remove duplicate ports key in webserver service (#37356)
+- Add ``AIRFLOW_HOME`` env var to log groomer sidecar (#37588)
+- Skip ``.`` path when preparing reproducible packages (#37402)
+
+Misc
+^^^^
+- Default airflow version to 2.8.2 (#37704)
+
+Airflow Helm Chart 1.12.0 (2024-02-11)
+--------------------------------------
+
+Significant Changes
+^^^^^^^^^^^^^^^^^^^
+
+The helm chart is now using a newer version of ``bitnami/postgresql`` dependency (#34817)
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The version of ``bitnami/postgresql`` subchart upgraded from ``12.10.0`` to ``13.2.24``.
+The version of ``PostgreSQL`` binaries upgraded from ``11`` to ``16.1.0``.
+
+The change requires existing ``bitnami/postgresql`` subchart users to perform manual major version upgrade using ``pg_dumpall`` or ``pg_upgrade``.
+
+As a reminder, it is recommended to `set up an external database <https://airflow.apache.org/docs/helm-chart/stable/production-guide.html#database>`_ in production.
+
+Default Airflow image is updated to ``2.8.1`` (#36907)
+""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The default Airflow image that is used with the Chart is now ``2.8.1``, previously it was ``2.7.1``.
+
+Default PgBouncer and PgBouncer Exporter images have been updated (#36898)
+""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The PgBouncer and PgBouncer Exporter images are based on newer software/os.
+
+  * ``pgbouncer``: 1.21.0 based on alpine 3.14 (``airflow-pgbouncer-2024.01.19-1.21.0``)
+  * ``pgbouncer-exporter``: 0.16.0 based on alpine 3.19 (``apache/airflow:airflow-pgbouncer-exporter-2024.01.19-0.16.0``)
+
+Default StatsD image is updated to ``v0.26.0`` (#37187)
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The default StatsD image that is used with the Chart is now ``v0.26.0``, previously it was ``v0.22.8``.
+
+Default Redis image is updated to ``7-bookworm`` (#37187)
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The default Redis image that is used with the Chart is now ``7-bookworm``, previously it was ``7-bullseye``.
+
+New Features
+^^^^^^^^^^^^
+
+- Enable native HPA for Airflow Workers (#36174)
+- Add init container + sidecar support for Airflow Kerberos (#35548)
+- Support MySQL backend as KEDA trigger (#36167)
+
+Improvements
+^^^^^^^^^^^^
+
+- Improve PriorityClass to improve debuggability (#36365)
+- Add ``securityContexts`` in dag processors log groomer sidecar (#34499)
+- Add support for ``securityContexts`` in dag processors wait-for-migrations container (#35593)
+- Add templating for PVC ``storageClassName`` (#35581)
+- Add ``volumeClaimTemplate`` for worker (#34986)
+- Add support for ``priorityClassName`` on Redis pods (#34879)
+- Configurable mount path for DAGs volume (#35083)
+- Add support for custom ``emptyDir`` config (#34837)
+- Added ability to enable/disable scheduler and webserver  (#36991)
+
+Bug Fixes
+^^^^^^^^^
+
+- Fix StatsD host in Airflow config (#35679)
+- Set ``AIRFLOW_HOME`` env var with ``airflowHome`` value (#34839)
+- Safer worker pod annotations (#35309)
+- Set worker ``safeToEvict`` properly (#35130)
+- Fix Redis broker URL with ``useStandardNaming`` (#34825)
+- Fix metadata DB & port in KEDA connection when ``usePgbouncer`` is false (#34741)
+- Fix PgBouncer connection with ``useStandardNaming`` (#34787)
+
+Doc only changes
+^^^^^^^^^^^^^^^^
+
+- Add docs about extending the Airflow Helm chart (#36331)
+- Add comment for Elasticsearch connection scheme (#35588)
+- Add notes about Virtualenvs preventing the need for custom images (#35306)
+
+Misc
+^^^^
+
+- Default Airflow version to 2.8.1 (#36907)
+- Support git-sync v4 (#34731)
+- Upgrade ``bitnami/postgresql`` subchart to ``13.2.24`` (#36156)
+- Change git sync container indent to 4 (#35824)
+- Remove K8S 1.24 support (#35214)
+- Rebuild ``pgbouncer`` and ``pgbouncer-exporter`` images with newer versions (#36898)
+- Update ``statsd`` and ``redis`` chart images (#37187)
+
+Airflow Helm Chart 1.11.0 (2023-10-02)
+--------------------------------------
+
+Significant Changes
+^^^^^^^^^^^^^^^^^^^
+
+Support naming customization on helm chart resources, some resources may be renamed during upgrade (#31066)
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+This is a new opt-in switch ``useStandardNaming``, for backwards compatibility, to leverage the standard naming convention, which allows full use of ``fullnameOverride`` and ``nameOverride`` in all resources.
+
+The following resources will be renamed using default of ``useStandardNaming=false`` when upgrading to 1.11.0 or a higher version.
+
+- ConfigMap ``{release}-airflow-config`` to ``{release}-config``
+- Secret ``{release}-airflow-metadata`` to ``{release}-metadata``
+- Secret ``{release}-airflow-result-backend`` to ``{release}-result-backend``
+- Ingress ``{release}-airflow-ingress`` to ``{release}-ingress``
+
+For existing installations, all your resources will be recreated with a new name and Helm will delete the previous resources.
+
+This won't delete existing PVCs for logs used by StatefulSet/Deployments, but it will recreate them with brand new PVCs.
+If you do want to preserve logs history you'll need to manually copy the data of these volumes into the new volumes after
+deployment. Depending on what storage backend/class you're using this procedure may vary. If you don't mind starting
+with fresh logs/redis volumes, you can just delete the old PVCs that will be names, for example:
+
+.. code-block:: bash
+
+    kubectl delete pvc -n airflow logs-gta-triggerer-0
+    kubectl delete pvc -n airflow logs-gta-worker-0
+    kubectl delete pvc -n airflow redis-db-gta-redis-0
+
+If you do not change ``useStandardNaming`` or ``fullnameOverride`` after upgrade, you can proceed as usual and no unexpected behaviours will be presented.
+
+``bitnami/postgresql`` subchart updated to ``12.10.0`` (#33747)
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The PostgreSQL subchart that is used with the Chart is now ``12.10.0``, previously it was ``12.1.9``.
+
+Default git-sync image is updated to ``3.6.9`` (#33748)
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The default git-sync image that is used with the Chart is now ``3.6.9``, previously it was ``3.6.3``.
+
+Default Airflow image is updated to ``2.7.1`` (#34186)
+""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The default Airflow image that is used with the Chart is now ``2.7.1``, previously it was ``2.6.2``.
+
+New Features
+^^^^^^^^^^^^
+
+- Add support for scheduler name to PODs templates (#33843)
+- Support KEDA scaling for triggerer (#32302)
+- Add support for container lifecycle hooks (#32349, #34677)
+- Support naming customization on helm chart resources (#31066)
+- Adding ``startupProbe`` to scheduler and webserver (#33107)
+- Allow disabling token mounts using ``automountServiceAccountToken`` (#32808)
+- Add support for defining custom priority classes (#31615)
+- Add support for ``runtimeClassName`` (#31868)
+- Add support for custom query in workers KEDA trigger (#32308)
+
+Improvements
+^^^^^^^^^^^^
+
+- Add ``containerSecurityContext`` for cleanup job (#34351)
+- Add existing secret support for PGBouncer metrics exporter (#32724)
+- Allow templating in webserver ingress hostnames (#33142)
+- Allow templating in flower ingress hostnames (#33363)
+- Add configmap annotations to StatsD and webserver (#33340)
+- Add pod security context to PgBouncer (#32662)
+- Add an option to use a direct DB connection in KEDA when PgBouncer is enabled (#32608)
+- Allow templating in cleanup.schedule (#32570)
+- Template dag processor ``waitformigration`` containers ``extraVolumeMounts`` (#32100)
+- Ability to inject extra containers into PgBouncer (#33686)
+- Allowing ability to add custom env into PgBouncer container (#33438)
+- Add support for env variables in the StatsD container (#33175)
+
+Bug Fixes
+^^^^^^^^^
+
+- Add ``airflow db migrate`` command to database migration job (#34178)
+- Pass ``workers.terminationGracePeriodSeconds`` into KubeExecutor pod template (#33514)
+- CeleryExecutor namespace depends on Airflow version (#32753)
+- Fix dag processor not including webserver config volume (#32644)
+- Dag processor liveness probe include ``--local`` and ``--job-type`` args (#32426)
+- Revising flower_url_prefix considering default value (#33134)
+
+Doc only changes
+^^^^^^^^^^^^^^^^
+
+- Add more explicit "embedded postgres" exclusion for production (#33034)
+- Update git-sync description (#32181)
+
+Misc
+^^^^
+
+- Default Airflow version to 2.7.1 (#34186)
+- Update PostgreSQL subchart to 12.10.0 (#33747)
+- Update git-sync to 3.6.9 (#33748)
+- Remove unnecessary loops to load env from helm values (#33506)
+- Replace ``common.tplvalues.render`` with ``tpl`` in ingress template files (#33384)
+- Remove K8S 1.23 support (#32899)
+- Fix chart named template comments (#32681)
+- Remove outdated comment from chart values in the workers KEDA conf section (#32300)
+- Remove unnecessary ``or`` function in template files (#34415)
+
+Airflow Helm Chart 1.10.0 (2023-06-26)
+--------------------------------------
+
+Significant Changes
+^^^^^^^^^^^^^^^^^^^
+
+Default Airflow image is updated to ``2.6.2`` (#31979)
+""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The default Airflow image that is used with the Chart is now ``2.6.2``, previously it was ``2.5.3``.
+
+New Features
+^^^^^^^^^^^^
+
+- Add support for container security context (#31043)
+
+Improvements
+^^^^^^^^^^^^
+
+- Validate ``executor`` and ``config.core.executor`` match (#30693)
+- Support ``minAvailable`` property for PodDisruptionBudget (#30603)
+- Add ``volumeMounts`` to dag processor ``waitForMigrations`` (#30990)
+- Template extra volumes (#30773)
+
+Bug Fixes
+^^^^^^^^^
+
+- Fix webserver probes timeout and period (#30609)
+- Add missing ``waitForMigrations`` for workers (#31625)
+- Add missing ``priorityClassName`` to K8S worker pod template (#31328)
+- Adding log groomer sidecar to dag processor (#30726)
+- Do not propagate global security context to statsd and redis (#31865)
+
+Misc
+^^^^
+
+- Default Airflow version to 2.6.2 (#31979)
+- Use template comments for the chart license header (#30569)
+- Align ``apiVersion`` and ``kind`` order in chart templates (#31850)
+- Cleanup Kubernetes < 1.23 support (#31847)
+
+Airflow Helm Chart 1.9.0 (2023-04-14)
+-------------------------------------
+
+Significant Changes
+^^^^^^^^^^^^^^^^^^^
+
+Default PgBouncer and PgBouncer Exporter images have been updated (#29919)
+""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The PgBouncer and PgBouncer Exporter images are based on newer software/os. They are also multi-platform AMD/ARM images:
+
+  * ``pgbouncer``: 1.16.1 based on alpine 3.14 (``airflow-pgbouncer-2023.02.24-1.16.1``)
+  * ``pgbouncer-exporter``: 0.14.0 based on alpine 3.17 (``apache/airflow:airflow-pgbouncer-exporter-2023.02.21-0.14.0``)
+
+Default Airflow image is updated to ``2.5.3`` (#30411)
+""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The default Airflow image that is used with the Chart is now ``2.5.3``, previously it was ``2.5.1``.
+
+New Features
+^^^^^^^^^^^^
+
+- Add support for ``hostAliases`` for Airflow webserver and scheduler (#30051)
+- Add support for annotations on StatsD Deployment and cleanup CronJob (#30126)
+- Add support for annotations in logs PVC (#29270)
+- Add support for annotations in extra ConfigMap and Secrets (#30303)
+- Add support for pod annotations to PgBouncer (#30168)
+- Add support for ``ttlSecondsAfterFinished`` on ``migrateDatabaseJob`` and ``createUserJob`` (#29314)
+- Add support for using SHA digest of Docker images (#30214)
+
+Improvements
+^^^^^^^^^^^^
+
+- Template extra volumes in Helm Chart (#29357)
+- Make Liveness/Readiness Probe timeouts configurable for PgBouncer Exporter (#29752)
+- Enable individual trigger logging (#29482)
+
+Bug Fixes
+^^^^^^^^^
+
+- Add ``config.kubernetes_executor`` to values (#29818)
+- Block extra properties in image config (#30217)
+- Remove replicas if KEDA is enabled (#29838)
+- Mount ``kerberos.keytab`` to worker when enabled (#29526)
+- Fix adding annotations for dag persistence PVC (#29622)
+- Fix ``bitnami/postgresql`` default username and password (#29478)
+- Add global volumes in pod template file (#29295)
+- Add log groomer sidecar to triggerer service (#29392)
+- Helm deployment fails when ``postgresql.nameOverride`` is used (#29214)
+
+Doc only changes
+^^^^^^^^^^^^^^^^
+
+- Add gitSync optional env description (#29378)
+- Add webserver NodePort example (#29460)
+- Include Rancher in Helm chart install instructions (#28416)
+- Change RSA SSH host key to reflect update from Github (#30286)
+
+Misc
+^^^^
+
+- Update Airflow version to 2.5.3 (#30411)
+- Switch to newer versions of PgBouncer and PgBouncer Exporter in chart (#29919)
+- Reformat chart templates (#29917)
+- Reformat chart templates part 2 (#29941)
+- Reformat chart templates part 3 (#30312)
+- Replace deprecated k8s registry references (#29938)
+- Fix ``airflow_dags_mount`` formatting (#29296)
+- Fix ``webserver.service.ports`` formatting (#29297)
+
+Airflow Helm Chart 1.8.0 (2023-02-06)
+-------------------------------------
+
+Significant Changes
+^^^^^^^^^^^^^^^^^^^
+
+``bitnami/postgresql`` subchart updated to ``12.1.9`` (#29071)
+""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The version of postgresql installed is still version 11.
+
+If you are upgrading an existing helm release with the built-in postgres database, you will either need to delete your release and reinstall fresh, or manually delete these 2 objects:
+
+.. code-block::
+
+    kubectl delete secret {RELEASE_NAME}-postgresql
+    kubectl delete statefulset {RELEASE_NAME}-postgresql
+
+As a reminder, it is recommended to `set up an external database <https://airflow.apache.org/docs/helm-chart/stable/production-guide.html#database>`_ in production.
+
+This version of the chart uses different variable names for setting usernames and passwords in the postgres database.
+
+- ``postgresql.auth.enablePostgresUser`` is used to determine if the "postgres" admin account will be created.
+- ``postgresql.auth.postgresPassword`` sets the password for the "postgres" user.
+- ``postgresql.auth.username`` and ``postrgesql.auth.password`` are used to set credentials for a non-admin account if desired.
+- ``postgresql.postgresqlUsername`` and ``postgresql.postresqlPassword``, which were used in the previous version of the chart, are no longer used.
+
+Users will need to make those changes in their values files if they are changing the Postgres configuration.
+
+Previously the subchart version was ``10.5.3``.
+
+Default ``dags.gitSync.wait`` reduced to ``5`` seconds (#27625)
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The default for ``dags.gitSync.wait`` has been reduced from ``60`` seconds to ``5`` seconds to reduce the likelihood of DAGs
+becoming inconsistent between Airflow components. This will, however, increase traffic to the remote git repository.
+
+Default Airflow image is updated to ``2.5.1`` (#29074)
+""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The default Airflow image that is used with the Chart is now ``2.5.1``, previously it was ``2.4.1``.
+
+Default git-sync image is updated to ``3.6.3`` (#27848)
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The default git-sync image that is used with the Chart is now ``3.6.3``, previously it was ``3.4.0``.
+
+Default redis image is updated to ``7-bullseye`` (#27443)
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The default redis image that is used with the Chart is now ``7-bullseye``, previously it was ``6-bullseye``.
+
+New Features
+^^^^^^^^^^^^
+
+- Add annotations on deployments (#28688)
+- Add global volume & volumeMounts to the chart (#27781)
+
+Improvements
+^^^^^^^^^^^^
+
+- Add support for ``webserverConfigConfigMapName`` (#27419)
+- Enhance chart to allow overriding command-line args to statsd exporter (#28041)
+- Add support for NodePort in Services (#26945)
+- Add worker log-groomer-sidecar enable option (#27178)
+- Add HostAliases to Pod template file (#27544)
+- Allow PgBouncer replicas to be configurable (#27439)
+
+Bug Fixes
+^^^^^^^^^
+
+- Create scheduler service to serve task logs for LocalKubernetesExecutor (#28828)
+- Fix NOTES.txt to show correct URL (#28264)
+- Add worker service account for LocalKubernetesExecutor (#28813)
+- Remove checks for 1.19 api checks (#28461)
+- Add airflow_local_settings to all airflow containers (#27779)
+- Make custom env vars optional for job templates (#27148)
+- Decrease default gitSync wait (#27625)
+- Add ``extraVolumeMounts`` to sidecars too (#27420)
+- Fix PgBouncer after PostgreSQL subchart upgrade (#29207)
+
+Doc only changes
+^^^^^^^^^^^^^^^^
+
+- Enhance production guide with a few Argo specific guidelines (#29078)
+- Add doc note about Pod template images (#29032)
+- Update production guide db section (#28610)
+- Fix to LoadBalancer snippet (#28014)
+- Fix gitSync example code (#28083)
+- Correct repo example for cloning via ssh (#27671)
+
+Misc
+^^^^
+
+- Update Airflow version to 2.5.1 (#29074)
+- Update git-sync to 3.6.3 (#27848)
+- Upgrade ``bitnami/postgresql`` subchart to 12.1.9 (#29071)
+- Update redis to 7 (#27443)
+- Replace helm chart icon (#27704)
+
 Airflow Helm Chart 1.7.0 (2022-10-14)
 -------------------------------------
 
 Significant Changes
 ^^^^^^^^^^^^^^^^^^^
 
-- Default Airflow image is updated to ``2.4.1``
+Default Airflow image is updated to ``2.4.1`` (#26485)
+""""""""""""""""""""""""""""""""""""""""""""""""""""""
 
-  The default Airflow image that is used with the Chart is now ``2.4.1``, previously it was ``2.3.2``. (#26485)
+The default Airflow image that is used with the Chart is now ``2.4.1``, previously it was ``2.3.2``.
 
 New Features
 ^^^^^^^^^^^^
@@ -112,7 +1271,7 @@ Flower disabled by default
 """"""""""""""""""""""""""
 
 Flower is no longer enabled by default when using CeleryExecutor. If you'd like to deploy it, set
-``flower.enabed`` to true in your values file.
+``flower.enabled`` to true in your values file.
 
 New Features
 ^^^^^^^^^^^^

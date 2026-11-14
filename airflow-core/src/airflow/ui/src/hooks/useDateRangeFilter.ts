@@ -1,0 +1,401 @@
+/*!
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import { useCallback, useEffect, useState, type ChangeEvent } from "react";
+
+import dayjs from "dayjs";
+import timezone from "dayjs/plugin/timezone";
+import type { TFunction } from "i18next";
+
+import type { DateRangeValue } from "src/components/FilterBar/types";
+import { isValidDateValue } from "src/components/FilterBar/utils";
+
+import { useTimezone } from "src/context/timezone";
+
+dayjs.extend(timezone);
+
+export const DATE_INPUT_FORMAT = "YYYY/MM/DD";
+export const TIME_INPUT_FORMAT = "HH:mm";
+export const DATETIME_INPUT_FORMAT = `${DATE_INPUT_FORMAT} ${TIME_INPUT_FORMAT}`;
+
+export type DateSelection = "end" | "start" | undefined;
+
+export type ValidationError = {
+  field: "end" | "endTime" | "range" | "start" | "startTime";
+  message: string;
+};
+
+export type DateRangeEditingState = {
+  currentMonth: dayjs.Dayjs;
+  inputs: {
+    end: string;
+    endTime: string;
+    start: string;
+    startTime: string;
+  };
+  selectionTarget: DateSelection;
+  validationErrors: Array<ValidationError>;
+};
+
+type UseDateRangeFilterArgs = {
+  onChange: (next: DateRangeValue) => void;
+  translate: TFunction;
+  value: DateRangeValue;
+};
+
+export const validateDateInput = (dateStr: string): boolean => {
+  if (!dateStr.trim()) {
+    return true; // Empty is valid
+  }
+
+  const parsed = dayjs(dateStr, DATE_INPUT_FORMAT, true);
+
+  if (!parsed.isValid()) {
+    return false;
+  }
+
+  // Check if the parsed date exactly matches the input format
+  // This prevents dayjs from auto-correcting invalid dates
+  return parsed.format(DATE_INPUT_FORMAT) === dateStr;
+};
+
+export const validateTimeInput = (timeStr: string): boolean => {
+  if (!timeStr.trim()) {
+    return true; // Empty is valid
+  }
+
+  const parsed = dayjs(`2000-01-01 ${timeStr}`, `YYYY-MM-DD ${TIME_INPUT_FORMAT}`, true);
+
+  if (!parsed.isValid()) {
+    return false;
+  }
+
+  // Check if the parsed time exactly matches the input format
+  // This prevents dayjs from auto-correcting invalid times
+  return parsed.format(TIME_INPUT_FORMAT) === timeStr;
+};
+
+const validateDateRange = (startDate?: string, endDate?: string): boolean => {
+  if (!Boolean(startDate) || !Boolean(endDate)) {
+    return true; // Incomplete ranges are valid
+  }
+
+  const start = dayjs(startDate);
+  const end = dayjs(endDate);
+
+  return start.isBefore(end) || start.isSame(end);
+};
+
+// The inputs are minute-granular ("HH:mm"), so the commit comparison ignores
+// sub-minute differences: re-deriving an unchanged value (e.g. a calendar-picked
+// "end of day" 23:59:59.999 from a displayed 23:59) must not fire onChange.
+const isSameMinuteValue = (next?: string, current?: string): boolean => {
+  const nextIsAbsent = next === undefined || next === "";
+  const currentIsAbsent = current === undefined || current === "";
+
+  if (nextIsAbsent || currentIsAbsent) {
+    return nextIsAbsent && currentIsAbsent;
+  }
+
+  const nextDate = dayjs(next);
+  const currentDate = dayjs(current);
+
+  return nextDate.isValid() && currentDate.isValid() && nextDate.isSame(currentDate, "minute");
+};
+
+export const combineDateAndTime = (
+  dateStr: string,
+  timeStr: string,
+  { endOfDay = false, timezone: tz }: { endOfDay?: boolean; timezone: string },
+): string => {
+  const date = dayjs(dateStr, DATE_INPUT_FORMAT, true);
+
+  if (!date.isValid()) {
+    return "";
+  }
+
+  // When no (or an invalid) time is provided, fall back to the start of the day — or the end of the
+  // day for a range's upper bound so it stays inclusive.
+  const withDefaultTime = () =>
+    (endOfDay ? date.endOf("day") : date.startOf("day")).tz(tz, true).toISOString();
+
+  if (!timeStr.trim()) {
+    return withDefaultTime();
+  }
+
+  const time = dayjs(`2000-01-01 ${timeStr}`, `YYYY-MM-DD ${TIME_INPUT_FORMAT}`, true);
+
+  if (!time.isValid()) {
+    return withDefaultTime();
+  }
+
+  const combined = date.hour(time.hour()).minute(time.minute()).second(0).millisecond(0);
+
+  return combined.tz(tz, true).toISOString();
+};
+
+export const useDateRangeFilter = ({ onChange, translate, value }: UseDateRangeFilterArgs) => {
+  const { selectedTimezone } = useTimezone();
+  const startDateValue = isValidDateValue(value.startDate) ? dayjs(value.startDate) : undefined;
+  const endDateValue = isValidDateValue(value.endDate) ? dayjs(value.endDate) : undefined;
+
+  // The inputs are labeled with and committed in the selected timezone, so they
+  // must be filled in that timezone too — filling in the browser timezone would
+  // make opening and closing the picker shift the value.
+  const formatInputDate = useCallback(
+    (date: dayjs.Dayjs | undefined) => date?.tz(selectedTimezone).format(DATE_INPUT_FORMAT) ?? "",
+    [selectedTimezone],
+  );
+  const formatInputTime = useCallback(
+    (date: dayjs.Dayjs | undefined) => date?.tz(selectedTimezone).format(TIME_INPUT_FORMAT) ?? "",
+    [selectedTimezone],
+  );
+
+  const [editingState, setEditingState] = useState<DateRangeEditingState>(() => ({
+    currentMonth: startDateValue ?? endDateValue ?? dayjs(),
+    inputs: {
+      end: formatInputDate(endDateValue),
+      endTime: formatInputTime(endDateValue),
+      start: formatInputDate(startDateValue),
+      startTime: formatInputTime(startDateValue),
+    },
+    selectionTarget: undefined,
+    validationErrors: [],
+  }));
+
+  const validateInputs = (inputs: DateRangeEditingState["inputs"]): Array<ValidationError> => {
+    const errors: Array<ValidationError> = [];
+
+    if (inputs.start && !validateDateInput(inputs.start)) {
+      errors.push({
+        field: "start",
+        message: translate("components:dateRangeFilter.validation.invalidDateFormat"),
+      });
+    }
+
+    if (inputs.end && !validateDateInput(inputs.end)) {
+      errors.push({
+        field: "end",
+        message: translate("components:dateRangeFilter.validation.invalidDateFormat"),
+      });
+    }
+
+    if (inputs.startTime && !validateTimeInput(inputs.startTime)) {
+      errors.push({
+        field: "startTime",
+        message: translate("components:dateRangeFilter.validation.invalidTimeFormat"),
+      });
+    }
+
+    if (inputs.endTime && !validateTimeInput(inputs.endTime)) {
+      errors.push({
+        field: "endTime",
+        message: translate("components:dateRangeFilter.validation.invalidTimeFormat"),
+      });
+    }
+
+    if (
+      Boolean(inputs.start) &&
+      Boolean(inputs.end) &&
+      validateDateInput(inputs.start) &&
+      validateDateInput(inputs.end)
+    ) {
+      const startDateTime = combineDateAndTime(inputs.start, inputs.startTime, {
+        timezone: selectedTimezone,
+      });
+      const endDateTime = combineDateAndTime(inputs.end, inputs.endTime, {
+        endOfDay: true,
+        timezone: selectedTimezone,
+      });
+
+      if (Boolean(startDateTime) && Boolean(endDateTime) && !validateDateRange(startDateTime, endDateTime)) {
+        errors.push({
+          field: "range",
+          message: translate("components:dateRangeFilter.validation.startBeforeEnd"),
+        });
+      }
+    }
+
+    return errors;
+  };
+
+  useEffect(() => {
+    // Compute dayjs values inside the effect to avoid stale closures
+    const startVal = isValidDateValue(value.startDate) ? dayjs(value.startDate) : undefined;
+    const endVal = isValidDateValue(value.endDate) ? dayjs(value.endDate) : undefined;
+
+    setEditingState((prev) => ({
+      ...prev,
+      inputs: {
+        end: formatInputDate(endVal),
+        endTime: formatInputTime(endVal),
+        start: formatInputDate(startVal),
+        startTime: formatInputTime(startVal),
+      },
+    }));
+  }, [formatInputDate, formatInputTime, value.endDate, value.startDate]);
+
+  const handleDateClick = (clickedDate: dayjs.Dayjs) => {
+    const currentTarget = editingState.selectionTarget;
+    let nextTarget: DateSelection = "end";
+    let newStartDate: string | undefined = value.startDate;
+    let newEndDate: string | undefined = value.endDate;
+
+    // Interpret the clicked grid day as a calendar date in the selected timezone,
+    // matching how typed inputs are committed, so closing the picker afterwards
+    // re-derives the same value instead of shifting it.
+    const clickedDay = dayjs.tz(clickedDate.format("YYYY-MM-DD"), selectedTimezone);
+
+    if (currentTarget === "start" || (!startDateValue && !endDateValue)) {
+      // Set start date with start of day time
+      newStartDate = clickedDay.startOf("day").toISOString();
+
+      if (endDateValue && clickedDate.isAfter(endDateValue, "day")) {
+        newEndDate = undefined;
+      }
+    } else {
+      // Set end date with end of day time
+      newEndDate = clickedDay.endOf("day").toISOString();
+
+      if (startDateValue && clickedDate.isBefore(startDateValue, "day")) {
+        newStartDate = clickedDay.startOf("day").toISOString();
+        newEndDate = clickedDay.endOf("day").toISOString();
+      }
+      nextTarget = undefined;
+    }
+
+    onChange({ endDate: newEndDate, startDate: newStartDate });
+    setEditingState((prev) => {
+      // Update inputs to reflect the new date values
+      const newInputs = {
+        ...prev.inputs,
+        end: newEndDate === undefined ? "" : dayjs(newEndDate).tz(selectedTimezone).format(DATE_INPUT_FORMAT),
+        start:
+          newStartDate === undefined
+            ? ""
+            : dayjs(newStartDate).tz(selectedTimezone).format(DATE_INPUT_FORMAT),
+      };
+      // Revalidate with the new inputs
+      const validationErrors = validateInputs(newInputs);
+
+      return {
+        ...prev,
+        currentMonth: clickedDate,
+        inputs: newInputs,
+        selectionTarget: nextTarget,
+        validationErrors,
+      };
+    });
+  };
+
+  const handleInputChange =
+    (field: "end" | "start", inputType: "date" | "time") => (event: ChangeEvent<HTMLInputElement>) => {
+      const inputValue = event.target.value;
+      const inputKey = inputType === "date" ? field : (`${field}Time` as const);
+
+      // Keep the change local: committing on every keystroke updates the URL
+      // search params, and the sync effect below then rewrites the inputs from
+      // the committed value mid-typing, which makes the picker unusable.
+      setEditingState((prev) => {
+        const newInputs = { ...prev.inputs, [inputKey]: inputValue };
+        const validationErrors = validateInputs(newInputs);
+
+        return {
+          ...prev,
+          inputs: newInputs,
+          validationErrors,
+        };
+      });
+    };
+
+  const commitEditingState = () => {
+    const { inputs } = editingState;
+
+    if (validateInputs(inputs).length > 0) {
+      return;
+    }
+
+    const nextStartDate = combineDateAndTime(inputs.start, inputs.startTime, {
+      timezone: selectedTimezone,
+    });
+    const nextEndDate = combineDateAndTime(inputs.end, inputs.endTime, {
+      endOfDay: true,
+      timezone: selectedTimezone,
+    });
+    const nextValue = {
+      endDate: nextEndDate || undefined,
+      startDate: nextStartDate || undefined,
+    };
+
+    if (
+      !isSameMinuteValue(nextValue.startDate, value.startDate) ||
+      !isSameMinuteValue(nextValue.endDate, value.endDate)
+    ) {
+      onChange(nextValue);
+    }
+  };
+
+  const formatDateTime = (date: dayjs.Dayjs) => {
+    const dateStr = date.tz(selectedTimezone).format("MMM DD, YYYY");
+
+    return `${dateStr} ${date.tz(selectedTimezone).format("HH:mm")}`;
+  };
+
+  const formatDisplayValue = () => {
+    if (!startDateValue && !endDateValue) {
+      return "";
+    }
+
+    if (startDateValue && endDateValue) {
+      // simplified format for same-day ranges
+      if (startDateValue.isSame(endDateValue, "day")) {
+        const dateStr = startDateValue.tz(selectedTimezone).format("MMM DD, YYYY");
+        const startTime = startDateValue.tz(selectedTimezone).format("HH:mm");
+        const endTime = endDateValue.tz(selectedTimezone).format("HH:mm");
+
+        return `${dateStr} ${startTime} - ${endTime}`;
+      }
+
+      return `${formatDateTime(startDateValue)} - ${formatDateTime(endDateValue)}`;
+    }
+
+    if (startDateValue) {
+      return `${translate("common:table.from")} ${formatDateTime(startDateValue)}`;
+    }
+
+    return endDateValue ? `${translate("common:table.to")} ${formatDateTime(endDateValue)}` : "";
+  };
+
+  const getFieldError = (field: ValidationError["field"]) =>
+    editingState.validationErrors.find((error) => error.field === field);
+
+  const hasValidationErrors = editingState.validationErrors.length > 0;
+
+  return {
+    commitEditingState,
+    editingState,
+    endDateValue,
+    formatDisplayValue,
+    getFieldError,
+    handleDateClick,
+    handleInputChange,
+    hasValidationErrors,
+    setEditingState,
+    startDateValue,
+  };
+};

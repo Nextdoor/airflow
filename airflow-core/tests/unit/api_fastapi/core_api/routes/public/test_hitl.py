@@ -1,0 +1,1431 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+import json
+from collections.abc import Callable
+from datetime import datetime, timedelta
+from operator import itemgetter
+from typing import TYPE_CHECKING, Any
+from unittest import mock
+
+import pytest
+import time_machine
+from sqlalchemy import delete, select, update
+from sqlalchemy.orm import Session
+
+from airflow._shared.serialization import CLASSNAME, FORBIDDEN_XCOM_KEYS
+from airflow._shared.timezones.timezone import utc, utcnow
+from airflow.api_fastapi.core_api.routes.public import hitl as hitl_routes
+from airflow.models.dag import DagModel
+from airflow.models.dagbundle import DagBundleModel
+from airflow.models.dynamic_region import DynamicRegion
+from airflow.models.hitl import HITLDetail
+from airflow.models.log import Log
+from airflow.models.taskinstance import TaskInstance as TIModel
+from airflow.models.team import Team
+from airflow.providers.standard.operators.empty import EmptyOperator
+from airflow.sdk import task_group
+from airflow.sdk.definitions._internal.loop import create_loop
+from airflow.sdk.execution_time.hitl import HITLUser
+from airflow.utils.platform import getuser
+from airflow.utils.session import NEW_SESSION
+from airflow.utils.state import TaskInstanceState
+
+from tests_common.test_utils.asserts import assert_queries_count
+from tests_common.test_utils.config import conf_vars
+from tests_common.test_utils.db import clear_db_dag_bundles, clear_db_dags, clear_db_teams
+from tests_common.test_utils.format_datetime import from_datetime_to_zulu_without_ms
+
+if TYPE_CHECKING:
+    from fastapi.testclient import TestClient
+
+    from airflow.models.taskinstance import TaskInstance
+
+    from tests_common.pytest_plugin import CreateTaskInstance
+
+
+pytestmark = pytest.mark.db_test
+
+
+LOOP_PASS_SUBJECTS = {"original": "Iteration 3", "rerun": "Iteration 3 rerun"}
+
+
+def _create_loop_iterations(dag_maker, session):
+    @task_group
+    def body():
+        EmptyOperator(task_id="work")
+
+    with dag_maker(serialized=True) as dag:
+        loop = create_loop(body, max_iterations=4)
+    run = dag_maker.create_dagrun()
+    region = session.scalar(select(DynamicRegion).where(DynamicRegion.node_id == loop.group_id))
+    resumed_region = DynamicRegion(
+        dag_id=run.dag_id,
+        run_id=run.run_id,
+        node_id=loop.group_id,
+        forked_from_region_id=region.id,
+        resumes_from_index=2,
+    )
+    session.add(resumed_region)
+    session.flush()
+    passes = {}
+    for name, region_id in (("rerun", resumed_region.id), ("original", region.id)):
+        ti = TIModel(
+            task=dag.get_task("body.work"),
+            run_id=run.run_id,
+            dag_version_id=run.created_dag_version_id,
+            region_id=region_id,
+            region_index=2,
+        )
+        ti.try_number = 1
+        ti.state = TaskInstanceState.AWAITING_INPUT
+        session.add(ti)
+        session.flush()
+        session.add(HITLDetail(ti_id=ti.id, options=["Approve", "Reject"], subject=LOOP_PASS_SUBJECTS[name]))
+        passes[name] = ti
+    session.commit()
+    return run, passes
+
+
+def _assert_selected_iteration(data, name, ti):
+    assert data["subject"] == LOOP_PASS_SUBJECTS[name]
+    assert data["task_instance"]["map_index"] == -1
+    assert data["task_instance"]["region_index"] == 2
+    assert data["task_instance"]["region_id"] == str(ti.region_id)
+
+
+@pytest.mark.parametrize("selected", ["original", "rerun"])
+def test_hitl_get_selects_loop_iteration(test_client, dag_maker, session, selected):
+    run, passes = _create_loop_iterations(dag_maker, session)
+    url = f"/dags/{run.dag_id}/dagRuns/{run.run_id}/taskInstances/body.work/-1/hitlDetails"
+
+    response = test_client.get(url, params={"region_id": str(passes[selected].region_id), "region_index": 2})
+
+    assert response.status_code == 200, response.text
+    _assert_selected_iteration(response.json(), selected, passes[selected])
+
+
+@pytest.mark.parametrize("selected", ["original", "rerun"])
+def test_hitl_history_selects_loop_iteration(test_client, dag_maker, session, selected):
+    run, passes = _create_loop_iterations(dag_maker, session)
+    for ti in passes.values():
+        ti.state = TaskInstanceState.SUCCESS
+        ti.archive(reason="superseded", session=session)
+    session.commit()
+    url = f"/dags/{run.dag_id}/dagRuns/{run.run_id}/taskInstances/body.work/-1/hitlDetails/tries/1"
+
+    response = test_client.get(url, params={"region_id": str(passes[selected].region_id), "region_index": 2})
+
+    assert response.status_code == 200, response.text
+    _assert_selected_iteration(response.json(), selected, passes[selected])
+
+
+def test_hitl_list_reports_every_loop_iteration(test_client, dag_maker, session):
+    run, passes = _create_loop_iterations(dag_maker, session)
+
+    response = test_client.get(
+        f"/dags/{run.dag_id}/dagRuns/{run.run_id}/hitlDetails", params={"map_index": -1}
+    )
+
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["total_entries"] == 2
+    selected = next(row for row in data["hitl_details"] if row["subject"] == LOOP_PASS_SUBJECTS["original"])
+    _assert_selected_iteration(selected, "original", passes["original"])
+
+
+@pytest.mark.parametrize("with_region_index", [False, True])
+def test_hitl_list_selects_loop_iteration_by_region(test_client, dag_maker, session, with_region_index):
+    run, passes = _create_loop_iterations(dag_maker, session)
+    params = {
+        "region_id": str(passes["original"].region_id),
+        **({"region_index": 2} if with_region_index else {}),
+    }
+
+    response = test_client.get(f"/dags/{run.dag_id}/dagRuns/{run.run_id}/hitlDetails", params=params)
+
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["total_entries"] == 1
+    _assert_selected_iteration(data["hitl_details"][0], "original", passes["original"])
+
+
+def test_hitl_list_rejects_region_index_without_region_id(test_client, dag_maker, session):
+    run, _ = _create_loop_iterations(dag_maker, session)
+
+    response = test_client.get(
+        f"/dags/{run.dag_id}/dagRuns/{run.run_id}/hitlDetails", params={"region_index": 2}
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "region_index requires region_id"
+
+
+@pytest.mark.parametrize(("selected", "other"), [("original", "rerun"), ("rerun", "original")])
+def test_hitl_respond_selects_loop_iteration(test_client, dag_maker, session, selected, other):
+    run, passes = _create_loop_iterations(dag_maker, session)
+    url = f"/dags/{run.dag_id}/dagRuns/{run.run_id}/taskInstances/body.work/-1/hitlDetails"
+
+    response = test_client.patch(
+        url,
+        params={"region_id": str(passes[selected].region_id), "region_index": 2},
+        json={"chosen_options": ["Approve"]},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["chosen_options"] == ["Approve"]
+    session.refresh(passes[selected])
+    session.refresh(passes[other])
+    assert passes[selected].state == TaskInstanceState.SCHEDULED
+    assert passes[other].state == TaskInstanceState.AWAITING_INPUT
+
+
+DAG_ID = "test_hitl_dag"
+ANOTHER_DAG_ID = "another_hitl_dag"
+TASK_ID = "sample_task_hitl"
+
+
+DEFAULT_CREATED_AT = datetime(2025, 9, 15, 13, 0, 0, tzinfo=utc)
+ANOTHER_CREATED_AT = datetime(2025, 9, 16, 12, 0, 0, tzinfo=utc)
+
+
+def _attach_dag_to_team(dag_id: str, team_name: str, *, session: Session = NEW_SESSION) -> None:
+    """Move a Dag into a team-scoped bundle, which is how a Dag gains a team."""
+    bundle = DagBundleModel(name=f"team-bundle-{team_name}")
+    bundle.teams.append(Team(name=team_name))
+    session.add(bundle)
+    session.flush()
+    session.execute(update(DagModel).where(DagModel.dag_id == dag_id).values(bundle_name=bundle.name))
+    session.commit()
+
+
+@pytest.fixture
+def sample_ti(
+    create_task_instance: CreateTaskInstance,
+    session: Session,
+) -> TaskInstance:
+    ti = create_task_instance(
+        dag_id=DAG_ID,
+        task_id=TASK_ID,
+        session=session,
+    )
+    session.commit()
+    return ti
+
+
+@pytest.fixture
+def sample_ti_url_identifier() -> str:
+    return f"/dags/{DAG_ID}/dagRuns/test/taskInstances/{TASK_ID}/-1"
+
+
+@pytest.fixture
+def sample_hitl_detail(sample_ti: TaskInstance, session: Session) -> HITLDetail:
+    hitl_detail_model = HITLDetail(
+        ti_id=sample_ti.id,
+        options=["Approve", "Reject"],
+        subject="This is subject",
+        body="this is body",
+        defaults=["Approve"],
+        multiple=False,
+        params={"input_1": 1},
+        assignees=None,
+    )
+    session.add(hitl_detail_model)
+    session.commit()
+
+    return hitl_detail_model
+
+
+@pytest.fixture
+def sample_hitl_detail_non_respondent(sample_ti: TaskInstance, session: Session) -> HITLDetail:
+    hitl_detail_model = HITLDetail(
+        ti_id=sample_ti.id,
+        options=["Approve", "Reject"],
+        subject="This is subject",
+        body="this is body",
+        defaults=["Approve"],
+        multiple=False,
+        params={"input_1": 1},
+        assignees=[HITLUser(id="non_test", name="non_test")],
+    )
+    session.add(hitl_detail_model)
+    session.commit()
+
+    return hitl_detail_model
+
+
+@pytest.fixture
+def sample_hitl_detail_respondent(sample_ti: TaskInstance, session: Session) -> HITLDetail:
+    hitl_detail_model = HITLDetail(
+        ti_id=sample_ti.id,
+        options=["Approve", "Reject"],
+        subject="This is subject",
+        body="this is body",
+        defaults=["Approve"],
+        multiple=False,
+        params={"input_1": 1},
+        assignees=[HITLUser(id="test", name="test")],
+    )
+    session.add(hitl_detail_model)
+    session.commit()
+
+    return hitl_detail_model
+
+
+@pytest.fixture
+def sample_tis(create_task_instance: CreateTaskInstance) -> list[TaskInstance]:
+    tis = [
+        create_task_instance(
+            dag_id=f"hitl_dag_{i}",
+            run_id=f"hitl_run_{i}",
+            task_id=f"hitl_task_{i}",
+            state=TaskInstanceState.DEFERRED,
+        )
+        for i in range(5)
+    ]
+    tis.extend(
+        [
+            create_task_instance(
+                dag_id=f"other_Dag_{i}",
+                run_id=f"another_hitl_run_{i}",
+                task_id=f"another_hitl_task_{i}",
+                state=TaskInstanceState.SUCCESS,
+            )
+            for i in range(3)
+        ]
+    )
+    return tis
+
+
+@pytest.fixture
+def sample_hitl_details(sample_tis: list[TaskInstance], session: Session) -> list[HITLDetail]:
+    hitl_detail_models = [
+        HITLDetail(
+            ti_id=ti.id,
+            options=["Approve", "Reject"],
+            subject=f"This is subject {i}",
+            body=f"this is body {i}",
+            defaults=["Approve"],
+            multiple=False,
+            params={"input_1": 1},
+            created_at=DEFAULT_CREATED_AT,
+        )
+        for i, ti in enumerate(sample_tis[:5])
+    ]
+    hitl_detail_models.extend(
+        [
+            HITLDetail(
+                ti_id=ti.id,
+                options=["1", "2", "3"],
+                subject=f"Subject {i} this is",
+                body=f"Body {i} this is",
+                defaults=["1"],
+                multiple=False,
+                params={"input": 1},
+                responded_at=utcnow(),
+                chosen_options=[str(i)],
+                params_input={"input": i},
+                responded_by={"id": "test", "name": "test"},
+                created_at=ANOTHER_CREATED_AT,
+            )
+            for i, ti in enumerate(sample_tis[5:])
+        ]
+    )
+
+    session.add_all(hitl_detail_models)
+    session.commit()
+
+    return hitl_detail_models
+
+
+expected_ti_not_found_error_msg = (
+    f"The Task Instance with dag_id: `{DAG_ID}`,"
+    f" run_id: `test`, task_id: `{TASK_ID}` and map_index: `-1` was not found"
+)
+
+
+@pytest.fixture
+def expected_hitl_detail_not_found_error_msg(sample_ti: TaskInstance) -> str:
+    if TYPE_CHECKING:
+        assert sample_ti.task
+
+    return f"Human-in-the-loop detail does not exist for Task Instance with id {sample_ti.id}"
+
+
+@pytest.fixture
+def expected_sample_hitl_detail_dict(sample_ti: TaskInstance) -> dict[str, Any]:
+    return {
+        "body": "this is body",
+        "defaults": ["Approve"],
+        "multiple": False,
+        "options": ["Approve", "Reject"],
+        "params": {"input_1": {"value": 1, "schema": {}, "description": None}},
+        "assigned_users": [],
+        "created_at": mock.ANY,
+        "params_input": {},
+        "responded_at": None,
+        "chosen_options": None,
+        "response_received": False,
+        "subject": "This is subject",
+        "responded_by_user": None,
+        "task_instance": {
+            "dag_display_name": DAG_ID,
+            "dag_id": DAG_ID,
+            "dag_run_id": "test",
+            "dag_version": {
+                "bundle_name": "dag_maker",
+                "bundle_url": None,
+                "bundle_version": None,
+                "created_at": mock.ANY,
+                "dag_display_name": DAG_ID,
+                "dag_id": DAG_ID,
+                "id": mock.ANY,
+                "version_number": 1,
+            },
+            "duration": None,
+            "end_date": None,
+            "executor": None,
+            "executor_config": "{}",
+            "hostname": "",
+            "id": str(sample_ti.id),
+            "logical_date": mock.ANY,
+            "in_loop": False,
+            "loop_iteration": None,
+            "map_index": -1,
+            "max_tries": 0,
+            "note": None,
+            "operator": "EmptyOperator",
+            "operator_name": "EmptyOperator",
+            "pid": None,
+            "pool": "default_pool",
+            "pool_slots": 1,
+            "priority_weight": 1,
+            "queue": "default",
+            "queued_when": None,
+            "rendered_fields": {},
+            "rendered_map_index": None,
+            "run_after": mock.ANY,
+            "scheduled_when": None,
+            "start_date": None,
+            "state": None,
+            "task_display_name": "sample_task_hitl",
+            "task_id": TASK_ID,
+            "team_name": None,
+            "state_reason": None,
+            "retry_at": None,
+            "trigger": None,
+            "triggerer_job": None,
+            "try_number": 0,
+            "unixname": getuser(),
+        },
+    }
+
+
+@pytest.fixture(autouse=True)
+def cleanup_audit_log(session: Session) -> None:
+    session.execute(delete(Log))
+    session.commit()
+
+
+def _assert_sample_audit_log(audit_log: Log) -> None:
+    assert audit_log.dag_id == DAG_ID
+    assert audit_log.task_id == TASK_ID
+    assert audit_log.run_id == "test"
+    assert audit_log.try_number is None
+    assert audit_log.owner == "test"
+    assert audit_log.owner_display_name == "test"
+    assert audit_log.event == "update_hitl_detail"
+
+    if TYPE_CHECKING:
+        assert isinstance(audit_log.extra, str)
+
+    expected_extra = {
+        "chosen_options": ["Approve"],
+        "params_input": {"input_1": 2},
+        "method": "PATCH",
+        "map_index": "-1",
+    }
+
+    assert json.loads(audit_log.extra) == expected_extra
+
+
+@pytest.fixture
+def park_sample_ti(sample_ti: TaskInstance, session: Session) -> None:
+    ti = session.get(TIModel, sample_ti.id)
+    assert ti is not None
+    ti.state = TaskInstanceState.AWAITING_INPUT
+    session.commit()
+
+
+@pytest.fixture
+def sample_update_payload() -> dict[str, Any]:
+    return {"chosen_options": ["Approve"], "params_input": {"input_1": 2}}
+
+
+class TestUpdateHITLDetailEndpoint:
+    def test_response_rejects_attempt_archived_after_lookup(
+        self,
+        test_client,
+        sample_ti,
+        sample_hitl_detail,
+        sample_ti_url_identifier,
+        sample_update_payload,
+        session,
+        mocker,
+    ):
+        get_task_instance = hitl_routes._get_task_instance_with_hitl_detail
+
+        def archive_after_lookup(*args, **kwargs):
+            task_instance = get_task_instance(*args, **kwargs)
+            with Session(bind=session.get_bind()) as other_session:
+                current = other_session.get(TIModel, task_instance.id)
+                current.prepare_db_for_next_try(other_session)
+                other_session.commit()
+            return task_instance
+
+        mocker.patch.object(
+            hitl_routes,
+            "_get_task_instance_with_hitl_detail",
+            autospec=True,
+            side_effect=archive_after_lookup,
+        )
+
+        response = test_client.patch(f"{sample_ti_url_identifier}/hitlDetails", json=sample_update_payload)
+
+        assert response.status_code == 409
+        with Session(bind=session.get_bind()) as verify_session:
+            assert verify_session.get(TIModel, sample_ti.id).working_set is None
+            assert not verify_session.get(HITLDetail, sample_ti.id).response_received
+            current = verify_session.scalar(
+                select(TIModel).where(
+                    TIModel.dag_id == sample_ti.dag_id,
+                    TIModel.task_id == sample_ti.task_id,
+                    TIModel.run_id == sample_ti.run_id,
+                )
+            )
+            assert current.id != sample_ti.id
+            assert current.state is None
+            assert verify_session.get(HITLDetail, current.id) is None
+
+    @time_machine.travel(datetime(2025, 7, 3, 0, 0, 0), tick=False)
+    @pytest.mark.usefixtures("sample_hitl_detail", "park_sample_ti")
+    @mock.patch(
+        "airflow.api_fastapi.auth.managers.simple.user.SimpleAuthManagerUser.get_display_name",
+        return_value="Jane Doe",
+    )
+    def test_response_records_responder_display_name(
+        self,
+        mock_display_name: mock.MagicMock,
+        test_client: TestClient,
+        sample_ti_url_identifier: str,
+        sample_update_payload: dict[str, Any],
+    ) -> None:
+        response = test_client.patch(
+            f"{sample_ti_url_identifier}/hitlDetails",
+            json=sample_update_payload,
+        )
+        assert response.status_code == 200
+        assert response.json()["responded_by"] == {"id": "test", "name": "Jane Doe"}
+
+    @time_machine.travel(datetime(2025, 7, 3, 0, 0, 0), tick=False)
+    @pytest.mark.usefixtures("sample_hitl_detail", "park_sample_ti")
+    def test_should_respond_200_with_existing_response(
+        self,
+        test_client: TestClient,
+        sample_ti_url_identifier: str,
+        sample_update_payload: dict[str, Any],
+        session: Session,
+    ) -> None:
+        response = test_client.patch(
+            f"{sample_ti_url_identifier}/hitlDetails",
+            json=sample_update_payload,
+        )
+        assert response.status_code == 200
+        assert response.json() == {
+            "params_input": {"input_1": 2},
+            "chosen_options": ["Approve"],
+            "responded_by": {"id": "test", "name": "test"},
+            "responded_at": "2025-07-03T00:00:00Z",
+        }
+
+        audit_log = session.scalar(select(Log))
+        assert audit_log is not None
+        _assert_sample_audit_log(audit_log)
+
+    @time_machine.travel(datetime(2025, 7, 3, 0, 0, 0), tick=False)
+    @pytest.mark.usefixtures("sample_hitl_detail")
+    def test_response_resumes_awaiting_input_task_without_trigger(
+        self,
+        test_client: TestClient,
+        sample_ti_url_identifier: str,
+        sample_update_payload: dict[str, Any],
+        sample_ti: TaskInstance,
+        session: Session,
+    ) -> None:
+        """A human response transitions a parked AWAITING_INPUT task straight to SCHEDULED, no trigger."""
+        # Park the task exactly as the 3.3 operator does: AWAITING_INPUT, next_method set, no trigger.
+        ti = session.get(TIModel, sample_ti.id)
+        assert ti is not None
+        ti.state = TaskInstanceState.AWAITING_INPUT
+        ti.next_method = "execute_complete"
+        ti.next_kwargs = {}
+        ti.trigger_id = None
+        session.commit()
+        # Sanity: the park persisted before we respond.
+        session.expire_all()
+        parked = session.get(TIModel, sample_ti.id)
+        assert parked is not None
+        assert parked.state == TaskInstanceState.AWAITING_INPUT
+
+        response = test_client.patch(
+            f"{sample_ti_url_identifier}/hitlDetails",
+            json=sample_update_payload,
+        )
+        assert response.status_code == 200
+
+        session.expire_all()
+        refreshed = session.get(TIModel, sample_ti.id)
+        assert refreshed is not None
+        # Resumed so the scheduler re-queues execute_complete -- with no triggerer involved.
+        assert refreshed.state == TaskInstanceState.SCHEDULED
+        assert refreshed.trigger_id is None
+        assert refreshed.next_method == "execute_complete"
+        assert "event" in (refreshed.next_kwargs or {})
+
+    @pytest.mark.parametrize(
+        ("next_method", "resumed_offset", "expected_status"),
+        [
+            pytest.param(None, None, 200, id="first-run"),
+            pytest.param(
+                "resume_after_tool_approval", timedelta(minutes=-5), 200, id="resumed-run-asked-again"
+            ),
+            pytest.param("execute_complete", timedelta(minutes=5), 409, id="resumed-after-a-timeout"),
+        ],
+    )
+    @pytest.mark.usefixtures("sample_hitl_detail")
+    def test_response_to_a_running_task_is_stored_while_it_waits(
+        self,
+        test_client: TestClient,
+        sample_ti_url_identifier: str,
+        sample_update_payload: dict[str, Any],
+        sample_ti: TaskInstance,
+        session: Session,
+        next_method: str | None,
+        resumed_offset: timedelta | None,
+        expected_status: int,
+    ) -> None:
+        detail = session.scalar(select(HITLDetail).where(HITLDetail.ti_id == sample_ti.id))
+        ti = session.get(TIModel, sample_ti.id)
+        assert detail is not None
+        assert ti is not None
+        ti.state = TaskInstanceState.RUNNING
+        ti.next_method = next_method
+        # start_date comes from the worker's clock, which can run ahead of the API server's.
+        ti.start_date = detail.created_at + timedelta(seconds=2)
+        # The server stamps scheduled_dttm when it resumes a task.
+        ti.scheduled_dttm = None if resumed_offset is None else detail.created_at + resumed_offset
+        session.commit()
+
+        response = test_client.patch(f"{sample_ti_url_identifier}/hitlDetails", json=sample_update_payload)
+
+        assert response.status_code == expected_status
+        session.expire_all()
+        refreshed_detail = session.scalar(select(HITLDetail).where(HITLDetail.ti_id == sample_ti.id))
+        refreshed_ti = session.get(TIModel, sample_ti.id)
+        assert refreshed_detail is not None
+        assert refreshed_ti is not None
+        assert refreshed_detail.response_received is (expected_status == 200)
+        # The running task picks the answer up itself, so the response never resumes it.
+        assert refreshed_ti.state == TaskInstanceState.RUNNING
+
+    @pytest.mark.usefixtures("sample_hitl_detail")
+    def test_should_respond_400_for_invalid_option(
+        self,
+        test_client: TestClient,
+        sample_ti_url_identifier: str,
+    ) -> None:
+        """Write-side validation rejects an out-of-set option (400) instead of failing the task on resume."""
+        response = test_client.patch(
+            f"{sample_ti_url_identifier}/hitlDetails",
+            json={"chosen_options": ["Maybe"], "params_input": {}},
+        )
+        assert response.status_code == 400
+        assert "Invalid options" in response.json()["detail"]
+
+    @pytest.mark.usefixtures("sample_hitl_detail", "park_sample_ti")
+    def test_should_validate_against_row_refreshed_under_lock(
+        self,
+        test_client: TestClient,
+        sample_ti_url_identifier: str,
+        sample_ti: TaskInstance,
+    ) -> None:
+        original = hitl_routes._get_task_instance_with_hitl_detail
+
+        def load_then_rewrite_options(**kwargs: Any) -> Any:
+            ti = original(**kwargs)
+            kwargs["session"].execute(
+                update(HITLDetail).where(HITLDetail.ti_id == sample_ti.id).values(options=["Retry"]),
+                execution_options={"synchronize_session": False},
+            )
+            return ti
+
+        with mock.patch.object(
+            hitl_routes, "_get_task_instance_with_hitl_detail", side_effect=load_then_rewrite_options
+        ):
+            response = test_client.patch(
+                f"{sample_ti_url_identifier}/hitlDetails",
+                json={"chosen_options": ["Retry"], "params_input": {}},
+            )
+        assert response.status_code == 200
+        assert response.json()["chosen_options"] == ["Retry"]
+
+    @pytest.mark.usefixtures("sample_hitl_detail")
+    @pytest.mark.parametrize("reserved_key", sorted(FORBIDDEN_XCOM_KEYS))
+    @pytest.mark.parametrize(
+        "make_params_input",
+        [
+            pytest.param(lambda key: {key: "x"}, id="top-level"),
+            pytest.param(lambda key: {"nested": {key: "x"}}, id="nested-dict"),
+            pytest.param(lambda key: {"items": [{key: "x"}]}, id="inside-list"),
+        ],
+    )
+    def test_should_respond_422_for_reserved_key_in_params_input(
+        self,
+        test_client: TestClient,
+        sample_ti_url_identifier: str,
+        reserved_key: str,
+        make_params_input: Callable[[str], dict[str, Any]],
+    ) -> None:
+        """A params_input carrying a reserved key at any depth is rejected (422) at submission time."""
+        response = test_client.patch(
+            f"{sample_ti_url_identifier}/hitlDetails",
+            json={"chosen_options": ["Approve"], "params_input": make_params_input(reserved_key)},
+        )
+        assert response.status_code == 422
+        detail = str(response.json()["detail"])
+        assert "reserved serialization keys" in detail
+        assert reserved_key in detail
+
+    @pytest.mark.usefixtures("sample_hitl_detail", "park_sample_ti")
+    def test_should_respond_200_for_json_string_holding_a_reserved_key(
+        self,
+        test_client: TestClient,
+        sample_ti_url_identifier: str,
+    ) -> None:
+        """A string value stays a string through serde, so it is not decoded and searched."""
+        params_input = {"input_1": '{"__classname__": "x"}'}
+        response = test_client.patch(
+            f"{sample_ti_url_identifier}/hitlDetails",
+            json={"chosen_options": ["Approve"], "params_input": params_input},
+        )
+        assert response.status_code == 200
+
+    @time_machine.travel(datetime(2025, 7, 3, 0, 0, 0), tick=False)
+    @pytest.mark.usefixtures("sample_hitl_detail")
+    def test_rejected_reserved_key_leaves_task_resumable(
+        self,
+        test_client: TestClient,
+        sample_ti_url_identifier: str,
+        sample_ti: TaskInstance,
+        session: Session,
+    ) -> None:
+        """A rejected reserved-key response records nothing, so the parked task is still resumable by a corrected resubmission."""
+        ti = session.get(TIModel, sample_ti.id)
+        assert ti is not None
+        ti.state = TaskInstanceState.AWAITING_INPUT
+        ti.next_method = "execute_complete"
+        ti.next_kwargs = {}
+        ti.trigger_id = None
+        session.commit()
+
+        rejected = test_client.patch(
+            f"{sample_ti_url_identifier}/hitlDetails",
+            json={"chosen_options": ["Approve"], "params_input": {CLASSNAME: "x"}},
+        )
+        assert rejected.status_code == 422
+
+        session.expire_all()
+        parked = session.get(TIModel, sample_ti.id)
+        assert parked is not None
+        assert parked.state == TaskInstanceState.AWAITING_INPUT
+        detail = session.scalar(select(HITLDetail).where(HITLDetail.ti_id == sample_ti.id))
+        assert detail is not None
+        assert detail.response_received is False
+
+        accepted = test_client.patch(
+            f"{sample_ti_url_identifier}/hitlDetails",
+            json={"chosen_options": ["Approve"], "params_input": {"input_1": 2}},
+        )
+        assert accepted.status_code == 200
+
+        session.expire_all()
+        resumed = session.get(TIModel, sample_ti.id)
+        assert resumed is not None
+        assert resumed.state == TaskInstanceState.SCHEDULED
+        assert "event" in (resumed.next_kwargs or {})
+
+    @time_machine.travel(datetime(2025, 7, 3, 0, 0, 0), tick=False)
+    @pytest.mark.usefixtures("sample_hitl_detail_respondent", "park_sample_ti")
+    def test_should_respond_200_to_assigned_users(
+        self,
+        test_client: TestClient,
+        sample_ti_url_identifier: str,
+        sample_update_payload: dict[str, Any],
+        session: Session,
+    ):
+        """Test with an authorized user and the user is a respondent to the task."""
+        response = test_client.patch(
+            f"{sample_ti_url_identifier}/hitlDetails",
+            json=sample_update_payload,
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "params_input": {"input_1": 2},
+            "chosen_options": ["Approve"],
+            "responded_by": {"id": "test", "name": "test"},
+            "responded_at": "2025-07-03T00:00:00Z",
+        }
+
+        audit_log = session.scalar(select(Log))
+        assert audit_log is not None
+        _assert_sample_audit_log(audit_log)
+
+    def test_should_respond_401(
+        self,
+        unauthenticated_test_client: TestClient,
+        sample_ti_url_identifier: str,
+        sample_update_payload: dict[str, Any],
+    ) -> None:
+        response = unauthenticated_test_client.patch(
+            f"{sample_ti_url_identifier}/hitlDetails",
+            json=sample_update_payload,
+        )
+        assert response.status_code == 401
+
+    def test_should_respond_403(
+        self,
+        unauthorized_test_client: TestClient,
+        sample_ti_url_identifier: str,
+        sample_update_payload: dict[str, Any],
+    ) -> None:
+        response = unauthorized_test_client.patch(
+            f"{sample_ti_url_identifier}/hitlDetails",
+            json=sample_update_payload,
+        )
+        assert response.status_code == 403
+
+    @time_machine.travel(datetime(2025, 7, 3, 0, 0, 0), tick=False)
+    @pytest.mark.usefixtures("sample_hitl_detail_non_respondent")
+    def test_should_respond_403_to_non_respondent_user(
+        self,
+        test_client: TestClient,
+        sample_ti_url_identifier: str,
+        sample_update_payload: dict[str, Any],
+    ):
+        """Test with an authorized user but the user is not a respondent to the task."""
+        response = test_client.patch(
+            f"{sample_ti_url_identifier}/hitlDetails",
+            json=sample_update_payload,
+        )
+        assert response.status_code == 403
+
+    def test_should_respond_404_without_ti(
+        self,
+        test_client: TestClient,
+        sample_ti_url_identifier: str,
+    ) -> None:
+        response = test_client.patch(
+            f"{sample_ti_url_identifier}/hitlDetails",
+            json={"chosen_options": ["Approve"], "params_input": {"input_1": 2}},
+        )
+        assert response.status_code == 404
+        assert response.json() == {"detail": expected_ti_not_found_error_msg}
+
+    def test_should_respond_404_without_hitl_detail(
+        self,
+        test_client: TestClient,
+        sample_ti_url_identifier: str,
+        sample_update_payload: dict[str, Any],
+        expected_hitl_detail_not_found_error_msg: str,
+    ) -> None:
+        response = test_client.patch(
+            f"{sample_ti_url_identifier}/hitlDetails",
+            json=sample_update_payload,
+        )
+
+        assert response.status_code == 404
+        assert response.json() == {"detail": expected_hitl_detail_not_found_error_msg}
+
+    @time_machine.travel(datetime(2025, 7, 3, 0, 0, 0), tick=False)
+    @pytest.mark.usefixtures("sample_hitl_detail", "park_sample_ti")
+    def test_should_respond_409(
+        self,
+        test_client: TestClient,
+        sample_ti_url_identifier: str,
+        sample_ti: TaskInstance,
+    ) -> None:
+        response = test_client.patch(
+            f"{sample_ti_url_identifier}/hitlDetails",
+            json={"chosen_options": ["Approve"], "params_input": {"input_1": 2}},
+        )
+
+        expected_response = {
+            "params_input": {"input_1": 2},
+            "chosen_options": ["Approve"],
+            "responded_by": {"id": "test", "name": "test"},
+            "responded_at": "2025-07-03T00:00:00Z",
+        }
+        assert response.status_code == 200
+        assert response.json() == expected_response
+
+        response = test_client.patch(
+            f"{sample_ti_url_identifier}/hitlDetails",
+            json={"chosen_options": ["Approve"], "params_input": {"input_1": 3}},
+        )
+        assert response.status_code == 409
+        assert response.json() == {
+            "detail": (
+                "Human-in-the-loop detail has already been updated for Task Instance "
+                f"with id {sample_ti.id} "
+                "and is not allowed to write again."
+            )
+        }
+
+    @pytest.mark.usefixtures("sample_hitl_detail")
+    @pytest.mark.parametrize(
+        "state",
+        [
+            None,
+            TaskInstanceState.SCHEDULED,
+            TaskInstanceState.QUEUED,
+            TaskInstanceState.RUNNING,
+            TaskInstanceState.FAILED,
+        ],
+    )
+    def test_a_response_to_a_task_no_longer_waiting_is_refused(
+        self,
+        test_client: TestClient,
+        sample_ti_url_identifier: str,
+        sample_update_payload: dict[str, Any],
+        sample_ti: TaskInstance,
+        session: Session,
+        state: TaskInstanceState | None,
+    ) -> None:
+        ti = session.get(TIModel, sample_ti.id)
+        assert ti is not None
+        ti.state = state
+        ti.next_method = "execute_complete"
+        ti.next_kwargs = {}
+        session.commit()
+
+        response = test_client.patch(f"{sample_ti_url_identifier}/hitlDetails", json=sample_update_payload)
+
+        assert response.status_code == 409
+        assert response.json() == {
+            "detail": (
+                "The Task Instance is no longer waiting for a response, so this Human-in-the-loop "
+                "response was not recorded."
+            )
+        }
+        session.expire_all()
+        detail = session.get(HITLDetail, sample_ti.id)
+        assert detail is not None
+        assert not detail.response_received
+        assert detail.responded_at is None
+        assert detail.responded_by is None
+        assert detail.chosen_options is None
+        refreshed = session.get(TIModel, sample_ti.id)
+        assert refreshed is not None
+        assert refreshed.state == state
+        assert refreshed.next_kwargs == {}
+
+    @pytest.mark.usefixtures("sample_hitl_detail")
+    @pytest.mark.parametrize("state", [TaskInstanceState.AWAITING_INPUT, TaskInstanceState.DEFERRED])
+    def test_a_response_to_a_waiting_task_is_recorded_and_resumes_it(
+        self,
+        test_client: TestClient,
+        sample_ti_url_identifier: str,
+        sample_update_payload: dict[str, Any],
+        sample_ti: TaskInstance,
+        session: Session,
+        state: TaskInstanceState,
+    ) -> None:
+        ti = session.get(TIModel, sample_ti.id)
+        assert ti is not None
+        ti.state = state
+        ti.next_method = "execute_complete"
+        ti.next_kwargs = {}
+        session.commit()
+
+        response = test_client.patch(f"{sample_ti_url_identifier}/hitlDetails", json=sample_update_payload)
+
+        assert response.status_code == 200
+        session.expire_all()
+        detail = session.get(HITLDetail, sample_ti.id)
+        assert detail is not None
+        assert detail.response_received
+        assert detail.chosen_options == ["Approve"]
+        refreshed = session.get(TIModel, sample_ti.id)
+        assert refreshed is not None
+        assert refreshed.state == TaskInstanceState.SCHEDULED
+        assert "event" in (refreshed.next_kwargs or {})
+
+    @time_machine.travel(datetime(2025, 7, 3, 0, 0, 0, tzinfo=utc), tick=False)
+    @pytest.mark.usefixtures("sample_hitl_detail")
+    def test_a_response_after_trigger_timeout_is_accepted_while_still_awaiting_input(
+        self,
+        test_client: TestClient,
+        sample_ti_url_identifier: str,
+        sample_update_payload: dict[str, Any],
+        sample_ti: TaskInstance,
+        session: Session,
+    ) -> None:
+        """The gate looks at state only: the scheduler has not timed the task out yet, so it is still waiting."""
+        ti = session.get(TIModel, sample_ti.id)
+        assert ti is not None
+        ti.state = TaskInstanceState.AWAITING_INPUT
+        ti.next_method = "execute_complete"
+        ti.next_kwargs = {}
+        ti.trigger_timeout = datetime(2025, 7, 2, 0, 0, 0, tzinfo=utc)
+        session.commit()
+
+        response = test_client.patch(f"{sample_ti_url_identifier}/hitlDetails", json=sample_update_payload)
+
+        assert response.status_code == 200
+        session.expire_all()
+        detail = session.get(HITLDetail, sample_ti.id)
+        assert detail is not None
+        assert detail.response_received
+        assert detail.chosen_options == ["Approve"]
+        refreshed = session.get(TIModel, sample_ti.id)
+        assert refreshed is not None
+        assert refreshed.state == TaskInstanceState.SCHEDULED
+        assert "event" in (refreshed.next_kwargs or {})
+
+    @pytest.mark.usefixtures("sample_hitl_detail")
+    def test_a_response_for_a_replaced_request_is_refused(
+        self,
+        test_client: TestClient,
+        sample_ti_url_identifier: str,
+        sample_ti: TaskInstance,
+        session: Session,
+    ) -> None:
+        """A form loaded before the task asked again names the old request; it must not answer the new one."""
+        loaded = test_client.get(f"{sample_ti_url_identifier}/hitlDetails").json()["created_at"]
+        # The task asks again: core replaces the request, and with it created_at.
+        detail = session.get(HITLDetail, sample_ti.id)
+        assert detail is not None
+        detail.created_at = detail.created_at + timedelta(minutes=5)
+        session.commit()
+
+        response = test_client.patch(
+            f"{sample_ti_url_identifier}/hitlDetails",
+            json={"chosen_options": ["Approve"], "params_input": {}, "request_created_at": loaded},
+        )
+
+        assert response.status_code == 409
+        assert "replaced after it was loaded" in response.json()["detail"]
+        session.expire_all()
+        unanswered = session.get(HITLDetail, sample_ti.id)
+        assert unanswered is not None
+        assert not unanswered.response_received
+
+    @pytest.mark.usefixtures("sample_hitl_detail", "park_sample_ti")
+    def test_a_stale_response_to_an_answered_request_reports_it_answered(
+        self,
+        test_client: TestClient,
+        sample_ti_url_identifier: str,
+        sample_ti: TaskInstance,
+        session: Session,
+    ) -> None:
+        """Nothing is waiting, so the error must not tell the user to answer the waiting request."""
+        loaded = test_client.get(f"{sample_ti_url_identifier}/hitlDetails").json()["created_at"]
+        detail = session.get(HITLDetail, sample_ti.id)
+        assert detail is not None
+        detail.created_at = detail.created_at + timedelta(minutes=5)
+        session.commit()
+        answered = test_client.patch(
+            f"{sample_ti_url_identifier}/hitlDetails",
+            json={"chosen_options": ["Approve"], "params_input": {"input_1": 2}},
+        )
+        assert answered.status_code == 200
+
+        response = test_client.patch(
+            f"{sample_ti_url_identifier}/hitlDetails",
+            json={"chosen_options": ["Approve"], "params_input": {}, "request_created_at": loaded},
+        )
+
+        assert response.status_code == 409
+        assert "already been updated" in response.json()["detail"]
+
+    @pytest.mark.usefixtures("sample_hitl_detail")
+    def test_a_naive_request_created_at_is_rejected(
+        self,
+        test_client: TestClient,
+        sample_ti_url_identifier: str,
+    ) -> None:
+        response = test_client.patch(
+            f"{sample_ti_url_identifier}/hitlDetails",
+            json={"chosen_options": ["Approve"], "request_created_at": "2025-07-03T00:00:00"},
+        )
+
+        assert response.status_code == 422
+
+    @pytest.mark.usefixtures("sample_hitl_detail", "park_sample_ti")
+    def test_a_response_naming_the_waiting_request_is_applied(
+        self,
+        test_client: TestClient,
+        sample_ti_url_identifier: str,
+    ) -> None:
+        loaded = test_client.get(f"{sample_ti_url_identifier}/hitlDetails").json()["created_at"]
+
+        response = test_client.patch(
+            f"{sample_ti_url_identifier}/hitlDetails",
+            json={
+                "chosen_options": ["Approve"],
+                "params_input": {"input_1": 2},
+                "request_created_at": loaded,
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["chosen_options"] == ["Approve"]
+
+    @pytest.mark.usefixtures("sample_hitl_detail")
+    def test_should_respond_422_with_empty_option(
+        self,
+        test_client: TestClient,
+        sample_ti_url_identifier: str,
+    ) -> None:
+        response = test_client.patch(
+            f"{sample_ti_url_identifier}/hitlDetails",
+            json={"chosen_options": [], "params_input": {"input_1": 2}},
+        )
+
+        assert response.status_code == 422
+
+
+class TestGetHITLDetailEndpoint:
+    @pytest.mark.usefixtures("sample_hitl_detail")
+    def test_should_respond_200_with_existing_response(
+        self,
+        test_client: TestClient,
+        sample_ti_url_identifier: str,
+        expected_sample_hitl_detail_dict: dict[str, Any],
+    ) -> None:
+        response = test_client.get(f"{sample_ti_url_identifier}/hitlDetails")
+        assert response.status_code == 200
+        assert response.json() == expected_sample_hitl_detail_dict
+
+    def test_should_respond_401(
+        self,
+        unauthenticated_test_client: TestClient,
+        sample_ti_url_identifier: str,
+    ) -> None:
+        response = unauthenticated_test_client.get(f"{sample_ti_url_identifier}/hitlDetails")
+        assert response.status_code == 401
+
+    def test_should_respond_403(
+        self,
+        unauthorized_test_client: TestClient,
+        sample_ti_url_identifier: str,
+    ) -> None:
+        response = unauthorized_test_client.get(f"{sample_ti_url_identifier}/hitlDetails")
+        assert response.status_code == 403
+
+    def test_should_respond_404_without_ti(
+        self,
+        test_client: TestClient,
+        sample_ti_url_identifier: str,
+    ) -> None:
+        response = test_client.get(f"{sample_ti_url_identifier}/hitlDetails")
+        assert response.status_code == 404
+        assert response.json() == {"detail": expected_ti_not_found_error_msg}
+
+    def test_should_respond_404_without_hitl_detail(
+        self,
+        test_client: TestClient,
+        sample_ti_url_identifier: str,
+        expected_hitl_detail_not_found_error_msg: str,
+    ) -> None:
+        response = test_client.get(f"{sample_ti_url_identifier}/hitlDetails")
+        assert response.status_code == 404
+        assert response.json() == {"detail": expected_hitl_detail_not_found_error_msg}
+
+
+class TestGetHITLDetailsEndpoint:
+    def test_lists_only_current_task_instance_details(
+        self, test_client, sample_ti, sample_hitl_detail, session
+    ):
+        old_id = sample_ti.id
+        successor = sample_ti.prepare_db_for_next_try(session)
+        session.add(
+            HITLDetail(
+                ti_id=successor.id,
+                options=["Approve", "Reject"],
+                subject="Current subject",
+                body="Current body",
+                defaults=["Approve"],
+                multiple=False,
+                params={},
+                assignees=None,
+            )
+        )
+        session.commit()
+
+        response = test_client.get("/dags/~/dagRuns/~/hitlDetails")
+
+        assert response.status_code == 200
+        assert response.json()["total_entries"] == 1
+        assert [detail["task_instance"]["id"] for detail in response.json()["hitl_details"]] == [
+            str(successor.id)
+        ]
+        assert session.get(HITLDetail, sample_hitl_detail.ti_id).ti_id == old_id
+
+    @pytest.mark.usefixtures("sample_hitl_detail")
+    def test_should_respond_200_with_existing_response(
+        self,
+        test_client: TestClient,
+        expected_sample_hitl_detail_dict: dict[str, Any],
+    ) -> None:
+        with assert_queries_count(5):
+            response = test_client.get("/dags/~/dagRuns/~/hitlDetails")
+        assert response.status_code == 200
+        assert response.json() == {
+            "hitl_details": [expected_sample_hitl_detail_dict],
+            "total_entries": 1,
+        }
+
+    @pytest.mark.usefixtures("sample_hitl_details")
+    @pytest.mark.parametrize(
+        ("params", "expected_ti_count"),
+        [
+            # ti related filter
+            ({"dag_id_pattern": "hitl_dag"}, 5),
+            ({"dag_id_pattern": "other_Dag_"}, 3),
+            ({"task_id": "hitl_task_0"}, 1),
+            ({"task_id_pattern": "another_hitl"}, 3),
+            ({"dag_id_prefix_pattern": "hitl_dag"}, 5),
+            ({"dag_id_prefix_pattern": "other_Dag_"}, 3),
+            ({"task_id_prefix_pattern": "another_hitl"}, 3),
+            ({"map_index": -1}, 8),
+            ({"map_index": 1}, 0),
+            ({"state": "deferred"}, 5),
+            ({"state": "success"}, 3),
+            # hitl detail related filter
+            ({"subject_search": "This is subject"}, 5),
+            ({"body_search": "this is"}, 8),
+            ({"response_received": False}, 5),
+            ({"response_received": True}, 3),
+            ({"responded_by_user_id": ["test"]}, 3),
+            ({"responded_by_user_name": ["test"]}, 3),
+            (
+                {"created_at_gte": from_datetime_to_zulu_without_ms(DEFAULT_CREATED_AT + timedelta(days=1))},
+                0,
+            ),
+            (
+                {"created_at_lte": from_datetime_to_zulu_without_ms(DEFAULT_CREATED_AT - timedelta(days=1))},
+                0,
+            ),
+            (
+                {
+                    "created_at_gte": from_datetime_to_zulu_without_ms(DEFAULT_CREATED_AT),
+                    "created_at_lte": from_datetime_to_zulu_without_ms(DEFAULT_CREATED_AT),
+                },
+                5,
+            ),
+        ],
+        ids=[
+            "dag_id_pattern_hitl_dag",
+            "dag_id_pattern_other_dag",
+            "task_id",
+            "task_id_pattern",
+            "dag_id_prefix_pattern_hitl_dag",
+            "dag_id_prefix_pattern_other_dag",
+            "task_id_prefix_pattern",
+            "map_index_none",
+            "map_index_1",
+            "ti_state_deferred",
+            "ti_state_success",
+            "subject",
+            "body",
+            "response_not_received",
+            "response_received",
+            "responded_by_user_id",
+            "responded_by_user_name",
+            "created_at_gte",
+            "created_at_lte",
+            "created_at",
+        ],
+    )
+    def test_should_respond_200_with_existing_response_and_query(
+        self,
+        test_client: TestClient,
+        params: dict[str, Any],
+        expected_ti_count: int,
+    ) -> None:
+        with assert_queries_count(5):
+            response = test_client.get("/dags/~/dagRuns/~/hitlDetails", params=params)
+        assert response.status_code == 200
+        assert response.json()["total_entries"] == expected_ti_count
+        assert len(response.json()["hitl_details"]) == expected_ti_count
+
+    @conf_vars({("core", "multi_team"): "True"})
+    @pytest.mark.usefixtures("sample_hitl_details")
+    def test_should_respond_200_filtered_by_team(
+        self,
+        test_client: TestClient,
+        session: Session,
+    ) -> None:
+        _attach_dag_to_team("hitl_dag_0", "team-hitl", session=session)
+        try:
+            response = test_client.get("/dags/~/dagRuns/~/hitlDetails", params={"teams": ["team-hitl"]})
+            assert response.status_code == 200
+            response_data = response.json()
+            assert response_data["total_entries"] == 1
+            assert {detail["task_instance"]["dag_id"] for detail in response_data["hitl_details"]} == {
+                "hitl_dag_0"
+            }
+            assert {detail["task_instance"]["team_name"] for detail in response_data["hitl_details"]} == {
+                "team-hitl"
+            }
+
+            response = test_client.get(
+                "/dags/~/dagRuns/~/hitlDetails", params={"teams": ["team-without-dags"]}
+            )
+            assert response.status_code == 200
+            assert response.json()["total_entries"] == 0
+        finally:
+            clear_db_dags()
+            clear_db_dag_bundles()
+            clear_db_teams()
+
+    @pytest.mark.usefixtures("sample_hitl_details")
+    def test_should_respond_200_with_existing_response_and_concrete_query(
+        self,
+        test_client: TestClient,
+    ) -> None:
+        response = test_client.get("/dags/hitl_dag_0/dagRuns/hitl_run_0/hitlDetails")
+        assert response.status_code == 200
+        assert response.json() == {
+            "hitl_details": [
+                {
+                    "task_instance": mock.ANY,
+                    "options": ["Approve", "Reject"],
+                    "subject": "This is subject 0",
+                    "body": "this is body 0",
+                    "defaults": ["Approve"],
+                    "multiple": False,
+                    "params": {"input_1": {"value": 1, "schema": {}, "description": None}},
+                    "assigned_users": [],
+                    "created_at": from_datetime_to_zulu_without_ms(DEFAULT_CREATED_AT),
+                    "responded_by_user": None,
+                    "responded_at": None,
+                    "chosen_options": None,
+                    "params_input": {},
+                    "response_received": False,
+                }
+            ],
+            "total_entries": 1,
+        }
+
+    @pytest.mark.usefixtures("sample_hitl_details")
+    @pytest.mark.parametrize("asc_desc_mark", ["", "-"], ids=["asc", "desc"])
+    @pytest.mark.parametrize(
+        ("key", "get_key_lambda"),
+        [
+            # ti key
+            ("ti_id", lambda x: x["task_instance"]["id"]),
+            ("dag_id", lambda x: x["task_instance"]["dag_id"]),
+            ("run_id", lambda x: x["task_instance"]["dag_run_id"]),
+            ("run_after", lambda x: x["task_instance"]["run_after"]),
+            ("rendered_map_index", lambda x: x["task_instance"]["rendered_map_index"]),
+            ("task_instance_operator", lambda x: x["task_instance"]["operator_name"]),
+            ("task_instance_state", lambda x: x["task_instance"]["state"]),
+            # hitl key
+            ("subject", itemgetter("subject")),
+            ("responded_at", itemgetter("responded_at")),
+            ("created_at", itemgetter("created_at")),
+        ],
+        ids=[
+            # ti key
+            "ti_id",
+            "dag_id",
+            "run_id",
+            "run_after",
+            "rendered_map_index",
+            "task_instance_operator",
+            "task_instance_state",
+            # hitl key
+            "subject",
+            "responded_at",
+            "created_at",
+        ],
+    )
+    def test_should_respond_200_with_existing_response_and_order_by(
+        self,
+        test_client: TestClient,
+        asc_desc_mark: str,
+        key: str,
+        get_key_lambda: Callable,
+    ) -> None:
+        reverse = asc_desc_mark == "-"
+
+        response = test_client.get(
+            "/dags/~/dagRuns/~/hitlDetails", params={"order_by": f"{asc_desc_mark}{key}"}
+        )
+        data = response.json()
+        hitl_details = data["hitl_details"]
+
+        assert response.status_code == 200
+        assert data["total_entries"] == 8
+        assert len(hitl_details) == 8
+
+        sorted_hitl_details = sorted(
+            hitl_details,
+            key=lambda x: (
+                # pull none to the last no matter it's asc or desc
+                (get_key_lambda(x) is not None) if reverse else (get_key_lambda(x) is None),
+                get_key_lambda(x),
+                x["task_instance"]["id"],
+            ),
+            reverse=reverse,
+        )
+
+        # Remove entries with None, because None orders depends on the DB implementation
+        hitl_details = [d for d in hitl_details if get_key_lambda(d) is not None]
+        sorted_hitl_details = [d for d in sorted_hitl_details if get_key_lambda(d) is not None]
+
+        assert hitl_details == sorted_hitl_details
+
+    def test_should_respond_200_without_response(self, test_client: TestClient) -> None:
+        response = test_client.get("/dags/~/dagRuns/~/hitlDetails")
+        assert response.status_code == 200
+        assert response.json() == {
+            "hitl_details": [],
+            "total_entries": 0,
+        }
+
+    def test_should_respond_401(self, unauthenticated_test_client: TestClient) -> None:
+        response = unauthenticated_test_client.get("/dags/~/dagRuns/~/hitlDetails")
+        assert response.status_code == 401
+
+    def test_should_respond_403(self, unauthorized_test_client: TestClient) -> None:
+        response = unauthorized_test_client.get("/dags/~/dagRuns/~/hitlDetails")
+        assert response.status_code == 403

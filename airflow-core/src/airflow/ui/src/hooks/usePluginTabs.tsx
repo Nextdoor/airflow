@@ -1,0 +1,65 @@
+/*!
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import type { ReactNode } from "react";
+
+import { LuPlug } from "react-icons/lu";
+
+import { usePluginServiceGetPlugins } from "openapi/queries";
+
+import { useColorMode } from "src/context/colorMode";
+import { useScopedPluginViews } from "src/hooks/useScopedPluginViews";
+import { getPluginIconSrc } from "src/utils/pluginIcon";
+
+type TabPlugin = {
+  icon: ReactNode;
+  label: string;
+  showIconWithLabel: boolean;
+  value: string;
+};
+
+export const usePluginTabs = (destination: string): Array<TabPlugin> => {
+  const { colorMode } = useColorMode();
+  const { data: pluginData } = usePluginServiceGetPlugins();
+
+  const views =
+    pluginData?.plugins.flatMap((plugin) => [...plugin.external_views, ...plugin.react_apps]) ?? [];
+
+  const scopedViews = useScopedPluginViews(views, destination);
+
+  return scopedViews
+    .filter((view) => Boolean(view.url_route))
+    .map((view) => {
+      const iconSrc = getPluginIconSrc(view, colorMode);
+      const hasIconInEveryTheme = Boolean(view.icon);
+
+      const icon =
+        iconSrc === undefined ? (
+          <LuPlug />
+        ) : (
+          <img alt={view.name} src={iconSrc} style={{ height: "1rem", width: "1rem" }} />
+        );
+
+      return {
+        icon,
+        label: view.name,
+        showIconWithLabel: view.show_icon_with_label === true && hasIconInEveryTheme,
+        value: `plugin/${view.url_route}`,
+      };
+    });
+};

@@ -1,0 +1,236 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import re
+from typing import TYPE_CHECKING
+
+from airflow.providers.common.compat.openlineage.check import require_openlineage_version
+from airflow.providers.dbt.cloud.hooks.dbt import DBT_CAUSE_MAX_LENGTH
+
+if TYPE_CHECKING:
+    from airflow.models.taskinstance import TaskInstance
+    from airflow.providers.dbt.cloud.operators.dbt import DbtCloudRunJobOperator
+    from airflow.providers.dbt.cloud.sensors.dbt import DbtCloudJobRunSensor
+    from airflow.providers.openlineage.extractors.base import OperatorLineage
+
+
+log = logging.getLogger(__name__)
+
+
+def _get_parent_run_metadata(task_instance):
+    """
+    Retrieve the ParentRunMetadata associated with a specific Airflow task instance.
+
+    This metadata helps link OpenLineage events of child jobs to the original Airflow task execution.
+    Establishing this connection enables better lineage tracking and observability.
+    """
+    from openlineage.common.provider.dbt import ParentRunMetadata
+
+    from airflow.providers.openlineage.plugins.macros import (
+        lineage_job_name,
+        lineage_job_namespace,
+        lineage_root_job_name,
+        lineage_root_job_namespace,
+        lineage_root_run_id,
+        lineage_run_id,
+    )
+
+    return ParentRunMetadata(
+        run_id=lineage_run_id(task_instance),
+        job_name=lineage_job_name(task_instance),
+        job_namespace=lineage_job_namespace(),
+        root_parent_run_id=lineage_root_run_id(task_instance),
+        root_parent_job_name=lineage_root_job_name(task_instance),
+        root_parent_job_namespace=lineage_root_job_namespace(task_instance),
+    )
+
+
+def _get_openlineage_parent_facet_dict(task_instance) -> dict:
+    """Build the OpenLineage ``ParentRunFacet`` payload (parent and root) for a task instance."""
+    metadata = _get_parent_run_metadata(task_instance)
+    return {
+        "parent": {
+            "run": {"runId": metadata.run_id},
+            "job": {"namespace": metadata.job_namespace, "name": metadata.job_name},
+        },
+        "root": {
+            "run": {"runId": metadata.root_parent_run_id},
+            "job": {
+                "namespace": metadata.root_parent_job_namespace,
+                "name": metadata.root_parent_job_name,
+            },
+        },
+    }
+
+
+def inject_parent_job_information_into_dbt_cloud_cause(cause: str | None, task_instance) -> str | None:
+    """
+    Replace the dbt Cloud run ``cause`` with OpenLineage parent job information as JSON.
+
+    This serializes the Airflow task's OpenLineage parent (and root) run identifiers into the
+    triggered run's ``cause`` field. A consumer that reads dbt Cloud runs can parse this JSON and
+    attach a ``ParentRunFacet``, linking the dbt Cloud run back to the Airflow task that triggered it.
+
+    The dbt Cloud ``cause`` is limited to ``DBT_CAUSE_MAX_LENGTH`` characters. The essential ``parent``
+    link is always kept; the ``root`` block is dropped if the two together do not fit. If even the
+    parent-only payload does not fit, the original ``cause`` is returned unchanged.
+    """
+    try:
+        facet = _get_openlineage_parent_facet_dict(task_instance)
+    except ImportError:
+        log.warning(
+            "Could not import OpenLineage provider. Skipping the injection of OpenLineage "
+            "parent job information into the dbt Cloud run cause."
+        )
+        return cause
+
+    candidates = [
+        {"parent": facet["parent"], "root": facet["root"]},
+        {"parent": facet["parent"]},
+    ]
+    for payload in candidates:
+        serialized = json.dumps(payload, separators=(",", ":"))
+        if len(serialized) <= DBT_CAUSE_MAX_LENGTH:
+            return serialized
+
+    log.warning(
+        "OpenLineage parent job information exceeds the dbt Cloud cause limit of %s characters. "
+        "Skipping the injection of OpenLineage parent job information into the dbt Cloud run cause.",
+        DBT_CAUSE_MAX_LENGTH,
+    )
+    return cause
+
+
+@require_openlineage_version(provider_min_version="2.16.0")
+def generate_openlineage_events_from_dbt_cloud_run(
+    operator: DbtCloudRunJobOperator | DbtCloudJobRunSensor, task_instance: TaskInstance
+) -> OperatorLineage:
+    """
+    Generate OpenLineage events from the DBT Cloud run.
+
+    This function retrieves information about a DBT Cloud run, including the associated job,
+    project, and execution details. It processes the run's artifacts, such as the manifest and run results,
+    in parallel for many steps.
+    Then it generates and emits OpenLineage events based on the executed DBT tasks.
+
+    :param operator: Instance of DBT Cloud operator that executed DBT tasks.
+        It already should have run_id and dbt cloud hook.
+    :param task_instance: Currently executed task instance
+
+    :return: An empty OperatorLineage object indicating the completion of events generation.
+    """
+    from openlineage.common.provider.dbt import DbtCloudArtifactProcessor
+
+    from airflow.providers.openlineage.api import emit
+    from airflow.providers.openlineage.extractors import OperatorLineage
+    from airflow.providers.openlineage.plugins.adapter import _PRODUCER
+
+    # if no account_id set this will fallback
+    log.debug("Retrieving information about DBT job run.")
+    job_run = operator.hook.get_job_run(
+        run_id=operator.run_id, account_id=operator.account_id, include_related=["run_steps,job"]
+    ).json()["data"]
+    job = job_run["job"]
+    # retrieve account_id from job and use that starting from this line
+    account_id = job["account_id"]
+    project = operator.hook.get_project(project_id=job["project_id"], account_id=account_id).json()["data"]
+    connection = project["connection"]
+    execute_steps = job["execute_steps"]
+    run_steps = job_run["run_steps"]
+
+    log.debug("Filtering only DBT invocation steps for further processing.")
+    # filter only dbt invocation steps
+    steps = []
+    for run_step in run_steps:
+        name = run_step["name"]
+        if name.startswith("Invoke dbt with `"):
+            regex_pattern = "Invoke dbt with `([^`.]*)`"
+            m = re.search(regex_pattern, name)
+            if m and m.group(1) in execute_steps:
+                steps.append(run_step["index"])
+
+    # catalog is available only if docs are generated
+    catalog = None
+    try:
+        log.debug("Retrieving information about catalog artifact from DBT.")
+        catalog = operator.hook.get_job_run_artifact(operator.run_id, path="catalog.json").json()["data"]
+    except Exception:
+        log.info(
+            "Openlineage could not find DBT catalog artifact, usually available when docs are generated."
+            "Proceeding with metadata extraction. "
+            "If you see error logs above about `HTTP error: Not Found` it's safe to ignore them."
+        )
+
+    async def get_artifacts_for_steps(steps, artifacts):
+        """Get artifacts for a list of steps concurrently."""
+        tasks = [
+            operator.hook.get_job_run_artifacts_concurrently(
+                run_id=operator.run_id,
+                account_id=account_id,
+                step=step,
+                artifacts=artifacts,
+            )
+            for step in steps
+        ]
+        return await asyncio.gather(*tasks)
+
+    # get artifacts for steps concurrently
+    log.debug("Retrieving information about artifacts for all job steps from DBT.")
+    step_artifacts = asyncio.run(
+        get_artifacts_for_steps(steps=steps, artifacts=["manifest.json", "run_results.json"])
+    )
+
+    log.debug("Preparing OpenLineage parent job information to be included in DBT events.")
+    parent_metadata = _get_parent_run_metadata(task_instance)
+
+    # process each step in loop, sending generated events in the same order as steps
+    for counter, artifacts in enumerate(step_artifacts, 1):
+        log.debug("Parsing information about artifact no. %s.", counter)
+
+        # process manifest
+        manifest = artifacts["manifest.json"]
+
+        if not artifacts.get("run_results.json", None):
+            log.debug("No run results found for artifact no. %s. Skipping.", counter)
+            continue
+
+        processor = DbtCloudArtifactProcessor(
+            producer=_PRODUCER,
+            job_namespace=parent_metadata.job_namespace,
+            skip_errors=False,
+            logger=operator.log,
+            manifest=manifest,
+            run_result=artifacts["run_results.json"],
+            profile=connection,
+            catalog=catalog,
+        )
+
+        processor.dbt_run_metadata = parent_metadata
+
+        events = processor.parse().events()
+        log.debug("Found %s OpenLineage events for artifact no. %s.", len(events), counter)
+
+        for event in events:
+            emit(event)
+        log.debug("Emitted all OpenLineage events for artifact no. %s.", counter)
+
+    log.info("OpenLineage has successfully finished processing information about DBT job run.")
+    return OperatorLineage()

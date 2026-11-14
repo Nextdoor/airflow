@@ -1,0 +1,309 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+"""Default celery configuration."""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+import ssl
+from typing import TYPE_CHECKING, cast
+
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError, NoSuchModuleError
+
+from airflow.exceptions import AirflowConfigException as CoreAirflowConfigException
+from airflow.providers.celery.version_compat import AIRFLOW_V_3_0_PLUS
+from airflow.providers.common.compat.sdk import AirflowConfigException, AirflowException, conf
+
+if TYPE_CHECKING:
+    from typing import Any
+
+    from airflow.sdk.configuration import AirflowSDKConfigParser
+
+log = logging.getLogger(__name__)
+
+_USE_PSYCOPG3: bool
+try:
+    from importlib.metadata import version
+    from importlib.util import find_spec
+
+    from packaging.version import Version
+
+    _is_sqla2 = Version(version("sqlalchemy")) >= Version("2.0.0")
+    _USE_PSYCOPG3 = _is_sqla2 and find_spec("psycopg") is not None
+except (ImportError, ModuleNotFoundError):
+    _USE_PSYCOPG3 = False
+
+
+# broker_transport_options accessed as dict
+# e.g. https://github.com/celery/kombu/blob/4281680ef3a275a7d87433a703790251d9805803/kombu/transport/confluentkafka.py#L338
+_BROKER_TRANSPORT_DICT_OPTIONS = [
+    "client-config",
+    "fetch_message_attributes",
+    "kafka_admin_config",
+    "kafka_common_config",
+    "kafka_consumer_config",
+    "kafka_producer_config",
+    "predefined_exchanges",
+    "predefined_queues",
+    "queue_tags",
+    "sentinel_kwargs",
+    "sqs-creation-attributes",
+]
+
+
+def _broker_supports_visibility_timeout(url):
+    return url.startswith(("redis://", "rediss://", "sqs://", "sentinel://"))
+
+
+def _broker_transport_options(broker_url: str, conf: AirflowSDKConfigParser | Any) -> dict[str, Any]:
+    """
+    Parse broker_transport_options including dict options.
+
+    :param broker_url: Celery broker url
+    :param conf: ExecutorConf object
+    :return: broker_transport_options dict
+    """
+    broker_transport_options: dict[str, str | int | float | Any] = (
+        conf.getsection("celery_broker_transport_options") or {}
+    )
+    if "visibility_timeout" not in broker_transport_options:
+        if _broker_supports_visibility_timeout(broker_url):
+            broker_transport_options["visibility_timeout"] = 86400
+            log.warning(
+                "No visibility_timeout configured in [celery_broker_transport_options]. "
+                "Using default of 86400 seconds (24 hours). Celery tasks running longer than this "
+                "will be redelivered by the broker. On Airflow 3.2.0 and newer the redelivered "
+                "message is discarded and the original task keeps running; on earlier versions the "
+                "redelivery terminates the original task. "
+                "If you have long-running tasks, increase this value in your Airflow configuration: "
+                "[celery_broker_transport_options] visibility_timeout = <seconds>"
+            )
+
+    # Parse dict options
+    for option in _BROKER_TRANSPORT_DICT_OPTIONS:
+        if option in broker_transport_options:
+            try:
+                option_value = broker_transport_options[option]
+                if not isinstance(option_value, str):
+                    raise ValueError(f"broker_transport_option {option} is not string: {option_value}")
+                option_json = json.loads(option_value)
+                if not isinstance(option_json, dict):
+                    raise ValueError(
+                        f"broker_transport_option {option} value is not dictionary: {option_json}"
+                    )
+                broker_transport_options[option] = option_json
+            except Exception as exc:
+                raise ValueError(
+                    f"Broker transport option {option} value should be written in the correct JSON format."
+                ) from exc
+    return broker_transport_options
+
+
+def _get_database_engine_options(result_backend: str, options: dict[str, Any]) -> dict[str, Any]:
+    if not result_backend.startswith("db+"):
+        return options
+    try:
+        driver = make_url(result_backend.removeprefix("db+")).get_driver_name()
+    except (ArgumentError, NoSuchModuleError):
+        # Defer invalid or unavailable dialects to Celery's backend initialization.
+        return options
+    if driver != "psycopg":
+        return options
+    # Celery creates its own engines, so metadata-engine defaults do not protect transaction poolers.
+    return {
+        **options,
+        "connect_args": {"prepare_threshold": None, **options.get("connect_args", {})},
+    }
+
+
+def get_default_celery_config(team_conf: AirflowSDKConfigParser | Any) -> dict[str, Any]:
+    """
+    Build Celery configuration using team-aware config.
+
+    For Airflow versions < 3.2 that don't support multi-team configuration,
+    falls back to using the global conf object.
+
+    :param team_conf: ExecutorConf instance with team-specific configuration, or conf object
+    :return: Dictionary with Celery configuration
+    """
+    # Check if team_conf supports team-specific config (has getsection method), if not then we know that
+    # we're not running in a multi-team capable Airflow version, so we fallback to using the global conf.
+    if not hasattr(team_conf, "getsection"):
+        team_conf = conf
+
+    broker_url = team_conf.get("celery", "BROKER_URL", fallback="redis://redis:6379/0")
+
+    broker_transport_options = _broker_transport_options(broker_url, team_conf)
+
+    if team_conf.has_option("celery", "RESULT_BACKEND"):
+        result_backend = team_conf.get_mandatory_value("celery", "RESULT_BACKEND")
+    else:
+        log.debug("Value for celery result_backend not found. Using sql_alchemy_conn with db+ prefix.")
+        sql_alchemy_conn = team_conf.get("database", "SQL_ALCHEMY_CONN")
+        # Airflow's sync metadata-database driver default is psycopg (v3); mirror that explicitly
+        # for driverless PostgreSQL URLs instead of relying on SQLAlchemy's own default. Fall back to
+        # psycopg2 when psycopg/SQLAlchemy 2.0 aren't both available, matching PostgresHook's own
+        # USE_PSYCOPG3 gating so this doesn't break environments still on the older combination.
+        target_scheme = "postgresql+psycopg://" if _USE_PSYCOPG3 else "postgresql+psycopg2://"
+        sql_alchemy_conn = sql_alchemy_conn.replace("postgresql://", target_scheme, 1)
+        result_backend = f"db+{sql_alchemy_conn}"
+
+    # Handle result backend transport options (for Redis Sentinel support)
+    result_backend_transport_options: dict = (
+        team_conf.getsection("celery_result_backend_transport_options") or {}
+    )
+    if "sentinel_kwargs" in result_backend_transport_options:
+        try:
+            result_sentinel_kwargs = json.loads(result_backend_transport_options["sentinel_kwargs"])
+            if not isinstance(result_sentinel_kwargs, dict):
+                raise ValueError
+            result_backend_transport_options["sentinel_kwargs"] = result_sentinel_kwargs
+        except Exception:
+            raise AirflowException(
+                "sentinel_kwargs in [celery_result_backend_transport_options] should be written "
+                "in the correct dictionary format."
+            )
+
+    extra_celery_config = team_conf.getjson("celery", "extra_celery_config", fallback={})
+
+    config = {
+        "accept_content": ["json"],
+        "event_serializer": "json",
+        "worker_prefetch_multiplier": team_conf.getint("celery", "worker_prefetch_multiplier", fallback=1),
+        "task_acks_late": team_conf.getboolean("celery", "task_acks_late", fallback=True),
+        "task_default_queue": team_conf.get("operators", "DEFAULT_QUEUE"),
+        "task_default_exchange": team_conf.get("operators", "DEFAULT_QUEUE"),
+        "task_track_started": team_conf.getboolean("celery", "task_track_started", fallback=True),
+        "broker_url": broker_url,
+        "broker_transport_options": broker_transport_options,
+        "broker_connection_retry_on_startup": team_conf.getboolean(
+            "celery", "broker_connection_retry_on_startup", fallback=True
+        ),
+        "result_backend": result_backend,
+        "result_backend_transport_options": result_backend_transport_options,
+        "database_engine_options": _get_database_engine_options(
+            result_backend,
+            cast(
+                "dict[str, Any]",
+                team_conf.getjson("celery", "result_backend_sqlalchemy_engine_options", fallback={}),
+            ),
+        ),
+        "worker_concurrency": team_conf.getint("celery", "WORKER_CONCURRENCY", fallback=16),
+        "worker_enable_remote_control": team_conf.getboolean(
+            "celery", "worker_enable_remote_control", fallback=True
+        ),
+        **(extra_celery_config if isinstance(extra_celery_config, dict) else {}),
+    }
+
+    # In order to not change anything pre Task Execution API, we leave this setting as it was (unset) in Airflow2
+    if AIRFLOW_V_3_0_PLUS:
+        config.setdefault("worker_redirect_stdouts", False)
+        config.setdefault("worker_hijack_root_logger", False)
+
+    # Handle SSL configuration
+    try:
+        celery_ssl_active = team_conf.getboolean("celery", "SSL_ACTIVE", fallback=False)
+    # ``team_conf`` is the Task SDK parser at module scope and core's ``ExecutorConf`` on the
+    # multi-team path. Their ``AirflowConfigException`` classes share a name but are not the same class.
+    except (AirflowConfigException, CoreAirflowConfigException):
+        log.warning("Celery Executor will run without SSL")
+        celery_ssl_active = False
+
+    try:
+        if celery_ssl_active:
+            ssl_mutual_tls = team_conf.getboolean("celery", "SSL_MUTUAL_TLS", fallback=True)
+            ssl_key = team_conf.get("celery", "SSL_KEY")
+            ssl_cert = team_conf.get("celery", "SSL_CERT")
+            ssl_cacert = team_conf.get("celery", "SSL_CACERT")
+
+            if ssl_mutual_tls and (not ssl_key or not ssl_cert):
+                raise ValueError(
+                    "SSL_MUTUAL_TLS is True (default) but SSL_KEY and/or SSL_CERT are not set. "
+                    "Set both for mutual TLS, or set SSL_MUTUAL_TLS=False for one-way TLS."
+                )
+
+            if not ssl_cacert:
+                log.info("SSL_CACERT is not set. Using system CA certificates for server verification.")
+
+            if not ssl_mutual_tls and (ssl_key or ssl_cert):
+                log.warning(
+                    "SSL_MUTUAL_TLS is False but SSL_KEY/SSL_CERT are configured. "
+                    "Client certificates will not be used. "
+                    "Set SSL_MUTUAL_TLS=True if you intend to use mutual TLS."
+                )
+
+            broker_use_ssl: dict[str, str | int] = {}
+
+            if broker_url and re.search(r"amqps?://", broker_url):
+                broker_use_ssl["cert_reqs"] = ssl.CERT_REQUIRED
+                if ssl_cacert:
+                    broker_use_ssl["ca_certs"] = ssl_cacert
+                if ssl_mutual_tls:
+                    broker_use_ssl["keyfile"] = ssl_key
+                    broker_use_ssl["certfile"] = ssl_cert
+            elif broker_url and re.search("rediss?://|sentinel://", broker_url):
+                broker_use_ssl["ssl_cert_reqs"] = ssl.CERT_REQUIRED
+                if ssl_cacert:
+                    broker_use_ssl["ssl_ca_certs"] = ssl_cacert
+                if ssl_mutual_tls:
+                    broker_use_ssl["ssl_keyfile"] = ssl_key
+                    broker_use_ssl["ssl_certfile"] = ssl_cert
+            else:
+                raise ValueError(
+                    "The broker you configured does not support SSL_ACTIVE to be True. "
+                    "Please use RabbitMQ or Redis if you would like to use SSL for broker."
+                )
+
+            config["broker_use_ssl"] = broker_use_ssl
+    except ValueError:
+        raise
+    except Exception as e:
+        raise RuntimeError(
+            f"Unknown Celery SSL error. Please ensure you want to use SSL and have all necessary certs and key ({e})."
+        ) from e
+
+    # Warning for not recommended backends
+    match_not_recommended_backend = re.search("rediss?://|amqp://|rpc://", result_backend)
+    if match_not_recommended_backend:
+        log.warning(
+            "You have configured a result_backend using the protocol `%s`,"
+            " it is highly recommended to use an alternative result_backend (i.e. a database).",
+            match_not_recommended_backend.group(0).strip("://"),
+        )
+
+    return config
+
+
+# IMPORTANT NOTE! Celery Executor has initialization done dynamically and it performs initialization when
+# it is imported, so we need fallbacks here in order to be able to import the class directly without
+# having configuration initialized before. Do not remove those fallbacks!
+#
+# This is not strictly needed for production:
+#
+#   * for Airflow 2.6 and before the defaults will come from the core defaults
+#   * for Airflow 2.7+ the defaults will be loaded via ProvidersManager
+#
+# But it helps in our tests to import the executor class and validate if the celery code can be imported
+# in the current and older versions of Airflow.
+
+# For backward compatibility, keep DEFAULT_CELERY_CONFIG at module level using global config
+# Use conf directly since we don't need team-specific config for the module-level default
+DEFAULT_CELERY_CONFIG = get_default_celery_config(conf)

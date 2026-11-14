@@ -1,0 +1,122 @@
+/*!
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import { useTranslation } from "react-i18next";
+import { FiGlobe } from "react-icons/fi";
+import { Link as RouterLink } from "react-router-dom";
+
+import type { MenuItem } from "openapi/requests/types.gen";
+
+import { Menu } from "src/system-components";
+
+import type { NavItemResponse } from "src/utils/types";
+
+import { NavButton } from "./NavButton";
+import { NavMenu } from "./NavMenu";
+import { PluginMenuItem } from "./PluginMenuItem";
+
+const links = [
+  {
+    href: "/events",
+    key: "auditLog",
+    title: "Audit Log",
+  },
+  {
+    href: "/dag_bundles",
+    key: "dagBundles",
+    // Must stay byte-identical to MenuItem.DAG_BUNDLES: the filter below matches on this string.
+    title: "Dag Bundles",
+  },
+  {
+    href: "/dag_runs",
+    key: "dagRuns",
+    // Reuses the label the Dags pages already show on their tabs.
+    labelKey: "dagRun_other",
+    // There is no menu item of its own for Dag runs: they follow the Dags permission.
+    title: "Dags",
+  },
+  {
+    href: "/deadlines",
+    key: "deadlines",
+    title: "Deadlines",
+  },
+  {
+    href: "/jobs",
+    key: "jobs",
+    title: "Jobs",
+  },
+  {
+    href: "/task_instances",
+    key: "taskInstances",
+    labelKey: "taskInstance_other",
+    title: "Dags",
+  },
+  {
+    href: "/xcoms",
+    key: "xcoms",
+    title: "XComs",
+  },
+  {
+    href: "/required_actions",
+    key: "requiredActions",
+    title: "Required Actions",
+  },
+];
+
+export const BrowseButton = ({
+  authorizedMenuItems,
+  externalViews,
+}: {
+  readonly authorizedMenuItems: Array<MenuItem>;
+  readonly externalViews: Array<NavItemResponse>;
+}) => {
+  const { t: translate } = useTranslation();
+  const authorizedLinks = links.filter(({ title }) => authorizedMenuItems.includes(title as MenuItem));
+  const menuItems = authorizedLinks.map((link) => {
+    const label = translate(link.labelKey ?? `browse.${link.key}`);
+
+    return (
+      <Menu.Item asChild key={link.key} value={label}>
+        <RouterLink aria-label={label} to={link.href}>
+          {label}
+        </RouterLink>
+      </Menu.Item>
+    );
+  });
+
+  if (!menuItems.length && !externalViews.length) {
+    return undefined;
+  }
+
+  return (
+    <NavMenu
+      trigger={
+        <NavButton
+          icon={FiGlobe}
+          title={translate("nav.browse")}
+          to={authorizedLinks.map(({ href }) => href)}
+        />
+      }
+    >
+      {menuItems}
+      {externalViews.map((view) => (
+        <PluginMenuItem {...view} key={view.name} />
+      ))}
+    </NavMenu>
+  );
+};

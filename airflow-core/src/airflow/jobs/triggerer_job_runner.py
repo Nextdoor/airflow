@@ -1,0 +1,2107 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+import asyncio
+import contextvars
+import functools
+import gc
+import logging
+import math
+import os
+import selectors
+import signal
+import sys
+import threading
+import time
+from collections import Counter, deque
+from collections.abc import Callable, Generator, Hashable, Iterable, Iterator
+from contextlib import contextmanager, suppress
+from datetime import datetime
+from socket import socket
+from traceback import format_exception
+from typing import TYPE_CHECKING, Annotated, Any, BinaryIO, ClassVar, Literal, NamedTuple, TextIO, TypedDict
+from uuid import uuid4
+
+import anyio
+import attrs
+import greenback
+import structlog
+from opentelemetry import trace
+from opentelemetry.trace import Status, StatusCode
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+from pydantic import BaseModel, Field, TypeAdapter
+from sqlalchemy import func, select
+from structlog.contextvars import bind_contextvars as bind_log_contextvars
+
+from airflow._shared.module_loading import import_string
+from airflow._shared.observability.metrics import stats
+from airflow._shared.timezones import timezone
+from airflow.api_fastapi.execution_api.datamodels.taskinstance import task_instance_to_runtime
+from airflow.api_fastapi.execution_api.in_process import TRIGGER_TI_ID_HEADER, InProcessExecutionAPI
+from airflow.configuration import conf
+from airflow.exceptions import TaskNotFound
+from airflow.executors import workloads
+from airflow.executors.workloads.task import TaskInstanceDTO
+from airflow.jobs.base_job_runner import BaseJobRunner
+from airflow.jobs.job import perform_heartbeat
+from airflow.models.dagbag import DBDagBag
+from airflow.models.task_coordinates import TaskCoordinateResolver
+from airflow.models.trigger import RecordedFailure, Trigger, TriggerKind
+from airflow.observability.metrics import stats_utils
+from airflow.sdk._shared.secrets_masker import redact  # noqa: SDK001
+from airflow.sdk.bases.xcom import _current_trigger_ti
+from airflow.sdk.definitions.asset import Asset
+from airflow.sdk.execution_time import supervisor
+from airflow.sdk.execution_time.comms import (
+    AssetStateStoreResult,
+    ClearAssetStateStoreByName,
+    ClearAssetStateStoreByUri,
+    CommsDecoder,
+    ConnectionResult,
+    DagRunStateResult,
+    DeleteAssetStateStoreByName,
+    DeleteAssetStateStoreByUri,
+    DeleteVariable,
+    DeleteXCom,
+    DRCount,
+    ErrorResponse,
+    GetAssetStateStoreByName,
+    GetAssetStateStoreByUri,
+    GetConnection,
+    GetDagRunState,
+    GetDRCount,
+    GetHITLDetailResponse,
+    GetPreviousTI,
+    GetTaskStates,
+    GetTICount,
+    GetVariable,
+    GetVariableKeys,
+    GetXCom,
+    HITLDetailResponseResult,
+    MaskSecret,
+    OKResponse,
+    PutVariable,
+    SetAssetStateStoreByName,
+    SetAssetStateStoreByUri,
+    SetXCom,
+    TaskStatesResult,
+    TICount,
+    UpdateHITLDetail,
+    VariableKeysResult,
+    VariableResult,
+    XComResult,
+    _new_encoder,
+    _RequestFrame,
+)
+from airflow.sdk.execution_time.context import AssetStateStoreAccessors, set_current_team_name
+from airflow.sdk.execution_time.request_handlers import (
+    handle_clear_asset_state_store_by_name,
+    handle_clear_asset_state_store_by_uri,
+    handle_delete_asset_state_store_by_name,
+    handle_delete_asset_state_store_by_uri,
+    handle_delete_variable,
+    handle_delete_xcom,
+    handle_get_asset_state_store_by_name,
+    handle_get_asset_state_store_by_uri,
+    handle_get_connection,
+    handle_get_dag_run_state,
+    handle_get_dr_count,
+    handle_get_hitl_detail_response,
+    handle_get_previous_ti,
+    handle_get_task_states,
+    handle_get_ti_count,
+    handle_get_variable,
+    handle_get_variable_keys,
+    handle_get_xcom,
+    handle_mask_secret,
+    handle_put_variable,
+    handle_set_asset_state_store_by_name,
+    handle_set_asset_state_store_by_uri,
+    handle_set_xcom,
+)
+from airflow.sdk.execution_time.supervisor import WatchedSubprocess, make_buffered_socket_reader
+from airflow.sdk.execution_time.task_runner import RuntimeTaskInstance
+from airflow.serialization.serialized_objects import DagSerialization
+from airflow.triggers.base import BaseEventTrigger, BaseTrigger, DiscrimatedTriggerEvent, TriggerEvent
+from airflow.triggers.shared_stream import SharedStreamManager
+from airflow.utils.helpers import prune_dict
+from airflow.utils.log.logging_mixin import LoggingMixin
+from airflow.utils.log.task_log_address import prepare_task_log_contexts, render_task_log_filename
+from airflow.utils.retries import run_with_db_retries
+from airflow.utils.session import create_session, provide_session
+
+if TYPE_CHECKING:
+    from uuid import UUID
+
+    import httpx2
+    from opentelemetry.util._decorator import _AgnosticContextManager
+    from sqlalchemy.orm import Session
+    from structlog.typing import FilteringBoundLogger, WrappedLogger
+
+    from airflow.jobs.job import Job
+    from airflow.sdk.api.client import Client
+    from airflow.sdk.definitions.context import Context
+    from airflow.sdk.types import RuntimeTaskInstanceProtocol as RuntimeTI
+    from airflow.utils.log.task_log_address import TaskLogContext
+
+logger = logging.getLogger(__name__)
+tracer = trace.get_tracer(__name__)
+# Private sentinel passed as the cancel message when a trigger is cancelled by user action
+_USER_ACTION_CANCEL_MSG = "__airflow_user_action__"
+# Private sentinel passed as the cancel message when a trigger's row moved to another triggerer, so
+# run_trigger() drops it locally without invoking on_kill()
+_REASSIGNED_CANCEL_MSG = "__airflow_reassigned__"
+
+_ON_CANCEL_TIMEOUT: int = conf.getint("triggerer", "on_kill_timeout", fallback=30)
+
+# Task instance of the trigger whose request the supervisor is handling, sent to the API as
+# ``TRIGGER_TI_ID_HEADER``.
+_handling_trigger_ti_id: contextvars.ContextVar[UUID | None] = contextvars.ContextVar(
+    "airflow_handling_trigger_ti_id", default=None
+)
+
+
+def _add_trigger_ti_id_header(request: httpx2.Request) -> None:
+    if (ti_id := _handling_trigger_ti_id.get()) is not None:
+        request.headers[TRIGGER_TI_ID_HEADER] = str(ti_id)
+
+
+def _make_trigger_span(
+    ti: TaskInstanceDTO | None, trigger_id: int, name: str
+) -> _AgnosticContextManager[trace.Span]:
+    parent_context = (
+        TraceContextTextMapPropagator().extract(ti.context_carrier) if ti and ti.context_carrier else None
+    )
+    attributes: dict[str, str | int] = {
+        "airflow.trigger.name": name,
+    }
+    if isinstance(ti, TaskInstanceDTO):
+        span_name = f"trigger.{ti.task_id}" if ti else f"trigger.{trigger_id}"
+        if ti.map_index >= 0:
+            span_name += f"_{ti.map_index}"
+        attributes = {
+            **attributes,
+            "airflow.dag_id": ti.dag_id,
+            "airflow.task_id": ti.task_id,
+            "airflow.dag_run.run_id": ti.run_id,
+            "airflow.task_instance.try_number": ti.try_number,
+            "airflow.task_instance.map_index": ti.map_index,
+        }
+    else:
+        span_name = f"trigger.{name}"
+    return tracer.start_as_current_span(span_name, attributes=attributes, context=parent_context)
+
+
+__all__ = [
+    "TriggerRunner",
+    "TriggerRunnerSupervisor",
+    "TriggererJobRunner",
+]
+
+
+class TriggererJobRunner(BaseJobRunner, LoggingMixin):
+    """
+    Run active triggers in asyncio and update their dependent tests/DAGs once their events have fired.
+
+    It runs as two threads:
+     - The main thread does DB calls/checkins
+     - A subthread runs all the async code
+    """
+
+    job_type = "TriggererJob"
+
+    def __init__(
+        self,
+        job: Job,
+        capacity=None,
+        queues: set[str] | None = None,
+    ):
+        super().__init__(job)
+        if capacity is None:
+            self.capacity = conf.getint("triggerer", "capacity")
+        elif isinstance(capacity, int) and capacity > 0:
+            self.capacity = capacity
+        else:
+            raise ValueError(f"Capacity number {capacity!r} is invalid")
+        self.queues = queues
+        # Set up only when _execute() starts the subprocess; keep it defined so that
+        # signal handlers (or other code) firing before startup don't hit AttributeError.
+        self.trigger_runner: TriggerRunnerSupervisor | None = None
+
+    def register_signals(self) -> None:
+        """Register signals that stop child processes."""
+        signal.signal(signal.SIGINT, self._exit_gracefully)
+        signal.signal(signal.SIGTERM, self._exit_gracefully)
+
+    @classmethod
+    @provide_session
+    def is_needed(cls, *, session: Session) -> bool:
+        """
+        Test if the triggerer job needs to be run (i.e., if there are triggers in the trigger table).
+
+        This is used for the warning boxes in the UI.
+        """
+        return session.execute(select(func.count(Trigger.id))).scalar_one() > 0
+
+    def on_kill(self):
+        """
+        Stop the trigger runner.
+
+        Called when there is an external kill command (via the heartbeat mechanism, for example).
+        """
+        # TODO: signal instead.
+        self.trigger_runner.stop = True
+
+    def _exit_gracefully(self, signum, frame) -> None:
+        # The first time, try to exit nicely
+        if self.trigger_runner and not self.trigger_runner.stop:
+            self.log.info("Exiting gracefully upon receiving signal %s", signum)
+            self.trigger_runner.stop = True
+        else:
+            self.log.warning("Forcing exit due to second exit signal %s", signum)
+            if self.trigger_runner:
+                self.trigger_runner.kill(signal.SIGKILL)
+            sys.exit(os.EX_SOFTWARE)
+
+    def _execute(self) -> int | None:
+        # Mark as server context for secrets backend detection when handling GetConnection
+        # requests from the TriggerRunner subprocess (needs MetastoreBackend).
+        # The subprocess explicitly sets _AIRFLOW_PROCESS_CONTEXT=client to prevent
+        # inheriting server privileges (runs user trigger/callback code).
+        # Similar to DagProcessorManager / DagProcessor child pattern.
+        _prev_ctx = os.environ.get("_AIRFLOW_PROCESS_CONTEXT")
+        os.environ["_AIRFLOW_PROCESS_CONTEXT"] = "server"
+        self.log.info("Starting the triggerer")
+        self.register_signals()
+        stats.initialize(
+            factory=stats_utils.get_stats_factory(),
+            export_legacy_names=conf.getboolean("metrics", "legacy_names_on"),
+        )
+        self.trigger_runner = None
+        try:
+            # Kick off runner sub-process without DB access
+            self.trigger_runner = TriggerRunnerSupervisor.start(
+                job=self.job,
+                capacity=self.capacity,
+                logger=log,
+                queues=self.queues,
+                # A triggerer is started with at most one ``--team-name`` for now, so while a Job can
+                # serve several teams this one never does, and the runner stays scoped to a single team.
+                # If we later let a triggerer take several ``--team-name`` values, this must fan out.
+                team_name=next(iter(self.job.team_names), None),
+            )
+            # Run the main DB comms loop in this process
+            self.trigger_runner.run()
+            return self.trigger_runner._exit_code
+        except Exception:
+            self.log.exception("Exception when executing TriggerRunnerSupervisor.run")
+            raise
+        finally:
+            self.log.info("Waiting for triggers to clean up")
+            # Tell the subprocess to stop and then wait for it.
+            # If the user interrupts/terms again, _graceful_exit will allow them
+            # to force-kill here. trigger_runner may be None if start() raised.
+            if self.trigger_runner is not None:
+                self.trigger_runner.kill(escalation_delay=10, force=True)
+            self.log.info("Exited trigger loop")
+            if _prev_ctx is None:
+                os.environ.pop("_AIRFLOW_PROCESS_CONTEXT", None)
+            else:
+                os.environ["_AIRFLOW_PROCESS_CONTEXT"] = _prev_ctx
+
+
+log: FilteringBoundLogger = structlog.get_logger(logger_name=__name__)
+
+# Stored on the trigger row and shown by the API to everyone who can see the trigger's owner; the traceback
+# stays in the logs.
+TRIGGER_ERROR_MAX_LENGTH = 1000
+
+# A trigger that stays up this long after it was last (re-)created has recovered, so one that crashes after
+# running a while is not counted as failing ever since its first crash.
+TRIGGER_RECOVERY_UPTIME = 120.0
+
+
+def format_trigger_error(exc: list[str] | None) -> str:
+    """
+    Return the exception type and message of a trigger failure, redacted and truncated.
+
+    The runner formats the traceback before anything masks it, so it is redacted here with the task SDK
+    masker, which learns the connections and variables the runner fetched, as the task runner does.
+    """
+    if not exc:
+        return "The trigger exited without yielding an event"
+    error = str(redact(exc[-1].strip()))[:TRIGGER_ERROR_MAX_LENGTH]
+    # Escape what a text column refuses (NUL on Postgres, a lone surrogate in UTF-8), as repr() would, so
+    # writing the failure cannot raise out of the triggerer's loop.
+    return error.replace("\x00", "\\x00").encode("utf-8", "backslashreplace").decode("utf-8")
+
+
+@attrs.define
+class _TriggerFailures:
+    consecutive: int = 0
+    # When the trigger was last (re-)created, on the monotonic clock; None until it is running again.
+    started_at: float | None = None
+
+
+@attrs.define
+class TriggerFailureTracker:
+    """
+    Count the failures of each trigger since it last recovered, for the triggers assigned to this triggerer.
+
+    A trigger recovers when it fires an event, or once it has stayed up for ``recovery_uptime`` seconds
+    since it was last (re-)created. Only triggers that failed since they last recovered are tracked.
+    """
+
+    recovery_uptime: float = TRIGGER_RECOVERY_UPTIME
+    failures: dict[int, _TriggerFailures] = attrs.field(factory=dict)
+
+    def consecutive(self, trigger_id: int) -> int:
+        return state.consecutive if (state := self.failures.get(trigger_id)) is not None else 0
+
+    def continue_from(self, trigger_id: int, consecutive_failures: int | None) -> None:
+        """Continue the count recorded on the trigger row, e.g. by the triggerer that ran it before."""
+        if consecutive_failures and trigger_id not in self.failures:
+            self.failures[trigger_id] = _TriggerFailures(consecutive=consecutive_failures)
+
+    def record_failure(self, trigger_id: int, now: float) -> int:
+        """Count a failure and return the trigger's consecutive failures."""
+        state = self.failures.setdefault(trigger_id, _TriggerFailures())
+        if state.started_at is not None and now - state.started_at >= self.recovery_uptime:
+            state.consecutive = 0
+        state.consecutive += 1
+        state.started_at = None
+        return state.consecutive
+
+    def record_success(self, trigger_id: int) -> int:
+        """Forget the failures of a trigger that fired an event; return how many it recovered from."""
+        state = self.failures.pop(trigger_id, None)
+        return state.consecutive if state is not None else 0
+
+    def record_started(self, trigger_ids: Iterable[int], now: float) -> None:
+        for trigger_id in trigger_ids:
+            if (state := self.failures.get(trigger_id)) is not None:
+                state.started_at = now
+
+    def pop_recovered(self, now: float) -> dict[int, int]:
+        """Forget the triggers that stayed up long enough; return the failures each recovered from."""
+        recovered = {
+            trigger_id: state.consecutive
+            for trigger_id, state in self.failures.items()
+            if state.started_at is not None and now - state.started_at >= self.recovery_uptime
+        }
+        for trigger_id in recovered:
+            del self.failures[trigger_id]
+        return recovered
+
+    def forget(self, trigger_ids: Iterable[int]) -> None:
+        for trigger_id in trigger_ids:
+            self.failures.pop(trigger_id, None)
+
+
+class TriggerEventEntry(NamedTuple):
+    """A fired trigger event queued for dispatch to the Trigger model."""
+
+    trigger_id: int
+    event: DiscrimatedTriggerEvent
+    persist_seq: int | None  # None when the event does not gate a broker advance
+
+
+# Using this as a simple namespace
+class messages:
+    class StartTriggerer(BaseModel):
+        """Tell the async trigger runner process to start, and where to send status update messages."""
+
+        type: Literal["StartTriggerer"] = "StartTriggerer"
+        team_name: str | None = None
+
+    class TriggerStateChanges(BaseModel):
+        """
+        Report state change about triggers back to the TriggerRunnerSupervisor.
+
+        The supervisor will respond with a TriggerStateSync message.
+        """
+
+        type: Literal["TriggerStateChanges"] = "TriggerStateChanges"
+        events: Annotated[
+            list[TriggerEventEntry] | None,
+            # We have to specify a default here, as otherwise Pydantic struggles to deal with the discriminated
+            # union :shrug:
+            Field(default=None),
+        ]
+        # Format of list[str] is the exc traceback format
+        failures: list[tuple[int, list[str] | None]] | None = None
+        finished: list[int] | None = None
+        # Ids the runner has a live coroutine for; None when the message carries no information
+        running_ids: set[int] | None = None
+
+    class TriggerStateSync(BaseModel):
+        type: Literal["TriggerStateSync"] = "TriggerStateSync"
+
+        to_create: list[workloads.RunTrigger]
+        # Triggers whose row is gone (task no longer deferred on it); the runner invokes on_kill()
+        to_cancel: set[int]
+        # Triggers whose row now belongs to another triggerer; the runner drops them without on_kill()
+        to_release: set[int] = Field(default_factory=set)
+        # Seqs of shared-stream trigger events the supervisor has persisted
+        # since the previous sync; the runner releases the matching broker
+        # advances on receipt.
+        events_persisted: list[int] | None = None
+
+
+ToTriggerRunner = Annotated[
+    messages.StartTriggerer
+    | messages.TriggerStateSync
+    | ConnectionResult
+    | VariableResult
+    | VariableKeysResult
+    | XComResult
+    | DagRunStateResult
+    | DRCount
+    | TICount
+    | TaskStatesResult
+    | AssetStateStoreResult
+    | HITLDetailResponseResult
+    | ErrorResponse
+    | OKResponse,
+    Field(discriminator="type"),
+]
+"""
+The types of messages we can send in to the Trigger Runner process (the process that runs the actual async
+code).
+"""
+
+
+ToTriggerSupervisor = Annotated[
+    messages.TriggerStateChanges
+    | GetConnection
+    | DeleteVariable
+    | GetVariable
+    | GetVariableKeys
+    | PutVariable
+    | DeleteXCom
+    | GetXCom
+    | SetXCom
+    | GetTICount
+    | GetTaskStates
+    | ClearAssetStateStoreByName
+    | ClearAssetStateStoreByUri
+    | DeleteAssetStateStoreByName
+    | DeleteAssetStateStoreByUri
+    | GetAssetStateStoreByName
+    | GetAssetStateStoreByUri
+    | SetAssetStateStoreByName
+    | SetAssetStateStoreByUri
+    | GetDagRunState
+    | GetDRCount
+    | GetPreviousTI
+    | GetHITLDetailResponse
+    | UpdateHITLDetail
+    | MaskSecret,
+    Field(discriminator="type"),
+]
+"""
+The types of messages that the async Trigger Runner can send back up to the supervisor process.
+"""
+
+
+@attrs.define(kw_only=True)
+class TriggerLoggingFactory:
+    log_path: str
+
+    # Callback triggers have no task instance; ``upload_to_remote`` accepts ``ti=None``.
+    ti: RuntimeTI | None = attrs.field(default=None, repr=False)
+
+    bound_logger: WrappedLogger = attrs.field(init=False, repr=False)
+
+    _filehandle: TextIO | BinaryIO = attrs.field(init=False, repr=False)
+
+    def __call__(self, processors: Iterable[structlog.typing.Processor]) -> WrappedLogger:
+        if hasattr(self, "bound_logger"):
+            return self.bound_logger
+
+        from airflow.sdk.log import init_log_file
+
+        log_file = init_log_file(self.log_path)
+
+        pretty_logs = False
+        if pretty_logs:
+            self._filehandle = log_file.open("w", buffering=1)
+            underlying_logger: WrappedLogger = structlog.WriteLogger(self._filehandle)
+        else:
+            self._filehandle = log_file.open("wb")
+            underlying_logger = structlog.BytesLogger(self._filehandle)
+        logger = structlog.wrap_logger(underlying_logger, processors=processors).bind()
+        self.bound_logger = logger
+        return logger
+
+    def close(self):
+        # Explicitly close the file descriptor.
+        if hasattr(self, "_filehandle") and self._filehandle and not self._filehandle.closed:
+            self._filehandle.close()
+
+    def upload_to_remote(self):
+        from airflow.sdk.log import upload_to_remote
+
+        if not hasattr(self, "bound_logger"):
+            # Never actually called, nothing to do
+            return
+
+        upload_to_remote(self.bound_logger, self.ti)
+
+
+@attrs.define(kw_only=True)
+class TriggerRunnerSupervisor(WatchedSubprocess):
+    """
+    TriggerRunnerSupervisor is responsible for monitoring the subprocess and marshalling DB access.
+
+    This class (which runs in the main/sync process) is responsible for querying the DB, sending RunTrigger
+    workload messages to the subprocess, and collecting results and updating them in the DB.
+
+    ``job`` is optional so AIP-92 Execution-API-backed subclasses can run without a metadata-DB
+    ``Job``. Such subclasses **must** override the methods that read ``self.job`` —
+    :meth:`heartbeat`, :meth:`load_triggers`, and :meth:`metric_tags` — to source their data
+    from the Execution API or another backend. The base implementations of those methods raise
+    :class:`RuntimeError` when called with ``job=None`` so a missing override fails immediately
+    rather than silently zombieing the supervisor.
+    """
+
+    job: Job | None = None
+    capacity: int
+    queues: set[str] | None = None
+    team_name: str | None = None
+
+    health_check_threshold = conf.getint("triggerer", "triggerer_health_check_threshold")
+    runner_health_check_threshold = conf.getfloat("triggerer", "runner_health_check_threshold")
+
+    runner: TriggerRunner | None = None
+    stop: bool = False
+
+    # Timestamp of the last message received from the TriggerRunner subprocess.  Updated on
+    # every message; if it goes silent for longer than runner_health_check_threshold the
+    # subprocess's async event loop has likely deadlocked.  Initialised to +inf so the watchdog
+    # stays silent until the first message arrives — avoids false positives on slow/cold-start
+    # hosts where startup can exceed the threshold.
+    _last_runner_comms: float = attrs.field(init=False, default=math.inf)
+    _runner_comms_silence_logged: bool = attrs.field(init=False, default=False)
+
+    decoder: ClassVar[TypeAdapter[ToTriggerSupervisor]] = TypeAdapter(ToTriggerSupervisor)
+
+    # Maps trigger IDs that we think are running in the sub process
+    running_triggers: set[int] = attrs.field(factory=set, init=False)
+
+    logger_cache: dict[int, TriggerLoggingFactory] = attrs.field(factory=dict, init=False)
+
+    # A list of triggers that we have told the async process to cancel. We keep them here until we receive the
+    # FinishedTriggers message
+    cancelling_triggers: set[int] = attrs.field(factory=set, init=False)
+
+    releasing_triggers: set[int] = attrs.field(factory=set, init=False)
+
+    # A list of RunTrigger workloads to send to the async process when it next checks in. We can't send it
+    # directly as all comms has to be initiated by the subprocess
+    creating_triggers: deque[workloads.RunTrigger] = attrs.field(factory=deque, init=False)
+
+    # Outbound queue of events
+    events: deque[TriggerEventEntry] = attrs.field(factory=deque, init=False)
+
+    # Seqs of shared-stream trigger events persisted since the last state
+    # sync; drained into TriggerStateSync.events_persisted.
+    persisted_event_seqs: deque[int] = attrs.field(factory=deque, init=False)
+
+    # Outbound queue of failed triggers
+    failed_triggers: deque[tuple[int, list[str] | None]] = attrs.field(factory=deque, init=False)
+
+    # Failures of the triggers assigned here since each last recovered, recorded on the trigger row.
+    failure_tracker: TriggerFailureTracker = attrs.field(factory=TriggerFailureTracker, init=False)
+    # Triggers that recovered since the last loop; their failure state on the trigger row is cleared.
+    recovered_triggers: set[int] = attrs.field(factory=set, init=False)
+    # TriggerKind value of each trigger assigned here, for the trigger_kind metric tag
+    trigger_kinds: dict[int, str] = attrs.field(factory=dict, init=False)
+
+    def is_alive(self) -> bool:
+        # Set by `_service_subprocess` in the loop
+        return self._exit_code is None
+
+    @classmethod
+    def start(
+        cls,
+        *,
+        job: Job | None = None,
+        logger=None,
+        **kwargs,
+    ):
+        proc_id = job.id if job is not None else uuid4()
+        if not supervisor._should_use_exec():
+            # Freeze before the bare fork and stay frozen: unfreezing would let this process's next
+            # full GC split the pages the runner child shares copy-on-write (a memory jump with no
+            # new allocation). Forked once, like the Dag processor manager. Skipped when the child
+            # execs, which discards the inherited pages.
+            gc.freeze()
+        # Triggers run user code that polls APIs / watches queues / hits HTTP
+        # endpoints -- almost always network calls that trigger macOS-unsafe ObjC
+        # initialization. Fork+exec a clean interpreter for the runner child.
+        proc = super().start(
+            id=proc_id,
+            job=job,
+            target=cls.run_in_process,
+            logger=logger,
+            use_exec=supervisor._should_use_exec(),
+            **kwargs,
+        )
+
+        team_name = kwargs.get("team_name")
+        msg = messages.StartTriggerer(team_name=team_name)
+        proc.send_msg(msg, request_id=0)
+        return proc
+
+    @functools.cached_property
+    def client(self) -> Client:
+        return self.make_client()
+
+    def make_client(self) -> Client:
+        """
+        Build the API client used to talk to the API server.
+
+        Subclasses may override this to substitute a different transport — e.g. a
+        real HTTP client pointing at a remote API server — instead of the default
+        in-process one. The returned client must have ``base_url`` set; downstream
+        request handling (``self.client.variables``, ``.xcoms``, etc.) reads it
+        when issuing requests.
+        """
+        from airflow.sdk.api.client import Client
+
+        triggerer_id = self.job.id if self.job is not None else None
+        in_process_api = InProcessExecutionAPI(triggerer_id=triggerer_id)
+        client = Client(base_url=None, token="", dry_run=True, transport=in_process_api.transport)
+        # Mypy is wrong -- the setter accepts a string on the property setter! `URLType = URL | str`
+        client.base_url = "http://in-process.invalid./"
+        if triggerer_id is not None:
+            client.event_hooks["request"].append(_add_trigger_ti_id_header)
+        return client
+
+    @contextmanager
+    def _request_scope(self, request: _RequestFrame) -> Iterator[None]:
+        token = _handling_trigger_ti_id.set(request.ti_id)
+        try:
+            yield
+        finally:
+            _handling_trigger_ti_id.reset(token)
+
+    def _handle_request(self, msg: ToTriggerSupervisor, log: FilteringBoundLogger, req_id: int) -> None:
+
+        resp: BaseModel | None = None
+        dump_opts: dict[str, bool] = {}
+        self._last_runner_comms = time.monotonic()
+
+        if isinstance(msg, messages.TriggerStateChanges):
+            # Events before failures: a trigger that fired and then failed starts a new count.
+            if msg.events:
+                self.events.extend(msg.events)
+                for entry in msg.events:
+                    self.record_trigger_success(entry.trigger_id)
+            if msg.failures:
+                self.failed_triggers.extend(msg.failures)
+                now = time.monotonic()
+                for trigger_id, _ in msg.failures:
+                    self.failure_tracker.record_failure(trigger_id, now)
+                    self.recovered_triggers.discard(trigger_id)
+            for id in msg.finished or ():
+                self.running_triggers.discard(id)
+                self.cancelling_triggers.discard(id)
+                self.releasing_triggers.discard(id)
+                self.finalize_trigger_log(id)
+
+            self.check_for_unhandled_triggers(msg.running_ids)
+
+            # Drain the persist confirmations accumulated since the last sync.
+            events_persisted: list[int] = []
+            while self.persisted_event_seqs:
+                events_persisted.append(self.persisted_event_seqs.popleft())
+
+            response = messages.TriggerStateSync(
+                to_create=[],
+                to_cancel=self.cancelling_triggers,
+                to_release=self.releasing_triggers,
+                events_persisted=events_persisted or None,
+            )
+
+            # Pull out of these dequeues in a thread-safe manner
+            while self.creating_triggers:
+                workload = self.creating_triggers.popleft()
+                response.to_create.append(workload)
+            self.running_triggers.update(m.id for m in response.to_create)
+            self.failure_tracker.record_started((m.id for m in response.to_create), time.monotonic())
+            resp = response
+
+        elif isinstance(msg, GetConnection):
+            resp, dump_opts = handle_get_connection(self.client, msg)
+        elif isinstance(msg, DeleteVariable):
+            resp, dump_opts = handle_delete_variable(self.client, msg)
+        elif isinstance(msg, GetVariable):
+            resp, dump_opts = handle_get_variable(self.client, msg)
+        elif isinstance(msg, GetVariableKeys):
+            resp, dump_opts = handle_get_variable_keys(self.client, msg)
+        elif isinstance(msg, PutVariable):
+            resp, dump_opts = handle_put_variable(self.client, msg)
+        elif isinstance(msg, DeleteXCom):
+            resp, dump_opts = handle_delete_xcom(self.client, msg)
+        elif isinstance(msg, GetXCom):
+            resp, dump_opts = handle_get_xcom(self.client, msg)
+        elif isinstance(msg, SetXCom):
+            resp, dump_opts = handle_set_xcom(self.client, msg)
+        elif isinstance(msg, GetDRCount):
+            resp, dump_opts = handle_get_dr_count(self.client, msg)
+        elif isinstance(msg, GetDagRunState):
+            resp, dump_opts = handle_get_dag_run_state(self.client, msg)
+
+        elif isinstance(msg, GetTICount):
+            resp, dump_opts = handle_get_ti_count(self.client, msg)
+
+        elif isinstance(msg, GetTaskStates):
+            resp, dump_opts = handle_get_task_states(self.client, msg)
+        elif isinstance(msg, GetPreviousTI):
+            resp, dump_opts = handle_get_previous_ti(self.client, msg)
+        elif isinstance(msg, UpdateHITLDetail):
+            api_resp = self.client.hitl.update_response(
+                ti_id=msg.ti_id,
+                chosen_options=msg.chosen_options,
+                params_input=msg.params_input,
+            )
+            resp = HITLDetailResponseResult.from_api_response(response=api_resp)
+        elif isinstance(msg, GetHITLDetailResponse):
+            resp, dump_opts = handle_get_hitl_detail_response(self.client, msg)
+        elif isinstance(msg, MaskSecret):
+            handle_mask_secret(msg)
+        elif isinstance(msg, ClearAssetStateStoreByName):
+            handle_clear_asset_state_store_by_name(self.client, msg)
+            resp = OKResponse(ok=True)
+        elif isinstance(msg, ClearAssetStateStoreByUri):
+            handle_clear_asset_state_store_by_uri(self.client, msg)
+            resp = OKResponse(ok=True)
+        elif isinstance(msg, DeleteAssetStateStoreByName):
+            handle_delete_asset_state_store_by_name(self.client, msg)
+            resp = OKResponse(ok=True)
+        elif isinstance(msg, DeleteAssetStateStoreByUri):
+            handle_delete_asset_state_store_by_uri(self.client, msg)
+            resp = OKResponse(ok=True)
+        elif isinstance(msg, GetAssetStateStoreByName):
+            resp, dump_opts = handle_get_asset_state_store_by_name(self.client, msg)
+        elif isinstance(msg, GetAssetStateStoreByUri):
+            resp, dump_opts = handle_get_asset_state_store_by_uri(self.client, msg)
+        elif isinstance(msg, SetAssetStateStoreByName):
+            handle_set_asset_state_store_by_name(self.client, msg)
+            resp = OKResponse(ok=True)
+        elif isinstance(msg, SetAssetStateStoreByUri):
+            handle_set_asset_state_store_by_uri(self.client, msg)
+            resp = OKResponse(ok=True)
+        else:
+            raise ValueError(f"Unknown message type {type(msg)}")
+
+        self.send_msg(resp, request_id=req_id, error=None, **dump_opts)
+
+    def run(self) -> None:
+        """Run synchronously and handle all database reads/writes."""
+        with self.run_context():
+            while not self.should_stop():
+                if not self.is_alive():
+                    log.error("Trigger runner process has died! Exiting.")
+                    break
+                self.run_once()
+
+    @contextmanager
+    def run_context(self) -> Iterator[None]:
+        """Wrap the run loop. Subclasses can override to install setup/teardown."""
+        yield
+
+    def should_stop(self) -> bool:
+        """Return True when the run loop should exit."""
+        return self.stop
+
+    def run_once(self) -> None:
+        """Perform a single iteration of the run loop."""
+        self.load_triggers()
+
+        # Wait for up to 1 second for activity
+        self._service_subprocess(1)
+
+        self.handle_events()
+        self.handle_recovered_triggers()
+        self.handle_failed_triggers()
+        self.clean_unused()
+        self.heartbeat()
+
+        self.emit_metrics()
+
+    def heartbeat(self):
+        if self.job is None:
+            raise RuntimeError(
+                "TriggerRunnerSupervisor.heartbeat() requires a Job; "
+                "subclasses without a metadata-DB Job must override this method."
+            )
+        elapsed = time.monotonic() - self._last_runner_comms
+        if self.runner_health_check_threshold > 0 and elapsed > self.runner_health_check_threshold:
+            if not self._runner_comms_silence_logged:
+                log.error(
+                    "TriggerRunner subprocess event loop appears deadlocked: no communication received "
+                    "for %.1fs (threshold: %.1fs). Skipping heartbeat so the triggerer appears unhealthy "
+                    "to the scheduler and its triggers are reassigned.",
+                    elapsed,
+                    self.runner_health_check_threshold,
+                )
+                self._runner_comms_silence_logged = True
+            return
+        self._runner_comms_silence_logged = False
+        perform_heartbeat(self.job, heartbeat_callback=self.heartbeat_callback, only_if_necessary=True)
+
+    def heartbeat_callback(self, session: Session | None = None) -> None:
+        stats.incr("triggerer_heartbeat", 1, 1, tags=prune_dict({"team_name": self.team_name}))
+
+    def load_triggers(self) -> None:
+        """Assign triggers to this triggerer and update the runner with the IDs it should run."""
+        if self.job is None:
+            raise RuntimeError(
+                "TriggerRunnerSupervisor.load_triggers() requires a Job; "
+                "subclasses without a metadata-DB Job must override this method."
+            )
+        Trigger.assign_unassigned(
+            self.job.id,
+            self.capacity,
+            self.health_check_threshold,
+            queues=self.queues,
+            team_name=self.team_name,
+        )
+        ids = Trigger.ids_for_triggerer(self.job.id, queues=self.queues, team_name=self.team_name)
+        self.update_triggers(set(ids))
+
+    def handle_events(self):
+        """Dispatch outbound events to the Trigger model which pushes them to the relevant task instances."""
+        while self.events:
+            entry = self.events.popleft()
+            # Tell the model to wake up its tasks
+            self.on_trigger_event(trigger_id=entry.trigger_id, event=entry.event)
+            # Only reached when on_trigger_event returned, i.e. the event was
+            # persisted; a raise above leaves the seq unconfirmed so the
+            # bound shared-stream advance fails out and the broker redelivers.
+            if entry.persist_seq is not None:
+                self.persisted_event_seqs.append(entry.persist_seq)
+            # Emit stat event
+            stats.incr("triggers.succeeded", tags=self._trigger_kind_tags(entry.trigger_id))
+
+    def on_trigger_event(self, trigger_id: int, event: TriggerEvent) -> None:
+        """Record that a trigger fired an event."""
+        Trigger.submit_event(trigger_id=trigger_id, event=event)
+
+    def clean_unused(self) -> None:
+        """Remove triggers that are no longer needed, retrying database errors in a new transaction."""
+        for attempt in run_with_db_retries():
+            with attempt, create_session() as session:
+                Trigger.clean_unused(session=session)
+
+    def finalize_trigger_log(self, trigger_id: int) -> None:
+        """
+        Upload and close the log file of a trigger that no longer runs here.
+
+        Every path that drops an id from ``running_triggers`` has to call it: re-creation
+        reuses the log path, so a leftover entry is lost.
+        """
+        if factory := self.logger_cache.pop(trigger_id, None):
+            try:
+                factory.upload_to_remote()
+            except Exception:
+                log.exception("Failed to upload trigger logs to remote", trigger_id=trigger_id)
+            finally:
+                # Close the FD explicitly even if upload raised, otherwise the file handle
+                # leaks for every failed upload. close() flushes, so it can raise too.
+                try:
+                    factory.close()
+                except Exception:
+                    log.exception("Failed to close trigger log file", trigger_id=trigger_id)
+
+    def check_for_unhandled_triggers(self, running_ids: set[int] | None) -> None:
+        """
+        Re-create triggers we track as running that the runner has no coroutine for.
+
+        Only valid between finished-removal and to_create-addition in ``_handle_request``, where the
+        two sides agree. Dropping the leftovers lets :meth:`update_triggers` rebuild them.
+        """
+        if running_ids is None:
+            return
+        unhandled = self.running_triggers - running_ids
+        if not unhandled:
+            return
+        log.error("Triggers have no coroutine in the runner; re-creating", trigger_ids=sorted(unhandled))
+        self.running_triggers -= unhandled
+        self.cancelling_triggers -= unhandled
+        self.releasing_triggers -= unhandled
+        for trigger_id in unhandled:
+            self.finalize_trigger_log(trigger_id)
+        stats.incr("triggers.state_mismatch", len(unhandled), tags=prune_dict({"team_name": self.team_name}))
+
+    def handle_failed_triggers(self):
+        """
+        Handle "failed" triggers. - ones that errored or exited before they sent an event.
+
+        Task Instances that depend on them need failing.
+        """
+        while self.failed_triggers:
+            # Tell the model to fail this trigger's deps
+            trigger_id, exc = self.failed_triggers.popleft()
+            self.on_trigger_failure(trigger_id=trigger_id, exc=exc)
+            # Emit stat event
+            stats.incr("triggers.failed", tags=self._trigger_kind_tags(trigger_id))
+
+    def _trigger_kind_tags(self, trigger_id: int) -> dict[str, str]:
+        return prune_dict({"team_name": self.team_name, "trigger_kind": self.trigger_kinds.get(trigger_id)})
+
+    def on_trigger_failure(self, trigger_id: int, exc: list[str] | None) -> None:
+        """Record that a trigger failed, and on its row why, whatever kind of trigger it is."""
+        # A deferred task's trigger fails its task and is not re-created, so it fails once.
+        failure = RecordedFailure(
+            consecutive_failures=self.failure_tracker.consecutive(trigger_id) or 1,
+            error=format_trigger_error(exc),
+        )
+        Trigger.submit_failure(
+            trigger_id=trigger_id,
+            exc=exc,
+            triggerer_id=self.job.id if self.job is not None else None,
+            failure=failure,
+        )
+
+    def record_trigger_success(self, trigger_id: int) -> None:
+        if after_failures := self.failure_tracker.record_success(trigger_id):
+            self._mark_recovered(trigger_id, after_failures)
+
+    def _mark_recovered(self, trigger_id: int, after_failures: int) -> None:
+        log.info(
+            "Trigger recovered",
+            trigger_id=trigger_id,
+            trigger_kind=self.trigger_kinds.get(trigger_id),
+            after_failures=after_failures,
+        )
+        self.recovered_triggers.add(trigger_id)
+
+    def handle_recovered_triggers(self) -> None:
+        """Clear the recorded failures of triggers that fired an event or have stayed up long enough."""
+        for trigger_id, after_failures in self.failure_tracker.pop_recovered(time.monotonic()).items():
+            self._mark_recovered(trigger_id, after_failures)
+        if self.recovered_triggers:
+            trigger_ids, self.recovered_triggers = self.recovered_triggers, set()
+            self.on_triggers_recovered(trigger_ids)
+
+    def on_triggers_recovered(self, trigger_ids: set[int]) -> None:
+        """Record that triggers recovered from their failures."""
+        Trigger.clear_recorded_failures(
+            trigger_ids, triggerer_id=self.job.id if self.job is not None else None
+        )
+
+    def metric_tags(self) -> dict[str, str]:
+        """
+        Return extra tags applied to gauges emitted by :meth:`emit_metrics`.
+
+        Subclasses that don't have a metadata-DB ``Job`` (e.g. AIP-92 Execution-API-backed
+        triggerers) **must** override this to supply ``hostname`` (and any other identity
+        tags) from another source. ``triggers.running`` and ``triggerer.capacity_left``
+        declare ``hostname`` as a required name variable in ``metrics_template.yaml``, so
+        an empty dict here would crash :meth:`emit_metrics` on every tick.
+        """
+        hostname = self.job.hostname if self.job is not None else None
+        if hostname is None:
+            raise RuntimeError(
+                "TriggerRunnerSupervisor.metric_tags() requires a Job with a hostname; "
+                "subclasses without a metadata-DB Job must override this method."
+            )
+        return prune_dict({"hostname": hostname, "team_name": self.team_name})
+
+    def emit_metrics(self):
+        tags = self.metric_tags()
+        stats.gauge(
+            "triggers.running",
+            len(self.running_triggers),
+            tags=tags,
+        )
+
+        capacity_left = self.capacity - len(self.running_triggers)
+        stats.gauge(
+            "triggerer.capacity_left",
+            capacity_left,
+            tags=tags,
+        )
+        failing = Counter(self.trigger_kinds.get(trigger_id) for trigger_id in self.failure_tracker.failures)
+        for kind in TriggerKind:
+            stats.gauge("triggers.failing", failing[kind.value], tags={**tags, "trigger_kind": kind.value})
+
+    @staticmethod
+    def _record_missing_owner(trigger: Trigger) -> None:
+        """
+        Record the owner of a deferred task's or callback's trigger whose row has none.
+
+        During a rolling upgrade, components still on the previous version keep creating these triggers after
+        ``db migrate`` filled in the owners of the rows that existed then. Written with the session that builds
+        the workload.
+        """
+        if getattr(trigger, "owner_ref", None) is not None:
+            return
+        if (ti := trigger.task_instance) is not None:
+            trigger.dag_id, trigger.owner_ref = ti.dag_id, {"ti_id": str(ti.id)}
+        elif (callback := getattr(trigger, "callback", None)) is not None:
+            dag_run = ((callback.data.get("kwargs") or {}).get("context") or {}).get("dag_run") or {}
+            trigger.dag_id = callback.get_dag_id() or dag_run.get("dag_id")
+            trigger.owner_ref = {"callback_id": str(callback.id)}
+
+    def _create_workload(
+        self,
+        trigger: Trigger,
+        dag_bag: DBDagBag,
+        render_log_fname: Callable[..., str],
+        session: Session,
+        log_context: TaskLogContext | None = None,
+    ) -> workloads.RunTrigger | None:
+        self._record_missing_owner(trigger)
+        self.trigger_kinds[trigger.id] = (
+            TriggerKind.TASK
+            if trigger.task_instance is not None
+            else TriggerKind.ASSET_WATCHER
+            if trigger.assets
+            else TriggerKind.CALLBACK
+        ).value
+        self.failure_tracker.continue_from(trigger.id, trigger.consecutive_failures)
+        if trigger.task_instance is None:
+            watched_assets: dict[str, str] | None = None
+
+            if trigger.assets:
+                watched_assets = {a.name: a.uri for a in trigger.assets}
+
+            if callback := getattr(trigger, "callback", None):
+                # Log callback triggers to a file the UI callback logs endpoint can read.
+                callback_data = callback.data or {}
+                context = (callback_data.get("kwargs") or {}).get("context") or {}
+                dag_run_data = context.get("dag_run") or {}
+                dag_id = callback_data.get("dag_id") or dag_run_data.get("dag_id") or "unknown"
+                run_id = dag_run_data.get("dag_run_id") or "unknown"
+                # One directory per callback: with delete_local_logs, remote handlers delete the
+                # log file's parent directory after upload, which must not hold other callbacks' logs.
+                self.logger_cache[trigger.id] = TriggerLoggingFactory(
+                    log_path=f"triggerer_callbacks/{dag_id}/{run_id}/{callback.id}/callback.log",
+                )
+
+            return workloads.RunTrigger(
+                id=trigger.id,
+                classpath=trigger.classpath,
+                encrypted_kwargs=trigger.encrypted_kwargs,
+                watched_assets=watched_assets,
+            )
+
+        if not trigger.task_instance.dag_version_id:
+            # This is to handle 2 to 3 upgrade where TI.dag_version_id can be none
+            log.warning(
+                "TaskInstance associated with Trigger has no associated Dag Version, skipping the trigger",
+                ti_id=trigger.task_instance.id,
+            )
+            return None
+
+        log_path = render_log_fname(ti=trigger.task_instance)
+        ser_ti = task_instance_to_runtime(
+            trigger.task_instance,
+            model=TaskInstanceDTO,
+            map_index=(
+                log_context.map_index
+                if log_context is not None
+                else TaskCoordinateResolver(dag_bag, session).public_map_index(trigger.task_instance)
+            ),
+        )
+
+        # When producing logs from TIs, include the supervisor id producing the logs to disambiguate it.
+        # Note: with a Job this is an int (Job.id); without a Job it's a UUID. The reader side
+        # (FileTaskHandler.add_triggerer_suffix) currently formats the suffix from
+        # ``ti.triggerer_job.id``, which only resolves the int form — AIP-92 subclasses without a
+        # metadata Job need their own log retrieval path.
+        log_id = self.job.id if self.job is not None else self.id
+        self.logger_cache[trigger.id] = TriggerLoggingFactory(
+            log_path=f"{log_path}.trigger.{log_id}.log",
+            ti=ser_ti,  # type: ignore
+        )
+
+        dag_run = trigger.task_instance.get_dagrun(session=session)
+        serialized_dag_model = dag_bag.get_serialized_dag_model_for_run(
+            dag_run, session=session
+        ) or dag_bag.get_serialized_dag_model(
+            version_id=trigger.task_instance.dag_version_id, session=session
+        )
+
+        if serialized_dag_model:
+            task = None
+            try:
+                task = serialized_dag_model.dag.get_task(trigger.task_instance.task_id)
+            except TaskNotFound:
+                log.warning(
+                    "Task not found in resolved Dag version; building plain workload",
+                    task_id=trigger.task_instance.task_id,
+                    dag_id=trigger.task_instance.dag_id,
+                )
+
+            # When a TaskInstance of a Trigger contains a task with start_from_trigger enabled,
+            # it means we need to load the SerializedDagModel so we can build a RuntimeTaskInstance later on which
+            # will allow us to build a context on which we will render the templated fields.
+            if task is not None and task.start_from_trigger:
+                log.info("Start from trigger enabled for task %s", task.task_id)
+
+                return workloads.RunTrigger(
+                    id=trigger.id,
+                    classpath=trigger.classpath,
+                    encrypted_kwargs=trigger.encrypted_kwargs,
+                    ti=ser_ti,
+                    timeout_after=trigger.task_instance.trigger_timeout,
+                    dag_data=serialized_dag_model.data,
+                    dag_run_data=dag_run.dag_run_data.model_dump(exclude_unset=True),
+                )
+        return workloads.RunTrigger(
+            id=trigger.id,
+            classpath=trigger.classpath,
+            encrypted_kwargs=trigger.encrypted_kwargs,
+            ti=ser_ti,
+            timeout_after=trigger.task_instance.trigger_timeout,
+        )
+
+    def fetch_trigger_details(self, trigger_ids: set[int], *, session: Session) -> dict[int, Trigger]:
+        """Fetch trigger rows by ID."""
+        return Trigger.bulk_fetch(trigger_ids, session=session)
+
+    def fetch_non_task_trigger_ids(self, *, session: Session) -> set[int]:
+        """Fetch trigger IDs associated with non-task entities."""
+        return Trigger.fetch_trigger_ids_with_non_task_associations(session=session)
+
+    def fetch_trigger_assignments(self, trigger_ids: set[int]) -> dict[int, int | None]:
+        """
+        Map each trigger ID whose row still exists to the triggerer that owns it now.
+
+        Owns its own session so that ``update_triggers`` stays a pure diff/enqueue step that
+        subclasses without a metadata DB can keep calling after overriding this hook.
+        """
+        with create_session() as session:
+            return Trigger.fetch_assignments(trigger_ids, session=session)
+
+    def build_trigger_workloads(self, new_trigger_ids: set[int]) -> list[workloads.RunTrigger]:
+        """Build workloads for new trigger IDs."""
+        dag_bag = DBDagBag()
+        with create_session() as session:
+            new_triggers = self.fetch_trigger_details(new_trigger_ids, session=session)
+            log_contexts = prepare_task_log_contexts(
+                [
+                    trigger.task_instance
+                    for trigger in new_triggers.values()
+                    if trigger.task_instance is not None and trigger.task_instance.dag_version_id
+                ],
+                session=session,
+                dag_bag=dag_bag,
+                filename_template=conf.get("logging", "log_filename_template"),
+            )
+
+            def render_log_fname(*, ti):
+                return render_task_log_filename(ti, ti.try_number, context=log_contexts[ti.id])
+
+            trigger_ids_with_non_task_associations = self.fetch_non_task_trigger_ids(session=session)
+            to_create: list[workloads.RunTrigger] = []
+            for new_trigger_id in new_trigger_ids:
+                # Check it didn't vanish in the meantime
+                if new_trigger_id not in new_triggers:
+                    log.warning("Trigger disappeared before we could start it", id=new_trigger_id)
+                    continue
+
+                new_trigger_orm = new_triggers[new_trigger_id]
+
+                # If the trigger is not associated to a task, an asset, or a callback, this means the TaskInstance
+                # row was updated by either Trigger.submit_event or Trigger.submit_failure
+                # and can happen when a single trigger Job is being run on multiple TriggerRunners
+                # in a High-Availability setup.
+                if (
+                    new_trigger_orm.task_instance is None
+                    and new_trigger_id not in trigger_ids_with_non_task_associations
+                ):
+                    log.info(
+                        (
+                            "TaskInstance of Trigger is None. It was likely updated by another trigger job. "
+                            "Skipping trigger instantiation."
+                        ),
+                        id=new_trigger_id,
+                    )
+                    continue
+
+                if workload := self._create_workload(
+                    trigger=new_trigger_orm,
+                    dag_bag=dag_bag,
+                    render_log_fname=render_log_fname,
+                    session=session,
+                    log_context=(
+                        log_contexts.get(new_trigger_orm.task_instance.id)
+                        if new_trigger_orm.task_instance is not None
+                        else None
+                    ),
+                ):
+                    to_create.append(workload)
+
+        return to_create
+
+    def update_triggers(self, requested_trigger_ids: set[int]):
+        """
+        Request that we update what triggers we're running.
+
+        Works out the differences - ones to add, and ones to remove - then
+        adds them to the dequeues so the subprocess can actually mutate the running
+        trigger set.
+        """
+        known_trigger_ids = self.running_triggers.union(
+            (x[0] for x in self.events),
+            self.cancelling_triggers,
+            self.releasing_triggers,
+            (trigger[0] for trigger in self.failed_triggers),
+            (trigger.id for trigger in self.creating_triggers),
+        )
+        # Work out the two difference sets. Triggers already queued for cancellation or release stay
+        # in running_triggers until the runner reports them finished; don't classify them again.
+        new_trigger_ids = requested_trigger_ids - known_trigger_ids
+        cancel_trigger_ids = (
+            self.running_triggers - requested_trigger_ids - self.cancelling_triggers - self.releasing_triggers
+        )
+
+        for trigger_id in self.trigger_kinds.keys() - requested_trigger_ids - known_trigger_ids:
+            del self.trigger_kinds[trigger_id]
+        self.failure_tracker.forget(
+            self.failure_tracker.failures.keys() - requested_trigger_ids - known_trigger_ids
+        )
+
+        if new_trigger_ids:
+            workloads_to_create = self.build_trigger_workloads(new_trigger_ids)
+
+            queued_at = time.monotonic()
+
+            for workload in workloads_to_create:
+                workload.queued_at = queued_at
+
+            self.creating_triggers.extend(workloads_to_create)
+
+        if cancel_trigger_ids:
+            # Only the DB tells the two cases apart: a gone row means the task left the
+            # deferred state (user action), a surviving row means assign_unassigned handed
+            # the trigger to a triggerer that is now polling the remote work.
+            assignments = self.fetch_trigger_assignments(cancel_trigger_ids)
+            if assignments:
+                log.info(
+                    "Triggers were reassigned to another triggerer, releasing them without on_kill",
+                    new_owners=assignments,
+                )
+                self.releasing_triggers.update(assignments)
+            self.cancelling_triggers.update(cancel_trigger_ids - assignments.keys())
+
+    def _register_pipe_readers(
+        self,
+        stdout: socket,
+        stderr: socket,
+        requests: socket,
+        logs: socket,
+        *,
+        data: dict[socket, bytes],
+    ):
+        super()._register_pipe_readers(stdout, stderr, requests, logs, data=data)
+
+        # We want to handle logging differently here, so un-register the one our parent class created
+        self.selector.unregister(logs)
+
+        self.selector.register(
+            logs,
+            selectors.EVENT_READ,
+            make_buffered_socket_reader(
+                self._process_log_messages_from_subprocess(), on_close=self._on_socket_closed
+            ),
+        )
+
+    def _process_log_messages_from_subprocess(self) -> Generator[None, bytes | bytearray, None]:
+        import msgspec
+        from structlog.stdlib import NAME_TO_LEVEL
+
+        from airflow.sdk.log import configure_logging
+
+        configure_logging(json_output=conf.getboolean("logging", "json_logs", fallback=False))
+
+        fallback_log = structlog.get_logger(logger_name=__name__)
+
+        from airflow.sdk.log import logging_processors
+
+        processors = logging_processors(json_output=True)
+
+        def get_logger(trigger_id: int) -> WrappedLogger:
+            # TODO: Is a separate dict worth it, or should we make `self.running_triggers` a dict?
+            if factory := self.logger_cache.get(trigger_id):
+                return factory(processors)
+            return fallback_log
+
+        # We need to look at the json, pull out the
+        while True:
+            # Generator receive syntax, values are "sent" in  by the `make_buffered_socket_reader` and returned to
+            # the yield.
+            line = yield
+
+            try:
+                event: dict[str, Any] = msgspec.json.decode(line)
+            except Exception:
+                fallback_log.exception("Malformed json log", line=line)
+                continue
+
+            if trigger_id := event.pop("trigger_id", None):
+                log = get_logger(trigger_id)
+            else:
+                # Log message about the TriggerRunner itself -- just output it
+                log = fallback_log
+
+            if exc := event.pop("exception", None):
+                # TODO: convert the dict back to a pretty stack trace
+                event["error_detail"] = exc
+            if lvl_name := NAME_TO_LEVEL.get(event.pop("level")):
+                log.log(lvl_name, event.pop("event", None), **event)
+
+    @classmethod
+    def run_in_process(cls):
+        TriggerRunner().run()
+
+
+class TriggerDetails(TypedDict):
+    """Type class for the trigger details dictionary."""
+
+    task: asyncio.Task
+    is_watcher: bool
+    name: str
+    events: int
+
+
+@attrs.define(kw_only=True)
+class TriggerCommsDecoder(CommsDecoder[ToTriggerRunner, ToTriggerSupervisor]):
+    _async_writer: asyncio.StreamWriter = attrs.field(alias="async_writer")
+    _async_reader: asyncio.StreamReader = attrs.field(alias="async_reader")
+
+    body_decoder: TypeAdapter[ToTriggerRunner] = attrs.field(
+        factory=lambda: TypeAdapter(ToTriggerRunner), repr=False
+    )
+
+    _pending: dict[int, asyncio.Future] = attrs.field(factory=dict, repr=False)
+    _loop: asyncio.AbstractEventLoop | None = attrs.field(default=None, repr=False)
+    _loop_thread_id: int | None = attrs.field(default=None, repr=False)
+    _reader_task: asyncio.Task | None = attrs.field(default=None, repr=False)
+
+    async def _aread_frame(self):
+        try:
+            len_bytes = await self._async_reader.readexactly(4)
+        except ConnectionResetError:
+            asyncio.current_task().cancel("Supervisor closed")
+            raise
+        length = int.from_bytes(len_bytes, byteorder="big")
+        if length >= 2**32:
+            raise OverflowError(f"Refusing to receive messages larger than 4GiB {length=}")
+        buffer = await self._async_reader.readexactly(length)
+        return self.resp_decoder.decode(buffer)
+
+    async def _reader_loop(self) -> None:
+        try:
+            while True:
+                frame = await self._aread_frame()
+                future = self._pending.pop(frame.id, None)
+                if future is not None and not future.done():
+                    future.set_result(frame)
+                else:
+                    self.log.warning("Got response for unknown request frame", frame_id=frame.id)
+        finally:
+            for fut in self._pending.values():
+                if not fut.done():
+                    fut.cancel("Reader loop exited")
+            self._pending.clear()
+
+    async def start_reader(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._loop_thread_id = threading.get_ident()
+        self._reader_task = asyncio.create_task(self._reader_loop(), name="trigger-comms-reader")
+
+    def send(self, msg: ToTriggerSupervisor) -> ToTriggerRunner | None:
+        if self._loop is None:
+            raise RuntimeError("start_reader() must be called before send()")
+        if threading.get_ident() == self._loop_thread_id:
+            # Called from the event loop thread itself (e.g. a trigger calling a sync SDK method
+            # directly from async def run()). run_coroutine_threadsafe(...).result() would deadlock
+            # here because .result() blocks the thread the event loop runs on.
+            # greenback.await_() teleports the coroutine back into the running loop instead.
+            if not greenback.has_portal():
+                raise RuntimeError(
+                    "Sync SDK methods (e.g. get_connection(), get_variable()) cannot be called "
+                    "from a trigger's async def run() when AIRFLOW_DISABLE_GREENBACK_PORTAL is "
+                    "set. Either remove that environment variable, or use the async equivalent "
+                    "(e.g. aget_connection(), aget_variable())."
+                )
+            return greenback.await_(self.asend(msg))
+        return asyncio.run_coroutine_threadsafe(self.asend(msg), self._loop).result()
+
+    async def asend(self, msg: ToTriggerSupervisor) -> ToTriggerRunner | None:
+        if self._loop is None:
+            raise RuntimeError("start_reader() must be called before asend()")
+        current_loop = asyncio.get_running_loop()
+        if self._loop is not None and current_loop is not self._loop:
+            # Called from a foreign event loop (e.g. via async_to_sync). Bridge to the main loop
+            # so _reader_loop can resolve the future, then await via wrap_future which is
+            # non-blocking for the foreign loop.
+            cf = asyncio.run_coroutine_threadsafe(self.asend(msg), self._loop)
+            return await asyncio.wrap_future(cf)
+        trigger_ti = _current_trigger_ti.get()
+        frame = _RequestFrame(
+            id=next(self.id_counter),
+            body=msg.model_dump(),
+            ti_id=trigger_ti.id if trigger_ti else None,
+        )
+        future: asyncio.Future = current_loop.create_future()
+        self._pending[frame.id] = future
+        try:
+            self._async_writer.write(frame.as_bytes())
+            return self._from_frame(await future)
+        except BaseException:
+            self._pending.pop(frame.id, None)
+            raise
+
+
+class TriggerRunner:
+    """
+    Runtime environment for all triggers.
+
+    Mainly runs inside its own process, where it hands control off to an asyncio
+    event loop. All communication between this and it's (sync) supervisor is done via sockets
+    """
+
+    # Maps trigger IDs to their running tasks and other info
+    triggers: dict[int, TriggerDetails]
+
+    # Cache for looking up triggers by classpath
+    trigger_cache: dict[str, type[BaseTrigger]]
+
+    # Inbound queue of new triggers
+    to_create: deque[workloads.RunTrigger]
+
+    # Inbound queue of deleted triggers (user acted on the task; on_kill() runs)
+    to_cancel: deque[int]
+
+    # Inbound queue of triggers reassigned to another triggerer (dropped locally; on_kill() skipped)
+    to_release: deque[int]
+
+    # Outbound queue of events
+    events: deque[TriggerEventEntry]
+
+    # Outbound queue of failed triggers
+    failed_triggers: deque[tuple[int, BaseException | None]]
+
+    # Team associated with this triggerer instance.
+    team_name: str | None
+
+    # Should-we-stop flag
+    stop: bool = False
+    _stop_event: anyio.Event | None = None
+
+    # TODO: connect this to the parent process
+    log: FilteringBoundLogger = structlog.get_logger()
+
+    comms_decoder: TriggerCommsDecoder
+
+    def __init__(self):
+        super().__init__()
+        self.triggers = {}
+        self.trigger_cache = {}
+        self.to_create = deque()
+        self.to_cancel = deque()
+        self.to_release = deque()
+        self.events = deque()
+        self.failed_triggers = deque()
+        self.team_name = None
+        self.job_id = None
+        self._stop_event = None
+        self._shared_streams = SharedStreamManager(
+            log=self.log,
+            max_subscriber_queue=conf.getint("triggerer", "shared_stream_subscriber_queue_size"),
+            ack_timeout=conf.getfloat("triggerer", "shared_stream_ack_timeout"),
+            cohort_grace_period=conf.getfloat("triggerer", "shared_stream_cohort_grace_period"),
+        )
+        self.blocked_main_thread_warning_threshold = conf.getfloat(
+            "triggerer", "blocked_main_thread_warning_threshold"
+        )
+
+    def _handle_signal(self, signum, frame) -> None:
+        """Handle termination signals gracefully."""
+        self.stop = True
+        if self._stop_event is not None:
+            self._stop_event.set()
+
+    def run(self):
+        """Sync entrypoint - just run arun in an async loop."""
+        # Mark as client-side (runs user trigger/callback code)
+        # Prevents inheriting server context from parent TriggerRunnerSupervisor
+        prev_ctx = os.environ.get("_AIRFLOW_PROCESS_CONTEXT")
+        os.environ["_AIRFLOW_PROCESS_CONTEXT"] = "client"
+        try:
+            signal.signal(signal.SIGINT, self._handle_signal)
+            signal.signal(signal.SIGTERM, self._handle_signal)
+            asyncio.run(self.arun())
+        finally:
+            if prev_ctx is None:
+                os.environ.pop("_AIRFLOW_PROCESS_CONTEXT", None)
+            else:
+                os.environ["_AIRFLOW_PROCESS_CONTEXT"] = prev_ctx
+
+    async def arun(self):
+        """
+        Run trigger addition/deletion/cleanup; main (asynchronous) logic loop.
+
+        Actual triggers run in their own separate coroutines.
+        """
+        # Make sure comms are initialized before allowing any Triggers to run
+        await self.init_comms()
+
+        watchdog = asyncio.create_task(self.block_watchdog())
+        stop_event = self._stop_event = anyio.Event()
+
+        last_status = time.monotonic()
+        try:
+            while not self.stop:
+                # Raise exceptions from the tasks
+                if watchdog.done():
+                    watchdog.result()
+
+                if self.comms_decoder._reader_task.done():
+                    self.comms_decoder._reader_task.result()
+                    raise RuntimeError("Supervisor connection lost")
+
+                # Run core logic
+
+                finished_ids = await self.cleanup_finished_triggers()
+                # This also loads the triggers we need to create or cancel
+                await self.sync_state_to_supervisor(finished_ids)
+                await self.create_triggers()
+                await self.cancel_triggers()
+                # Sleep for a bit, or exit early if stop is requested.
+                with anyio.move_on_after(1):
+                    await stop_event.wait()
+                # Every minute, log status
+                if (now := time.monotonic()) - last_status >= 60:
+                    watchers = len([trigger for trigger in self.triggers.values() if trigger["is_watcher"]])
+                    triggers = len(self.triggers) - watchers
+                    self.log.info("%i triggers currently running", triggers)
+                    self.log.info("%i watchers currently running", watchers)
+                    last_status = now
+
+        except Exception:
+            with suppress(BrokenPipeError):
+                await log.aexception("Trigger runner failed")
+            self.stop = True
+            raise
+        finally:
+            if (reader_task := self.comms_decoder._reader_task) is not None:
+                reader_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await reader_task
+            # Safety net: cancel any shared-stream poll tasks whose group
+            # survived per-trigger cleanup. The normal eviction path is
+            # ``SharedStreamManager.unsubscribe`` in ``run_trigger``'s
+            # finally; this call only matters when that path was bypassed
+            # (e.g. the unsubscribe coroutine raised and was swallowed).
+            await self._shared_streams.stop_all()
+        # Wait for supporting tasks to complete
+        await watchdog
+
+    async def init_comms(self):
+        """
+        Set up the communications pipe between this process and the supervisor.
+
+        This also sets up the SUPERVISOR_COMMS so that TaskSDK code can work as expected too (but that will
+        need to be wrapped in an ``sync_to_async()`` call)
+        """
+        from airflow.sdk.execution_time import task_runner
+
+        # Yes, we read and write to stdin! It's a socket, not a normal stdin.
+        reader, writer = await asyncio.open_connection(sock=socket(fileno=0))
+
+        self.comms_decoder = TriggerCommsDecoder(
+            async_writer=writer,
+            async_reader=reader,
+        )
+
+        task_runner.SUPERVISOR_COMMS = self.comms_decoder
+
+        frame = await self.comms_decoder._aread_frame()
+        msg = self.comms_decoder._from_frame(frame)
+        if not isinstance(msg, messages.StartTriggerer):
+            raise RuntimeError(f"Required first message to be a messages.StartTriggerer, it was {msg}")
+
+        self.team_name = msg.team_name
+        set_current_team_name(msg.team_name)
+
+        await self.comms_decoder.start_reader()
+
+    @classmethod
+    def create_runtime_ti(
+        cls, task_instance: TaskInstanceDTO, encoded_dag: dict, dag_run_data: dict
+    ) -> RuntimeTaskInstance:
+        from airflow.api_fastapi.execution_api.datamodels.taskinstance import DagRun as DRDataModel
+        from airflow.sdk.api.datamodels._generated import TIRunContext
+
+        task = DagSerialization.from_dict(encoded_dag).get_task(task_instance.task_id)
+
+        # I need to recreate a TaskInstance from task_runner before invoking get_template_context (airflow.executors.workloads.TaskInstance)
+        return RuntimeTaskInstance.model_construct(
+            **task_instance.model_dump(exclude_unset=True),
+            task=task,
+            _ti_context_from_server=TIRunContext.model_construct(
+                dag_run=DRDataModel(**dag_run_data),
+                max_tries=task.retries,
+            ),
+        )
+
+    async def create_triggers(self):
+        """Drain the to_create queue and create all new triggers that have been requested in the DB."""
+        # Emit batch creation duration only when triggers were processed.
+        has_work = bool(self.to_create)
+
+        if has_work:
+            creation_start = time.monotonic()
+
+        while self.to_create:
+            await asyncio.sleep(0)
+            context: Context | None = None
+            workload = self.to_create.popleft()
+            trigger_id = workload.id
+            if trigger_id in self.triggers:
+                self.log.warning("Trigger %s had insertion attempted twice", trigger_id)
+                continue
+            try:
+                trigger_class = self.get_trigger_by_classpath(workload.classpath)
+            except BaseException as e:
+                # Either the trigger code or the path to it is bad. Fail the trigger.
+                self.log.error("Trigger failed to load code", error=e, classpath=workload.classpath)
+                self.failed_triggers.append((trigger_id, e))
+                continue
+
+            # Loading the trigger class could have been expensive. Lets give other things a chance to run!
+            await asyncio.sleep(0)
+
+            try:
+                from airflow.serialization.decoders import smart_decode_trigger_kwargs
+
+                # Decrypt and clean trigger kwargs before for execution
+                # Note: We only clean up serialization artifacts (__var, __type keys) here,
+                # not in `_decrypt_kwargs` because it is used during hash comparison in
+                # add_asset_trigger_references and could lead to adverse effects like hash mismatches
+                # that could cause None values in collections.
+                kw = Trigger._decrypt_kwargs(workload.encrypted_kwargs)
+                deserialised_kwargs = {k: smart_decode_trigger_kwargs(v) for k, v in kw.items()}
+
+                if ti := workload.ti:
+                    trigger_name = f"{ti.dag_id}/{ti.run_id}/{ti.task_id}/{ti.map_index}/{ti.try_number} (ID {trigger_id})"
+                    trigger_instance = trigger_class(**deserialised_kwargs)
+
+                    if workload.dag_data:
+                        runtime_ti = self.create_runtime_ti(ti, workload.dag_data, workload.dag_run_data)
+                        context = runtime_ti.get_template_context()
+                        trigger_instance.task_instance = runtime_ti
+                    else:
+                        trigger_instance.task_instance = ti
+                else:
+                    trigger_name = f"ID {trigger_id}"
+                    trigger_instance = trigger_class(**deserialised_kwargs)
+            except Exception as err:
+                # Kwargs are decoded here rather than when queued, so one trigger with undecodable
+                # kwargs (e.g. a class not in allowed_deserialization_classes) must not stop the runner.
+                self.log.error("Trigger failed to inflate", error=err, trigger_id=trigger_id)
+                self.failed_triggers.append((trigger_id, err))
+                continue
+            trigger_instance.trigger_id = trigger_id
+            trigger_instance.triggerer_job_id = self.job_id
+            trigger_instance.timeout_after = workload.timeout_after
+
+            if isinstance(trigger_instance, BaseEventTrigger) and workload.watched_assets:
+                trigger_instance.asset_state_store = AssetStateStoreAccessors(
+                    inlets=[Asset(name=name, uri=uri) for name, uri in workload.watched_assets.items()]
+                )
+            if workload.queued_at is not None:
+                # `queued_at` is captured by the supervisor process and consumed by the runner process.
+                # Both run on the same host, so their monotonic timestamps are comparable.
+                stats.timing(
+                    "triggerer.trigger_queue_delay",
+                    int((time.monotonic() - workload.queued_at) * 1000),
+                    tags=prune_dict({"team_name": self.team_name}),
+                )
+
+            self.triggers[trigger_id] = {
+                "task": asyncio.create_task(
+                    self.run_trigger(trigger_id, trigger_instance, workload.timeout_after, context),
+                    name=trigger_name,
+                ),
+                "is_watcher": isinstance(trigger_instance, BaseEventTrigger),
+                "name": trigger_name,
+                "events": 0,
+            }
+
+        if has_work:
+            stats.timing(
+                "triggerer.batch_trigger_creation_duration",
+                (time.monotonic() - creation_start) * 1000,
+                tags=prune_dict({"team_name": self.team_name}),
+            )
+
+    async def cancel_triggers(self):
+        """Drain to_cancel and to_release; the cancel message tells run_trigger() if on_kill() applies."""
+        for queue, cancel_msg in (
+            (self.to_cancel, _USER_ACTION_CANCEL_MSG),
+            (self.to_release, _REASSIGNED_CANCEL_MSG),
+        ):
+            while queue:
+                trigger_id = queue.popleft()
+                if trigger_id in self.triggers:
+                    self.triggers[trigger_id]["task"].cancel(cancel_msg)
+                await asyncio.sleep(0)
+
+    async def cleanup_finished_triggers(self) -> list[int]:
+        """
+        Go through all trigger tasks (coroutines) and clean up entries for ones that have exited.
+
+        Optionally warn users if the exit was not normal.
+        """
+        finished_ids: list[int] = []
+        for trigger_id, details in list(self.triggers.items()):
+            if details["task"].done():
+                finished_ids.append(trigger_id)
+                # Check to see if it exited for good reasons
+                saved_exc = None
+                try:
+                    result = details["task"].result()
+                except (asyncio.CancelledError, SystemExit, KeyboardInterrupt):
+                    # These are "expected" exceptions and we stop processing here
+                    # If we don't, then the system requesting a trigger be removed -
+                    # which turns into CancelledError - results in a failure.
+                    del self.triggers[trigger_id]
+                    continue
+                except BaseException as e:
+                    # This is potentially bad, so log it.
+                    self.log.exception(
+                        "Trigger %s exited with error %s", details["name"], e, trigger_id=trigger_id
+                    )
+                    saved_exc = e
+                else:
+                    # See if they foolishly returned a TriggerEvent
+                    if isinstance(result, TriggerEvent):
+                        self.log.error(
+                            "Trigger returned a TriggerEvent rather than yielding it",
+                            trigger=details["name"],
+                            trigger_id=trigger_id,
+                        )
+                # See if this exited without sending an event, in which case
+                # any task instances depending on it need to be failed
+                if details["events"] == 0:
+                    self.log.error(
+                        "Trigger exited without sending an event. Dependent tasks will be failed.",
+                        name=details["name"],
+                        trigger_id=trigger_id,
+                    )
+                    # TODO: better formatting of the exception?
+                    self.failed_triggers.append((trigger_id, saved_exc))
+                del self.triggers[trigger_id]
+            await asyncio.sleep(0)
+        return finished_ids
+
+    def process_trigger_events(self, finished_ids: list[int]) -> messages.TriggerStateChanges:
+        # Copy out of our dequeues in threadsafe manner to sync state with parent
+        events_to_send: list[TriggerEventEntry] = []
+        failures_to_send: list[tuple[int, list[str] | None]] = []
+        finished_to_send = list(finished_ids)
+
+        while self.events:
+            events_to_send.append(self.events.popleft())
+
+        while self.failed_triggers:
+            trigger_id, exc = self.failed_triggers.popleft()
+            tb = format_exception(type(exc), exc, exc.__traceback__) if exc else None
+            failures_to_send.append((trigger_id, tb))
+            if trigger_id not in self.triggers and trigger_id not in finished_to_send:
+                finished_to_send.append(trigger_id)
+
+        return messages.TriggerStateChanges(
+            events=events_to_send if events_to_send else None,
+            finished=finished_to_send if finished_to_send else None,
+            failures=failures_to_send if failures_to_send else None,
+            running_ids=set(self.triggers),
+        )
+
+    def sanitize_trigger_events(self, msg: messages.TriggerStateChanges) -> messages.TriggerStateChanges:
+        req_encoder = _new_encoder()
+        events_to_send: list[TriggerEventEntry] = []
+
+        if msg.events:
+            for entry in msg.events:
+                try:
+                    req_encoder.encode(entry.event)
+                except Exception as e:
+                    logger.error(
+                        "Trigger %s returned non-serializable result %r. Cancelling trigger.",
+                        entry.trigger_id,
+                        entry.event,
+                    )
+                    # The dropped event's seq (if any) is never confirmed, so
+                    # the bound shared-stream advance times out as failed and
+                    # the broker redelivers — the safe direction for an event
+                    # that was never persisted.
+                    self.failed_triggers.append((entry.trigger_id, e))
+                else:
+                    events_to_send.append(entry)
+
+        return messages.TriggerStateChanges(
+            events=events_to_send if events_to_send else None,
+            finished=msg.finished,
+            failures=msg.failures,
+            running_ids=msg.running_ids,
+        )
+
+    async def sync_state_to_supervisor(self, finished_ids: list[int]) -> None:
+        msg = self.process_trigger_events(finished_ids=finished_ids)
+
+        # Tell the monitor that we've finished triggers so it can update things
+        try:
+            resp = await self.asend(msg)
+        except NotImplementedError:
+            # A non-serializable trigger event was detected, remove it and fail associated trigger
+            resp = await self.asend(self.sanitize_trigger_events(msg))
+
+        if resp:
+            self.to_create.extend(resp.to_create)
+            self.to_cancel.extend(resp.to_cancel)
+            self.to_release.extend(resp.to_release)
+            if resp.events_persisted:
+                self._shared_streams.confirm_persisted(resp.events_persisted)
+
+    async def asend(self, msg: messages.TriggerStateChanges) -> messages.TriggerStateSync | None:
+        try:
+            response = await self.comms_decoder.asend(msg)
+
+            if not isinstance(response, messages.TriggerStateSync):
+                raise RuntimeError(f"Expected to get a TriggerStateSync message, instead we got {type(msg)}")
+
+            return response
+        except asyncio.IncompleteReadError:
+            if task := asyncio.current_task():
+                task.cancel("EOF - shutting down")
+                return None
+            raise
+
+    async def block_watchdog(self):
+        """
+        Watchdog loop that detects blocking (badly-written) triggers.
+
+        Triggers should be well-behaved async coroutines and await whenever
+        they need to wait; this loop tries to run every 100ms to see if
+        there are badly-written triggers taking longer than that and blocking
+        the event loop.
+
+        Unfortunately, we can't tell what trigger is blocking things, but
+        we can at least detect the top-level problem.
+        """
+        while not self.stop:
+            last_run = time.monotonic()
+            await asyncio.sleep(0.1)
+            # We allow a generous amount of buffer room for now, since it might
+            # be a busy event loop.
+            time_elapsed = time.monotonic() - last_run
+            if time_elapsed > self.blocked_main_thread_warning_threshold:
+                await self.log.ainfo(
+                    "Triggerer's async thread was blocked for %.2f seconds, "
+                    "exceeding the configured warning threshold of %.2f seconds. "
+                    "This is likely caused by a badly-written trigger. "
+                    "Set PYTHONASYNCIODEBUG=1 to get more information on overrunning coroutines.",
+                    time_elapsed,
+                    self.blocked_main_thread_warning_threshold,
+                )
+                stats.incr(
+                    "triggers.blocked_main_thread",
+                    tags=prune_dict({"team_name": self.team_name}),
+                )
+
+    async def run_trigger(
+        self,
+        trigger_id: int,
+        trigger: BaseTrigger,
+        timeout_after: datetime | None = None,
+        context: Context | None = None,
+    ):
+        """Run a trigger (they are async generators) and push their events into our outbound event deque."""
+        if not os.environ.get("AIRFLOW_DISABLE_GREENBACK_PORTAL", "").lower() == "true":
+            await greenback.ensure_portal()
+
+        ti = trigger.task_instance
+        if ti is not None:
+            _current_trigger_ti.set(ti)
+        bind_log_contextvars(
+            trigger_id=trigger_id,
+            ti_id=str(ti.id) if ti else None,
+            dag_id=ti.dag_id if ti else None,
+            task_id=ti.task_id if ti else None,
+            run_id=ti.run_id if ti else None,
+            try_number=ti.try_number if ti else None,
+            map_index=ti.map_index if ti else None,
+        )
+
+        name = self.triggers[trigger_id]["name"]
+        self.log.info("trigger %s starting", name)
+
+        # Triggers that opt into a shared underlying I/O stream
+        # (BaseEventTrigger.shared_stream_key returns non-None) consume a
+        # broadcast stream produced by SharedStreamManager and convert it
+        # via filter_shared_stream(). Everything else stays on the original
+        # standalone-run() path. The key is computed after
+        # render_template_fields so any templated attributes are already
+        # resolved when the key is constructed.
+        event_trigger: BaseEventTrigger | None = None
+        if isinstance(trigger, BaseEventTrigger):
+            event_trigger = trigger
+        shared_key: Hashable | None = None
+
+        with _make_trigger_span(ti=trigger.task_instance, trigger_id=trigger_id, name=name) as span:
+            try:
+                if context is not None:
+                    trigger.render_template_fields(context=context)
+
+                if event_trigger is not None:
+                    try:
+                        shared_key = event_trigger.shared_stream_key()
+                    except Exception:
+                        self.log.exception(
+                            "shared_stream_key() raised; falling back to standalone run",
+                            trigger_id=trigger_id,
+                        )
+                        shared_key = None
+
+                if shared_key is not None and event_trigger is not None:
+                    # subscribe() may start the group's poll task, which copies the current context but
+                    # serves several triggers.
+                    subscribe_ctx = contextvars.copy_context()
+                    subscribe_ctx.run(_current_trigger_ti.set, None)
+                    shared_stream = subscribe_ctx.run(
+                        self._shared_streams.subscribe,
+                        trigger_id=trigger_id,
+                        trigger=event_trigger,
+                        key=shared_key,
+                    )
+                    event_stream = event_trigger.filter_shared_stream(shared_stream)
+                else:
+                    event_stream = trigger.run()
+
+                async for event in event_stream:
+                    # Avoid logging the full payload at INFO — it may contain sensitive data and
+                    # inflate log storage on every execution. DEBUG is used instead so developers
+                    # can still inspect the payload when needed without cluttering production logs.
+                    await self.log.ainfo("Trigger fired event", name=self.triggers[trigger_id]["name"])
+                    await self.log.adebug(
+                        "Trigger fired event payload", name=self.triggers[trigger_id]["name"], result=event
+                    )
+
+                    self.triggers[trigger_id]["events"] += 1
+                    seq: int | None = None
+                    if shared_key is not None:
+                        # Bind and append back to back with no await in
+                        # between, so no other coroutine can observe the
+                        # event bound but not yet queued (or vice versa).
+                        seq = self._shared_streams.bind_pending_event(trigger_id=trigger_id, key=shared_key)
+                    self.events.append(TriggerEventEntry(trigger_id=trigger_id, event=event, persist_seq=seq))
+                span.set_status(Status(StatusCode.OK))
+            except asyncio.CancelledError as e:
+                # A trigger can be cancelled for three reasons:
+                #   - The user acted on the task (mark failed / clear / mark succeeded).
+                #   - The trigger was reassigned to another triggerer (see
+                #     TriggerRunnerSupervisor.update_triggers); the new owner keeps running it.
+                #   - The triggerer is shutting down, here cancel_triggers() is not
+                #     involved — the shutdown path cancels tasks directly without a message.
+                # Only the first case should invoke on_kill().
+                #
+                # For timeout, raise immediately without calling on_kill().
+                if timeout := timeout_after:
+                    timeout = timeout.replace(tzinfo=timezone.utc) if not timeout.tzinfo else timeout
+                    if timeout < timezone.utcnow():
+                        await self.log.aerror("Trigger cancelled due to timeout")
+                        span.set_status(Status(StatusCode.ERROR), description=str(e))
+                        raise
+                if e.args and e.args[0] == _REASSIGNED_CANCEL_MSG:
+                    await self.log.ainfo(
+                        "Trigger reassigned to another triggerer, dropping it without on_kill", name=name
+                    )
+                elif e.args and e.args[0] == _USER_ACTION_CANCEL_MSG:
+                    await self.log.ainfo("Trigger cancelled by user action, invoking on_kill", name=name)
+                    try:
+                        await asyncio.wait_for(trigger.on_kill(), timeout=_ON_CANCEL_TIMEOUT)
+                    except TimeoutError:
+                        await self.log.awarning("on_kill() timed out", timeout=_ON_CANCEL_TIMEOUT, name=name)
+                    except asyncio.CancelledError:
+                        # on_kill() was itself cancelled (e.g. triggerer shutting down
+                        # while on_kill() was running). Swallow it so the outer
+                        # CancelledError (variable `e`) can be re-raised below.
+                        pass
+                    except Exception:
+                        await self.log.awarning("on_kill() raised an exception", name=name, exc_info=True)
+                span.set_status(Status(StatusCode.OK), description=str(e))
+                raise
+            except Exception as e:
+                span.set_status(Status(StatusCode.ERROR), description=str(e))
+                raise
+            finally:
+                # CancelledError will get injected when we're stopped - which is
+                # fine, the cleanup process will understand that, but we want to
+                # allow triggers a chance to cleanup, either in that case or if
+                # they exit cleanly. Exception from cleanup methods are ignored.
+                if shared_key is not None:
+                    try:
+                        await self._shared_streams.unsubscribe(trigger_id, shared_key)
+                    except Exception:
+                        # Best-effort cleanup, but log so we don't lose
+                        # cancel-propagation or _handle_poll_terminate bugs.
+                        self.log.exception(
+                            "Failed to unsubscribe trigger from shared stream",
+                            trigger_id=trigger_id,
+                            key=shared_key,
+                        )
+                with suppress(Exception):
+                    await trigger.cleanup()
+
+                await self.log.ainfo("trigger completed", name=name)
+
+    def get_trigger_by_classpath(self, classpath: str) -> type[BaseTrigger]:
+        """
+        Get a trigger class by its classpath ("path.to.module.classname").
+
+        The resolved object must be a :class:`~airflow.triggers.base.BaseTrigger`
+        subclass. This is validated before the class is cached and, crucially,
+        before it is ever instantiated in ``create_triggers`` -- ``classpath``
+        originates from the (attacker-influenceable) deferred-task payload, so
+        without this check an arbitrary importable callable could be invoked in
+        the triggerer process.
+
+        Uses a cache dictionary to speed up lookups after the first time.
+        """
+        if classpath not in self.trigger_cache:
+            trigger_class = import_string(classpath)
+            if not (isinstance(trigger_class, type) and issubclass(trigger_class, BaseTrigger)):
+                raise TypeError(
+                    f"The trigger classpath {classpath!r} does not resolve to a "
+                    f"{BaseTrigger.__module__}.{BaseTrigger.__qualname__} subclass; "
+                    f"refusing to load it."
+                )
+            self.trigger_cache[classpath] = trigger_class
+        return self.trigger_cache[classpath]

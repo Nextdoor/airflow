@@ -1,0 +1,312 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+"""Shared provider discovery utilities."""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import logging
+import pathlib
+from collections.abc import Callable, MutableMapping
+from dataclasses import dataclass
+from functools import wraps
+from importlib.metadata import Distribution
+from importlib.resources import files as resource_files
+from time import perf_counter
+from typing import NamedTuple, ParamSpec, Protocol, cast
+
+from packaging.utils import canonicalize_name
+
+from ..module_loading import entry_points_with_dist
+
+log = logging.getLogger(__name__)
+
+
+PS = ParamSpec("PS")
+
+
+KNOWN_UNHANDLED_OPTIONAL_FEATURE_ERRORS = [("apache-airflow-providers-google", "No module named 'paramiko'")]
+
+
+class ProvidersManagerProtocol(Protocol):
+    """Protocol for ProvidersManager for type checking purposes."""
+
+    _initialized_cache: dict[str, bool]
+
+
+@dataclass
+class ProviderInfo:
+    """
+    Provider information.
+
+    :param version: version string
+    :param data: dictionary with information about the provider
+    """
+
+    version: str
+    data: dict
+
+
+class HookClassProvider(NamedTuple):
+    """Hook class and Provider it comes from."""
+
+    hook_class_name: str
+    package_name: str
+
+
+class HookInfo(NamedTuple):
+    """Hook information."""
+
+    hook_class_name: str
+    connection_id_attribute_name: str
+    package_name: str
+    hook_name: str
+    connection_type: str
+    connection_testable: bool
+    dialects: list[str] = []
+
+
+class PluginInfo(NamedTuple):
+    """Plugin class, name and provider it comes from."""
+
+    name: str
+    plugin_class: str
+    provider_name: str
+
+
+class LazyDictWithCache(MutableMapping):
+    """
+    Lazy-loaded cached dictionary.
+
+    Dictionary, which in case you set callable, executes the passed callable with `key` attribute
+    at first use - and returns and caches the result.
+    """
+
+    __slots__ = ["_resolved", "_raw_dict"]
+
+    def __init__(self, *args, **kw):
+        self._resolved = set()
+        self._raw_dict = dict(*args, **kw)
+
+    def __setitem__(self, key, value):
+        self._raw_dict.__setitem__(key, value)
+
+    def __getitem__(self, key):
+        value = self._raw_dict.__getitem__(key)
+        if key not in self._resolved and callable(value):
+            # exchange callable with result of calling it -- but only once! allow resolver to return a
+            # callable itself
+            value = value()
+            self._resolved.add(key)
+            self._raw_dict.__setitem__(key, value)
+        return value
+
+    def __delitem__(self, key):
+        with contextlib.suppress(KeyError):
+            self._resolved.remove(key)
+        self._raw_dict.__delitem__(key)
+
+    def __iter__(self):
+        return iter(self._raw_dict)
+
+    def __len__(self):
+        return len(self._raw_dict)
+
+    def __contains__(self, key):
+        return key in self._raw_dict
+
+    def clear(self):
+        self._resolved.clear()
+        self._raw_dict.clear()
+
+
+def _read_schema_from_resources_or_local_file(filename: str) -> dict:
+    """Read JSON schema from resources or local file."""
+    try:
+        with resource_files("airflow").joinpath(filename).open("rb") as f:
+            schema = json.load(f)
+    except (TypeError, FileNotFoundError):
+        with (pathlib.Path(__file__).parent / filename).open("rb") as f:
+            schema = json.load(f)
+    return schema
+
+
+def _create_provider_info_schema_validator():
+    """Create JSON schema validator from the provider_info.schema.json."""
+    import jsonschema
+
+    schema = _read_schema_from_resources_or_local_file("provider_info.schema.json")
+    cls = jsonschema.validators.validator_for(schema)
+    validator = cls(schema)
+    return validator
+
+
+def _check_builtin_provider_prefix(provider_package: str, class_name: str) -> bool:
+    """Check if builtin provider class has correct prefix."""
+    if provider_package.startswith("apache-airflow"):
+        provider_path = provider_package[len("apache-") :].replace("-", ".")
+        if not class_name.startswith(provider_path):
+            log.warning(
+                "Coherence check failed when importing '%s' from '%s' package. It should start with '%s'",
+                class_name,
+                provider_package,
+                provider_path,
+            )
+            return False
+    return True
+
+
+def log_optional_feature_disabled(class_name, e, provider_package):
+    """Log optional feature disabled."""
+    log.debug(
+        "Optional feature disabled on exception when importing '%s' from '%s' package",
+        class_name,
+        provider_package,
+        exc_info=e,
+    )
+    log.info(
+        "Optional provider feature disabled when importing '%s' from '%s' package",
+        class_name,
+        provider_package,
+    )
+
+
+def log_import_warning(class_name, e, provider_package):
+    """Log import warning."""
+    log.warning(
+        "Exception when importing '%s' from '%s' package",
+        class_name,
+        provider_package,
+        exc_info=e,
+    )
+
+
+def provider_info_cache(cache_name: str) -> Callable[[Callable[PS, None]], Callable[PS, None]]:
+    """
+    Decorate and cache provider info.
+
+    Decorator factory that create decorator that caches initialization of provider's parameters
+    :param cache_name: Name of the cache
+    """
+
+    def provider_info_cache_decorator(func: Callable[PS, None]) -> Callable[PS, None]:
+        @wraps(func)
+        def wrapped_function(*args: PS.args, **kwargs: PS.kwargs) -> None:
+            instance = cast("ProvidersManagerProtocol", args[0])
+
+            if cache_name in instance._initialized_cache:
+                return
+            start_time = perf_counter()
+            log.debug("Initializing Provider Manager[%s]", cache_name)
+            func(*args, **kwargs)
+            instance._initialized_cache[cache_name] = True
+            log.debug(
+                "Initialization of Provider Manager[%s] took %.2f seconds",
+                cache_name,
+                perf_counter() - start_time,
+            )
+
+        return wrapped_function
+
+    return provider_info_cache_decorator
+
+
+def discover_all_providers_from_packages(
+    provider_dict: dict[str, ProviderInfo],
+    provider_schema_validator,
+    incompatibility_reason: Callable[[Distribution], str | None] | None = None,
+) -> None:
+    """
+    Discover all providers by scanning packages installed.
+
+    The list of providers should be returned via the 'apache_airflow_provider'
+    entrypoint as a dictionary conforming to the 'airflow/provider_info.schema.json'
+    schema. Note that the schema is different at runtime than provider.yaml.schema.json.
+    The development version of provider schema is more strict and changes together with
+    the code. The runtime version is more relaxed (allows for additional properties)
+    and verifies only the subset of fields that are needed at runtime.
+
+    :param provider_dict: Dictionary to populate with discovered providers
+    :param provider_schema_validator: JSON schema validator for provider info
+    """
+    import jsonschema
+
+    for entry_point, dist in entry_points_with_dist("apache_airflow_provider"):
+        if not dist.metadata:
+            continue
+        package_name = canonicalize_name(dist.metadata["name"])
+        if package_name in provider_dict:
+            continue
+        log.debug("Loading %s from package %s", entry_point, package_name)
+        version = dist.version
+        if incompatibility_reason and (reason := incompatibility_reason(dist)):
+            log.warning(reason)
+            continue
+        provider_info = entry_point.load()()
+        try:
+            provider_schema_validator.validate(provider_info)
+        except jsonschema.ValidationError:
+            # One provider's malformed metadata must not stop the others from loading. This
+            # used to escape discovery entirely, so every provider after it was skipped and
+            # initialize_providers_list() raised on this and every later call.
+            # Only ValidationError is caught: a SchemaError or UnknownType means the schema
+            # itself is broken, which must stay loud rather than be reported once per provider.
+            log.warning(
+                "The provider %s does not conform to the provider_info schema and has been skipped.",
+                package_name,
+                exc_info=True,
+            )
+            continue
+        # 'package-name' is not in the runtime schema's required list, so validation passing
+        # does not guarantee it is present.
+        provider_info_package_name = provider_info.get("package-name")
+        if not provider_info_package_name:
+            log.warning(
+                "The provider %s does not declare 'package-name' in its provider info and has been skipped.",
+                package_name,
+            )
+            continue
+        if package_name != provider_info_package_name:
+            raise ValueError(
+                f"The package '{package_name}' from packaging information "
+                f"{provider_info_package_name} do not match. Please make sure they are aligned"
+            )
+
+        # issue-59576: Retrieve the project.urls.documentation from dist.metadata
+        project_urls = dist.metadata.get_all("Project-URL")
+        documentation_url: str | None = None
+
+        if project_urls:
+            for entry in project_urls:
+                if "," in entry:
+                    name, url = entry.split(",", 1)
+                    if name.strip().lower() == "documentation":
+                        documentation_url = url.strip()
+                        break
+
+        provider_info["documentation-url"] = documentation_url
+
+        if package_name not in provider_dict:
+            provider_dict[package_name] = ProviderInfo(version, provider_info)
+        else:
+            log.warning(
+                "The provider for package '%s' could not be registered from because providers for that "
+                "package name have already been registered",
+                package_name,
+            )

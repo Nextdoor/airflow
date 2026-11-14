@@ -1,0 +1,47 @@
+[
+    {"eventType": "START", "job": {"name": "openlineage_mapped_simple_dag"}},
+    {
+        "eventType": "START",
+        "run": {
+            "facets": {
+                "airflow": {
+                    "task": {
+                        "mapped": "{{ result == true }}"
+                    },
+                    "taskInstance": {
+                        "map_index": 1,
+                        "try_number": 1,
+                        "max_tries": 0,
+                        "state": "running",
+                        "id": "{{ is_uuid(result) }}"
+                    }
+                }
+            }
+        },
+        "job": {
+            "name": "openlineage_mapped_simple_dag.add_one"
+        }
+    },
+    {
+        "eventType": "COMPLETE",
+        "run": {
+            "facets": {
+                "airflow": {
+                    "task": {
+                        "mapped": "{{ result == true }}"
+                    },
+                    "taskInstance": {
+                        "map_index": 1,
+                        "try_number": 1,
+                        "max_tries": 0,
+                        "state": "success",
+                        "id": "{{ is_uuid(result) }}"
+                    }
+                }
+            }
+        },
+        "job": {
+            "name": "openlineage_mapped_simple_dag.add_one"
+        }
+    }
+]

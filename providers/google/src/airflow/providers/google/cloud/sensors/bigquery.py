@@ -1,0 +1,490 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+"""This module contains Google BigQuery sensors."""
+
+from __future__ import annotations
+
+import warnings
+from collections.abc import Sequence
+from datetime import timedelta
+from typing import TYPE_CHECKING, Any
+
+from google.api_core.exceptions import NotFound
+from google.cloud.bigquery import DatasetReference, TableReference
+
+from airflow.exceptions import AirflowProviderDeprecationWarning
+from airflow.providers.common.compat.sdk import AirflowException, BaseSensorOperator, conf, timezone
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from airflow.providers.google.cloud.triggers.bigquery import (
+    BigQueryStreamingBufferEmptyTrigger,
+    BigQueryTableExistenceTrigger,
+    BigQueryTablePartitionExistenceTrigger,
+)
+from airflow.providers.google.version_compat import AIRFLOW_V_3_0_PLUS
+
+if TYPE_CHECKING:
+    from datetime import datetime
+
+    from airflow.providers.common.compat.sdk import Context
+
+
+class BigQueryTableExistenceSensor(BaseSensorOperator):
+    """
+    Checks for the existence of a table in Google Bigquery.
+
+    :param project_id: The Google cloud project in which to look for the table.
+        The connection supplied to the hook must provide
+        access to the specified project.
+    :param dataset_id: The name of the dataset in which to look for the table.
+        storage bucket.
+    :param table_id: The name of the table to check the existence of.
+    :param gcp_conn_id: (Optional) The connection ID used to connect to Google Cloud.
+    :param impersonation_chain: Optional service account to impersonate using short-term
+        credentials, or chained list of accounts required to get the access_token
+        of the last account in the list, which will be impersonated in the request.
+        If set as a string, the account must grant the originating account
+        the Service Account Token Creator IAM role.
+        If set as a sequence, the identities from the list must grant
+        Service Account Token Creator IAM role to the directly preceding identity, with first
+        account from the list granting this role to the originating account (templated).
+    """
+
+    template_fields: Sequence[str] = (
+        "project_id",
+        "dataset_id",
+        "table_id",
+        "impersonation_chain",
+        "gcp_conn_id",
+    )
+    ui_color = "#f0eee4"
+
+    def __init__(
+        self,
+        *,
+        project_id: str,
+        dataset_id: str,
+        table_id: str,
+        gcp_conn_id: str = "google_cloud_default",
+        impersonation_chain: str | Sequence[str] | None = None,
+        deferrable: bool = conf.getboolean("operators", "default_deferrable", fallback=False),
+        **kwargs,
+    ) -> None:
+        if deferrable and "poke_interval" not in kwargs:
+            # TODO: Remove once deprecated
+            if "polling_interval" in kwargs:
+                kwargs["poke_interval"] = kwargs["polling_interval"]
+                warnings.warn(
+                    "Argument `poll_interval` is deprecated and will be removed "
+                    "in a future release.  Please use `poke_interval` instead. Planned removal date: October 5, 2026.",
+                    AirflowProviderDeprecationWarning,
+                    stacklevel=2,
+                )
+            else:
+                kwargs["poke_interval"] = 5
+
+        super().__init__(**kwargs)
+
+        self.project_id = project_id
+        self.dataset_id = dataset_id
+        self.table_id = table_id
+        self.gcp_conn_id = gcp_conn_id
+        self.impersonation_chain = impersonation_chain
+
+        self.deferrable = deferrable
+
+    def poke(self, context: Context) -> bool:
+        table_uri = f"{self.project_id}:{self.dataset_id}.{self.table_id}"
+        self.log.info("Sensor checks existence of table: %s", table_uri)
+        hook = BigQueryHook(
+            gcp_conn_id=self.gcp_conn_id,
+            impersonation_chain=self.impersonation_chain,
+        )
+        return hook.table_exists(
+            project_id=self.project_id, dataset_id=self.dataset_id, table_id=self.table_id
+        )
+
+    def execute(self, context: Context) -> None:
+        """Airflow runs this method on the worker and defers using the trigger."""
+        if not self.deferrable:
+            super().execute(context)
+        else:
+            if not self.poke(context=context):
+                self.defer(
+                    timeout=timedelta(seconds=self.timeout),
+                    trigger=BigQueryTableExistenceTrigger(
+                        dataset_id=self.dataset_id,
+                        table_id=self.table_id,
+                        project_id=self.project_id,
+                        poll_interval=self.poke_interval,
+                        gcp_conn_id=self.gcp_conn_id,
+                        impersonation_chain=self.impersonation_chain,
+                        hook_params={
+                            "impersonation_chain": self.impersonation_chain,
+                        },
+                    ),
+                    method_name="execute_complete",
+                )
+
+    def execute_complete(self, context: dict[str, Any], event: dict[str, str] | None = None) -> str:
+        """
+        Act as a callback for when the trigger fires - returns immediately.
+
+        Relies on trigger to throw an exception, otherwise it assumes execution was successful.
+        """
+        table_uri = f"{self.project_id}:{self.dataset_id}.{self.table_id}"
+        self.log.info("Sensor checks existence of table: %s", table_uri)
+        if event:
+            if event["status"] == "success":
+                return event["message"]
+            raise AirflowException(event["message"])
+
+        message = "No event received in trigger callback"
+        raise AirflowException(message)
+
+
+class BigQueryRoutineExistenceSensor(BaseSensorOperator):
+    """
+    Checks for the existence of a routine (UDF, procedure, or TVF) in a BigQuery dataset.
+
+    :param project_id: The Google Cloud project that owns the dataset.
+    :param dataset_id: The dataset that owns the routine.
+    :param routine_id: The identifier of the routine to check.
+    :param gcp_conn_id: (Optional) The connection ID used to connect to Google Cloud.
+    :param impersonation_chain: Optional service account to impersonate using short-term
+        credentials, or chained list of accounts required to get the access_token
+        of the last account in the list, which will be impersonated in the request.
+        If set as a string, the account must grant the originating account
+        the Service Account Token Creator IAM role.
+        If set as a sequence, the identities from the list must grant
+        Service Account Token Creator IAM role to the directly preceding identity, with first
+        account from the list granting this role to the originating account (templated).
+    """
+
+    template_fields: Sequence[str] = (
+        "project_id",
+        "dataset_id",
+        "routine_id",
+        "impersonation_chain",
+        "gcp_conn_id",
+    )
+    ui_color = "#f0eee4"
+
+    def __init__(
+        self,
+        *,
+        project_id: str,
+        dataset_id: str,
+        routine_id: str,
+        gcp_conn_id: str = "google_cloud_default",
+        impersonation_chain: str | Sequence[str] | None = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.project_id = project_id
+        self.dataset_id = dataset_id
+        self.routine_id = routine_id
+        self.gcp_conn_id = gcp_conn_id
+        self.impersonation_chain = impersonation_chain
+
+    def poke(self, context: Context) -> bool:
+        routine_uri = f"{self.project_id}.{self.dataset_id}.{self.routine_id}"
+        self.log.info("Sensor checks existence of routine: %s", routine_uri)
+        hook = BigQueryHook(
+            gcp_conn_id=self.gcp_conn_id,
+            impersonation_chain=self.impersonation_chain,
+        )
+        try:
+            hook.get_routine(
+                project_id=self.project_id,
+                dataset_id=self.dataset_id,
+                routine_id=self.routine_id,
+            )
+        except NotFound:
+            return False
+        return True
+
+
+class BigQueryTablePartitionExistenceSensor(BaseSensorOperator):
+    """
+    Checks for the existence of a partition within a table in Google Bigquery.
+
+    :param project_id: The Google cloud project in which to look for the table.
+        The connection supplied to the hook must provide
+        access to the specified project.
+    :param dataset_id: The name of the dataset in which to look for the table.
+        storage bucket.
+    :param table_id: The name of the table to check the existence of.
+    :param partition_id: The name of the partition to check the existence of.
+    :param gcp_conn_id: (Optional) The connection ID used to connect to Google Cloud.
+    :param impersonation_chain: Optional service account to impersonate using short-term
+        credentials, or chained list of accounts required to get the access_token
+        of the last account in the list, which will be impersonated in the request.
+        If set as a string, the account must grant the originating account
+        the Service Account Token Creator IAM role.
+        If set as a sequence, the identities from the list must grant
+        Service Account Token Creator IAM role to the directly preceding identity, with first
+        account from the list granting this role to the originating account (templated).
+    """
+
+    template_fields: Sequence[str] = (
+        "project_id",
+        "dataset_id",
+        "table_id",
+        "partition_id",
+        "impersonation_chain",
+        "gcp_conn_id",
+    )
+    ui_color = "#f0eee4"
+
+    def __init__(
+        self,
+        *,
+        project_id: str,
+        dataset_id: str,
+        table_id: str,
+        partition_id: str,
+        gcp_conn_id: str = "google_cloud_default",
+        impersonation_chain: str | Sequence[str] | None = None,
+        deferrable: bool = conf.getboolean("operators", "default_deferrable", fallback=False),
+        **kwargs,
+    ) -> None:
+        if deferrable and "poke_interval" not in kwargs:
+            kwargs["poke_interval"] = 5
+        super().__init__(**kwargs)
+
+        self.project_id = project_id
+        self.dataset_id = dataset_id
+        self.table_id = table_id
+        self.partition_id = partition_id
+        self.gcp_conn_id = gcp_conn_id
+        self.impersonation_chain = impersonation_chain
+
+        self.deferrable = deferrable
+
+    def poke(self, context: Context) -> bool:
+        table_uri = f"{self.project_id}:{self.dataset_id}.{self.table_id}"
+        self.log.info('Sensor checks existence of partition: "%s" in table: %s', self.partition_id, table_uri)
+        hook = BigQueryHook(
+            gcp_conn_id=self.gcp_conn_id,
+            impersonation_chain=self.impersonation_chain,
+        )
+        return hook.table_partition_exists(
+            project_id=self.project_id,
+            dataset_id=self.dataset_id,
+            table_id=self.table_id,
+            partition_id=self.partition_id,
+        )
+
+    def execute(self, context: Context) -> None:
+        """Airflow runs this method on the worker and defers using the triggers if deferrable is True."""
+        if not self.deferrable:
+            super().execute(context)
+        else:
+            if not self.poke(context=context):
+                self.defer(
+                    timeout=timedelta(seconds=self.timeout),
+                    trigger=BigQueryTablePartitionExistenceTrigger(
+                        dataset_id=self.dataset_id,
+                        table_id=self.table_id,
+                        project_id=self.project_id,
+                        partition_id=self.partition_id,
+                        poll_interval=self.poke_interval,
+                        gcp_conn_id=self.gcp_conn_id,
+                        impersonation_chain=self.impersonation_chain,
+                        hook_params={
+                            "impersonation_chain": self.impersonation_chain,
+                        },
+                    ),
+                    method_name="execute_complete",
+                )
+
+    def execute_complete(self, context: dict[str, Any], event: dict[str, str] | None = None) -> str:
+        """
+        Act as a callback for when the trigger fires - returns immediately.
+
+        Relies on trigger to throw an exception, otherwise it assumes execution was successful.
+        """
+        table_uri = f"{self.project_id}:{self.dataset_id}.{self.table_id}"
+        self.log.info('Sensor checks existence of partition: "%s" in table: %s', self.partition_id, table_uri)
+        if event:
+            if event["status"] == "success":
+                return event["message"]
+
+            raise AirflowException(event["message"])
+
+        message = "No event received in trigger callback"
+        raise AirflowException(message)
+
+
+class BigQueryStreamingBufferEmptySensor(BaseSensorOperator):
+    """
+    Wait for the streaming buffer of a BigQuery table to be empty.
+
+    BigQuery DML statements (UPDATE, DELETE, MERGE) cannot run against rows that
+    are still in the streaming buffer; the buffer is flushed within ~90 minutes.
+    Use this sensor between a streaming insert and a DML step to avoid
+    ``UPDATE/MERGE/DELETE statement over table ... would affect rows in the
+    streaming buffer`` errors.
+
+    .. warning::
+        BigQuery's ``table.streaming_buffer`` metadata is eventually consistent.
+        The sensor mitigates this by requiring multiple consecutive empty
+        observations before reporting the buffer empty (configurable via
+        ``empty_confirmations``), but this may delay success by up to one
+        ``poke_interval`` compared to earlier releases. ``mode="reschedule"`` with
+        ``empty_confirmations > 1`` needs a running triggerer once an empty reading is seen;
+        ``empty_confirmations=1`` keeps the worker-only behaviour.
+
+    :param project_id: Google Cloud project containing the table.
+    :param dataset_id: Dataset of the table to monitor.
+    :param table_id: Table to monitor.
+    :param gcp_conn_id: Airflow connection ID for GCP.
+    :param impersonation_chain: Optional service account to impersonate, or a
+        chained list of accounts. See the Google provider docs for details.
+    :param empty_confirmations: Number of consecutive empty readings required
+        before considering the streaming buffer empty. Must be at least 1.
+        Defaults to 2.
+    :param deferrable: Run in deferrable mode using
+        :class:`BigQueryStreamingBufferEmptyTrigger`.
+    """
+
+    template_fields: Sequence[str] = (
+        "project_id",
+        "dataset_id",
+        "table_id",
+        "impersonation_chain",
+        "gcp_conn_id",
+    )
+
+    ui_color = "#f0eee4"
+
+    def __init__(
+        self,
+        *,
+        project_id: str,
+        dataset_id: str,
+        table_id: str,
+        gcp_conn_id: str = "google_cloud_default",
+        impersonation_chain: str | Sequence[str] | None = None,
+        empty_confirmations: int = 2,
+        deferrable: bool = conf.getboolean("operators", "default_deferrable", fallback=False),
+        **kwargs,
+    ) -> None:
+        if deferrable and "poke_interval" not in kwargs:
+            kwargs["poke_interval"] = 30
+
+        super().__init__(**kwargs)
+
+        if empty_confirmations < 1:
+            raise ValueError("empty_confirmations must be at least 1")
+
+        self.project_id = project_id
+        self.dataset_id = dataset_id
+        self.table_id = table_id
+        self.gcp_conn_id = gcp_conn_id
+        self.impersonation_chain = impersonation_chain
+        self.empty_confirmations = empty_confirmations
+        self.deferrable = deferrable
+        self._consecutive_empty = 0
+
+    def execute(self, context: Context) -> None:
+        if not self.deferrable:
+            super().execute(context)
+            return
+        if self.poke(context=context):
+            return
+        self._defer_to_trigger(timeout=self.timeout)
+
+    def _defer_to_trigger(self, timeout: float) -> None:
+        self.defer(
+            timeout=timedelta(seconds=timeout),
+            trigger=BigQueryStreamingBufferEmptyTrigger(
+                project_id=self.project_id,
+                dataset_id=self.dataset_id,
+                table_id=self.table_id,
+                poll_interval=self.poke_interval,
+                gcp_conn_id=self.gcp_conn_id,
+                impersonation_chain=self.impersonation_chain,
+                empty_confirmations=self.empty_confirmations,
+            ),
+            method_name="execute_complete",
+        )
+
+    def execute_complete(self, context: dict[str, Any], event: dict[str, str] | None = None) -> str:
+        if event is None:
+            raise ValueError("No event received in trigger callback")
+        if event["status"] == "success":
+            return event["message"]
+        raise RuntimeError(event["message"])
+
+    def poke(self, context: Context) -> bool:
+        table_uri = f"{self.project_id}:{self.dataset_id}.{self.table_id}"
+        self.log.info("Checking streaming buffer state for table: %s", table_uri)
+
+        # ``Client.get_table`` only accepts a ``TableReference`` or a standard-SQL
+        # ``project.dataset.table`` string -- not the legacy ``project:dataset.table``
+        # form -- so build an explicit reference here.
+        table_ref = TableReference(
+            dataset_ref=DatasetReference(self.project_id, self.dataset_id),
+            table_id=self.table_id,
+        )
+
+        hook = BigQueryHook(gcp_conn_id=self.gcp_conn_id, impersonation_chain=self.impersonation_chain)
+        try:
+            table = hook.get_client(project_id=self.project_id).get_table(table_ref)
+        except NotFound as err:
+            raise ValueError(f"Table {table_uri} not found") from err
+
+        if table.streaming_buffer is not None:
+            self._consecutive_empty = 0
+            return False
+
+        self._consecutive_empty += 1
+        self.log.info(
+            "Streaming buffer reported empty (%s/%s confirmations) for table: %s",
+            self._consecutive_empty,
+            self.empty_confirmations,
+            table_uri,
+        )
+        if self._consecutive_empty >= self.empty_confirmations:
+            return True
+        if self.reschedule and not self.deferrable:
+            # A reschedule rebuilds the operator and Airflow 3 clears XComs on each run start, so the
+            # confirmation count cannot survive it; the trigger repeats the full confirmation count instead.
+            first_reschedule_date = self._get_first_reschedule_date(context)
+            elapsed = (
+                (timezone.utcnow() - first_reschedule_date).total_seconds() if first_reschedule_date else 0
+            )
+            if self.timeout - elapsed > 0:
+                self._defer_to_trigger(timeout=self.timeout - elapsed)
+        return False
+
+    def _get_first_reschedule_date(self, context: Context) -> datetime | None:
+        if AIRFLOW_V_3_0_PLUS:
+            return context["ti"].get_first_reschedule_date(context)
+        # Same lookup as the Airflow 2.11 BaseSensorOperator.execute; `_orig_start_date` only exists in Airflow 2.
+        from airflow.sensors.base import _orig_start_date  # type: ignore[attr-defined]
+
+        ti = context["ti"]
+        return _orig_start_date(
+            dag_id=ti.dag_id,
+            task_id=ti.task_id,
+            run_id=ti.run_id,
+            map_index=ti.map_index,
+            try_number=(ti.max_tries or 0) - (self.retries or 0) + 1,
+        )

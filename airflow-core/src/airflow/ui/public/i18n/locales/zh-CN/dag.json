@@ -1,0 +1,371 @@
+{
+  "allMapIndexes": "所有映射索引",
+  "allRuns": "所有执行",
+  "blockingDeps": {
+    "dependency": "依赖 ",
+    "reason": "原因",
+    "title": "依赖阻碍任务调度"
+  },
+  "calendar": {
+    "backfill": "回填",
+    "daily": "每日",
+    "hourly": "每小时",
+    "legend": {
+      "less": "更少",
+      "mixed": "混合",
+      "more": "更多"
+    },
+    "navigation": {
+      "nextMonth": "下个月",
+      "nextYear": "下一年",
+      "previousMonth": "上个月",
+      "previousYear": "上一年"
+    },
+    "noData": "无数据",
+    "noFailedRuns": "无失败的执行",
+    "noRuns": "未执行",
+    "totalRuns": "总执行次数",
+    "week": "第 {{weekNumber}} 周",
+    "weekdays": {
+      "friday": "周五",
+      "monday": "周一",
+      "saturday": "周六",
+      "sunday": "周日",
+      "thursday": "周四",
+      "tuesday": "周二",
+      "wednesday": "周三"
+    }
+  },
+  "callbacks": {
+    "callback_one": "回调",
+    "callback_other": "回调",
+    "columns": {
+      "alertName": "截止期限警告",
+      "callback": "回调",
+      "deadlineTime": "截止时间",
+      "missedBy": "超出时长",
+      "type": "类型"
+    },
+    "types": {
+      "executor": "同步",
+      "triggerer": "异步"
+    }
+  },
+  "code": {
+    "bundleUrl": "套件包链接",
+    "noCode": "找不到代码",
+    "parseDuration": "解析耗时：",
+    "parsedAt": "解析时间："
+  },
+  "deadlineAlerts": {
+    "completionRule": "必须在{{reference}}后的 {{interval}} 内完成",
+    "completionRuleDynamic": "必须在从{{reference}}起算的可变时间间隔内完成",
+    "count_one": "1 个截止期限",
+    "count_other": "{{count, number}} 个截止期限",
+    "referenceType": {
+      "AverageRuntimeDeadline": "平均运行时间",
+      "DagRunLogicalDateDeadline": "逻辑日期",
+      "DagRunQueuedAtDeadline": "排队时间"
+    }
+  },
+  "deadlineStatus": {
+    "actual": "实际",
+    "expected": "预期",
+    "finishedEarly": "在截止期限前 {{duration}} 完成",
+    "finishedLate": "在截止期限后 {{duration}} 完成",
+    "label": "截止期限",
+    "met": "已达成",
+    "missed": "已错过",
+    "missedCount_one": "1 个已错过的截止期限",
+    "missedCount_other": "{{count, number}} 个已错过的截止期限",
+    "mixedCount": "{{missedCount, number}} 个已错过，{{upcomingCount, number}} 个即将到期",
+    "stillRunning": "仍在运行",
+    "upcoming": "即将到期",
+    "upcomingCount_one": "1 个即将到期的截止期限",
+    "upcomingCount_other": "{{count, number}} 个即将到期的截止期限"
+  },
+  "extraLinks": "额外链接",
+  "grid": {
+    "buttons": {
+      "newerRuns": "较新的执行",
+      "olderRuns": "较早的执行",
+      "resetToLatest": "重置为最新",
+      "toggleGroup": "切换分组状态"
+    },
+    "runTypeLegend": "执行类型图例"
+  },
+  "header": {
+    "buttons": {
+      "advanced": "高级功能",
+      "dagDocs": "Dag 文档"
+    },
+    "status": {
+      "deactivated": "已停用"
+    }
+  },
+  "logs": {
+    "allLevels": "所有日志等级",
+    "allSources": "所有来源",
+    "critical": "CRITICAL",
+    "debug": "DEBUG",
+    "error": "ERROR",
+    "info": "INFO",
+    "noTryNumber": "没有重试次数",
+    "search": {
+      "matchCount": "{{current, number}} / {{total, number}}",
+      "nextMatch": "下一个匹配项",
+      "noMatches": "无匹配项",
+      "placeholder": "搜索日志...",
+      "previousMatch": "上一个匹配项"
+    },
+    "settings": "日志设置",
+    "tryNotStarted": "此次尝试尚未开始。",
+    "viewFailedTry": "查看第 {{tryNumber}} 次失败尝试的日志",
+    "viewInExternal": "在 {{name}} 中查看日志（重试 {{attempt}}）",
+    "viewPreviousTry": "查看上一次尝试（第 {{tryNumber}} 次）的日志",
+    "waitingToRetry": "第 {{tryNumber}} 次尝试正在等待重试。",
+    "warning": "WARNING"
+  },
+  "loop": {
+    "history": {
+      "capLabel": "上限：{{max}}",
+      "iterationsAxis": "迭代次数",
+      "stats": {
+        "capHits": "达到上限",
+        "medianIterations": "迭代次数中位数"
+      },
+      "title": "每次执行的迭代次数"
+    },
+    "iterationLabel": "迭代 {{index}}",
+    "iterations": "迭代",
+    "outcome": "结果",
+    "reason": {
+      "cap_reached": "已达到迭代上限 ({{max}})",
+      "failed": "在迭代 {{index}} 时失败",
+      "iteration_failed": "迭代 {{index}} 在 {{taskId}} 中失败",
+      "ran_to_cap": "已执行全部 {{max}} 次允许的迭代",
+      "removed": "已移除",
+      "running": "执行中",
+      "skipped": "已跳过",
+      "stopped_early": "在迭代 {{index}} 时提前停止"
+    },
+    "rules": {
+      "behaviour": "行为",
+      "boundedFor": "执行固定次数的迭代",
+      "exitCriteria": "退出条件",
+      "maxIterations": "最大迭代次数",
+      "whileUntil": "重复执行，直到 {{criteria}}"
+    }
+  },
+  "notFound": {
+    "back": "返回",
+    "backToDags": "返回 Dags",
+    "message": "Dag \"{{dagId}}\" 不存在。",
+    "title": "找不到 Dag"
+  },
+  "overview": {
+    "buttons": {
+      "failedRun_one": "失败的执行",
+      "failedRun_other": "失败的执行",
+      "failedTask_one": "失败的任务",
+      "failedTask_other": "失败的任务",
+      "failedTaskInstance_one": "失败的任务实例",
+      "failedTaskInstance_other": "失败的任务实例"
+    },
+    "charts": {
+      "assetEvent_one": "已创建资源事件",
+      "assetEvent_other": "已创建资源事件"
+    },
+    "deadlines": {
+      "showAll": "全部显示",
+      "title": "截止期限"
+    },
+    "failedLogs": {
+      "hideLogs": "隐藏日志",
+      "showLogs": "显示日志",
+      "title": "最近失败任务的日志",
+      "viewFullLogs": "查看完整日志"
+    }
+  },
+  "panel": {
+    "buttons": {
+      "options": "选项",
+      "showGantt": "显示甘特图",
+      "showGraphShortcut": "显示图表（按 g）",
+      "showGridShortcut": "显示网格（按 g）"
+    },
+    "dagRuns": {
+      "label": "Dag 执行次数"
+    },
+    "dependencies": {
+      "allDagDependencies": "所有 Dag 依赖项"
+    },
+    "graphDirection": {
+      "label": "图表方向"
+    },
+    "graphFilters": {
+      "clearFilters": "清除筛选器",
+      "durationGte": "最短持续时间（秒）",
+      "durationGteHint": "对于已映射任务，统计所有实例的总时长",
+      "mapIndex": "最小映射索引",
+      "mapIndexHint": "展开已映射任务，至少显示到此索引",
+      "selectStatus": "选择状态",
+      "selectTaskGroup": "选择任务分组",
+      "title": "任务筛选器"
+    },
+    "showVersionIndicator": {
+      "label": "显示版本指示器",
+      "options": {
+        "hideAll": "全部隐藏",
+        "showAll": "全部显示",
+        "showBundleVersion": "显示套件包版本",
+        "showDagVersion": "显示 Dag 版本"
+      }
+    },
+    "taskStreamFilter": {
+      "activeFilter": "已启用的筛选器",
+      "clearFilter": "清除筛选器",
+      "clickTask": "点击任务以选取为筛选根节点",
+      "depth": "深度",
+      "direction": "方向",
+      "label": "筛选",
+      "mode": "模式",
+      "modeTooltip": "静态模式下切换任务时保持当前视图不变，遍历模式下点击任务时自动更新筛选条件，方便浏览 Dag 结构。",
+      "modes": {
+        "static": "静态",
+        "traverse": "遍历"
+      },
+      "options": {
+        "both": "同时显示上游和下游",
+        "downstream": "下游",
+        "upstream": "上游"
+      },
+      "selectedTask": "已选择的任务"
+    }
+  },
+  "paramsFailed": "加载参数失败",
+  "parse": {
+    "toaster": {
+      "error": {
+        "description": "Dag 解析请求失败。可能还有待处理的解析请求。",
+        "title": "Dag 重新解析失败"
+      },
+      "success": {
+        "description": "Dag 即将重新解析。",
+        "title": "已成功提交重新解析请求"
+      }
+    }
+  },
+  "tabs": {
+    "assetEvents": "资源事件",
+    "auditLog": "审计日志",
+    "backfills": "回填",
+    "calendar": "日历",
+    "callbacks": "回调",
+    "code": "代码",
+    "details": "详细信息",
+    "logs": "日志",
+    "mappedTaskInstances_one": "任务实例 [{{count, number}}]",
+    "mappedTaskInstances_other": "任务实例 [{{count, number}}]",
+    "overview": "总览",
+    "renderedTemplates": "渲染后的模板",
+    "requiredActions": "待响应的任务实例",
+    "runs": "执行记录",
+    "taskInstances": "任务实例",
+    "taskStateStore": "任务存储",
+    "tasks": "任务",
+    "versions": "版本",
+    "xcom": "XCom"
+  },
+  "taskGroups": {
+    "collapseAll": "收起所有任务分组",
+    "expandAll": "展开所有任务分组"
+  },
+  "taskStateStore": {
+    "add": "新增任务存储",
+    "clearAll": {
+      "resource": "所有任务存储",
+      "title": "清除所有任务存储",
+      "warning": "所有任务存储都将被清空。使用此存储跟踪外部工作的任务将无法恢复，必须从头重新运行。"
+    },
+    "delete": "删除任务存储",
+    "deleteWarning": "该任务将丢失此持久化数据。如果任务使用此键跟踪外部工作（例如外部作业 ID），将无法恢复该工作。",
+    "edit": "编辑任务存储",
+    "emptyStore": "任务存储保存可在多次重试之间持久化的值。工作节点可以通过 Task SDK 写入任务存储。",
+    "entry_one": "条目",
+    "entry_other": "条目",
+    "expiresAt": {
+      "column": "过期时间",
+      "custom": "自定义",
+      "default": "默认 ({{interval}})",
+      "label": "过期",
+      "never": "永不"
+    },
+    "title": "任务存储"
+  },
+  "versions": {
+    "base": "比较起始版本",
+    "categories": {
+      "asset": "资源",
+      "authorization": "授权",
+      "callback": "回调",
+      "deadline": "截止期限",
+      "dependency": "依赖",
+      "metadata": "元数据",
+      "param": "参数",
+      "provenance": "来源",
+      "schedule": "调度",
+      "task": "任务",
+      "unknown": "未知"
+    },
+    "codeAccess": "查看值需要 Dag 代码访问权限",
+    "columns": {
+      "after": "之后",
+      "before": "之前",
+      "category": "类别",
+      "impact": "影响",
+      "operation": "操作",
+      "path": "路径"
+    },
+    "heading": "版本 {{base}} → 版本 {{target}}",
+    "impacts": {
+      "authorization": "授权",
+      "execution": "执行",
+      "metadata": "元数据",
+      "provenance": "来源",
+      "unknown": "未知"
+    },
+    "limitReached": {
+      "description": "变更数量超出了最大变更数的限制。请提高限制以查看其余变更。",
+      "descriptionDefault": "变更数量超出了默认限制。请调高最大变更数以查看其余变更。",
+      "title": "仅显示前 {{limit, number}} 项变更"
+    },
+    "maxChanges": "最大变更数",
+    "maxChangesDefault": "默认",
+    "noChanges": "这些版本保存的状态相同。",
+    "operations": {
+      "added": "已添加",
+      "changed": "已修改",
+      "removed": "已移除"
+    },
+    "pathOccurrences_one": "1 项变更共享此路径",
+    "pathOccurrences_other": "{{count, number}} 项变更共享此路径",
+    "pathOccurrencesAtLeast_one": "至少 1 项变更共享此路径",
+    "pathOccurrencesAtLeast_other": "至少 {{count, number}} 项变更共享此路径",
+    "record_one": "记录",
+    "record_other": "记录",
+    "schemaChange": "序列化 Schema {{baseSchema}} → {{targetSchema}}",
+    "selectPrompt": "选择两个版本以查看它们之间的变更。",
+    "summary_one": "1 项变更",
+    "summary_other": "{{count, number}} 项变更",
+    "summaryAtLeast_one": "至少 1 项变更",
+    "summaryAtLeast_other": "至少 {{count, number}} 项变更",
+    "target": "比较目标版本",
+    "unavailable": {
+      "description": "无法比较这些版本。原因：",
+      "title": "无法比较",
+      "withoutReason": "无法比较这些版本。"
+    },
+    "valuesHidden": "值已隐藏"
+  }
+}

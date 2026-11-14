@@ -1,0 +1,139 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+
+from pydantic import NonNegativeInt
+
+
+@dataclass
+class ConfigurationDetails:
+    """Represents the details of a configuration."""
+
+    section: str | None = None
+
+
+@dataclass
+class ConnectionDetails:
+    """Represents the details of a connection."""
+
+    conn_id: str | None = None
+    team_name: str | None = None
+
+
+@dataclass
+class DagDetails:
+    """Represents the details of a Dag."""
+
+    id: str | None = None
+    team_name: str | None = None
+
+
+@dataclass
+class BackfillDetails:
+    """
+    Represents the details of a backfill.
+
+    .. deprecated:: 3.1.8
+        Use DagAccessEntity.Run instead for a dag level access control.
+    """
+
+    id: NonNegativeInt | None = None
+
+
+@dataclass
+class AssetDetails:
+    """Represents the details of an asset."""
+
+    id: str | None = None
+    name: str | None = None
+    uri: str | None = None
+
+
+@dataclass
+class AssetAliasDetails:
+    """Represents the details of an asset alias."""
+
+    id: str | None = None
+
+
+@dataclass
+class PoolDetails:
+    """Represents the details of a pool."""
+
+    name: str | None = None
+    team_name: str | None = None
+
+
+@dataclass
+class TeamDetails:
+    """Represents the details of a team."""
+
+    name: str | None = None
+
+
+@dataclass
+class VariableDetails:
+    """Represents the details of a variable."""
+
+    key: str | None = None
+    team_name: str | None = None
+
+
+class AccessView(Enum):
+    """Enum of specific views the user tries to access."""
+
+    # Audit log rows not tied to a Dag -- Connection, Variable, Pool, … operations:
+    # there is no per-Dag key to authorize on, so they get their own admin-by-default
+    # view rather than riding on Dag-level ``DagAccessEntity.AUDIT_LOG`` access.
+    AUDIT_LOGS_ALL = "AUDIT_LOGS_ALL"
+    CLUSTER_ACTIVITY = "CLUSTER_ACTIVITY"
+    # Dag bundles, the files in them and their parse state. A bundle is deployed as a whole, so it
+    # is authorized on its own rather than through the Dags it happens to hold.
+    DAG_BUNDLES = "DAG_BUNDLES"
+    DOCS = "DOCS"
+    IMPORT_ERRORS = "IMPORT_ERRORS"
+    # Import errors for files with no registered Dag: there is no per-Dag key to
+    # authorize on, so they get their own admin-by-default view.
+    IMPORT_ERRORS_ALL = "IMPORT_ERRORS_ALL"
+    JOBS = "JOBS"
+    PLUGINS = "PLUGINS"
+    PROVIDERS = "PROVIDERS"
+    # Reparsing a file with no registered Dag: there is no per-Dag key to
+    # authorize on, so it gets its own admin-by-default view.
+    REPARSE_ALL = "REPARSE_ALL"
+    TRIGGERS = "TRIGGERS"
+    WEBSITE = "WEBSITE"
+
+
+class DagAccessEntity(Enum):
+    """Enum of Dag entities the user tries to access."""
+
+    AUDIT_LOG = "AUDIT_LOG"
+    CODE = "CODE"
+    DEPENDENCIES = "DEPENDENCIES"
+    HITL_DETAIL = "HITL_DETAIL"
+    RUN = "RUN"
+    TASK = "TASK"
+    TASK_INSTANCE = "TASK_INSTANCE"
+    TASK_LOGS = "TASK_LOGS"
+    VERSION = "VERSION"
+    WARNING = "WARNING"
+    XCOM = "XCOM"

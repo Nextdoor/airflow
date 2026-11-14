@@ -23,29 +23,40 @@ echo "Starting the tests with those pytest arguments:" "${@}"
 echo
 set +e
 
-pytest "${@}" | python "$( dirname "${BASH_SOURCE[0]}" )/filter_out_warnings.py"
-RES=$?
+# A segfault kills the process before buffered output reaches the log, which leaves nothing
+# to diagnose from; both of these make the crash describe itself instead.
+export PYTHONFAULTHANDLER="1"
+export PYTHONUNBUFFERED="1"
 
-if [[ -f ${WARNINGS_FILE} ]]; then
-    echo "Number of warnings: $(wc -l "${WARNINGS_FILE}")"
+# Breeze passes the JUnit XML path only as a pytest argument.
+RESULT_LOG_FILE=""
+for arg in "${@}"; do
+    if [[ ${arg} == --junitxml=* ]]; then
+        RESULT_LOG_FILE="${arg#--junitxml=}"
+    fi
+done
+# A report left by an earlier run would let a segfault pass the check below.
+if [[ -n ${RESULT_LOG_FILE} ]]; then
+    rm -f "${RESULT_LOG_FILE}"
 fi
 
+pytest "${@}"
+RES=$?
 
 if [[ ${RES} == "139" ]]; then
     echo "${COLOR_YELLOW}Sometimes Pytest fails at exiting with segfault, but all tests actually passed${COLOR_RESET}"
-    echo "${COLOR_YELLOW}We should ignore such case. Checking if junitxml file ${RESULT_LOG_FILE} is there with 0 errors and failures${COLOR_RESET}"
-    if [[ -f ${RESULT_LOG_FILE} ]]; then
+    echo "${COLOR_YELLOW}We should ignore such case. Checking if junitxml file ${RESULT_LOG_FILE:-<unset>} is there with 0 errors and failures${COLOR_RESET}"
+    if [[ -n ${RESULT_LOG_FILE:-} && -f ${RESULT_LOG_FILE} ]]; then
         python "${AIRFLOW_SOURCES}/scripts/in_container/check_junitxml_result.py" "${RESULT_LOG_FILE}"
         RES=$?
     else
-        echo "${COLOR_YELLOW}JunitXML file ${RESULT_LOG_FILE} does not exist. Proceeding with failure as we cannot check if there were no failures.${COLOR_RESET}"
+        echo "${COLOR_YELLOW}JunitXML file ${RESULT_LOG_FILE:-<unset>} does not exist. Proceeding with failure as we cannot check if there were no failures.${COLOR_RESET}"
     fi
 fi
 
 set +x
 if [[ "${RES}" == "0" && ( ${CI:="false"} == "true" || ${CI} == "True" ) ]]; then
     echo "All tests successful"
-    cp .coverage /files
 fi
 
 MAIN_GITHUB_REPOSITORY="apache/airflow"
@@ -64,6 +75,25 @@ if [[ ${TEST_TYPE:=} == "Quarantined" ]]; then
         fi
     fi
 fi
+
+if [[ ${CI:="false"} == "true" && ${RES} != "0" && ${USE_AIRFLOW_VERSION=} != "" ]]; then
+    echo
+    echo "${COLOR_YELLOW}Failing compatibility test of providers for for ${USE_AIRFLOW_VERSION} Airflow and you need to make sure it passes for it as well or deal with compatibility.${COLOR_RESET}"
+    echo
+    echo "${COLOR_BLUE}Read more on how to run the test locally and how to deal with Provider's compatibility with older Airflow versions at:${COLOR_RESET}"
+    echo "https://github.com/apache/airflow/blob/main/contributing-docs/testing/unit_tests.rst#compatibility-provider-unit-tests-against-older-airflow-releases"
+    echo
+fi
+
+if [[ ${CI:="false"} == "true" && ${RES} != "0" && ${FORCE_LOWEST_DEPENDENCIES=} == "true" ]]; then
+    echo
+    echo "${COLOR_YELLOW}Failing 'lowest-direct-dependencies' test. You need to make sure to set proper lower bounds in hatch_build.py or corresponding provider.yaml.${COLOR_RESET}"
+    echo
+    echo "${COLOR_BLUE}Read more on how to run the 'lowest-direct-dependencies' locally and how to solve problems:${COLOR_RESET}"
+    echo "https://github.com/apache/airflow/blob/main/contributing-docs/testing/unit_tests.rst#lowest-direct-dependency-resolution-tests"
+    echo
+fi
+
 
 if [[ ${CI:="false"} == "true" || ${CI} == "True" ]]; then
     if [[ ${RES} != "0" ]]; then

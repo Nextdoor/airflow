@@ -17,145 +17,637 @@
 """
 Global constants that are used by all other Breeze components.
 """
+
 from __future__ import annotations
 
 import json
 import platform
+import re
+from dataclasses import dataclass
 from enum import Enum
-from functools import lru_cache
 from pathlib import Path
 
+from airflow_breeze.utils.functools_cache import clearable_cache
 from airflow_breeze.utils.host_info_utils import Architecture
-from airflow_breeze.utils.path_utils import AIRFLOW_SOURCES_ROOT
+from airflow_breeze.utils.path_utils import (
+    AIRFLOW_CORE_SOURCES_PATH,
+    AIRFLOW_CTL_SOURCES_PATH,
+    AIRFLOW_ROOT_PATH,
+    AIRFLOW_TASK_SDK_SOURCES_PATH,
+    MYPY_SOURCES_PATH,
+)
 
-RUNS_ON_PUBLIC_RUNNER = "ubuntu-20.04"
-RUNS_ON_SELF_HOSTED_RUNNER = "self-hosted"
+PUBLIC_AMD_RUNNERS = '["ubuntu-22.04"]'
+PUBLIC_ARM_RUNNERS = '["ubuntu-22.04-arm"]'
+# RunsOn (runs-on.com) EC2 runner label templates. Jobs fill in their size class with
+# `format(<label>, cpu, ram)` in the workflow; the same call leaves the public labels unchanged.
+# `spot=co` (capacity-optimized) takes Spot from the pools least likely to run out or be reclaimed
+# instead of RunsOn's default price-capacity-optimized: a capacity miss or an interruption sends the
+# runner to on-demand (and reruns the whole job), which costs more than the higher Spot price.
+# A family matches as a prefix (`m5` also takes m5n, m5d, ...). Left out because their us-east-2 Spot
+# runners were reclaimed far more often than the rest (13-54% vs. 1-4%, Oct 2026): m5, m5a, m6a and,
+# for the in-memory runners, r7a, r6a, r6i; r7i, which AWS Spot Advisor rates >20% there, too.
+RUNS_ON_AMD_RUNNER_TEMPLATE = (
+    "runs-on={run_id}/env=flex/family=m8a+m8i+m7a+m7i+m6i/image=ubuntu22-full-x64/volume=150gb/spot=co"
+    "/cpu={{0}}/ram={{1}}"
+)
+RUNS_ON_ARM_RUNNER_TEMPLATE = (
+    "runs-on={run_id}/env=flex/family=m8g+m7g+m6g/image=ubuntu22-full-arm64/volume=150gb/spot=co"
+    "/cpu={{0}}/ram={{1}}"
+)
+# The same runners with docker, /tmp and /home/runner on a RAM disk (RunsOn `extras=tmpfs`), for jobs whose
+# databases wait on disk syncs. The RAM disk is capped at 100% of RAM before RunsOn v3.5.0, so these jobs
+# ask for memory headroom and also accept the memory-optimized r-family.
+RUNS_ON_AMD_IN_MEMORY_RUNNER_TEMPLATE = (
+    "runs-on={run_id}/env=flex/family=m8a+m8i+m7a+m7i+m6i+r8i"
+    "/image=ubuntu22-full-x64/volume=150gb/spot=co"
+    "/cpu={{0}}/ram={{1}}/extras=tmpfs"
+)
+RUNS_ON_ARM_IN_MEMORY_RUNNER_TEMPLATE = (
+    "runs-on={run_id}/env=flex/family=m8g+m7g+m6g+r8g+r7g+r6g/image=ubuntu22-full-arm64/volume=150gb/spot=co"
+    "/cpu={{0}}/ram={{1}}/extras=tmpfs"
+)
+
+# Platform the tests of a CI run execute on.
+CI_AMD_PLATFORM = "linux/amd64"
+CI_ARM_PLATFORM = "linux/arm64"
+CI_PLATFORMS = [CI_AMD_PLATFORM, CI_ARM_PLATFORM]
 
 ANSWER = ""
 
 APACHE_AIRFLOW_GITHUB_REPOSITORY = "apache/airflow"
 
 # Checked before putting in build cache
-ALLOWED_PYTHON_MAJOR_MINOR_VERSIONS = ["3.7", "3.8", "3.9", "3.10"]
+ALLOWED_PYTHON_MAJOR_MINOR_VERSIONS = ["3.11", "3.12", "3.13", "3.14"]
 DEFAULT_PYTHON_MAJOR_MINOR_VERSION = ALLOWED_PYTHON_MAJOR_MINOR_VERSIONS[0]
+DEFAULT_PYTHON_MAJOR_MINOR_VERSION_FOR_IMAGES = (
+    "3.14"  # "highest complete" python version (where all providers are included)
+)
+
 ALLOWED_ARCHITECTURES = [Architecture.X86_64, Architecture.ARM]
-ALLOWED_BACKENDS = ["sqlite", "mysql", "postgres", "mssql"]
-ALLOWED_PROD_BACKENDS = ["mysql", "postgres", "mssql"]
+# Database Backends used when starting Breeze. The "none" value means that the configuration is invalid.
+# No database will be started - access to a database will fail.
+# The "custom" value allows providing an external database via AIRFLOW__DATABASE__SQL_ALCHEMY_CONN.
+SQLITE_BACKEND = "sqlite"
+MYSQL_BACKEND = "mysql"
+POSTGRES_BACKEND = "postgres"
+NONE_BACKEND = "none"
+CUSTOM_BACKEND = "custom"
+ALLOWED_BACKENDS = [SQLITE_BACKEND, MYSQL_BACKEND, POSTGRES_BACKEND, NONE_BACKEND, CUSTOM_BACKEND]
+ALLOWED_PROD_BACKENDS = [MYSQL_BACKEND, POSTGRES_BACKEND]
 DEFAULT_BACKEND = ALLOWED_BACKENDS[0]
-ALL_INTEGRATIONS = [
-    "cassandra",
-    "kerberos",
-    "mongo",
-    "pinot",
+# Docker images that specific provider tests pull directly via testcontainers (bypassing docker
+# compose, so the "docker compose pull" pre-pull does not cover them). Keyed by the provider
+# distribution (dotted id) whose tests pull them, so an image is only pre-pulled when that provider's
+# tests are actually in the run. Pre-pulling (in CI only, before the timed run) keeps the pull -- slow
+# on cold caches, notably the GitHub-hosted ARM canary -- out of the per-test setup timeout. Keep the
+# tags in sync with the provider test conftests that use them (currently
+# providers/mongo/tests/conftest.py: MONGO_IMAGE + the testcontainers ryuk reaper).
+TESTCONTAINERS_IMAGES_BY_PROVIDER: dict[str, list[str]] = {
+    "mongo": ["mongo:8.0", "testcontainers/ryuk:0.8.1"],
+}
+
+TESTABLE_CORE_INTEGRATIONS = ["kerberos", "otel", "redis"]
+TESTABLE_PROVIDERS_INTEGRATIONS = [
     "celery",
+    "cassandra",
+    "drill",
+    "elasticsearch",
+    "opensearch",
+    "tinkerpop",
+    "kafka",
+    "localstack",
+    "mongo",
+    "mssql",
+    "pinot",
+    "qdrant",
+    "redis",
     "trino",
+    "ydb",
 ]
-ALLOWED_INTEGRATIONS = [
-    *ALL_INTEGRATIONS,
-    "all",
+DISABLE_TESTABLE_INTEGRATIONS_FROM_CI = [
+    "mssql",
+    "localstack",  # just for local integration testing for now
 ]
-ALLOWED_KUBERNETES_VERSIONS = ["v1.23.13", "v1.24.7", "v1.25.3", "v1.26.0"]
-ALLOWED_EXECUTORS = ["KubernetesExecutor", "CeleryExecutor", "LocalExecutor", "CeleryKubernetesExecutor"]
+DISABLE_TESTABLE_INTEGRATIONS_FROM_ARM = [
+    "kerberos",
+    "drill",
+    "tinkerpop",
+    "pinot",
+    "trino",
+    "ydb",
+]
+# Maps each testable provider integration to the provider distribution (dotted id)
+# that "owns" it. Used by selective checks to only run a provider integration when
+# its owning provider is among the affected providers of a change.
+TESTABLE_PROVIDERS_INTEGRATION_OWNERS = {
+    "celery": "celery",
+    "cassandra": "apache.cassandra",
+    "drill": "apache.drill",
+    "elasticsearch": "elasticsearch",
+    "opensearch": "opensearch",
+    "tinkerpop": "apache.tinkerpop",
+    "kafka": "apache.kafka",
+    "localstack": "amazon",
+    "mongo": "mongo",
+    "mssql": "microsoft.mssql",
+    "pinot": "apache.pinot",
+    "qdrant": "qdrant",
+    "redis": "redis",
+    "trino": "trino",
+    "ydb": "ydb",
+}
+KEYCLOAK_INTEGRATION = "keycloak"
+STATSD_INTEGRATION = "statsd"
+OTEL_INTEGRATION = "otel"
+OPENLINEAGE_INTEGRATION = "openlineage"
+OPENSEARCH_INTEGRATION = "opensearch"
+OTHER_CORE_INTEGRATIONS = [STATSD_INTEGRATION, KEYCLOAK_INTEGRATION]
+OTHER_PROVIDERS_INTEGRATIONS = [OPENLINEAGE_INTEGRATION]
+# The first one is the default. Only the PROD image can be built on the others - the CI image is
+# always built on the default one.
+ALLOWED_DEBIAN_VERSIONS = ["trixie", "bookworm"]
+# "hardened" images get Python from a Docker Hardened Image base, "legacy" ones compile it from
+# source on a plain debian-slim base - the way all images were built before.
+ALLOWED_IMAGE_FLAVORS = ["hardened", "legacy"]
+ALL_CORE_INTEGRATIONS = sorted(
+    [
+        *TESTABLE_CORE_INTEGRATIONS,
+        *OTHER_CORE_INTEGRATIONS,
+    ]
+)
+ALL_PROVIDERS_INTEGRATIONS = sorted(
+    [
+        *TESTABLE_PROVIDERS_INTEGRATIONS,
+        *OTHER_PROVIDERS_INTEGRATIONS,
+    ]
+)
+AUTOCOMPLETE_CORE_INTEGRATIONS = sorted(
+    [
+        "all-testable",
+        "all",
+        *ALL_CORE_INTEGRATIONS,
+    ]
+)
+AUTOCOMPLETE_PROVIDERS_INTEGRATIONS = sorted(
+    [
+        "all-testable",
+        "all",
+        *ALL_PROVIDERS_INTEGRATIONS,
+    ]
+)
+AUTOCOMPLETE_ALL_INTEGRATIONS = sorted(
+    [
+        "all-testable",
+        "all",
+        *ALL_CORE_INTEGRATIONS,
+        *ALL_PROVIDERS_INTEGRATIONS,
+    ]
+)
+ALLOWED_TTY = ["auto", "enabled", "disabled"]
+ALLOWED_TERMINAL_MULTIPLEXERS = ["mprocs", "tmux"]
+ALLOWED_DOCKER_COMPOSE_PROJECTS = [
+    "breeze",
+    "breeze-prek",
+    "breeze-quick-start",
+    "breeze-task-sdk-test",
+    "breeze-airflowctl-test",
+    "breeze-e2e-test",
+    "docker-compose",
+]
+
+KNOWN_DOCKER_COMPOSE_PROJECT_NAMES = ["breeze"]
+KNOWN_DOCKER_COMPOSE_PROJECT_PREFIXES = ["breeze-"]
+ALLOWED_LOG_LEVELS = ["INFO", "DEBUG", "WARNING", "ERROR", "CRITICAL"]
+DEFAULT_LOG_LEVEL = ALLOWED_LOG_LEVELS[0]
+
+# Unlike everything else, k8s versions are supported as long as 2 major cloud providers support them.
+# See:
+#   - https://endoflife.date/amazon-eks
+#   - https://endoflife.date/azure-kubernetes-service
+#   - https://endoflife.date/google-kubernetes-engine
+ALLOWED_KUBERNETES_VERSIONS = [
+    "v1.31.12",
+    "v1.32.11",
+    "v1.33.12",
+    "v1.34.11",
+    "v1.35.8",
+    "v1.36.4",
+    "v1.37.0",
+]
+
+LOCAL_EXECUTOR = "LocalExecutor"
+KUBERNETES_EXECUTOR = "KubernetesExecutor"
+CELERY_EXECUTOR = "CeleryExecutor"
+CELERY_K8S_EXECUTOR = "CeleryKubernetesExecutor"
+EDGE_EXECUTOR = "EdgeExecutor"
+ALLOWED_EXECUTORS = [
+    LOCAL_EXECUTOR,
+    KUBERNETES_EXECUTOR,
+    CELERY_EXECUTOR,
+    CELERY_K8S_EXECUTOR,
+    EDGE_EXECUTOR,
+]
+
+SIMPLE_AUTH_MANAGER = "SimpleAuthManager"
+FAB_AUTH_MANAGER = "FabAuthManager"
+
+JAVA_SDK = "java"
+TYPESCRIPT_SDK = "typescript"
+ALLOWED_SDKS = [JAVA_SDK, TYPESCRIPT_SDK]
+
+# JDK version used to build the Java SDK and its example bundles (e.g. the lang-SDK k8s system test).
+# Keep in sync with the toolchain the Java SDK Gradle build targets.
+JAVA_SDK_VERSION = "17"
+
+# Node image used to build the TypeScript SDK docs. Keep in sync with the ``engines.node``
+# requirement in ts-sdk/package.json.
+TYPESCRIPT_SDK_NODE_VERSION = "22"
+
+DEFAULT_ALLOWED_EXECUTOR = ALLOWED_EXECUTORS[0]
+ALLOWED_AUTH_MANAGERS = [SIMPLE_AUTH_MANAGER, FAB_AUTH_MANAGER]
+START_AIRFLOW_ALLOWED_EXECUTORS = [LOCAL_EXECUTOR, CELERY_EXECUTOR, EDGE_EXECUTOR]
+START_AIRFLOW_DEFAULT_ALLOWED_EXECUTOR = START_AIRFLOW_ALLOWED_EXECUTORS[0]
+ALLOWED_CELERY_EXECUTORS = [CELERY_EXECUTOR, CELERY_K8S_EXECUTOR]
+CONSTRAINTS_SOURCE_PROVIDERS = "constraints-source-providers"
+CONSTRAINTS = "constraints"
+CONSTRAINTS_NO_PROVIDERS = "constraints-no-providers"
+
 ALLOWED_KIND_OPERATIONS = ["start", "stop", "restart", "status", "deploy", "test", "shell", "k9s"]
-ALLOWED_CONSTRAINTS_MODES_CI = ["constraints-source-providers", "constraints", "constraints-no-providers"]
-ALLOWED_CONSTRAINTS_MODES_PROD = ["constraints", "constraints-no-providers", "constraints-source-providers"]
+ALLOWED_CONSTRAINTS_MODES_CI = [CONSTRAINTS_SOURCE_PROVIDERS, CONSTRAINTS, CONSTRAINTS_NO_PROVIDERS]
+ALLOWED_CONSTRAINTS_MODES_PROD = [CONSTRAINTS, CONSTRAINTS_NO_PROVIDERS, CONSTRAINTS_SOURCE_PROVIDERS]
+
+ALLOWED_LLM_MODELS = [
+    # Claude models (via claude CLI)
+    "claude/claude-opus-4-6",
+    "claude/claude-sonnet-4-6",
+    "claude/claude-opus-4-20250514",
+    "claude/claude-sonnet-4-20250514",
+    "claude/claude-haiku-4-5-20251001",
+    "claude/sonnet",
+    "claude/opus",
+    "claude/haiku",
+    # OpenAI Codex models (via codex CLI)
+    "codex/o3",
+    "codex/o4-mini",
+    "codex/gpt-4.1",
+]
+
+ALLOWED_CELERY_BROKERS = ["rabbitmq", "redis"]
+DEFAULT_CELERY_BROKER = ALLOWED_CELERY_BROKERS[1]
 
 MOUNT_SELECTED = "selected"
 MOUNT_ALL = "all"
 MOUNT_SKIP = "skip"
 MOUNT_REMOVE = "remove"
+MOUNT_TESTS = "tests"
+MOUNT_PROVIDERS_AND_TESTS = "providers-and-tests"
 
-ALLOWED_MOUNT_OPTIONS = [MOUNT_SELECTED, MOUNT_ALL, MOUNT_SKIP, MOUNT_REMOVE]
-ALLOWED_POSTGRES_VERSIONS = ["11", "12", "13", "14", "15"]
-ALLOWED_MYSQL_VERSIONS = ["5.7", "8"]
-ALLOWED_MSSQL_VERSIONS = ["2017-latest", "2019-latest"]
+ALLOWED_MOUNT_OPTIONS = [
+    MOUNT_SELECTED,
+    MOUNT_ALL,
+    MOUNT_SKIP,
+    MOUNT_REMOVE,
+    MOUNT_TESTS,
+    MOUNT_PROVIDERS_AND_TESTS,
+]
 
-PIP_VERSION = "22.3.1"
+USE_AIRFLOW_MOUNT_SOURCES = [MOUNT_REMOVE, MOUNT_TESTS, MOUNT_PROVIDERS_AND_TESTS]
+# Oracle introduced new release model for MySQL
+# - LTS: Long Time Support releases, new release approx every 2 year,
+#  with 5 year premier and 3 year extended support, no new features/removals during current LTS release.
+#  the first LTS release should be in summer/fall 2024.
+# - Innovations: Shot living releases with short support cycle - only until next Innovation/LTS release.
+# See: https://dev.mysql.com/blog-archive/introducing-mysql-innovation-and-long-term-support-lts-versions/
+MYSQL_LTS_RELEASES: list[str] = ["8.4"]
+MYSQL_OLD_RELEASES = ["8.0"]
+MYSQL_INNOVATION_RELEASE: str | None = None
+ALLOWED_MYSQL_VERSIONS = [*MYSQL_OLD_RELEASES, *MYSQL_LTS_RELEASES]
+if MYSQL_INNOVATION_RELEASE:
+    ALLOWED_MYSQL_VERSIONS.append(MYSQL_INNOVATION_RELEASE)
+
+ALLOWED_INSTALL_MYSQL_CLIENT_TYPES = ["mariadb"]
+
+PIP_VERSION = "26.3"
+UV_VERSION = "0.13.7"
+
+# packages that providers docs
+REGULAR_DOC_PACKAGES = [
+    "apache-airflow",
+    "docker-stack",
+    "helm-chart",
+    "apache-airflow-providers",
+    "java-sdk",
+    "task-sdk",
+    "ts-sdk",
+    "apache-airflow-ctl",
+    "apache-airflow-mypy",
+]
 
 
-@lru_cache(maxsize=None)
-def all_selective_test_types() -> tuple[str, ...]:
-    return tuple(sorted(e.value for e in SelectiveUnitTestTypes))
+# Type of the tarball to build
+class TarBallType(Enum):
+    AIRFLOW = "apache_airflow"
+    PROVIDERS = "apache_airflow_providers"
+    TASK_SDK = "apache_airflow_task_sdk"
+    AIRFLOW_CTL = "apache_airflow_ctl"
+    PYTHON_CLIENT = "apache_airflow_python_client"
+    HELM_CHART = "helm-chart"
 
 
-class SelectiveUnitTestTypes(Enum):
+DESTINATION_LOCATIONS = [
+    "s3://live-docs-airflow-apache-org/docs/",
+    "s3://staging-docs-airflow-apache-org/docs/",
+]
+
+SCHEMA_DESTINATION_LOCATIONS = [
+    "s3://live-docs-airflow-apache-org/schemas/",
+    "s3://staging-docs-airflow-apache-org/schemas/",
+]
+
+PACKAGES_METADATA_EXCLUDE_NAMES = ["docker-stack", "apache-airflow-providers"]
+
+# Published docs folders that are not PEP 440 versions, such as Maven snapshots staged for testing.
+# Any other invalid version folder still fails the docs publishing.
+PACKAGES_METADATA_EXCLUDE_VERSIONS: dict[str, list[str]] = {
+    "java-sdk": ["1.0.0-SNAPSHOT"],
+}
+
+
+@clearable_cache
+def all_selective_core_test_types() -> tuple[str, ...]:
+    return tuple(sorted(e.value for e in SelectiveCoreTestType))
+
+
+@clearable_cache
+def providers_test_type() -> tuple[str, ...]:
+    return tuple(sorted(e.value for e in SelectiveProvidersTestType))
+
+
+class SelectiveTestType(Enum):
+    pass
+
+
+class SelectiveCoreTestType(SelectiveTestType):
     ALWAYS = "Always"
     API = "API"
     CLI = "CLI"
     CORE = "Core"
+    SERIALIZATION = "Serialization"
     OTHER = "Other"
+
+
+class SelectiveProvidersTestType(SelectiveTestType):
     PROVIDERS = "Providers"
-    WWW = "WWW"
 
 
-ALLOWED_TEST_TYPE_CHOICES = [
-    "All",
-    *all_selective_test_types(),
-    "Helm",
-    "Postgres",
-    "MySQL",
-    "Quarantine",
+class SelectiveTaskSdkTestType(SelectiveTestType):
+    TASK_SDK = "TaskSdk"
+
+
+class SelectiveAirflowCtlTestType(SelectiveTestType):
+    AIRFLOW_CTL = "AirflowCTL"
+
+
+class GroupOfTests(Enum):
+    CORE = "core"
+    PROVIDERS = "providers"
+    TASK_SDK = "task-sdk"
+    TASK_SDK_INTEGRATION = "task-sdk-integration"
+    CTL = "airflow-ctl"
+    CTL_INTEGRATION = "airflow-ctl-integration"
+    HELM = "helm"
+    INTEGRATION_CORE = "integration-core"
+    INTEGRATION_PROVIDERS = "integration-providers"
+    SYSTEM = "system"
+    PYTHON_API_CLIENT = "python-api-client"
+
+
+ALL_TEST_TYPE = "All"
+NONE_TEST_TYPE = "None"
+
+ALL_TEST_SUITES: dict[str, tuple[str, ...]] = {
+    "All": (),
+    "All-Long": ("-m", "long_running", "--include-long-running"),
+    "All-Quarantined": ("-m", "quarantined", "--include-quarantined"),
+    "All-Postgres": ("--backend", "postgres"),
+    "All-MySQL": ("--backend", "mysql"),
+}
+
+
+@clearable_cache
+def all_helm_test_packages() -> list[str]:
+    return sorted(
+        [
+            candidate.name
+            for candidate in (AIRFLOW_ROOT_PATH / "chart" / "tests" / "helm_tests").iterdir()
+            if candidate.is_dir() and candidate.name != "__pycache__"
+        ]
+    )
+
+
+ALLOWED_TEST_TYPE_CHOICES: dict[GroupOfTests, list[str]] = {
+    GroupOfTests.CORE: [*ALL_TEST_SUITES.keys(), *all_selective_core_test_types()],
+    GroupOfTests.PROVIDERS: [*ALL_TEST_SUITES.keys()],
+    GroupOfTests.TASK_SDK: [ALL_TEST_TYPE],
+    GroupOfTests.TASK_SDK_INTEGRATION: [ALL_TEST_TYPE],
+    GroupOfTests.HELM: [ALL_TEST_TYPE, *all_helm_test_packages()],
+    GroupOfTests.CTL: [ALL_TEST_TYPE],
+    GroupOfTests.CTL_INTEGRATION: [ALL_TEST_TYPE],
+}
+
+
+@clearable_cache
+def all_task_sdk_test_packages() -> list[str]:
+    try:
+        return sorted(
+            [
+                candidate.name
+                for candidate in (AIRFLOW_ROOT_PATH / "task-sdk" / "tests").iterdir()
+                if candidate.is_dir() and candidate.name != "__pycache__"
+            ]
+        )
+    except FileNotFoundError:
+        return []
+
+
+ALLOWED_TASK_SDK_TEST_PACKAGES = [
+    "all",
+    *all_task_sdk_test_packages(),
 ]
 
-ALLOWED_PACKAGE_FORMATS = ["wheel", "sdist", "both"]
-ALLOWED_INSTALLATION_PACKAGE_FORMATS = ["wheel", "sdist"]
+
+@clearable_cache
+def all_ctl_test_packages() -> list[str]:
+    try:
+        return sorted(
+            [
+                candidate.name
+                for candidate in (AIRFLOW_ROOT_PATH / "airflow-ctl" / "tests").iterdir()
+                if candidate.is_dir() and candidate.name != "__pycache__"
+            ]
+        )
+    except FileNotFoundError:
+        return []
+
+
+ALLOWED_CTL_TEST_PACKAGES = [
+    "all",
+    *all_ctl_test_packages(),
+]
+
+ALLOWED_DISTRIBUTION_FORMATS = ["wheel", "sdist", "both"]
+ALLOWED_INSTALLATION_DISTRIBUTION_FORMATS = ["wheel", "sdist"]
 ALLOWED_INSTALLATION_METHODS = [".", "apache-airflow"]
 ALLOWED_BUILD_CACHE = ["registry", "local", "disabled"]
+ALLOWED_BUILD_PROGRESS = ["auto", "plain", "tty"]
 MULTI_PLATFORM = "linux/amd64,linux/arm64"
-SINGLE_PLATFORMS = ["linux/amd64", "linux/arm64"]
+ALTERNATIVE_PLATFORMS = ["linux/x86_64", "linux/aarch64"]
+SINGLE_PLATFORMS = ["linux/amd64", "linux/arm64", *ALTERNATIVE_PLATFORMS]
 ALLOWED_PLATFORMS = [*SINGLE_PLATFORMS, MULTI_PLATFORM]
+
 ALLOWED_USE_AIRFLOW_VERSIONS = ["none", "wheel", "sdist"]
 
-PROVIDER_PACKAGE_JSON_FILE = AIRFLOW_SOURCES_ROOT / "generated" / "provider_dependencies.json"
+ALL_HISTORICAL_PYTHON_VERSIONS = ["3.6", "3.7", "3.8", "3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+
+GITHUB_REPO_BRANCH_PATTERN = r"^([^/]+)/([^/:]+):([^:]+)$"
+PR_NUMBER_PATTERN = r"^\d+$"
 
 
-def get_available_documentation_packages(short_version=False) -> list[str]:
-    provider_names: list[str] = list(json.loads(PROVIDER_PACKAGE_JSON_FILE.read_text()).keys())
-    doc_provider_names = [provider_name.replace(".", "-") for provider_name in provider_names]
-    available_packages = [f"apache-airflow-providers-{doc_provider}" for doc_provider in doc_provider_names]
-    available_packages.extend(["apache-airflow", "docker-stack", "helm-chart"])
-    available_packages.sort()
-    if short_version:
-        prefix_len = len("apache-airflow-providers-")
-        available_packages = [
-            package[prefix_len:].replace("-", ".")
-            for package in available_packages
-            if len(package) > prefix_len
-        ]
-    return available_packages
+def normalize_platform_machine(platform_machine: str) -> str:
+    if "linux/" in platform_machine:
+        return {"linux/x86_64": "linux/amd64", "linux/aarch64": "linux/arm64"}.get(
+            platform_machine, platform_machine
+        )
+    return "linux/" + {"x86_64": "amd64", "aarch64": "arm64"}.get(platform_machine, platform_machine)
 
 
 def get_default_platform_machine() -> str:
-    machine = platform.uname().machine
-    # Some additional conversion for various platforms...
-    machine = {"AMD64": "x86_64"}.get(machine, machine)
-    return machine
+    machine = platform.uname().machine.lower()
+    return normalize_platform_machine(machine)
 
 
 # Initialise base variables
-DOCKER_DEFAULT_PLATFORM = f"linux/{get_default_platform_machine()}"
+DOCKER_DEFAULT_PLATFORM = get_default_platform_machine()
 DOCKER_BUILDKIT = 1
 
-SSH_PORT = "12322"
-WEBSERVER_HOST_PORT = "28080"
-POSTGRES_HOST_PORT = "25433"
-MYSQL_HOST_PORT = "23306"
-MSSQL_HOST_PORT = "21433"
+DRILL_HOST_PORT = "28047"
 FLOWER_HOST_PORT = "25555"
+GREMLIN_HOST_PORT = "8182"
+MSSQL_HOST_PORT = "21433"
+MYSQL_HOST_PORT = "23306"
+POSTGRES_HOST_PORT = "25433"
+RABBITMQ_HOST_PORT = "25672"
 REDIS_HOST_PORT = "26379"
+RABBITMQ_HOST_PORT = "25672"
+SSH_PORT = "12322"
+SIMPLE_AUTH_MANAGER_VITE_DEV_PORT = "5174"
+VITE_DEV_PORT = "5173"
+WEB_HOST_PORT = "28080"
+BREEZE_DEBUG_SCHEDULER_PORT = "50231"
+BREEZE_DEBUG_DAG_PROCESSOR_PORT = "50232"
+BREEZE_DEBUG_TRIGGERER_PORT = "50233"
+BREEZE_DEBUG_APISERVER_PORT = "50234"
+BREEZE_DEBUG_CELERY_WORKER_PORT = "50235"
+BREEZE_DEBUG_EDGE_PORT = "50236"
+BREEZE_DEBUG_WEBSERVER_PORT = "50237"
 
-SQLITE_URL = "sqlite:////root/airflow/airflow.db"
-PYTHONDONTWRITEBYTECODE = True
+CELERY_BROKER_URLS_MAP = {"rabbitmq": "amqp://guest:guest@rabbitmq:5672", "redis": "redis://redis:6379/0"}
+SQLITE_URL = "sqlite:////root/airflow/sqlite/airflow.db"
+# Bytecode cache lives outside the mounted sources so it never pollutes the host checkout
+# and can be persisted in a docker volume across container runs (see pycache.yml).
+PYCACHE_PREFIX_IN_CONTAINER = "/root/.cache/airflow-pycache"
 
 PRODUCTION_IMAGE = False
-ALL_PYTHON_MAJOR_MINOR_VERSIONS = ["3.7", "3.8", "3.9", "3.10"]
+# Python versions that CI on main builds images for and tests with.
+#
+# When main drops a Python version, the version goes through two phases here:
+# 1. While we still cherry-pick changes from main to a release branch that supports that version
+#    (e.g. v3-3-test), keep it in this list even though main no longer supports it. Changes made
+#    on main are then still tested on that version before they are cherry-picked.
+# 2. Once we stop cherry-picking to the last release branch that supports it (that branch then only
+#    gets fixes applied directly), remove it from this list. Release branches keep their own copy
+#    of this list, so their CI and image builds are not affected.
+ALL_PYTHON_MAJOR_MINOR_VERSIONS = ["3.11", "3.12", "3.13", "3.14"]
 CURRENT_PYTHON_MAJOR_MINOR_VERSIONS = ALL_PYTHON_MAJOR_MINOR_VERSIONS
-CURRENT_POSTGRES_VERSIONS = ["11", "12", "13", "14", "15"]
+# All versions we can run against (Need to include versions for main branch and the current release branch)
+ALLOWED_POSTGRES_VERSIONS = ["13", "14", "15", "16", "17", "18"]
+CURRENT_POSTGRES_VERSIONS = ["14", "15", "16", "17", "18"]
 DEFAULT_POSTGRES_VERSION = CURRENT_POSTGRES_VERSIONS[0]
-CURRENT_MYSQL_VERSIONS = ["5.7", "8"]
+
+USE_MYSQL_INNOVATION_RELEASE = True
+if USE_MYSQL_INNOVATION_RELEASE:
+    CURRENT_MYSQL_VERSIONS = ALLOWED_MYSQL_VERSIONS.copy()
+else:
+    CURRENT_MYSQL_VERSIONS = [*MYSQL_OLD_RELEASES, *MYSQL_LTS_RELEASES]
 DEFAULT_MYSQL_VERSION = CURRENT_MYSQL_VERSIONS[0]
-CURRENT_MSSQL_VERSIONS = ["2017-latest", "2019-latest"]
-DEFAULT_MSSQL_VERSION = CURRENT_MSSQL_VERSIONS[0]
+
+PYTHON_3_6_TO_3_8 = ["3.6", "3.7", "3.8"]
+PYTHON_3_6_TO_3_9 = ["3.6", "3.7", "3.8", "3.9"]
+PYTHON_3_6_TO_3_10 = ["3.7", "3.8", "3.9", "3.10"]
+PYTHON_3_7_TO_3_11 = ["3.7", "3.8", "3.9", "3.10", "3.11"]
+PYTHON_3_8_TO_3_11 = ["3.8", "3.9", "3.10", "3.11"]
+PYTHON_3_8_TO_3_12 = ["3.8", "3.9", "3.10", "3.11", "3.12"]
+PYTHON_3_9_TO_3_12 = ["3.9", "3.10", "3.11", "3.12"]
+PYTHON_3_10_TO_3_13 = ["3.10", "3.11", "3.12", "3.13"]
+PYTHON_3_10_TO_3_14 = ["3.10", "3.11", "3.12", "3.13", "3.14"]
+
+
+AIRFLOW_PYTHON_COMPATIBILITY_MATRIX = {
+    "2.0.0": PYTHON_3_6_TO_3_8,
+    "2.0.1": PYTHON_3_6_TO_3_8,
+    "2.0.2": PYTHON_3_6_TO_3_8,
+    "2.1.0": PYTHON_3_6_TO_3_8,
+    "2.1.1": PYTHON_3_6_TO_3_8,
+    "2.1.2": PYTHON_3_6_TO_3_9,
+    "2.1.3": PYTHON_3_6_TO_3_9,
+    "2.1.4": PYTHON_3_6_TO_3_9,
+    "2.2.0": PYTHON_3_6_TO_3_9,
+    "2.2.1": PYTHON_3_6_TO_3_9,
+    "2.2.2": PYTHON_3_6_TO_3_9,
+    "2.2.3": PYTHON_3_6_TO_3_9,
+    "2.2.4": PYTHON_3_6_TO_3_9,
+    "2.2.5": PYTHON_3_6_TO_3_9,
+    "2.3.0": PYTHON_3_6_TO_3_10,
+    "2.3.1": PYTHON_3_6_TO_3_10,
+    "2.3.2": PYTHON_3_6_TO_3_10,
+    "2.3.3": PYTHON_3_6_TO_3_10,
+    "2.3.4": PYTHON_3_6_TO_3_10,
+    "2.4.0": PYTHON_3_6_TO_3_10,
+    "2.4.1": PYTHON_3_6_TO_3_10,
+    "2.4.2": PYTHON_3_6_TO_3_10,
+    "2.4.3": PYTHON_3_6_TO_3_10,
+    "2.5.0": PYTHON_3_6_TO_3_10,
+    "2.5.1": PYTHON_3_6_TO_3_10,
+    "2.5.2": PYTHON_3_6_TO_3_10,
+    "2.5.3": PYTHON_3_6_TO_3_10,
+    "2.6.0": PYTHON_3_6_TO_3_10,
+    "2.6.1": PYTHON_3_6_TO_3_10,
+    "2.6.2": PYTHON_3_7_TO_3_11,
+    "2.6.3": PYTHON_3_7_TO_3_11,
+    "2.7.0": PYTHON_3_8_TO_3_11,
+    "2.7.1": PYTHON_3_8_TO_3_11,
+    "2.7.2": PYTHON_3_8_TO_3_11,
+    "2.7.3": PYTHON_3_8_TO_3_11,
+    "2.8.0": PYTHON_3_8_TO_3_11,
+    "2.8.1": PYTHON_3_8_TO_3_11,
+    "2.8.2": PYTHON_3_8_TO_3_11,
+    "2.8.3": PYTHON_3_8_TO_3_11,
+    "2.9.0": PYTHON_3_8_TO_3_12,
+    "2.9.1": PYTHON_3_8_TO_3_12,
+    "2.9.2": PYTHON_3_8_TO_3_12,
+    "2.9.3": PYTHON_3_8_TO_3_12,
+    "2.10.0": PYTHON_3_8_TO_3_12,
+    "2.10.1": PYTHON_3_8_TO_3_12,
+    "2.10.2": PYTHON_3_8_TO_3_12,
+    "2.10.3": PYTHON_3_8_TO_3_12,
+    "2.10.4": PYTHON_3_8_TO_3_12,
+    "2.10.5": PYTHON_3_8_TO_3_12,
+    "2.11.0": PYTHON_3_9_TO_3_12,
+    "3.0.0": PYTHON_3_9_TO_3_12,
+    "3.1.0": PYTHON_3_10_TO_3_13,
+    "3.2.0": PYTHON_3_10_TO_3_14,
+}
 
 DB_RESET = False
 START_AIRFLOW = "false"
@@ -167,62 +659,204 @@ INIT_SCRIPT_FILE = ""
 BREEZE_INIT_COMMAND = ""
 DRY_RUN_DOCKER = False
 INSTALL_AIRFLOW_VERSION = ""
-SQLITE_URL = "sqlite:////root/airflow/airflow.db"
+
+COMMITTERS = [
+    "BasPH",
+    "Fokko",
+    "KevinYang21",
+    "Lee-W",
+    "RNHTTR",
+    "Taragolis",
+    "XD-DENG",
+    "aijamalnk",
+    "alexvanboxel",
+    "amoghrajesh",
+    "aoen",
+    "artwr",
+    "ashb",
+    "bbovenzi",
+    "bolkedebruin",
+    "bugraoz93",
+    "criccomini",
+    "dabla",
+    "dheerajturaga",
+    "dimberman",
+    "dirrao",
+    "dstandish",
+    "eladkal",
+    "ephraimbuddy",
+    "feluelle",
+    "feng-tao",
+    "ferruzzi",
+    "gopidesupavan",
+    "guan404ming",
+    "houqp",
+    "hussein-awala",
+    "jason810496",
+    "jedcunningham",
+    "jgao54",
+    "jghoman",
+    "jhtimmins",
+    "jmcarp",
+    "josh-fell",
+    "jscheffl",
+    "kaxil",
+    "leahecole",
+    "malthe",
+    "mik-laj",
+    "milton0825",
+    "mistercrunch",
+    "mobuchowski",
+    "msumit",
+    "o-nikolas",
+    "pankajastro",
+    "pankajkoti",
+    "phanikumv",
+    "pierrejeambrun",
+    "pingzh",
+    "potiuk",
+    "r39132",
+    "rawwar",
+    "romsharon98",
+    "ryanahamilton",
+    "ryw",
+    "saguziel",
+    "sekikn",
+    "shahar1",
+    "shubhamraj-git",
+    "tirkarthi",
+    "turbaszek",
+    "uranusjr",
+    "utkarsharma2",
+    "vatsrahul1001",
+    "vikramkoka",
+    "vincbeck",
+    "xinbinhuang",
+    "yuqian90",
+    "zhongjiajie",
+    "choo121600",
+]
+
+
+def get_airflowctl_version():
+    airflowctl_init_py_file = AIRFLOW_CTL_SOURCES_PATH / "airflowctl" / "__init__.py"
+    airflowctl_version = "unknown"
+    with open(airflowctl_init_py_file) as init_file:
+        while line := init_file.readline():
+            if "__version__ = " in line:
+                airflowctl_version = line.split()[2][1:-1]
+                break
+    if airflowctl_version == "unknown":
+        raise RuntimeError("Unable to determine AirflowCTL version")
+    return airflowctl_version
+
+
+def get_airflow_mypy_version():
+    mypy_init_py_file = MYPY_SOURCES_PATH / "airflow_mypy" / "__init__.py"
+    mypy_version = "unknown"
+    with open(mypy_init_py_file) as init_file:
+        while line := init_file.readline():
+            if "__version__ = " in line:
+                mypy_version = line.split()[2][1:-1]
+                break
+    if mypy_version == "unknown":
+        raise RuntimeError("Unable to determine Apache Airflow Mypy version")
+    return mypy_version
 
 
 def get_airflow_version():
-    airflow_setup_file = AIRFLOW_SOURCES_ROOT / "setup.py"
-    with open(airflow_setup_file) as setup_file:
-        for line in setup_file.readlines():
-            if "version =" in line:
-                return line.split()[2][1:-1]
+    airflow_init_py_file = AIRFLOW_CORE_SOURCES_PATH / "airflow" / "__init__.py"
+    airflow_version = "unknown"
+    with open(airflow_init_py_file) as init_file:
+        while line := init_file.readline():
+            if "__version__ = " in line:
+                airflow_version = line.split()[2][1:-1]
+                break
+    if airflow_version == "unknown":
+        raise RuntimeError("Unable to determine Airflow version")
+    return airflow_version
 
 
+def get_task_sdk_version():
+    task_sdk_init_py_file = AIRFLOW_TASK_SDK_SOURCES_PATH / "airflow" / "sdk" / "__init__.py"
+    task_sdk_version = "unknown"
+    with open(task_sdk_init_py_file) as init_file:
+        while line := init_file.readline():
+            if "__version__ = " in line:
+                task_sdk_version = line.split()[2][1:-1]
+                break
+    if task_sdk_version == "unknown":
+        raise RuntimeError("Unable to determine Task SDK version")
+    return task_sdk_version
+
+
+def get_java_sdk_version() -> str:
+    """Read the Java SDK version from 'java-sdk/gradle.properties'."""
+    props_path = AIRFLOW_ROOT_PATH / "java-sdk" / "gradle.properties"
+    for line in props_path.read_text().splitlines():
+        if match := re.match(r"^projectVersion\s*=\s*(\S+)$", line.strip()):
+            return match.group(1)
+    raise RuntimeError(f"Java SDK version not found in {props_path}")
+
+
+def get_ts_sdk_version() -> str:
+    """Read the TypeScript SDK version from 'ts-sdk/package.json'."""
+    package_json_path = AIRFLOW_ROOT_PATH / "ts-sdk" / "package.json"
+    version = json.loads(package_json_path.read_text()).get("version")
+    if not version:
+        raise RuntimeError(f"TypeScript SDK version not found in {package_json_path}")
+    return version
+
+
+@clearable_cache
 def get_airflow_extras():
-    airflow_dockerfile = AIRFLOW_SOURCES_ROOT / "Dockerfile"
+    airflow_dockerfile = AIRFLOW_ROOT_PATH / "Dockerfile"
     with open(airflow_dockerfile) as dockerfile:
-        for line in dockerfile.readlines():
-            if "ARG AIRFLOW_EXTRAS=" in line:
-                line = line.split("=")[1].strip()
+        for line_raw in dockerfile:
+            if "ARG AIRFLOW_EXTRAS=" in line_raw:
+                line = line_raw.split("=")[1].strip()
                 return line.replace('"', "")
 
 
 # Initialize integrations
-AVAILABLE_INTEGRATIONS = [
-    "cassandra",
-    "kerberos",
-    "mongo",
-    "pinot",
-    "celery",
-    "statsd",
-    "trino",
-]
-ALL_PROVIDER_YAML_FILES = Path(AIRFLOW_SOURCES_ROOT).glob("airflow/providers/**/provider.yaml")
+PROVIDER_RUNTIME_DATA_SCHEMA_PATH = AIRFLOW_CORE_SOURCES_PATH / "airflow" / "provider_info.schema.json"
+
+ALL_PYPROJECT_TOML_FILES: list[Path] = []
+
+
+UPDATE_PROVIDER_DEPENDENCIES_SCRIPT = (
+    AIRFLOW_ROOT_PATH / "scripts" / "ci" / "prek" / "update_providers_dependencies.py"
+)
+
+
+DEVEL_DEPS_PATH = AIRFLOW_ROOT_PATH / "generated" / "devel_deps.txt"
+
+
 # Initialize files for rebuild check
 FILES_FOR_REBUILD_CHECK = [
-    "setup.py",
-    "setup.cfg",
     "Dockerfile.ci",
+    "dev/breeze/src/airflow_breeze/files/hardened_python_image_digests.json",
+    "dev/breeze/src/airflow_breeze/files/hardened_os_deps_image_digests.json",
     ".dockerignore",
     "scripts/docker/common.sh",
     "scripts/docker/install_additional_dependencies.sh",
-    "scripts/docker/install_airflow.sh",
-    "scripts/docker/install_airflow_dependencies_from_branch_tip.sh",
+    "scripts/docker/install_airflow_when_building_images.sh",
     "scripts/docker/install_from_docker_context_files.sh",
     "scripts/docker/install_mysql.sh",
-    *ALL_PROVIDER_YAML_FILES,
 ]
 
-ENABLED_SYSTEMS = ""
+# Hash of FILES_FOR_REBUILD_CHECK contents, set on CI images so other checkouts can detect identical sources
+CI_IMAGE_SOURCES_HASH_LABEL = "org.apache.airflow.ci.sources-hash"
 
 CURRENT_KUBERNETES_VERSIONS = ALLOWED_KUBERNETES_VERSIONS
-CURRENT_EXECUTORS = ["KubernetesExecutor"]
+CURRENT_EXECUTORS = [KUBERNETES_EXECUTOR]
 
 DEFAULT_KUBERNETES_VERSION = CURRENT_KUBERNETES_VERSIONS[0]
 DEFAULT_EXECUTOR = CURRENT_EXECUTORS[0]
 
-KIND_VERSION = "v0.17.0"
-HELM_VERSION = "v3.9.4"
+KIND_VERSION = "v0.33.0"
+HELM_VERSION = "v3.19.0"
+SKAFFOLD_VERSION = "v2.17.0"
 
 # Initialize image build variables - Have to check if this has to go to ci dataclass
 USE_AIRFLOW_VERSION = None
@@ -231,42 +865,265 @@ GITHUB_ACTIONS = ""
 ISSUE_ID = ""
 NUM_RUNS = ""
 
-MIN_DOCKER_VERSION = "20.10.0"
-MIN_DOCKER_COMPOSE_VERSION = "1.29.0"
+MIN_DOCKER_VERSION = "25.0.0"
+MIN_DOCKER_COMPOSE_VERSION = "2.20.2"
+MIN_GH_VERSION = "2.70.0"
 
 AIRFLOW_SOURCES_FROM = "."
 AIRFLOW_SOURCES_TO = "/opt/airflow"
 
 DEFAULT_EXTRAS = [
     # BEGINNING OF EXTRAS LIST UPDATED BY PRE COMMIT
+    "aiobotocore",
     "amazon",
     "async",
     "celery",
-    "cncf.kubernetes",
-    "dask",
+    "cncf-kubernetes",
+    "common-io",
+    "common-messaging",
     "docker",
     "elasticsearch",
+    "fab",
     "ftp",
+    "git",
     "google",
-    "google_auth",
+    "google-auth",
+    "graphviz",
     "grpc",
     "hashicorp",
     "http",
     "ldap",
-    "microsoft.azure",
+    "microsoft-azure",
     "mysql",
     "odbc",
+    "openlineage",
+    "opensearch",
     "pandas",
     "postgres",
     "redis",
     "sendgrid",
     "sftp",
     "slack",
+    "snowflake",
     "ssh",
     "statsd",
-    "virtualenv",
+    "uv",
     # END OF EXTRAS LIST UPDATED BY PRE COMMIT
 ]
+
+PROVIDERS_COMPATIBILITY_TESTS_MATRIX: list[dict[str, str | list[str]]] = [
+    {
+        "python-version": "3.11",
+        "airflow-version": "2.11.1",
+        "remove-providers": "anthropic common.messaging common.dataquality edge3 fab git huggingface keycloak informatica modal opensearch",
+        "run-unit-tests": "true",
+    },
+    {
+        "python-version": "3.11",
+        "airflow-version": "3.0.6",
+        "remove-providers": "",
+        "run-unit-tests": "true",
+    },
+    {
+        "python-version": "3.11",
+        "airflow-version": "3.1.8",
+        "remove-providers": "",
+        "run-unit-tests": "true",
+    },
+    {
+        "python-version": "3.11",
+        "airflow-version": "3.2.2",
+        "remove-providers": "",
+        "run-unit-tests": "true",
+    },
+    {
+        "python-version": "3.11",
+        "airflow-version": "3.3.2",
+        "remove-providers": "",
+        "run-unit-tests": "true",
+    },
+    {
+        "python-version": "3.11",
+        "airflow-version": "3.4.0",
+        "remove-providers": "",
+        "run-unit-tests": "true",
+    },
+]
+
+ALL_PYTHON_VERSION_TO_PATCHLEVEL_VERSION: dict[str, str] = {
+    "3.10": "3.10.22",
+    "3.11": "3.11.18",
+    "3.12": "3.12.16",
+    "3.13": "3.13.18",
+    "3.14": "3.14.10",
+}
+
+# Airflow images are based on Docker Hardened Images (https://dhi.io). The "-dev" variant carries
+# apt, a shell and runs as root; the tags encode the Debian release rather than its codename.
+# Pulling from dhi.io requires a Docker Hub login, so the tags Airflow builds against are mirrored
+# to a public ghcr.io repository by the "Mirror hardened base images" workflow - building Airflow
+# images needs no registry credentials at all, which is what the default below points at.
+HARDENED_PYTHON_IMAGE_SOURCE = "dhi.io/python"
+HARDENED_PYTHON_IMAGE_MIRROR = "ghcr.io/apache/airflow/base/python"
+DEBIAN_VERSION_TO_HARDENED_IMAGE_DISTRO = {"trixie": "debian13", "bookworm": "debian12"}
+
+
+def get_hardened_python_image_tag(python: str, debian_version: str = ALLOWED_DEBIAN_VERSIONS[0]) -> str:
+    distro = DEBIAN_VERSION_TO_HARDENED_IMAGE_DISTRO[debian_version]
+    return f"{ALL_PYTHON_VERSION_TO_PATCHLEVEL_VERSION.get(python, python)}-{distro}-dev"
+
+
+# The mirror refreshes its tags several times a day, so images are built on the digest each tag had
+# when "breeze ci upgrade" last moved it. A new base image therefore reaches the builds only through
+# the upgrade PR, after the full CI has passed on it. The digests live in a file of their own, which
+# scripts/ci/prek/upgrade_important_versions.py rewrites and the CI image rebuild check watches.
+HARDENED_PYTHON_IMAGE_DIGESTS_PATH = (
+    AIRFLOW_ROOT_PATH
+    / "dev"
+    / "breeze"
+    / "src"
+    / "airflow_breeze"
+    / "files"
+    / "hardened_python_image_digests.json"
+)
+HARDENED_PYTHON_IMAGE_DIGESTS: dict[str, str] = json.loads(HARDENED_PYTHON_IMAGE_DIGESTS_PATH.read_text())
+
+
+def get_hardened_python_base_image(python: str, debian_version: str = ALLOWED_DEBIAN_VERSIONS[0]) -> str:
+    tag = get_hardened_python_image_tag(python, debian_version)
+    image = f"{HARDENED_PYTHON_IMAGE_MIRROR}:{tag}"
+    digest = HARDENED_PYTHON_IMAGE_DIGESTS.get(tag)
+    return f"{image}@{digest}" if digest else image
+
+
+def get_hardened_python_image_retention_tag(tag: str, digest: str) -> str:
+    """Return the mirror tag that keeps a pinned digest tagged after its moving tag has moved on."""
+    return f"{tag}-{digest.removeprefix('sha256:')[:12]}"
+
+
+# The OS dependencies of the hardened images come from the dhi.io apt repository, which is live: it
+# moves on - and drops the versions it replaced - under a base image pinned to a digest. The
+# "Mirror hardened base images" workflow therefore also builds images with the OS dependencies already
+# installed, daily, one per installation type of install_os_dependencies.sh. The CI and release builds
+# start from those, pinned to a digest the same way as the Python base images.
+HARDENED_OS_DEPS_IMAGE_REPOSITORY = "ghcr.io/apache/airflow/base/os-deps"
+
+
+@dataclass(frozen=True)
+class OsDepsImageType:
+    """One installation type of install_os_dependencies.sh, built as an image of its own."""
+
+    name: str
+    dockerfile: str
+    # The stage that ends with the installation - its image is the OS-dependencies image.
+    target: str
+    # The build arg naming the image that stage starts from.
+    build_arg: str
+
+
+OS_DEPS_IMAGE_TYPES = (
+    OsDepsImageType(name="ci", dockerfile="Dockerfile.ci", target="ci-os-deps", build_arg="CI_OS_DEPS_IMAGE"),
+    OsDepsImageType(name="dev", dockerfile="Dockerfile", target="dev-os-deps", build_arg="DEV_OS_DEPS_IMAGE"),
+    OsDepsImageType(
+        name="runtime", dockerfile="Dockerfile", target="runtime-os-deps", build_arg="RUNTIME_OS_DEPS_IMAGE"
+    ),
+)
+# Only the default Debian version: the CI image and the default PROD image are built on it, the other
+# ones install their OS dependencies from the apt repositories.
+OS_DEPS_IMAGE_DEBIAN_VERSION = ALLOWED_DEBIAN_VERSIONS[0]
+# Written by scripts/ci/prek/upgrade_important_versions.py together with the Python base image digests,
+# so the pins only move in the upgrade PR, after the full CI has passed on them. Only main carries pins:
+# the images are built from main's install_os_dependencies.sh and Dockerfiles, so the upgrade leaves the
+# file empty on other branches until there are images per branch.
+HARDENED_OS_DEPS_IMAGE_DIGESTS_PATH = (
+    AIRFLOW_ROOT_PATH
+    / "dev"
+    / "breeze"
+    / "src"
+    / "airflow_breeze"
+    / "files"
+    / "hardened_os_deps_image_digests.json"
+)
+HARDENED_OS_DEPS_IMAGE_DIGESTS: dict[str, str] = json.loads(HARDENED_OS_DEPS_IMAGE_DIGESTS_PATH.read_text())
+
+
+def get_os_deps_image_tag(image_type: str, python: str) -> str:
+    """Return the tag of the latest published OS-dependencies image - also the key of its pin."""
+    return f"{image_type}-{get_hardened_python_image_tag(python, OS_DEPS_IMAGE_DEBIAN_VERSION)}"
+
+
+def get_os_deps_image_python_tag(image_type: str, python_tag: str, python_digest: str) -> str:
+    """Return the prefix of the tags of the OS-dependencies images built on one base image digest."""
+    return f"{image_type}-{python_tag}-{python_digest.removeprefix('sha256:')[:12]}"
+
+
+def get_pinned_os_deps_image(image_type: str, python: str) -> str | None:
+    """Return the pinned OS-dependencies image of an installation type, or None if there is no pin."""
+    tag = get_os_deps_image_tag(image_type, python)
+    digest = HARDENED_OS_DEPS_IMAGE_DIGESTS.get(tag)
+    return f"{HARDENED_OS_DEPS_IMAGE_REPOSITORY}:{tag}@{digest}" if digest else None
+
+
+def get_legacy_base_image(debian_version: str = ALLOWED_DEBIAN_VERSIONS[0]) -> str:
+    return f"debian:{debian_version}-slim"
+
+
+# The legacy flavor compiles Python from python.org sources, which get a patch release days before the
+# hardened images do, so it has patchlevels of its own. "breeze ci upgrade" moves them, which changes
+# the AIRFLOW_PYTHON_VERSION build arg and so rebuilds the legacy images on the new patch release.
+LEGACY_PYTHON_VERSIONS_PATH = (
+    AIRFLOW_ROOT_PATH / "dev" / "breeze" / "src" / "airflow_breeze" / "files" / "legacy_python_versions.json"
+)
+LEGACY_PYTHON_VERSIONS: dict[str, str] = json.loads(LEGACY_PYTHON_VERSIONS_PATH.read_text())
+
+
+# Number of slices for low dep tests
+NUMBER_OF_LOW_DEP_SLICES = 5
+
+# Number of slices for core test types (splitting reduces memory per xdist collection)
+NUMBER_OF_CORE_SLICES = 2
+
+# Slice counts on the self-hosted RunsOn runners. Jobs using `--run-in-parallel` run one serial pytest per
+# test type, so a job never uses more CPUs than it has test types. The core jobs are bound by their slowest
+# test type and the Non-DB xdist collection gets enough memory on RunsOn, so one slice only removes jobs.
+# Low dep providers run on 32-CPU runners and the heaviest test types start first, so about 40 test types per
+# job keep those CPUs busy while the short ones fill in around the long ones.
+NUMBER_OF_CORE_SLICES_ON_RUNS_ON = 1
+LOW_DEP_TEST_TYPES_PER_JOB_ON_RUNS_ON = 40
+
+# On RunsOn the longest-running providers are split further in the individually listed provider test types,
+# so every part runs in its own pytest process: `Providers[<id>:<part>]` runs the listed paths (relative to the
+# provider's `tests` folder), and `Providers[<id>:other]` runs the rest of the provider's tests.
+PROVIDER_TEST_SPLITS: dict[str, dict[str, list[str]]] = {
+    "amazon": {
+        "hooks": ["unit/amazon/aws/hooks"],
+        "operators": ["unit/amazon/aws/operators"],
+    },
+    "google": {
+        "cloud-hooks": ["unit/google/cloud/hooks"],
+        "cloud-operators": ["unit/google/cloud/operators"],
+    },
+    "standard": {
+        "decorators": ["unit/standard/decorators"],
+        "python": ["unit/standard/operators/test_python.py"],
+    },
+}
+PROVIDER_TEST_SPLIT_OTHER_PART = "other"
+
+
+def get_provider_split_test_types(provider_id: str) -> list[str]:
+    """Test types running the tests of a split provider, or the provider's single test type."""
+    parts = PROVIDER_TEST_SPLITS.get(provider_id)
+    if not parts:
+        return [f"Providers[{provider_id}]"]
+    return [f"Providers[{provider_id}:{part}]" for part in [*parts, PROVIDER_TEST_SPLIT_OTHER_PART]]
+
+
+# Milestone Tag Assistant configuration
+# Labels indicating a bug fix PR that should have a milestone
+MILESTONE_BUG_LABELS: frozenset[str] = frozenset({"kind:bug", "type:bug-fix"})
+# Labels that indicate the PR should be skipped from milestone auto-tagging
+MILESTONE_SKIP_LABELS: frozenset[str] = frozenset({"area:dev-tools", "area:dev-env", "area:CI"})
 
 
 class GithubEvents(Enum):
@@ -280,6 +1137,6 @@ class GithubEvents(Enum):
     WORKFLOW_RUN = "workflow_run"
 
 
-@lru_cache(maxsize=None)
+@clearable_cache
 def github_events() -> list[str]:
     return [e.value for e in GithubEvents]

@@ -1,0 +1,243 @@
+/*!
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import { useEffect, useState } from "react";
+
+import { Button, Flex } from "@chakra-ui/react";
+import { useTranslation } from "react-i18next";
+import { CgRedo } from "react-icons/cg";
+import { useParams } from "react-router-dom";
+
+import { useDagRunServiceGetDagRun, useDagServiceGetDagDetails } from "openapi/queries";
+import type { LightGridTaskInstanceSummary, TaskInstanceResponse } from "openapi/requests/types.gen";
+
+import { Checkbox, Modal, SegmentedControl } from "src/system-components";
+
+import { ActionAccordion } from "src/components/ActionAccordion";
+import { useRerunWithLatestVersion } from "src/components/Clear/useRerunWithLatestVersion";
+
+import { useClearKeepTaskStateDefault, useClearTaskInstanceDefaultOptions } from "src/hooks/useUserSettings";
+import { useClearTaskInstances } from "src/queries/useClearTaskInstances";
+import { useClearTaskInstancesDryRun } from "src/queries/useClearTaskInstancesDryRun";
+import { isStatePending, useAutoRefresh } from "src/utils";
+
+import { getRunOnLatestVersionState } from "./runOnLatestVersion";
+
+type Props = {
+  readonly onClose: () => void;
+  readonly open: boolean;
+  readonly taskInstance: LightGridTaskInstanceSummary;
+};
+
+export const ClearGroupTaskInstanceDialog = ({ onClose, open, taskInstance }: Props) => {
+  const { t: translate } = useTranslation();
+  const { dagId = "", runId = "" } = useParams();
+  const groupId = taskInstance.task_id;
+
+  const [clearTaskInstanceDefaultOptions] = useClearTaskInstanceDefaultOptions();
+  const [keepTaskStateDefault] = useClearKeepTaskStateDefault();
+  const [selectedOptions, setSelectedOptions] = useState<Array<string>>(clearTaskInstanceDefaultOptions);
+
+  const onlyFailed = selectedOptions.includes("onlyFailed");
+  const past = selectedOptions.includes("past");
+  const future = selectedOptions.includes("future");
+  const upstream = selectedOptions.includes("upstream");
+  const downstream = selectedOptions.includes("downstream");
+  const [keepTaskState, setKeepTaskState] = useState(keepTaskStateDefault);
+  const [includeDependentDags, setIncludeDependentDags] = useState(true);
+  const clearsDependentDags = downstream && includeDependentDags;
+  const [note, setNote] = useState<string | null>(null);
+
+  const onCloseDialog = () => {
+    setNote(null);
+    setKeepTaskState(keepTaskStateDefault);
+    onClose();
+  };
+
+  useEffect(() => {
+    if (open) {
+      setNote(null);
+      setKeepTaskState(keepTaskStateDefault);
+    }
+  }, [open, keepTaskStateDefault]);
+
+  const { isPending, mutate } = useClearTaskInstances({
+    dagRunId: runId,
+    onSuccessConfirm: onCloseDialog,
+  });
+
+  const { data: dagDetails } = useDagServiceGetDagDetails({
+    dagId,
+  });
+
+  const { data: dagRun } = useDagRunServiceGetDagRun({ dagId, dagRunId: runId }, undefined, {
+    enabled: open,
+  });
+
+  const { dagVersionsDiffer, runOnLatestVersionForced, shouldShowRunOnLatestOption } =
+    getRunOnLatestVersionState({
+      latestBundleVersion: dagDetails?.bundle_version,
+      latestDagVersionNumber: dagDetails?.latest_dag_version?.version_number,
+      selectedDagVersionNumber: taskInstance.dag_version_number,
+      selectedVersionMissing: dagRun?.dag_versions.length === 0,
+      // Fall back to legacy heuristic when grid summary has no version (older API).
+      useLatestBundleVersionAsFallback: true,
+    });
+
+  // dagVersionsDiffer becomes the fallback so the historical "auto-check when versions
+  // differ" heuristic still applies when neither DAG-level nor global config is set.
+  const { setValue: setRunOnLatestVersion, value: runOnLatestVersion } = useRerunWithLatestVersion({
+    dagLevelConfig: dagDetails?.rerun_with_latest_version,
+    fallback: dagVersionsDiffer,
+  });
+
+  const refetchInterval = useAutoRefresh({ dagId });
+
+  const { data } = useClearTaskInstancesDryRun({
+    dagId,
+    options: {
+      enabled: open,
+      refetchInterval: (query) =>
+        query.state.data?.task_instances.some((ti: TaskInstanceResponse) => isStatePending(ti.state))
+          ? refetchInterval
+          : false,
+      refetchOnMount: "always",
+    },
+    requestBody: {
+      dag_run_id: runId,
+      include_dependent_dags: clearsDependentDags,
+      include_downstream: downstream,
+      include_future: future,
+      include_past: past,
+      include_upstream: upstream,
+      only_failed: onlyFailed,
+      run_on_latest_version: runOnLatestVersion,
+      task_group_id: groupId,
+    },
+  });
+
+  const affectedTasks = data ?? {
+    task_instances: [],
+    total_entries: 0,
+  };
+
+  return (
+    <Modal
+      footerActions={
+        <Button
+          disabled={affectedTasks.total_entries === 0}
+          loading={isPending}
+          onClick={() => {
+            mutate({
+              dagId,
+              requestBody: {
+                dag_run_id: runId,
+                dry_run: false,
+                include_dependent_dags: clearsDependentDags,
+                include_downstream: downstream,
+                include_future: future,
+                include_past: past,
+                include_upstream: upstream,
+                ...(note === null ? {} : { note }),
+                ...(keepTaskState ? { keep_task_state: true } : {}),
+                only_failed: onlyFailed,
+                run_on_latest_version: runOnLatestVersion,
+                task_group_id: groupId,
+              },
+            });
+          }}
+        >
+          <CgRedo /> {translate("modal.confirm")}
+        </Button>
+      }
+      footerOptions={
+        <>
+          <Checkbox
+            checked={keepTaskState}
+            onCheckedChange={(event) => setKeepTaskState(Boolean(event.checked))}
+          >
+            {translate("dags:runAndTaskActions.options.keepTaskState")}
+          </Checkbox>
+          <Checkbox
+            checked={clearsDependentDags}
+            disabled={!downstream}
+            onCheckedChange={(event) => setIncludeDependentDags(Boolean(event.checked))}
+          >
+            {translate("dags:runAndTaskActions.options.includeDependentDags")}
+          </Checkbox>
+          {shouldShowRunOnLatestOption ? (
+            <Checkbox
+              checked={runOnLatestVersionForced || runOnLatestVersion}
+              disabled={runOnLatestVersionForced}
+              onCheckedChange={(event) => setRunOnLatestVersion(Boolean(event.checked))}
+              title={
+                runOnLatestVersionForced
+                  ? translate("dags:runAndTaskActions.options.runOnLatestVersionForced")
+                  : undefined
+              }
+            >
+              {translate("dags:runAndTaskActions.options.runOnLatestVersion")}
+            </Checkbox>
+          ) : undefined}
+        </>
+      }
+      lazyMount
+      onOpenChange={onCloseDialog}
+      open={open}
+      title={
+        <>
+          {translate("dags:runAndTaskActions.clear.title", {
+            type: translate("taskInstance", { count: affectedTasks.total_entries ?? 0 }),
+          })}
+          : {groupId}
+        </>
+      }
+    >
+      <Flex justifyContent="center">
+        <SegmentedControl
+          defaultValues={clearTaskInstanceDefaultOptions}
+          multiple
+          onChange={setSelectedOptions}
+          options={[
+            {
+              label: translate("dags:runAndTaskActions.options.past"),
+              value: "past",
+            },
+            {
+              label: translate("dags:runAndTaskActions.options.future"),
+              value: "future",
+            },
+            {
+              label: translate("dags:runAndTaskActions.options.upstream"),
+              value: "upstream",
+            },
+            {
+              label: translate("dags:runAndTaskActions.options.downstream"),
+              value: "downstream",
+            },
+            {
+              label: translate("dags:runAndTaskActions.options.onlyFailed"),
+              value: "onlyFailed",
+            },
+          ]}
+        />
+      </Flex>
+      <ActionAccordion affectedTasks={affectedTasks} note={note} setNote={setNote} />
+    </Modal>
+  );
+};

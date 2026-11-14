@@ -1,0 +1,1528 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+import logging
+import warnings
+from datetime import timedelta
+from pathlib import Path
+from textwrap import dedent
+from unittest import mock
+from uuid import UUID, uuid4
+
+import pendulum
+import pytest
+import structlog
+import time_machine
+from sqlalchemy.orm import Session
+
+from airflow._shared.timezones import timezone
+from airflow.callbacks.callback_requests import CallbackRequest
+from airflow.cli.cli_config import DefaultHelpParser, GroupCommand
+from airflow.cli.cli_parser import AirflowHelpFormatter
+from airflow.exceptions import RemovedInAirflow4Warning
+from airflow.executors import workloads
+from airflow.executors.base_executor import BaseExecutor, RunningRetryAttemptType
+from airflow.executors.local_executor import LocalExecutor
+from airflow.executors.workloads import WorkloadType
+from airflow.executors.workloads.base import BundleInfo
+from airflow.executors.workloads.callback import CallbackDTO
+from airflow.executors.workloads.types import TaskInstanceUuid
+from airflow.models.callback import CallbackFetchMethod, CallbackKey
+from airflow.models.connection_test import ConnectionTestKey, ConnectionTestState
+from airflow.models.taskinstance import TaskInstance, TaskInstanceKey
+from airflow.sdk import BaseOperator
+from airflow.sdk.execution_time.callback_supervisor import execute_callback
+from airflow.serialization.definitions.baseoperator import SerializedBaseOperator
+from airflow.utils.state import CallbackState, State, TaskInstanceState
+
+from tests_common.test_utils.config import conf_vars
+from tests_common.test_utils.markers import skip_if_force_lowest_dependencies_marker
+
+
+def test_sentry_integration():
+    assert not BaseExecutor.sentry_integration
+
+
+def test_is_local_default_value():
+    assert not BaseExecutor.is_local
+
+
+def test_is_production_default_value():
+    assert BaseExecutor.is_production
+
+
+def test_supports_multi_team_default_value():
+    assert not BaseExecutor.supports_multi_team
+
+
+def test_invalid_slotspool():
+    with pytest.raises(ValueError, match="parallelism is set to 0 or lower"):
+        BaseExecutor(0)
+
+
+def test_get_task_log():
+    executor = BaseExecutor()
+    ti = TaskInstance(task=SerializedBaseOperator(task_id="dummy"), dag_version_id=mock.MagicMock(spec=UUID))
+    assert executor.get_task_log(ti=ti, try_number=1) == ([], [])
+
+
+def test_get_streaming_task_log_not_implemented():
+    executor = BaseExecutor()
+    ti = TaskInstance(task=SerializedBaseOperator(task_id="dummy"), dag_version_id=mock.MagicMock(spec=UUID))
+
+    with pytest.raises(NotImplementedError):
+        executor.get_streaming_task_log(ti=ti, try_number=1)
+
+
+def test_serve_logs_default_value():
+    assert not BaseExecutor.serve_logs
+
+
+def test_no_cli_commands_vended():
+    assert not BaseExecutor.get_cli_commands()
+
+
+def test_get_event_buffer():
+    executor = BaseExecutor()
+
+    date = timezone.utcnow()
+    try_number = 1
+    key1, key2, key3 = (TaskInstanceUuid(uuid4()) for _ in range(3))
+    for key, dag_id in ((key1, "my_dag1"), (key2, "my_dag2"), (key3, "my_dag2")):
+        executor._register_task(
+            mock.Mock(spec=TaskInstance, id=key.id, key=TaskInstanceKey(dag_id, "task", date, try_number))
+        )
+    state = State.SUCCESS
+    executor.event_buffer[key1] = state, None
+    executor.event_buffer[key2] = state, None
+    executor.event_buffer[key3] = state, None
+
+    assert len(executor.get_event_buffer(("my_dag1",))) == 1
+    assert len(executor.get_event_buffer()) == 2
+    assert len(executor.event_buffer) == 0
+
+
+def test_get_event_buffer_always_includes_callback_keys():
+    """CallbackKey events are always returned regardless of the dag_ids filter."""
+    executor = BaseExecutor()
+
+    date = timezone.utcnow()
+    ti_key = TaskInstanceUuid(uuid4())
+    executor._register_task(
+        mock.Mock(spec=TaskInstance, id=ti_key.id, key=TaskInstanceKey("my_dag1", "my_task1", date, 1))
+    )
+    callback_key = CallbackKey(id="00000000-0000-0000-0000-000000000042")
+
+    executor.event_buffer[ti_key] = State.SUCCESS, None
+    executor.event_buffer[callback_key] = CallbackState.SUCCESS, None
+
+    # Filter for a dag that doesn't match the TI key. Callback should still be included
+    result = executor.get_event_buffer(("other_dag",))
+    assert callback_key in result
+    assert ti_key not in result
+
+
+def test_get_event_buffer_retains_unregistered_task_until_unfiltered_drain():
+    executor = BaseExecutor()
+    retired_id = TaskInstanceUuid(uuid4())
+    executor.event_buffer[retired_id] = TaskInstanceState.SUCCESS, None
+
+    assert executor.get_event_buffer(("some_dag",)) == {}
+    assert executor.get_event_buffer() == {retired_id: (TaskInstanceState.SUCCESS, None)}
+
+
+def test_get_event_buffer_releases_metadata_for_discarded_tasks():
+    executor = BaseExecutor()
+    ti = mock.Mock(spec=TaskInstance, id=uuid4(), key=TaskInstanceKey("dag", "task", "run", 1))
+    executor._register_task(ti)
+    executor.running.add(TaskInstanceUuid(ti.id))
+    executor.get_event_buffer()
+    assert TaskInstanceUuid(ti.id) in executor._task_coordinates
+
+    executor.running.remove(TaskInstanceUuid(ti.id))
+    executor.get_event_buffer()
+
+    assert executor._task_coordinates == {}
+
+
+def test_log_task_event_preserves_archived_identity_without_coordinates():
+    executor = BaseExecutor()
+    archived_id = uuid4()
+
+    executor.log_task_event(event="failed", extra="late executor event", ti_key=TaskInstanceUuid(archived_id))
+
+    assert executor._task_event_logs[0].task_instance_id == archived_id
+    assert executor._task_event_logs[0].dag_id is None
+
+
+def test_log_task_event_branches_on_key_type():
+    executor = BaseExecutor()
+    ti_key = TaskInstanceUuid(uuid4())
+    executor._register_task(
+        mock.Mock(
+            spec=TaskInstance,
+            id=ti_key.id,
+            key=TaskInstanceKey("my_dag", "my_task", "run", 1),
+        )
+    )
+
+    executor.log_task_event(event="task_event", extra="extra", ti_key=ti_key)
+    assert len(executor._task_event_logs) == 1
+    log = executor._task_event_logs[0]
+    assert log.task_instance_id == ti_key.id
+    assert (log.dag_id, log.task_id, log.run_id, log.try_number) == ("my_dag", "my_task", "run", 1)
+
+    callback_key = CallbackKey(id=str(UUID("00000000-0000-0000-0000-000000000001")))
+    executor.log_task_event(event="callback_event", extra="extra", ti_key=callback_key)
+    assert len(executor._task_event_logs) == 1
+
+    connection_test_key = ConnectionTestKey(id=str(UUID("00000000-0000-0000-0000-000000000002")))
+    executor.log_task_event(event="connection_test_event", extra="extra", ti_key=connection_test_key)
+    assert len(executor._task_event_logs) == 1
+
+
+@pytest.mark.parametrize(
+    ("method_name", "expected_state"),
+    [
+        ("fail", CallbackState.FAILED),
+        ("success", CallbackState.SUCCESS),
+        ("queued", CallbackState.QUEUED),
+        ("running_state", CallbackState.RUNNING),
+    ],
+)
+def test_state_methods_pick_callback_state_for_callback_key(method_name, expected_state):
+    executor = BaseExecutor()
+    callback_key = CallbackKey(id=str(UUID("00000000-0000-0000-0000-000000000002")))
+
+    getattr(executor, method_name)(callback_key)
+
+    assert executor.event_buffer[callback_key] == (expected_state, None)
+
+
+def test_fail_and_success():
+    executor = BaseExecutor()
+
+    success_state = State.SUCCESS
+    fail_state = State.FAILED
+    key1, key2, key3 = (TaskInstanceUuid(uuid4()) for _ in range(3))
+    executor.fail(key1, fail_state)
+    executor.fail(key2, fail_state)
+    executor.success(key3, success_state)
+
+    assert len(executor.running) == 0
+    assert executor.slots_occupied == 0
+    assert len(executor.get_event_buffer()) == 3
+
+
+def test_same_uuid_routes_distinct_task_callback_and_connection_states():
+    executor = BaseExecutor()
+    task_id = uuid4()
+    task_key = TaskInstanceUuid(task_id)
+    callback_key = CallbackKey(str(task_id))
+    connection_key = ConnectionTestKey(str(task_id))
+
+    executor.fail(task_key)
+    executor.fail(callback_key)
+    executor.fail(connection_key)
+
+    assert executor.get_event_buffer() == {
+        task_key: (TaskInstanceState.FAILED, None),
+        callback_key: (CallbackState.FAILED, None),
+        connection_key: (ConnectionTestState.FAILED, None),
+    }
+    with pytest.raises(TypeError, match="Unknown workload key type"):
+        executor.fail(task_id)
+    assert executor.event_buffer == {}
+
+
+@pytest.fixture
+def task_workload():
+    return workloads.ExecuteTask(
+        ti=workloads.TaskInstanceDTO(
+            id=uuid4(),
+            dag_version_id=uuid4(),
+            dag_id="dag",
+            task_id="task",
+            run_id="run",
+            try_number=1,
+            pool_slots=1,
+            priority_weight=1,
+            queue="default",
+        ),
+        dag_rel_path="dag.py",
+        bundle_info=BundleInfo(name="bundle"),
+        token="",
+        log_path=None,
+    )
+
+
+@pytest.mark.parametrize("override_queue", [False, True])
+@pytest.mark.parametrize("terminal_state", [TaskInstanceState.SUCCESS, TaskInstanceState.FAILED])
+@pytest.mark.parametrize("next_try_number", [1, 2])
+def test_legacy_executor_dispatch_and_completion_keep_submitted_identity(
+    task_workload, override_queue, terminal_state, next_try_number
+):
+    class LegacyExecutor(BaseExecutor):
+        def _process_workloads(self, items):
+            for workload in items:
+                key = workload.ti.key
+                del self.executor_queues[WorkloadType.EXECUTE_TASK][key]
+                self.running.add(key)
+                self.event_buffer[key] = (TaskInstanceState.QUEUED, "remote-id")
+
+    class OverrideExecutor(LegacyExecutor):
+        def queue_workload(self, workload, session):
+            self.executor_queues[workload.type][workload.key] = workload
+
+    executor = (OverrideExecutor if override_queue else LegacyExecutor)()
+    submitted_id, submitted_key = task_workload.ti.id, task_workload.ti.key
+    executor.queue_workload(task_workload, session=None)
+    assert executor.has_task(task_workload.ti)
+    assert executor._drain_events_with_task_ids() == ({}, {})
+    executor.heartbeat()
+    assert executor._drain_events_with_task_ids() == (
+        {TaskInstanceUuid(submitted_id): (TaskInstanceState.QUEUED, "remote-id")},
+        {TaskInstanceUuid(submitted_id): submitted_key},
+    )
+    assert executor.has_task(task_workload.ti)
+
+    task_workload.ti.id = uuid4()
+    task_workload.ti.try_number = next_try_number
+    assert not executor.has_task(task_workload.ti)
+    getattr(executor, "success" if terminal_state == TaskInstanceState.SUCCESS else "fail")(submitted_key)
+
+    assert executor._drain_events_with_task_ids() == (
+        {TaskInstanceUuid(submitted_id): (terminal_state, None)},
+        {TaskInstanceUuid(submitted_id): submitted_key},
+    )
+    assert not executor.running
+    assert not executor._task_coordinates
+
+
+def test_legacy_adoption_captures_identity_before_provider_emits_event(task_workload):
+    class AdoptingExecutor(BaseExecutor):
+        def try_adopt_task_instances(self, tis):
+            for ti in tis:
+                self.success(ti.key)
+            return []
+
+    executor = AdoptingExecutor()
+    adopted_id = task_workload.ti.id
+    assert executor.try_adopt_task_instances([task_workload.ti]) == []
+    task_workload.ti.id = uuid4()
+    assert executor._drain_events_with_task_ids() == (
+        {TaskInstanceUuid(adopted_id): (TaskInstanceState.SUCCESS, None)},
+        {TaskInstanceUuid(adopted_id): task_workload.ti.key},
+    )
+    assert not executor.running
+
+
+@pytest.mark.parametrize("accepted", [False, True])
+@pytest.mark.parametrize("uuid_keys", [False, True])
+def test_adoption_with_private_provider_tracking_survives_empty_event_drain(
+    task_workload, accepted, uuid_keys
+):
+    class AdoptingExecutor(BaseExecutor):
+        supports_task_instance_uuid = uuid_keys
+
+        def try_adopt_task_instances(self, tis):
+            return [] if accepted else tis
+
+    executor = AdoptingExecutor()
+    executor.try_adopt_task_instances([task_workload.ti])
+    assert executor._drain_events_with_task_ids() == ({}, {})
+    if not accepted:
+        assert not executor.running
+        assert executor.slots_occupied == 0
+        assert not executor._task_coordinates
+        return
+
+    assert executor.has_task(task_workload.ti)
+    assert executor.slots_occupied == 1
+    assert executor.slots_available == executor.parallelism - 1
+    executor.success(executor.get_task_key(task_workload.ti))
+    assert executor._drain_events_with_task_ids() == (
+        {TaskInstanceUuid(task_workload.ti.id): (TaskInstanceState.SUCCESS, None)},
+        {TaskInstanceUuid(task_workload.ti.id): task_workload.ti.key},
+    )
+    assert not executor.running
+    assert executor.slots_occupied == 0
+    assert not executor._task_coordinates
+
+
+@pytest.mark.parametrize("ambiguous", [False, True])
+def test_legacy_events_without_unique_captured_identity_are_dropped(task_workload, ambiguous):
+    executor = BaseExecutor()
+    if ambiguous:
+        executor._register_task(task_workload.ti)
+        executor._register_task(task_workload.ti.model_copy(update={"id": uuid4()}))
+    executor.success(task_workload.ti.key)
+    assert executor._drain_events_with_task_ids() == ({}, {})
+
+
+def test_legacy_event_dag_filter_retains_identity_until_consumed(task_workload):
+    executor = BaseExecutor()
+    executor.queue_workload(task_workload, session=None)
+    executor.executor_queues[WorkloadType.EXECUTE_TASK].clear()
+    executor.success(task_workload.ti.key)
+    assert executor._drain_events_with_task_ids(["other_dag"]) == ({}, {})
+    assert executor._drain_events_with_task_ids(["dag"]) == (
+        {TaskInstanceUuid(task_workload.ti.id): (TaskInstanceState.SUCCESS, None)},
+        {TaskInstanceUuid(task_workload.ti.id): task_workload.ti.key},
+    )
+
+
+@pytest.mark.parametrize("next_try_number", [1, 2])
+def test_task_workloads_with_matching_coordinates_keep_distinct_attempts(next_try_number):
+    executor = LocalExecutor()
+    first = workloads.ExecuteTask(
+        ti=workloads.TaskInstanceDTO(
+            id=uuid4(),
+            dag_version_id=uuid4(),
+            dag_id="dag",
+            task_id="task",
+            run_id="run",
+            try_number=1,
+            pool_slots=1,
+            priority_weight=1,
+            queue="default",
+        ),
+        dag_rel_path="dag.py",
+        bundle_info=BundleInfo(name="bundle"),
+        token="",
+        log_path=None,
+    )
+    second = first.model_copy(
+        update={"ti": first.ti.model_copy(update={"id": uuid4(), "try_number": next_try_number})}
+    )
+
+    executor.queue_workload(first, session=None)
+    executor.queue_workload(second, session=None)
+
+    assert set(executor.executor_queues[WorkloadType.EXECUTE_TASK]) == {
+        TaskInstanceUuid(first.ti.id),
+        TaskInstanceUuid(second.ti.id),
+    }
+    executor.running.update((TaskInstanceUuid(first.ti.id), TaskInstanceUuid(second.ti.id)))
+    executor.success(TaskInstanceUuid(first.ti.id))
+    assert executor.running == {TaskInstanceUuid(second.ti.id)}
+    assert executor.get_event_buffer() == {TaskInstanceUuid(first.ti.id): (TaskInstanceState.SUCCESS, None)}
+    executor.executor_queues[WorkloadType.EXECUTE_TASK].clear()
+    assert not executor.has_task(first.ti)
+    assert executor.has_task(second.ti)
+
+
+@pytest.mark.parametrize(
+    ("team_name", "expected_tags"),
+    [
+        pytest.param(None, {"status": "open", "executor_class_name": "BaseExecutor"}, id="without_team"),
+        pytest.param(
+            "team_a",
+            {"status": "open", "executor_class_name": "BaseExecutor", "team_name": "team_a"},
+            id="with_team",
+        ),
+    ],
+)
+@mock.patch("airflow.executors.base_executor.BaseExecutor.sync")
+@mock.patch("airflow.executors.base_executor.BaseExecutor.trigger_workloads")
+@mock.patch("airflow.executors.base_executor.stats.gauge")
+def test_gauge_executor_metrics_single_executor(
+    mock_stats_gauge, mock_trigger_workloads, mock_sync, team_name, expected_tags
+):
+    executor = BaseExecutor(team_name=team_name)
+    executor.heartbeat()
+    # Verify all three gauges use the expected tag structure
+    for metric, status in [
+        ("executor.open_slots", "open"),
+        ("executor.queued_tasks", "queued"),
+        ("executor.running_tasks", "running"),
+    ]:
+        mock_stats_gauge.assert_any_call(metric, value=mock.ANY, tags={**expected_tags, "status": status})
+
+
+@pytest.mark.parametrize(
+    ("executor_class", "executor_name"),
+    [(LocalExecutor, "LocalExecutor")],
+)
+@mock.patch("airflow.executors.local_executor.LocalExecutor.sync")
+@mock.patch("airflow.executors.base_executor.BaseExecutor.trigger_workloads")
+@mock.patch("airflow.executors.base_executor.stats.gauge")
+@mock.patch("airflow.executors.base_executor.ExecutorLoader.get_executor_names")
+def test_gauge_executor_metrics_with_multiple_executors(
+    mock_get_executor_names,
+    mock_stats_gauge,
+    mock_trigger_workloads,
+    mock_local_sync,
+    executor_class,
+    executor_name,
+):
+    # The names of the executors aren't relevant for this test, so long as a list of length > 1
+    # is returned. This forces the executor to use the multiple executors gauge logic.
+    mock_get_executor_names.return_value = ["Exec1", "Exec2"]
+    executor = executor_class()
+    executor.heartbeat()
+
+    calls = [
+        mock.call(
+            f"executor.open_slots.{executor_name}",
+            value=mock.ANY,
+            tags={"status": "open", "executor_class_name": executor_name},
+        ),
+        mock.call(
+            f"executor.queued_tasks.{executor_name}",
+            value=mock.ANY,
+            tags={"status": "queued", "executor_class_name": executor_name},
+        ),
+        mock.call(
+            f"executor.running_tasks.{executor_name}",
+            value=mock.ANY,
+            tags={"status": "running", "executor_class_name": executor_name},
+        ),
+    ]
+    mock_stats_gauge.assert_has_calls(calls)
+
+
+@pytest.mark.parametrize(
+    ("executor_class", "executor_name", "metric_name", "executors", "expected_metric_name"),
+    [
+        (
+            LocalExecutor,
+            "LocalExecutor",
+            "executor.open_slots",
+            ["Exec1", "Exec2"],
+            "executor.open_slots.LocalExecutor",
+        ),
+        (LocalExecutor, "LocalExecutor", "executor.open_slots", ["Exec1"], "executor.open_slots"),
+    ],
+)
+@mock.patch("airflow.executors.base_executor.ExecutorLoader.get_executor_names")
+def test_get_metric_name(
+    mock_get_executor_names,
+    executor_class,
+    executor_name,
+    metric_name,
+    executors,
+    expected_metric_name,
+):
+    # The mocked executor name is not relevant for this test, so long as the list of executors is returned > 1.
+    # This forces the executor to use the executor name in the metric name.
+
+    mock_get_executor_names.return_value = executors
+    executor = executor_class()
+    actual_metric_name = executor._get_metric_name(metric_name)
+    assert actual_metric_name == expected_metric_name
+
+
+def setup_dagrun(dag_maker):
+    date = timezone.utcnow()
+    start_date = date - timedelta(days=2)
+
+    with dag_maker("test_try_adopt_task_instances"):
+        BaseOperator(task_id="task_1", start_date=start_date)
+        BaseOperator(task_id="task_2", start_date=start_date)
+        BaseOperator(task_id="task_3", start_date=start_date)
+
+    return dag_maker.create_dagrun(logical_date=date)
+
+
+@pytest.mark.db_test
+def test_try_adopt_task_instances(dag_maker):
+    dagrun = setup_dagrun(dag_maker)
+    tis = dagrun.task_instances
+    assert {ti.task_id for ti in tis} == {"task_1", "task_2", "task_3"}
+    assert BaseExecutor().try_adopt_task_instances(tis) == tis
+
+
+def setup_trigger_workloads(dag_maker, parallelism=None):
+    dagrun = setup_dagrun(dag_maker)
+    if parallelism:
+        executor = BaseExecutor(parallelism=parallelism)
+    else:
+        executor = BaseExecutor()
+
+    executor._process_workloads = mock.Mock(spec=lambda workloads: None)
+
+    for task_instance in dagrun.task_instances:
+        workload = workloads.ExecuteTask.make(task_instance)
+        executor.executor_queues[WorkloadType.EXECUTE_TASK][TaskInstanceUuid(task_instance.id)] = workload
+
+    return executor, dagrun
+
+
+@pytest.mark.db_test
+def test_trigger_queued_tasks(dag_maker):
+    """Test that trigger_workloads() calls _process_workloads() when there are queued workloads."""
+    executor, dagrun = setup_trigger_workloads(dag_maker)
+
+    # Verify tasks are queued
+    assert len(executor.executor_queues[WorkloadType.EXECUTE_TASK]) == 3
+
+    # Call trigger_workloads with enough slots
+    executor.trigger_workloads(open_slots=10)
+
+    executor._process_workloads.assert_called_once()
+
+    # Verify it was called with the expected workloads
+    call_args = executor._process_workloads.call_args[0][0]
+    assert len(call_args) == 3
+
+
+@pytest.mark.db_test
+def test_trigger_running_tasks(dag_maker):
+    """Test that trigger_workloads() works when tasks are re-queued."""
+    executor, dagrun = setup_trigger_workloads(dag_maker)
+
+    executor.trigger_workloads(open_slots=10)
+    executor._process_workloads.assert_called_once()
+
+    # Reset mock for second call
+    executor._process_workloads.reset_mock()
+
+    # Re-queue one task (simulates retry scenario)
+    ti = dagrun.task_instances[0]
+
+    workload = workloads.ExecuteTask.make(ti)
+    executor.executor_queues[WorkloadType.EXECUTE_TASK][TaskInstanceUuid(ti.id)] = workload
+
+    executor.trigger_workloads(open_slots=10)
+
+    # Verify _process_workloads was called again
+    executor._process_workloads.assert_called_once()
+
+
+@pytest.mark.db_test
+def test_trigger_workloads_schedules_highest_priority_first(dag_maker):
+    """When there are fewer open slots than queued tasks, the lowest priority ones wait."""
+    date = timezone.utcnow()
+
+    with dag_maker("test_trigger_workloads_priority_order"):
+        BaseOperator(task_id="low", priority_weight=1)
+        BaseOperator(task_id="medium", priority_weight=5)
+        BaseOperator(task_id="high", priority_weight=10)
+
+    dagrun = dag_maker.create_dagrun(logical_date=date)
+
+    executor = BaseExecutor()
+    executor._process_workloads = mock.Mock(spec=lambda workloads: None)
+    for task_instance in dagrun.task_instances:
+        task_queue = executor.executor_queues[WorkloadType.EXECUTE_TASK]
+        task_queue[TaskInstanceUuid(task_instance.id)] = workloads.ExecuteTask.make(task_instance)
+
+    executor.trigger_workloads(open_slots=2)
+
+    scheduled = [workload.ti.task_id for workload in executor._process_workloads.call_args[0][0]]
+    assert scheduled == ["high", "medium"]
+
+
+def test_debug_dump(caplog):
+    executor = BaseExecutor()
+    with caplog.at_level(logging.INFO):
+        executor.debug_dump()
+    assert "executor.running" in caplog.text
+    assert "executor.event_buffer" in caplog.text
+
+
+@pytest.mark.db_test
+def test_debug_dump_with_populated_queues(caplog, dag_maker):
+    """Test debug_dump outputs queued workloads when queues are populated."""
+    executor = BaseExecutor()
+    dagrun = setup_dagrun(dag_maker)
+
+    for ti in dagrun.task_instances:
+        workload = workloads.ExecuteTask.make(ti)
+        executor.executor_queues[WorkloadType.EXECUTE_TASK][TaskInstanceUuid(ti.id)] = workload
+
+    with caplog.at_level(logging.INFO):
+        executor.debug_dump()
+
+    queued_msgs = [m for m in caplog.messages if "executor.queued" in m]
+    assert queued_msgs, "Expected at least one 'executor.queued' log message"
+    assert "executor.running" in caplog.text
+    assert "executor.event_buffer" in caplog.text
+
+
+def test_debug_dump_idle_prints_all_queue_counts(caplog):
+    """An idle executor still dumps a (zero) count line for every workload type."""
+    executor = BaseExecutor()
+    with caplog.at_level(logging.INFO):
+        executor.debug_dump()
+
+    queued_msgs = [m for m in caplog.messages if "executor.queued" in m]
+    assert len(queued_msgs) == len(WorkloadType)
+
+
+def test_base_executor_cannot_send_callback():
+    executor = BaseExecutor()
+    with pytest.raises(ValueError, match="Callback sink is not ready"):
+        executor.send_callback(mock.Mock(spec=CallbackRequest))
+
+
+def test_queued_tasks_setter_emits_warning_and_writes_through():
+    executor = BaseExecutor()
+    new_queue = {"k": "v"}
+    with pytest.warns(RemovedInAirflow4Warning, match="queued_tasks is deprecated"):
+        executor.queued_tasks = new_queue
+    assert executor.executor_queues[WorkloadType.EXECUTE_TASK] is new_queue
+
+
+def test_queued_callbacks_setter_emits_warning_and_writes_through():
+    executor = BaseExecutor()
+    new_queue = {"k": "v"}
+    with pytest.warns(RemovedInAirflow4Warning, match="queued_callbacks is deprecated"):
+        executor.queued_callbacks = new_queue
+    assert executor.executor_queues[WorkloadType.EXECUTE_CALLBACK] is new_queue
+
+
+@pytest.mark.parametrize(
+    ("flag", "workload_type"),
+    [
+        ("supports_callbacks", WorkloadType.EXECUTE_CALLBACK),
+        ("supports_connection_test", WorkloadType.TEST_CONNECTION),
+    ],
+)
+def test_supports_flag_setter_emits_warning_and_toggles_workload_type(flag, workload_type):
+    executor = BaseExecutor()
+    with pytest.warns(RemovedInAirflow4Warning, match=f"{flag} is deprecated"):
+        setattr(executor, flag, True)
+    assert workload_type in executor.supported_workload_types
+    assert workload_type not in BaseExecutor.supported_workload_types
+
+    setattr(executor, flag, False)
+    assert workload_type not in executor.supported_workload_types
+    assert WorkloadType.EXECUTE_TASK in executor.supported_workload_types
+
+
+def test_trigger_tasks_shim_emits_warning_and_forwards():
+    executor = BaseExecutor()
+    with mock.patch.object(executor, "trigger_workloads") as mocked:
+        with pytest.warns(RemovedInAirflow4Warning, match="trigger_tasks is deprecated"):
+            executor.trigger_tasks(7)
+    mocked.assert_called_once_with(7)
+
+
+def test_order_queued_tasks_by_priority_shim_emits_warning_and_forwards():
+    executor = BaseExecutor()
+    with mock.patch.object(executor, "_get_workloads_to_schedule", return_value=[]) as mocked:
+        with pytest.warns(RemovedInAirflow4Warning, match="order_queued_tasks_by_priority is deprecated"):
+            executor.order_queued_tasks_by_priority()
+    mocked.assert_called_once()
+
+
+def test_has_task_does_not_vivify_executor_queue():
+    executor = BaseExecutor()
+    ti = mock.Mock(spec=TaskInstance)
+    ti.id = "id-1"
+    ti.key = TaskInstanceKey("d", "t", "r", 1, -1)
+    assert executor.has_task(ti) is False
+    assert WorkloadType.EXECUTE_TASK not in executor.executor_queues
+
+
+def test_unknown_workload_type_sorts_last_without_crashing():
+    executor = BaseExecutor()
+    known_key = TaskInstanceUuid(uuid4())
+    known_workload = mock.Mock()
+    known_workload.type = WorkloadType.EXECUTE_TASK
+    known_workload.sort_key = 0
+    unknown_workload = mock.Mock()
+    unknown_workload.type = "SomeFutureType"
+    unknown_workload.sort_key = 0
+    executor.executor_queues[WorkloadType.EXECUTE_TASK][known_key] = known_workload
+    executor.executor_queues["SomeFutureType"]["unk"] = unknown_workload
+
+    scheduled = executor._get_workloads_to_schedule(open_slots=10)
+
+    assert [w for _, w in scheduled] == [known_workload, unknown_workload]
+
+
+@skip_if_force_lowest_dependencies_marker
+def test_parser_and_formatter_class():
+    executor = BaseExecutor(42)
+    parser = executor._get_parser()
+    assert isinstance(parser, DefaultHelpParser)
+    assert parser.formatter_class is AirflowHelpFormatter
+
+
+@mock.patch("airflow.cli.cli_parser._add_command")
+@mock.patch(
+    "airflow.executors.base_executor.BaseExecutor.get_cli_commands",
+    return_value=[
+        GroupCommand(
+            name="some_name",
+            help="some_help",
+            subcommands=["A", "B", "C"],
+            description="some_description",
+            epilog="some_epilog",
+        )
+    ],
+)
+def test_parser_add_command(mock_add_command, mock_get_cli_command):
+    executor = BaseExecutor()
+    executor._get_parser()
+    mock_add_command.assert_called_once()
+
+
+@pytest.mark.parametrize(("loop_duration", "total_tries"), [(0.5, 12), (1.0, 7), (1.7, 4), (10, 2)])
+def test_running_retry_attempt_type(loop_duration, total_tries):
+    """
+    Verify can_try_again returns True until at least 5 seconds have passed.
+
+    For faster loops, we total tries will be higher.  If loops take longer than 5 seconds, still should
+    end up trying 2 times.
+    """
+    min_seconds_for_test = 5
+
+    with time_machine.travel(pendulum.now("UTC"), tick=False) as t:
+        # set MIN_SECONDS so tests don't break if the value is changed
+        RunningRetryAttemptType.MIN_SECONDS = min_seconds_for_test
+        a = RunningRetryAttemptType()
+        while True:
+            if not a.can_try_again():
+                break
+            t.shift(loop_duration)
+        assert a.elapsed > min_seconds_for_test
+    assert a.total_tries == total_tries
+    assert a.tries_after_min == 1
+
+
+def test_state_fail():
+    executor = BaseExecutor()
+    key = TaskInstanceUuid(uuid4())
+    executor.running.add(key)
+    info = "info"
+    executor.fail(key, info=info)
+    assert not executor.running
+    assert executor.event_buffer[key] == (TaskInstanceState.FAILED, info)
+
+
+def test_state_success():
+    executor = BaseExecutor()
+    key = TaskInstanceUuid(uuid4())
+    executor.running.add(key)
+    info = "info"
+    executor.success(key, info=info)
+    assert not executor.running
+    assert executor.event_buffer[key] == (TaskInstanceState.SUCCESS, info)
+
+
+def test_state_queued():
+    executor = BaseExecutor()
+    key = TaskInstanceUuid(uuid4())
+    executor.running.add(key)
+    info = "info"
+    executor.queued(key, info=info)
+    assert not executor.running
+    assert executor.event_buffer[key] == (TaskInstanceState.QUEUED, info)
+
+
+def test_state_running():
+    executor = BaseExecutor()
+    key = TaskInstanceUuid(uuid4())
+    executor.running.add(key)
+    info = "info"
+    executor.running_state(key, info=info)
+    # Running state should not remove a command as running
+    assert executor.running
+    assert executor.event_buffer[key] == (TaskInstanceState.RUNNING, info)
+
+
+def test_repr():
+    executor = BaseExecutor(parallelism=10)
+    assert repr(executor) == "BaseExecutor(parallelism=10)"
+    executor = BaseExecutor(parallelism=10, team_name="teamA")
+    assert repr(executor) == "BaseExecutor(parallelism=10, team_name='teamA')"
+
+
+def test_test_connection_not_supported_by_default():
+    assert WorkloadType.TEST_CONNECTION not in BaseExecutor.supported_workload_types
+
+
+def test_queue_connection_test_workload_rejected_by_default():
+    """BaseExecutor (no TEST_CONNECTION in supported_workload_types) rejects TestConnection workloads."""
+    executor = BaseExecutor()
+    wl = workloads.TestConnection.make(
+        connection_test_id=uuid4(),
+        connection_id="test_conn",
+        timeout=60,
+    )
+    with pytest.raises(NotImplementedError, match="does not support TestConnection workloads"):
+        executor.queue_workload(wl, session=mock.MagicMock(spec=Session))
+
+
+def test_queue_connection_test_workload_accepted_when_supported():
+    """An executor that supports TEST_CONNECTION accepts TestConnection workloads."""
+    executor = LocalExecutor()
+    queue = executor.executor_queues[WorkloadType.TEST_CONNECTION]
+    queue.clear()
+    wl = workloads.TestConnection.make(
+        connection_test_id=uuid4(),
+        connection_id="test_conn",
+        timeout=60,
+        team_name="team_a",
+    )
+    executor.queue_workload(wl, session=mock.MagicMock(spec=Session))
+    assert len(queue) == 1
+    assert queue[wl.key] is wl
+    assert wl.team_name == "team_a"
+
+
+def test_queued_connection_test_dispatched_to_process_workloads():
+    """A queued TestConnection workload reaches _process_workloads via trigger_workloads."""
+    executor = LocalExecutor()
+    wl = workloads.TestConnection.make(
+        connection_test_id=uuid4(),
+        connection_id="test_conn",
+        timeout=60,
+    )
+    executor.queue_workload(wl, session=mock.MagicMock(spec=Session))
+    with mock.patch.object(executor, "_process_workloads") as mock_process:
+        executor.trigger_workloads(executor.parallelism)
+    mock_process.assert_called_once_with([wl])
+
+
+def test_connection_tests_prioritized_ahead_of_task_backlog():
+    """A task backlog must not starve short, user-interactive connection tests."""
+    executor = BaseExecutor()
+    for _ in range(3):
+        task_workload = mock.Mock()
+        task_workload.type = WorkloadType.EXECUTE_TASK
+        task_workload.sort_key = 0
+        executor.executor_queues[WorkloadType.EXECUTE_TASK][TaskInstanceUuid(uuid4())] = task_workload
+    conn_test = mock.Mock()
+    conn_test.type = WorkloadType.TEST_CONNECTION
+    conn_test.sort_key = 0
+    executor.executor_queues[WorkloadType.TEST_CONNECTION][ConnectionTestKey(id="ct")] = conn_test
+
+    scheduled = [w for _, w in executor._get_workloads_to_schedule(open_slots=2)]
+
+    assert scheduled[0] is conn_test
+
+
+@mock.patch(
+    "airflow.sdk.execution_time.connection_test_supervisor.supervise_connection_test",
+    autospec=True,
+)
+def test_run_workload_passes_team_name_to_connection_test_supervisor(mock_supervise):
+    """BaseExecutor.run_workload forwards TestConnection.team_name to the supervisor."""
+    mock_supervise.return_value = 0
+    test_id = uuid4()
+    wl = workloads.TestConnection.make(
+        connection_test_id=test_id,
+        connection_id="test_conn",
+        timeout=60,
+        team_name="team_a",
+    )
+    wl.token = "test-token"
+
+    BaseExecutor.run_workload(wl, server="http://localhost:8080/execution/")
+
+    mock_supervise.assert_called_once_with(
+        connection_test_id=test_id,
+        connection_id="test_conn",
+        timeout=60,
+        token="test-token",
+        server="http://localhost:8080/execution/",
+        team_name="team_a",
+    )
+
+
+@mock.patch("airflow.sdk.execution_time.supervisor.supervise_task")
+@pytest.mark.parametrize(
+    ("config_overrides", "explicit_arg", "expected"),
+    [
+        pytest.param({}, None, False, id="unset-defaults-to-false"),
+        pytest.param({("logging", "task_logs_to_stdout"): "True"}, None, True, id="logging-conf-true"),
+        pytest.param({("logging", "task_logs_to_stdout"): "False"}, None, False, id="logging-conf-false"),
+        pytest.param(
+            {("logging", "task_logs_to_stdout"): "True"}, False, False, id="explicit-false-overrides-conf"
+        ),
+        pytest.param(
+            {("logging", "task_logs_to_stdout"): "False"}, True, True, id="explicit-true-overrides-conf"
+        ),
+    ],
+)
+def test_run_workload_subprocess_logs_to_stdout(
+    mock_supervise_task, config_overrides, explicit_arg, expected
+):
+    """An omitted subprocess_logs_to_stdout falls back to [logging] task_logs_to_stdout; an explicit one wins."""
+    mock_supervise_task.return_value = 0
+    wl = workloads.ExecuteTask(
+        ti=workloads.TaskInstance(
+            id="00000000-0000-0000-0000-000000000001",
+            dag_version_id="00000000-0000-0000-0000-000000000002",
+            task_id="test_task",
+            dag_id="test_dag",
+            run_id="test_run",
+            try_number=1,
+            map_index=-1,
+            pool_slots=1,
+            queue="default",
+            priority_weight=1,
+        ),
+        dag_rel_path="test_dag.py",
+        bundle_info=BundleInfo(name="test-bundle", version=None),
+        token="test-token",
+        log_path="test.log",
+    )
+    kwargs = {} if explicit_arg is None else {"subprocess_logs_to_stdout": explicit_arg}
+
+    with conf_vars(config_overrides):
+        BaseExecutor.run_workload(wl, server="http://localhost:8080/execution/", **kwargs)
+
+    assert mock_supervise_task.call_args.kwargs["subprocess_logs_to_stdout"] is expected
+
+
+@mock.patch.dict("os.environ", {}, clear=True)
+class TestExecutorConf:
+    """Test ExecutorConf shim class that provides team-specific configuration access."""
+
+    def test_executor_conf_get(self):
+        """Test ExecutorConf.get() passes team_name to underlying conf.get()."""
+        from airflow.executors.base_executor import ExecutorConf
+
+        with conf_vars(
+            {
+                ("celery", "result_backend"): "DEFAULT_VALUE",
+                ("test_team=celery", "result_backend"): "TEAM_VALUE",
+            }
+        ):
+            # Test without team_name
+            executor_conf = ExecutorConf(team_name=None)
+            assert executor_conf.get("celery", "result_backend") == "DEFAULT_VALUE"
+
+            # Test with team_name
+            team_executor_conf = ExecutorConf(team_name="test_team")
+            assert team_executor_conf.get("celery", "result_backend") == "TEAM_VALUE"
+
+    def test_executor_conf_getboolean(self):
+        """Test ExecutorConf.getboolean() passes team_name to underlying conf.getboolean()."""
+        from airflow.executors.base_executor import ExecutorConf
+
+        with conf_vars(
+            {
+                ("celery", "ssl_active"): "true",
+                ("test_team=celery", "ssl_active"): "false",
+            }
+        ):
+            executor_conf = ExecutorConf(team_name=None)
+            assert executor_conf.getboolean("celery", "ssl_active") is True
+
+            team_executor_conf = ExecutorConf(team_name="test_team")
+            assert team_executor_conf.getboolean("celery", "ssl_active") is False
+
+    def test_executor_conf_getint(self):
+        """Test ExecutorConf.getint() passes team_name to underlying conf.getint()."""
+        from airflow.executors.base_executor import ExecutorConf
+
+        with conf_vars(
+            {
+                ("celery", "worker_concurrency"): "16",
+                ("test_team=celery", "worker_concurrency"): "32",
+            }
+        ):
+            executor_conf = ExecutorConf(team_name=None)
+            assert executor_conf.getint("celery", "worker_concurrency") == 16
+
+            team_executor_conf = ExecutorConf(team_name="test_team")
+            assert team_executor_conf.getint("celery", "worker_concurrency") == 32
+
+    def test_executor_conf_getjson(self):
+        """Test ExecutorConf.getjson() passes team_name to underlying conf.getjson()."""
+        from airflow.executors.base_executor import ExecutorConf
+
+        with conf_vars(
+            {
+                ("celery", "broker_transport_options"): '{"visibility_timeout": 3600}',
+                ("test_team=celery", "broker_transport_options"): '{"visibility_timeout": 7200}',
+            }
+        ):
+            executor_conf = ExecutorConf(team_name=None)
+            assert executor_conf.getjson("celery", "broker_transport_options") == {"visibility_timeout": 3600}
+
+            team_executor_conf = ExecutorConf(team_name="test_team")
+            assert team_executor_conf.getjson("celery", "broker_transport_options") == {
+                "visibility_timeout": 7200
+            }
+
+    def test_executor_conf_getsection(self):
+        """Test ExecutorConf.getsection() passes team_name to underlying conf.getsection()."""
+        from airflow.executors.base_executor import ExecutorConf
+
+        with conf_vars(
+            {
+                ("celery", "worker_concurrency"): "16",
+                ("celery", "result_backend"): "DEFAULT_BACKEND",
+                ("test_team=celery", "worker_concurrency"): "32",
+                ("test_team=celery", "result_backend"): "TEAM_BACKEND",
+            }
+        ):
+            executor_conf = ExecutorConf(team_name=None)
+            section = executor_conf.getsection("celery")
+            assert section["worker_concurrency"] == 16
+            assert section["result_backend"] == "DEFAULT_BACKEND"
+
+            team_executor_conf = ExecutorConf(team_name="test_team")
+            team_section = team_executor_conf.getsection("celery")
+            assert team_section["worker_concurrency"] == 32
+            assert team_section["result_backend"] == "TEAM_BACKEND"
+
+    def test_executor_conf_has_option(self):
+        """Test ExecutorConf.has_option() passes team_name to underlying conf.has_option()."""
+        from airflow.executors.base_executor import ExecutorConf
+
+        with conf_vars(
+            {
+                ("celery", "result_backend"): "DEFAULT",
+                ("test_team=celery", "result_backend"): "TEAM",
+                ("test_team=celery", "team_specific_option"): "VALUE",
+            }
+        ):
+            executor_conf = ExecutorConf(team_name=None)
+            assert executor_conf.has_option("celery", "result_backend") is True
+            assert executor_conf.has_option("celery", "team_specific_option") is False
+
+            team_executor_conf = ExecutorConf(team_name="test_team")
+            assert team_executor_conf.has_option("celery", "result_backend") is True
+            assert team_executor_conf.has_option("celery", "team_specific_option") is True
+
+    def test_executor_conf_get_mandatory_value(self):
+        """Test ExecutorConf.get_mandatory_value() passes team_name to underlying conf.get_mandatory_value()."""
+        from airflow.executors.base_executor import ExecutorConf
+
+        with conf_vars(
+            {
+                ("celery", "broker_url"): "redis://localhost",
+                ("test_team=celery", "broker_url"): "redis://team-redis",
+            }
+        ):
+            executor_conf = ExecutorConf(team_name=None)
+            assert executor_conf.get_mandatory_value("celery", "broker_url") == "redis://localhost"
+
+            team_executor_conf = ExecutorConf(team_name="test_team")
+            assert team_executor_conf.get_mandatory_value("celery", "broker_url") == "redis://team-redis"
+
+
+class TestCallbackSupport:
+    def test_supports_callbacks_flag_default_false(self):
+        executor = BaseExecutor()
+        assert WorkloadType.EXECUTE_CALLBACK not in executor.supported_workload_types
+
+    @pytest.mark.db_test
+    def test_queue_callback_without_support_raises_error(self, dag_maker, session):
+        executor = BaseExecutor()  # EXECUTE_CALLBACK not in supported_workload_types by default
+        callback_data = CallbackDTO(
+            id="12345678-1234-5678-1234-567812345678",
+            fetch_method=CallbackFetchMethod.IMPORT_PATH,
+            data={"path": "test.func", "kwargs": {}},
+        )
+        callback_workload = workloads.ExecuteCallback(
+            callback=callback_data,
+            dag_rel_path="test.py",
+            bundle_info=BundleInfo(name="test_bundle", version="1.0"),
+            token="test_token",
+            log_path="test.log",
+        )
+
+        with pytest.raises(NotImplementedError, match="does not support ExecuteCallback workloads"):
+            executor.queue_workload(callback_workload, session)
+
+    @pytest.mark.db_test
+    def test_queue_workload_with_execute_callback(self, dag_maker, session):
+        executor = BaseExecutor()
+        executor.supported_workload_types = frozenset(
+            {WorkloadType.EXECUTE_TASK, WorkloadType.EXECUTE_CALLBACK}
+        )
+        callback_data = CallbackDTO(
+            id="12345678-1234-5678-1234-567812345678",
+            fetch_method=CallbackFetchMethod.IMPORT_PATH,
+            data={"path": "test.func", "kwargs": {}},
+        )
+        callback_workload = workloads.ExecuteCallback(
+            callback=callback_data,
+            dag_rel_path="test.py",
+            bundle_info=BundleInfo(name="test_bundle", version="1.0"),
+            token="test_token",
+            log_path="test.log",
+        )
+
+        executor.queue_workload(callback_workload, session)
+
+        assert len(executor.executor_queues[WorkloadType.EXECUTE_CALLBACK]) == 1
+        assert callback_workload.key in executor.executor_queues[WorkloadType.EXECUTE_CALLBACK]
+
+    @pytest.mark.db_test
+    def test_get_workloads_prioritizes_callbacks(self, dag_maker, session):
+        executor = BaseExecutor()
+        executor.supported_workload_types = frozenset(
+            {WorkloadType.EXECUTE_TASK, WorkloadType.EXECUTE_CALLBACK}
+        )
+        dagrun = setup_dagrun(dag_maker)
+        callback_data = CallbackDTO(
+            id="12345678-1234-5678-1234-567812345678",
+            fetch_method=CallbackFetchMethod.IMPORT_PATH,
+            data={"path": "test.func", "kwargs": {}},
+        )
+        callback_workload = workloads.ExecuteCallback(
+            callback=callback_data,
+            dag_rel_path="test.py",
+            bundle_info=BundleInfo(name="test_bundle", version="1.0"),
+            token="test_token",
+            log_path="test.log",
+        )
+        executor.queue_workload(callback_workload, session)
+
+        for ti in dagrun.task_instances:
+            task_workload = workloads.ExecuteTask.make(ti)
+            executor.queue_workload(task_workload, session)
+
+        workloads_to_schedule = executor._get_workloads_to_schedule(open_slots=10)
+
+        assert len(workloads_to_schedule) == 4  # 1 callback + 3 tasks
+        _, first_workload = workloads_to_schedule[0]
+        assert isinstance(first_workload, workloads.ExecuteCallback)  # Assert callback comes first
+
+
+class TestBackwardCompatProperties:
+    """Tests for the backward-compat properties (queued_tasks, queued_callbacks, supports_callbacks)."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_legacy_warned(self):
+        BaseExecutor._legacy_warned = set()
+        yield
+        BaseExecutor._legacy_warned = set()
+
+    def test_queued_tasks_delegates_to_executor_queues(self):
+        executor = BaseExecutor()
+        executor.executor_queues[WorkloadType.EXECUTE_TASK]["key1"] = "workload1"
+
+        with pytest.warns(DeprecationWarning, match="queued_tasks is deprecated"):
+            result = executor.queued_tasks
+
+        assert result is executor.executor_queues[WorkloadType.EXECUTE_TASK]
+        assert "key1" in result
+
+    def test_queued_callbacks_delegates_to_executor_queues(self):
+        executor = BaseExecutor()
+        executor.executor_queues[WorkloadType.EXECUTE_CALLBACK]["cb1"] = "callback1"
+
+        with pytest.warns(DeprecationWarning, match="queued_callbacks is deprecated"):
+            result = executor.queued_callbacks
+
+        assert result is executor.executor_queues[WorkloadType.EXECUTE_CALLBACK]
+        assert "cb1" in result
+
+    def test_supports_callbacks_delegates_to_supported_workload_types(self):
+        executor = BaseExecutor()
+
+        with pytest.warns(DeprecationWarning, match="supports_callbacks is deprecated"):
+            assert executor.supports_callbacks is False
+
+        executor.supported_workload_types = frozenset(
+            {WorkloadType.EXECUTE_TASK, WorkloadType.EXECUTE_CALLBACK}
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RemovedInAirflow4Warning)
+            assert executor.supports_callbacks is True
+
+    def test_supports_connection_test_delegates_to_supported_workload_types(self):
+        executor = BaseExecutor()
+
+        with pytest.warns(DeprecationWarning, match="supports_connection_test is deprecated"):
+            assert executor.supports_connection_test is False
+
+        executor.supported_workload_types = frozenset(
+            {WorkloadType.EXECUTE_TASK, WorkloadType.TEST_CONNECTION}
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RemovedInAirflow4Warning)
+            assert executor.supports_connection_test is True
+
+    def test_warning_emitted_once_per_class(self, recwarn):
+        executor = BaseExecutor()
+        for _ in range(5):
+            _ = executor.queued_tasks
+        legacy = [w for w in recwarn.list if "queued_tasks is deprecated" in str(w.message)]
+        assert len(legacy) == 1
+
+    def test_warning_independent_per_subclass(self, recwarn):
+        class ExecutorA(BaseExecutor):
+            pass
+
+        class ExecutorB(BaseExecutor):
+            pass
+
+        _ = ExecutorA().queued_tasks
+        _ = ExecutorA().queued_tasks
+        _ = ExecutorB().queued_tasks
+        legacy = [w for w in recwarn.list if "queued_tasks is deprecated" in str(w.message)]
+        assert len(legacy) == 2
+
+    def test_queued_tasks_dict_operations(self):
+        """Verify dict operations through the backward-compat property work correctly."""
+        executor = BaseExecutor()
+        executor.executor_queues[WorkloadType.EXECUTE_TASK]["k1"] = "w1"
+        executor.executor_queues[WorkloadType.EXECUTE_TASK]["k2"] = "w2"
+
+        with pytest.warns(DeprecationWarning, match="queued_tasks is deprecated"):
+            qt = executor.queued_tasks
+
+        # All standard dict operations should work on the returned reference
+        assert len(qt) == 2
+        assert "k1" in qt
+        qt.pop("k1")
+        assert len(executor.executor_queues[WorkloadType.EXECUTE_TASK]) == 1
+
+
+class TestLegacySupportsCallbacksShim:
+    """Subclasses declaring legacy ``supports_callbacks = True`` must still receive callbacks."""
+
+    def test_legacy_flag_synthesises_supported_workload_types(self):
+        with pytest.warns(RemovedInAirflow4Warning, match="supports_callbacks = True"):
+
+            class LegacyExecutor(BaseExecutor):
+                supports_callbacks = True
+
+        assert LegacyExecutor.supported_workload_types == frozenset(
+            {WorkloadType.EXECUTE_TASK, WorkloadType.EXECUTE_CALLBACK}
+        )
+
+    def test_explicit_supported_workload_types_wins(self):
+        explicit = frozenset({WorkloadType.EXECUTE_TASK})
+        with pytest.warns(RemovedInAirflow4Warning, match="supports_callbacks = True"):
+
+            class MixedExecutor(BaseExecutor):
+                supports_callbacks = True
+                supported_workload_types = explicit
+
+        assert MixedExecutor.supported_workload_types is explicit
+
+    def test_modern_subclass_emits_no_warning(self, recwarn):
+        class ModernExecutor(BaseExecutor):
+            supported_workload_types = frozenset({WorkloadType.EXECUTE_TASK, WorkloadType.EXECUTE_CALLBACK})
+
+        legacy_warnings = [w for w in recwarn.list if "supports_callbacks = True" in str(w.message)]
+        assert legacy_warnings == []
+        assert WorkloadType.EXECUTE_CALLBACK in ModernExecutor.supported_workload_types
+
+    def test_legacy_false_removes_inherited_workload_type(self):
+        """``= False`` on a parent that declared the type must opt out, not silently inherit it."""
+        assert WorkloadType.TEST_CONNECTION in LocalExecutor.supported_workload_types
+        with pytest.warns(RemovedInAirflow4Warning, match="supports_connection_test = False"):
+
+            class Restricted(LocalExecutor):
+                supports_connection_test = False
+
+        assert WorkloadType.TEST_CONNECTION not in Restricted.supported_workload_types
+        assert Restricted.supported_workload_types == LocalExecutor.supported_workload_types - {
+            WorkloadType.TEST_CONNECTION
+        }
+        assert "supports_connection_test" not in vars(Restricted)
+
+    @pytest.mark.parametrize(
+        ("executor_cls", "expected"),
+        [
+            pytest.param(BaseExecutor, False, id="base-false"),
+            pytest.param(LocalExecutor, True, id="local-true"),
+        ],
+    )
+    def test_class_level_read_returns_bool(self, executor_cls, expected):
+        """``ExecutorCls.supports_callbacks`` must be a bool, not a truthy property object."""
+        executor_cls._legacy_warned = set()
+        with pytest.warns(RemovedInAirflow4Warning, match="supports_callbacks is deprecated"):
+            assert executor_cls.supports_callbacks is expected
+
+    def test_instance_assignment_on_legacy_subclass_writes_through(self):
+        """Once the class-body bool is folded in, ``self.flag = X`` must still reach the descriptor."""
+        with pytest.warns(RemovedInAirflow4Warning, match="supports_callbacks = False"):
+
+            class LegacyOptOut(LocalExecutor):
+                supports_callbacks = False
+
+        executor = LegacyOptOut()
+        assert WorkloadType.EXECUTE_CALLBACK not in executor.supported_workload_types
+
+        with pytest.warns(RemovedInAirflow4Warning, match="supports_callbacks is deprecated"):
+            executor.supports_callbacks = True
+
+        assert executor.supports_callbacks is True
+        assert WorkloadType.EXECUTE_CALLBACK in executor.supported_workload_types
+        assert "supports_callbacks" not in vars(executor)
+        assert WorkloadType.EXECUTE_CALLBACK not in LegacyOptOut.supported_workload_types
+
+    def test_legacy_connection_test_flag_synthesises_supported_workload_types(self):
+        with pytest.warns(RemovedInAirflow4Warning, match="supports_connection_test = True"):
+
+            class LegacyExecutor(BaseExecutor):
+                supports_connection_test = True
+
+        assert LegacyExecutor.supported_workload_types == frozenset(
+            {WorkloadType.EXECUTE_TASK, WorkloadType.TEST_CONNECTION}
+        )
+
+    def test_both_legacy_flags_synthesise_together(self):
+        with pytest.warns(RemovedInAirflow4Warning):
+
+            class LegacyExecutor(BaseExecutor):
+                supports_callbacks = True
+                supports_connection_test = True
+
+        assert LegacyExecutor.supported_workload_types == frozenset(
+            {WorkloadType.EXECUTE_TASK, WorkloadType.EXECUTE_CALLBACK, WorkloadType.TEST_CONNECTION}
+        )
+
+    def test_legacy_flag_unions_with_inherited_workload_types(self):
+        """A legacy flag on a subclass must not drop workload types inherited from the parent."""
+        with pytest.warns(RemovedInAirflow4Warning, match="supports_callbacks = True"):
+
+            class LegacyLocal(LocalExecutor):
+                supports_callbacks = True
+
+        assert LegacyLocal.supported_workload_types >= LocalExecutor.supported_workload_types
+        assert WorkloadType.TEST_CONNECTION in LegacyLocal.supported_workload_types
+
+    @pytest.mark.parametrize(
+        ("legacy_method", "replacement"),
+        [
+            ("trigger_tasks", "trigger_workloads"),
+            ("trigger_connection_tests", "trigger_workloads"),
+            ("order_queued_tasks_by_priority", "_get_workloads_to_schedule"),
+        ],
+    )
+    def test_legacy_method_override_warns_at_class_definition(self, legacy_method, replacement):
+        """Overrides of methods BaseExecutor no longer calls must warn instead of breaking silently."""
+        with pytest.warns(RemovedInAirflow4Warning, match=f"overrides `{legacy_method}`"):
+            type("OverridingExecutor", (BaseExecutor,), {legacy_method: lambda self, *args: None})
+
+
+class TestExecuteCallbackWorkload:
+    @pytest.mark.parametrize(
+        ("path", "kwargs", "dag_rel_path", "bundle_path", "expect_success", "error_contains"),
+        [
+            pytest.param(
+                "builtins.dict",
+                {"a": 1, "b": 2, "c": 3},
+                Path("test.py"),
+                Path("bundle/path"),
+                True,
+                None,
+                id="function_success",
+            ),
+            pytest.param(
+                "",
+                {},
+                Path("test.py"),
+                Path("bundle/path"),
+                False,
+                "Callback path not found",
+                id="missing_path",
+            ),
+            pytest.param(
+                "nonexistent.module.function",
+                {},
+                Path("test.py"),
+                Path("bundle/path"),
+                False,
+                "ModuleNotFoundError",
+                id="import_error",
+            ),
+            pytest.param(
+                "builtins.len",
+                {},
+                Path("test.py"),
+                Path("bundle/path"),
+                False,
+                "TypeError",
+                id="execution_error",
+            ),
+            pytest.param(
+                "unusual_prefix_fad099f9df8ac798a50aac7381aab95ad4008e79_test_dag.success_message",
+                {},
+                Path("test.py"),
+                Path("bundle/path"),
+                False,
+                "FileNotFoundError",
+                id="dag_import_error",
+            ),
+        ],
+    )
+    def test_execute_callback(self, path, kwargs, dag_rel_path, bundle_path, expect_success, error_contains):
+        log = structlog.get_logger()
+        success, error = execute_callback(
+            callback_path=path,
+            callback_kwargs=kwargs,
+            dag_rel_path=dag_rel_path,
+            bundle_path=bundle_path,
+            log=log,
+        )
+
+        assert success is expect_success
+        if error_contains:
+            assert error_contains in error
+        else:
+            assert error is None
+
+    def test_execute_callback_unusual_prefix_success(self, tmp_path):
+        """Test successful execution of callback with same Dag module path."""
+        dag_file = tmp_path / "test_dag.py"
+        dag_content = dedent('''
+            def test_callback(**kwargs):
+                """Test callback function."""
+                return "success"
+        ''')
+        dag_file.write_text(dag_content)
+
+        callback_path = "unusual_prefix_abc123_test_dag.test_callback"
+        callback_kwargs = {"param1": "value1", "context": {"dag_id": "test"}}
+        dag_rel_path = Path("test_dag.py")
+        bundle_path = tmp_path
+        log = structlog.get_logger()
+
+        success, error = execute_callback(
+            callback_path=callback_path,
+            callback_kwargs=callback_kwargs,
+            dag_rel_path=dag_rel_path,
+            bundle_path=bundle_path,
+            log=log,
+        )
+
+        assert success is True
+        assert error is None
+
+    @pytest.mark.parametrize(
+        ("dag_rel_path", "bundle_path", "expected_error"),
+        [
+            pytest.param(None, Path("bundle/path"), "Dag relative path not found", id="missing_dag_path"),
+            pytest.param(Path("test.py"), None, "Bundle path not found", id="missing_bundle_path"),
+        ],
+    )
+    def test_execute_callback_unusual_prefix_missing_paths(self, dag_rel_path, bundle_path, expected_error):
+        """Test same Dag module callback with missing required paths."""
+        callback_path = "unusual_prefix_abc123_test_dag.test_callback"
+        callback_kwargs = {"param1": "value1"}
+        log = structlog.get_logger()
+
+        success, error = execute_callback(
+            callback_path=callback_path,
+            callback_kwargs=callback_kwargs,
+            dag_rel_path=dag_rel_path,
+            bundle_path=bundle_path,
+            log=log,
+        )
+
+        assert success is False
+        assert expected_error in error

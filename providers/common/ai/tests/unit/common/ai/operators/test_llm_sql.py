@@ -1,0 +1,1001 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+import subprocess
+import sys
+from datetime import timedelta
+from decimal import Decimal
+from unittest.mock import ANY, MagicMock, PropertyMock, patch
+from uuid import uuid4
+
+import pytest
+from pydantic_ai import Agent
+from pydantic_ai.exceptions import UsageLimitExceeded
+from pydantic_ai.messages import ModelResponse, TextPart
+from pydantic_ai.models.function import FunctionModel
+from pydantic_ai.usage import UsageLimits
+
+from airflow.providers.common.ai.mixins.approval import (
+    LLMApprovalMixin,
+)
+from airflow.providers.common.ai.operators.llm import DecisionPolicy
+from airflow.providers.common.ai.operators.llm_sql import LLMSQLQueryOperator
+from airflow.providers.common.ai.utils.sql_validation import SQLSafetyError
+from airflow.providers.common.ai.utils.usage_budget import USAGE_BUDGET_KEY
+from airflow.providers.common.compat.sdk import TaskDeferred
+from airflow.providers.common.sql.config import DataSourceConfig
+
+from tests_common.test_utils.version_compat import AIRFLOW_V_3_1_PLUS, AIRFLOW_V_3_3_PLUS
+
+if AIRFLOW_V_3_3_PLUS:
+    # On Airflow 3.3+ require_approval pauses the task in AWAITING_INPUT; older Airflow versions defer to
+    # HITLTrigger. Both signals carry method_name/kwargs/timeout, so the approval tests assert
+    # against whichever pause signal the running Airflow version uses.
+    from airflow.sdk.exceptions import TaskAwaitingInput as ApprovalPauseSignal
+else:
+    ApprovalPauseSignal = TaskDeferred  # type: ignore[assignment, misc]
+
+
+def _make_mock_agent(output: str, make_mock_run_result):
+    """Create a mock agent that returns the given output string."""
+    mock_agent = MagicMock(spec=["run_sync", "instrument"])
+    mock_agent.run_sync.return_value = make_mock_run_result(output)
+    return mock_agent
+
+
+def _run_python_without_datafusion(code: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            f"""
+import builtins
+
+real_import = builtins.__import__
+
+
+def blocked_import(name, *args, **kwargs):
+    if name == "datafusion" or name.startswith("datafusion."):
+        raise ModuleNotFoundError("No module named 'datafusion'")
+    return real_import(name, *args, **kwargs)
+
+
+builtins.__import__ = blocked_import
+{code}
+""",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+class TestDataFusionOptionalDependency:
+    def test_relational_sql_imports_do_not_require_datafusion(self):
+        result = _run_python_without_datafusion(
+            """
+from airflow.providers.common.ai.decorators.llm_sql import llm_sql_task
+from airflow.providers.common.ai.operators.llm_sql import LLMSQLQueryOperator
+"""
+        )
+
+        assert result.returncode == 0, result.stderr
+
+    def test_object_storage_error_explains_how_to_install_datafusion(self):
+        result = _run_python_without_datafusion(
+            """
+from airflow.providers.common.ai.operators.llm_sql import LLMSQLQueryOperator
+from airflow.providers.common.compat.sdk import AirflowOptionalProviderFeatureException
+from airflow.providers.common.sql.config import DataSourceConfig
+
+operator = LLMSQLQueryOperator(
+    task_id="test",
+    prompt="test",
+    llm_conn_id="test",
+    datasource_config=DataSourceConfig(
+        conn_id="aws_default",
+        table_name="sales",
+        uri="s3://bucket/sales/",
+        format="parquet",
+    ),
+)
+
+try:
+    operator._introspect_object_storage_schema()
+except AirflowOptionalProviderFeatureException as error:
+    expected = 'pip install "apache-airflow-providers-common-sql[datafusion]"'
+    if expected not in str(error):
+        raise AssertionError(f"Missing installation guidance in: {{error}}") from error
+else:
+    raise AssertionError("Expected object-storage introspection to require DataFusion")
+"""
+        )
+
+        assert result.returncode == 0, result.stderr
+
+
+class TestStripLLMOutput:
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        (
+            pytest.param("SELECT 1", "SELECT 1", id="plain_sql"),
+            pytest.param("  SELECT 1  ", "SELECT 1", id="leading_trailing_whitespace"),
+            pytest.param("```sql\nSELECT 1\n```", "SELECT 1", id="sql_code_fence"),
+            pytest.param("```\nSELECT 1\n```", "SELECT 1", id="bare_code_fence"),
+            pytest.param("```SQL\nSELECT 1\n```", "SELECT 1", id="uppercase_language_tag"),
+            pytest.param(
+                "```sql\nSELECT id\nFROM users\nWHERE active\n```",
+                "SELECT id\nFROM users\nWHERE active",
+                id="multiline_query",
+            ),
+            pytest.param(
+                "```sql\nSELECT 1\n",
+                "SELECT 1",
+                id="missing_closing_fence",
+            ),
+            pytest.param(
+                "```SELECT 1```",
+                "SELECT 1",
+                id="single_line_fence_no_language_tag",
+            ),
+            pytest.param(
+                "```SELECT * FROM users LIMIT 10```",
+                "SELECT * FROM users LIMIT 10",
+                id="single_line_fence_with_query",
+            ),
+            pytest.param(
+                "```sql SELECT 1```",
+                "SELECT 1",
+                id="single_line_fence_with_language_tag",
+            ),
+            pytest.param(
+                "```SQL SELECT 1```",
+                "SELECT 1",
+                id="single_line_fence_with_uppercase_language_tag",
+            ),
+        ),
+    )
+    def test_strip_llm_output(self, raw, expected):
+        assert LLMSQLQueryOperator._strip_llm_output(raw) == expected
+
+    @pytest.mark.parametrize(
+        ("raw", "dialect", "expected"),
+        (
+            pytest.param("```postgres SELECT 1```", "postgres", "SELECT 1", id="dialect_tag_matches"),
+            pytest.param(
+                "```POSTGRES SELECT 1```", "postgres", "SELECT 1", id="dialect_tag_case_insensitive"
+            ),
+            pytest.param(
+                "```mysql SELECT 1```",
+                "postgres",
+                "mysql SELECT 1",
+                id="dialect_tag_mismatch_left_alone",
+            ),
+        ),
+    )
+    def test_strip_llm_output_with_dialect(self, raw, dialect, expected):
+        assert LLMSQLQueryOperator._strip_llm_output(raw, dialect=dialect) == expected
+
+
+class TestLLMSQLQueryOperator:
+    def test_inherits_from_llm_operator(self):
+        from airflow.providers.common.ai.operators.llm import LLMOperator
+
+        assert issubclass(LLMSQLQueryOperator, LLMOperator)
+
+    def test_output_type_rejected(self):
+        with pytest.raises(TypeError, match="LLMSQLQueryOperator does not accept 'output_type'"):
+            LLMSQLQueryOperator(task_id="test", prompt="get users", llm_conn_id="my_llm", output_type=int)
+
+    def test_template_fields_include_parent_and_sql_specific(self):
+        expected = {
+            "prompt",
+            "llm_conn_id",
+            "model_id",
+            "fallback_conn_ids",
+            "system_prompt",
+            "model_settings",
+            "usage_limits",
+            "db_conn_id",
+            "table_names",
+            "schema_context",
+        }
+        assert set(LLMSQLQueryOperator.template_fields) == expected
+
+    @patch("airflow.providers.common.ai.operators.llm.PydanticAIHook", autospec=True)
+    def test_execute_forwards_fallback_conn_ids_to_hook(self, mock_hook_cls, make_mock_run_result):
+        """``fallback_conn_ids`` is accepted without a per-subclass code change and reaches the hook."""
+        mock_agent = _make_mock_agent("SELECT id FROM users", make_mock_run_result)
+        mock_hook_cls.get_hook.return_value.create_agent.return_value = mock_agent
+
+        op = LLMSQLQueryOperator(
+            task_id="test",
+            prompt="Get users",
+            llm_conn_id="my_llm",
+            schema_context="Table: users\nColumns: id INT",
+            fallback_conn_ids=["conn_a", "conn_b"],
+        )
+        op.execute(context=MagicMock())
+
+        mock_hook_cls.get_hook.assert_called_once_with(
+            "my_llm", hook_params={"model_id": None, "fallback_conn_ids": ["conn_a", "conn_b"]}
+        )
+
+    @patch("airflow.providers.common.ai.operators.llm.PydanticAIHook", autospec=True)
+    def test_execute_with_schema_context(self, mock_hook_cls, make_mock_run_result):
+        """Operator uses schema_context and returns generated SQL."""
+        mock_agent = _make_mock_agent("SELECT id, name FROM users WHERE active = true", make_mock_run_result)
+        mock_hook_cls.get_hook.return_value.create_agent.return_value = mock_agent
+
+        op = LLMSQLQueryOperator(
+            task_id="test",
+            prompt="Get active users",
+            llm_conn_id="my_llm",
+            schema_context="Table: users\nColumns: id INT, name TEXT, active BOOLEAN",
+        )
+        result = op.execute(context=MagicMock())
+
+        assert result == "SELECT id, name FROM users WHERE active = true"
+        mock_agent.run_sync.assert_called_once_with(
+            "Get active users", usage=ANY, usage_limits=None, run_id=ANY, cancellation_token=ANY
+        )
+
+    @pytest.mark.parametrize("model_name", ["gpt-5", None])
+    @patch("airflow.providers.common.ai.operators.llm.PydanticAIHook", autospec=True)
+    def test_run_usage_run_id_and_model_name_pushed_to_xcom(
+        self, mock_hook_cls, make_reporting_agent, reporting_task_instance, model_name
+    ):
+        mock_agent, expected_pushes = make_reporting_agent("SELECT 1", model_name=model_name)
+        mock_hook_cls.get_hook.return_value.create_agent.return_value = mock_agent
+        op = LLMSQLQueryOperator(task_id="test", prompt="Get one", llm_conn_id="my_llm")
+        ti = reporting_task_instance
+
+        op.execute(context={"task_instance": ti})
+
+        assert {c.kwargs["key"]: c.kwargs["value"] for c in ti.xcom_push.call_args_list} == expected_pushes
+
+    @patch("airflow.providers.common.ai.operators.llm.PydanticAIHook", autospec=True)
+    def test_execute_coerces_usage_limits_dict_before_run_sync(
+        self, mock_hook_cls, make_mock_run_result, usage_budget_context
+    ):
+        """A dict ``usage_limits`` is coerced into a real ``UsageLimits`` before ``run_sync``."""
+        mock_agent = _make_mock_agent("SELECT id, name FROM users WHERE active = true", make_mock_run_result)
+        mock_hook_cls.get_hook.return_value.create_agent.return_value = mock_agent
+
+        op = LLMSQLQueryOperator(
+            task_id="test",
+            prompt="Get active users",
+            llm_conn_id="my_llm",
+            schema_context="Table: users\nColumns: id INT, name TEXT, active BOOLEAN",
+            usage_limits={"cost_limit": "0.5"},
+        )
+        op.execute(context=usage_budget_context)
+
+        _, kwargs = mock_agent.run_sync.call_args
+        assert kwargs["usage_limits"].cost_limit == Decimal("0.5")
+
+    @patch.object(LLMSQLQueryOperator, "_get_schema_context", autospec=True)
+    @patch("airflow.providers.common.ai.operators.llm.PydanticAIHook", autospec=True)
+    def test_unparsable_usage_limits_fails_before_schema_introspection(
+        self, mock_hook_cls, mock_schema_context
+    ):
+        """``_get_schema_context`` queries every configured connection, so a
+        ``usage_limits`` value that cannot be coerced has to fail ahead of it
+        rather than after the expensive part has already run."""
+        op = LLMSQLQueryOperator(
+            task_id="test",
+            prompt="Get active users",
+            llm_conn_id="my_llm",
+            usage_limits={"cost_limit": ""},
+        )
+
+        with pytest.raises(ValueError, match=r"usage_limits\['cost_limit'\]"):
+            op.execute(context={})
+
+        mock_schema_context.assert_not_called()
+        mock_hook_cls.get_hook.return_value.create_agent.assert_not_called()
+
+    @patch("airflow.providers.common.ai.operators.llm.PydanticAIHook", autospec=True)
+    def test_execute_validation_blocks_unsafe_sql(self, mock_hook_cls, make_mock_run_result):
+        """Validation catches unsafe SQL generated by the LLM."""
+        mock_hook_cls.get_hook.return_value.create_agent.return_value = _make_mock_agent(
+            "DROP TABLE users", make_mock_run_result
+        )
+
+        op = LLMSQLQueryOperator(task_id="test", prompt="Delete everything", llm_conn_id="my_llm")
+
+        with pytest.raises(SQLSafetyError, match="not allowed"):
+            op.execute(context=MagicMock())
+
+    @patch("airflow.providers.common.ai.operators.llm.PydanticAIHook", autospec=True)
+    def test_execute_validation_disabled(self, mock_hook_cls, make_mock_run_result):
+        """When validate_sql=False, unsafe SQL is returned without checks."""
+        mock_hook_cls.get_hook.return_value.create_agent.return_value = _make_mock_agent(
+            "DROP TABLE users", make_mock_run_result
+        )
+
+        op = LLMSQLQueryOperator(task_id="test", prompt="Drop it", llm_conn_id="my_llm", validate_sql=False)
+        result = op.execute(context=MagicMock())
+
+        assert result == "DROP TABLE users"
+
+    @patch("airflow.providers.common.ai.operators.llm.PydanticAIHook", autospec=True)
+    def test_execute_passes_model_settings_and_output_retries(self, mock_hook_cls, make_mock_run_result):
+        """model_settings and output_retries inherited from LLMOperator reach create_agent."""
+        mock_hook_cls.get_hook.return_value.create_agent.return_value = _make_mock_agent(
+            "SELECT 1", make_mock_run_result
+        )
+
+        op = LLMSQLQueryOperator(
+            task_id="test",
+            prompt="test",
+            llm_conn_id="my_llm",
+            model_settings={"temperature": 0},
+            output_retries=3,
+        )
+        op.execute(context=MagicMock())
+
+        create_agent_call = mock_hook_cls.get_hook.return_value.create_agent.call_args
+        assert create_agent_call.kwargs["retries"] == 3
+        assert create_agent_call.kwargs["model_settings"] == {"temperature": 0}
+
+    @patch("airflow.providers.common.ai.operators.llm.PydanticAIHook", autospec=True)
+    def test_system_prompt_appended_to_sql_instructions(self, mock_hook_cls, make_mock_run_result):
+        """User-provided system_prompt is appended to built-in SQL safety prompt."""
+        mock_hook_cls.get_hook.return_value.create_agent.return_value = _make_mock_agent(
+            "SELECT 1", make_mock_run_result
+        )
+
+        op = LLMSQLQueryOperator(
+            task_id="test",
+            prompt="test",
+            llm_conn_id="my_llm",
+            system_prompt="Always use LEFT JOINs.",
+        )
+        op.execute(context=MagicMock())
+
+        instructions = mock_hook_cls.get_hook.return_value.create_agent.call_args[1]["instructions"]
+        assert "Always use LEFT JOINs." in instructions
+        # Built-in SQL safety prompt should still be present
+        assert "Generate only SELECT queries" in instructions
+        assert "Never generate data modification" in instructions
+
+
+@pytest.mark.skipif(not AIRFLOW_V_3_3_PLUS, reason="usage budget needs Airflow >= 3.3")
+class TestLLMSQLQueryOperatorUsageBudget:
+    @staticmethod
+    def _make_operator(**kwargs):
+        return LLMSQLQueryOperator(
+            task_id="t",
+            prompt="p",
+            llm_conn_id="c",
+            schema_context="Table: users\nColumns: id INT",
+            usage_limits=UsageLimits(request_limit=2),
+            **kwargs,
+        )
+
+    @patch("airflow.providers.common.ai.operators.llm.PydanticAIHook", autospec=True)
+    def test_earlier_attempts_usage_counts_against_the_limit(
+        self, mock_hook_cls, task_state_store_accessor, seed_usage_budget, usage_budget_context
+    ):
+        seed_usage_budget(task_state_store_accessor, requests=2)
+        calls = []
+
+        def respond(messages, info):
+            calls.append(messages)
+            return ModelResponse(parts=[TextPart(content="SELECT 1")])
+
+        mock_hook_cls.get_hook.return_value.create_agent.side_effect = lambda **kw: Agent(
+            FunctionModel(respond), **kw
+        )
+
+        with pytest.raises(UsageLimitExceeded, match="request_limit"):
+            self._make_operator().execute(usage_budget_context)
+
+        assert calls == []
+
+    @patch("airflow.providers.common.ai.operators.llm.PydanticAIHook", autospec=True)
+    def test_unsafe_generated_sql_keeps_the_budget(
+        self,
+        mock_hook_cls,
+        make_mock_run_result,
+        task_state_store_accessor,
+        seed_usage_budget,
+        usage_budget_context,
+    ):
+        seed_usage_budget(task_state_store_accessor, requests=1)
+        mock_hook_cls.get_hook.return_value.create_agent.return_value = _make_mock_agent(
+            "DROP TABLE users", make_mock_run_result
+        )
+
+        with pytest.raises(SQLSafetyError, match="not allowed"):
+            self._make_operator().execute(usage_budget_context)
+
+        assert task_state_store_accessor.get(USAGE_BUDGET_KEY) is not None
+
+    @patch("airflow.providers.common.ai.operators.llm.PydanticAIHook", autospec=True)
+    def test_successful_run_clears_the_budget(
+        self,
+        mock_hook_cls,
+        make_mock_run_result,
+        task_state_store_accessor,
+        seed_usage_budget,
+        usage_budget_context,
+    ):
+        seed_usage_budget(task_state_store_accessor, requests=1)
+        mock_hook_cls.get_hook.return_value.create_agent.return_value = _make_mock_agent(
+            "SELECT 1", make_mock_run_result
+        )
+
+        assert self._make_operator().execute(usage_budget_context) == "SELECT 1"
+
+        assert task_state_store_accessor.get(USAGE_BUDGET_KEY) is None
+
+    @staticmethod
+    def _make_reviewed_event(sql):
+        return {
+            "chosen_options": ["Approve"],
+            "responded_by_user": {"id": "u1", "name": "dba"},
+            "params_input": {"output": sql},
+        }
+
+    def test_execute_complete_keeps_the_budget_when_revalidation_fails(
+        self, task_state_store_accessor, seed_usage_budget, usage_budget_context
+    ):
+        seed_usage_budget(task_state_store_accessor, requests=1)
+        op = self._make_operator(allow_modifications=True)
+
+        with pytest.raises(SQLSafetyError, match="not allowed"):
+            op.execute_complete(
+                usage_budget_context,
+                generated_output="SELECT 1",
+                event=self._make_reviewed_event("DROP TABLE users"),
+            )
+
+        assert task_state_store_accessor.get(USAGE_BUDGET_KEY) is not None
+
+    def test_execute_complete_clears_the_budget_once_the_reviewed_sql_is_valid(
+        self, task_state_store_accessor, seed_usage_budget, usage_budget_context
+    ):
+        seed_usage_budget(task_state_store_accessor, requests=1)
+        op = self._make_operator(allow_modifications=True)
+
+        result = op.execute_complete(
+            usage_budget_context,
+            generated_output="SELECT 1",
+            event=self._make_reviewed_event("SELECT id FROM users"),
+        )
+
+        assert result == "SELECT id FROM users"
+        assert task_state_store_accessor.get(USAGE_BUDGET_KEY) is None
+
+
+class TestLLMSQLQueryOperatorSchemaIntrospection:
+    @patch("airflow.providers.common.ai.operators.llm.PydanticAIHook", autospec=True)
+    def test_introspect_schemas_via_db_hook(self, mock_hook_cls, make_mock_run_result):
+        """db_conn_id + table_names triggers schema introspection."""
+        mock_agent = _make_mock_agent("SELECT id FROM users", make_mock_run_result)
+        mock_hook_cls.get_hook.return_value.create_agent.return_value = mock_agent
+
+        mock_db_hook = MagicMock(spec=["get_table_schema", "dialect_name"])
+        mock_db_hook.get_table_schema.return_value = [
+            {"name": "id", "type": "INTEGER"},
+            {"name": "name", "type": "VARCHAR"},
+        ]
+        mock_db_hook.dialect_name = "postgresql"
+
+        op = LLMSQLQueryOperator(
+            task_id="test",
+            prompt="Get user IDs",
+            llm_conn_id="my_llm",
+            db_conn_id="pg_default",
+            table_names=["users"],
+        )
+
+        with patch.object(type(op), "db_hook", new_callable=PropertyMock, return_value=mock_db_hook):
+            result = op.execute(context=MagicMock())
+
+        assert result == "SELECT id FROM users"
+        mock_db_hook.get_table_schema.assert_called_once_with("users")
+
+        # Verify the system prompt contains the schema info
+        instructions = mock_hook_cls.get_hook.return_value.create_agent.call_args[1]["instructions"]
+        assert "users" in instructions
+        assert "id INTEGER" in instructions
+
+    def test_introspect_raises_when_no_tables_found(self):
+        """Raise ValueError when all requested tables return empty columns."""
+        mock_db_hook = MagicMock(spec=["get_table_schema", "dialect_name"])
+        mock_db_hook.get_table_schema.return_value = []
+
+        op = LLMSQLQueryOperator(
+            task_id="test",
+            prompt="test",
+            llm_conn_id="my_llm",
+            db_conn_id="pg_default",
+            table_names=["nonexistent_table"],
+        )
+
+        with patch.object(type(op), "db_hook", new_callable=PropertyMock, return_value=mock_db_hook):
+            with pytest.raises(ValueError, match="None of the requested tables"):
+                op._introspect_schemas()
+
+    def test_schema_context_overrides_introspection(self):
+        """schema_context takes priority over db_conn_id introspection."""
+        op = LLMSQLQueryOperator(
+            task_id="test",
+            prompt="test",
+            llm_conn_id="my_llm",
+            db_conn_id="pg_default",
+            table_names=["users"],
+            schema_context="My custom schema info",
+        )
+        assert op._get_schema_context() == "My custom schema info"
+
+    @patch(
+        "airflow.providers.common.sql.datafusion.engine.DataFusionEngine",
+        autospec=True,
+    )
+    def test_introspect_object_storage_schema(self, mock_engine_cls):
+        """_introspect_object_storage_schema registers datasource and returns schema."""
+        mock_engine = mock_engine_cls.return_value
+        schema_text = "cust_id: int64\nname: string\namount: float64"
+        mock_engine.get_schema.return_value = schema_text
+
+        ds_config = DataSourceConfig(
+            conn_id="aws_default",
+            table_name="sales",
+            uri="s3://bucket/data/",
+            format="parquet",
+        )
+        op = LLMSQLQueryOperator(
+            task_id="test",
+            prompt="test",
+            llm_conn_id="my_llm",
+            datasource_config=ds_config,
+        )
+        result = op._introspect_object_storage_schema()
+
+        mock_engine.register_datasource.assert_called_once_with(ds_config)
+        mock_engine.get_schema.assert_called_once_with("sales")
+        assert result == schema_text
+
+    @patch(
+        "airflow.providers.common.sql.datafusion.engine.DataFusionEngine",
+        autospec=True,
+    )
+    def test_introspect_schemas_with_db_and_datasource_config(self, mock_engine_cls):
+        """_introspect_schemas includes both db table and object storage schema."""
+        mock_engine = mock_engine_cls.return_value
+        object_schema = "col_a: int64\ncol_b: string"
+        mock_engine.get_schema.return_value = object_schema
+
+        ds_config = DataSourceConfig(
+            conn_id="aws_default",
+            table_name="remote_table",
+            uri="s3://bucket/path/",
+            format="csv",
+        )
+        mock_db_hook = MagicMock(spec=["get_table_schema", "dialect_name"])
+        mock_db_hook.get_table_schema.return_value = [
+            {"name": "id", "type": "INTEGER"},
+        ]
+
+        op = LLMSQLQueryOperator(
+            task_id="test",
+            prompt="test",
+            llm_conn_id="my_llm",
+            db_conn_id="pg_default",
+            table_names=["local_table"],
+            datasource_config=ds_config,
+        )
+
+        with patch.object(type(op), "db_hook", new_callable=PropertyMock, return_value=mock_db_hook):
+            result = op._introspect_schemas()
+
+        assert "Table: local_table" in result
+        assert "id INTEGER" in result
+        assert "Table: remote_table" in result
+        assert object_schema in result
+
+    @patch(
+        "airflow.providers.common.sql.datafusion.engine.DataFusionEngine",
+        autospec=True,
+    )
+    def test_introspect_schemas_datasource_config_without_db_tables(self, mock_engine_cls):
+        """_introspect_schemas works when only datasource_config is provided (no db tables)."""
+        mock_engine = mock_engine_cls.return_value
+        mock_engine.get_schema.return_value = "ts: TIMESTAMP\nvalue: DOUBLE"
+
+        ds_config = DataSourceConfig(
+            conn_id="aws_default",
+            table_name="s3_data",
+            uri="s3://bucket/metrics/",
+            format="parquet",
+        )
+        op = LLMSQLQueryOperator(
+            task_id="test",
+            prompt="test",
+            llm_conn_id="my_llm",
+            db_conn_id="pg_default",
+            table_names=[],
+            datasource_config=ds_config,
+        )
+        mock_db_hook = MagicMock(spec=["get_table_schema", "dialect_name"])
+        mock_db_hook.get_table_schema.return_value = []
+
+        with patch.object(type(op), "db_hook", new_callable=PropertyMock, return_value=mock_db_hook):
+            result = op._introspect_schemas()
+
+        assert "Table: s3_data" in result
+        assert "ts: TIMESTAMP\nvalue: DOUBLE" in result
+
+    def test_introspect_schemas_raises_when_no_tables_and_no_datasource(self):
+        """ValueError is raised when no db tables return schema and no datasource_config is set."""
+        mock_db_hook = MagicMock(spec=["get_table_schema", "dialect_name"])
+        mock_db_hook.get_table_schema.return_value = []
+
+        op = LLMSQLQueryOperator(
+            task_id="test",
+            prompt="test",
+            llm_conn_id="my_llm",
+            db_conn_id="pg_default",
+            table_names=["missing_table"],
+        )
+
+        with patch.object(type(op), "db_hook", new_callable=PropertyMock, return_value=mock_db_hook):
+            with pytest.raises(ValueError, match="None of the requested tables"):
+                op._introspect_schemas()
+
+    @patch("airflow.providers.common.ai.operators.llm.PydanticAIHook", autospec=True)
+    @patch(
+        "airflow.providers.common.sql.datafusion.engine.DataFusionEngine",
+        autospec=True,
+    )
+    def test_execute_with_datasource_config_and_db_tables(
+        self, mock_engine_cls, mock_hook_cls, make_mock_run_result
+    ):
+        """Full execute flow with both db tables and object storage datasource."""
+        mock_engine = mock_engine_cls.return_value
+        mock_engine.get_schema.return_value = "event: TEXT\nts: TIMESTAMP"
+
+        mock_agent = _make_mock_agent(
+            "SELECT u.id, e.event FROM users u JOIN events e ON u.id = e.user_id", make_mock_run_result
+        )
+        mock_hook_cls.get_hook.return_value.create_agent.return_value = mock_agent
+
+        ds_config = DataSourceConfig(
+            conn_id="aws_default",
+            table_name="events",
+            uri="s3://bucket/events/",
+            format="parquet",
+        )
+        mock_db_hook = MagicMock(spec=["get_table_schema", "dialect_name"])
+        mock_db_hook.get_table_schema.return_value = [
+            {"name": "id", "type": "INTEGER"},
+            {"name": "name", "type": "VARCHAR"},
+        ]
+        mock_db_hook.dialect_name = "postgresql"
+
+        op = LLMSQLQueryOperator(
+            task_id="test",
+            prompt="Join users with events",
+            llm_conn_id="my_llm",
+            db_conn_id="pg_default",
+            table_names=["users"],
+            datasource_config=ds_config,
+        )
+
+        with patch.object(type(op), "db_hook", new_callable=PropertyMock, return_value=mock_db_hook):
+            result = op.execute(context=MagicMock())
+
+        assert "SELECT" in result
+        instructions = mock_hook_cls.get_hook.return_value.create_agent.call_args[1]["instructions"]
+        assert "users" in instructions
+        assert "events" in instructions
+        assert "event: TEXT\nts: TIMESTAMP" in instructions
+
+
+class TestLLMSQLQueryOperatorDialect:
+    def test_resolved_dialect_from_param(self):
+        op = LLMSQLQueryOperator(task_id="test", prompt="test", llm_conn_id="my_llm", dialect="mysql")
+        assert op._resolved_dialect == "mysql"
+
+    def test_resolved_dialect_from_db_hook_normalized(self):
+        """SQLAlchemy's 'postgresql' is normalized to sqlglot's 'postgres'."""
+        mock_db_hook = MagicMock(spec=["dialect_name"])
+        mock_db_hook.dialect_name = "postgresql"
+
+        op = LLMSQLQueryOperator(task_id="test", prompt="test", llm_conn_id="my_llm", db_conn_id="pg_default")
+        with patch.object(type(op), "db_hook", new_callable=PropertyMock, return_value=mock_db_hook):
+            assert op._resolved_dialect == "postgres"
+
+    def test_resolved_dialect_none_when_nothing_set(self):
+        op = LLMSQLQueryOperator(task_id="test", prompt="test", llm_conn_id="my_llm")
+        assert op._resolved_dialect is None
+
+
+class TestLLMSQLQueryOperatorDbHook:
+    @patch("airflow.providers.common.ai.operators.llm_sql.BaseHook", autospec=True)
+    def test_db_hook_returns_none_without_conn_id(self, mock_base_hook):
+        op = LLMSQLQueryOperator(task_id="test", prompt="test", llm_conn_id="my_llm")
+        assert op.db_hook is None
+        mock_base_hook.get_connection.assert_not_called()
+
+    @patch("airflow.providers.common.ai.operators.llm_sql.BaseHook", autospec=True)
+    def test_db_hook_raises_for_non_dbapi_hook(self, mock_base_hook):
+        mock_conn = MagicMock(spec=["get_hook"])
+        mock_conn.get_hook.return_value = MagicMock()  # Not a DbApiHook
+        mock_base_hook.get_connection.return_value = mock_conn
+
+        op = LLMSQLQueryOperator(task_id="test", prompt="test", llm_conn_id="my_llm", db_conn_id="bad_conn")
+
+        with pytest.raises(ValueError, match="does not provide a DbApiHook"):
+            _ = op.db_hook
+
+
+def _make_context(ti_id=None):
+    ti_id = ti_id or uuid4()
+    ti = MagicMock()
+    ti.id = ti_id
+    return MagicMock(**{"__getitem__": lambda self, key: {"task_instance": ti}[key]})
+
+
+@pytest.mark.skipif(
+    not AIRFLOW_V_3_1_PLUS, reason="Human in the loop is only compatible with Airflow >= 3.1.0"
+)
+class TestLLMSQLQueryOperatorApproval:
+    """Tests for LLMSQLQueryOperator with require_approval=True (LLMApprovalMixin integration)."""
+
+    def test_inherits_llm_approval_mixin(self):
+        assert issubclass(LLMSQLQueryOperator, LLMApprovalMixin)
+
+    def test_approval_flags_default_values(self):
+        op = LLMSQLQueryOperator(
+            task_id="t", prompt="generate top 5 customer scores", llm_conn_id="pydantic_default"
+        )
+        assert op.require_approval is False
+        assert op.allow_modifications is False
+        assert op.approval_timeout is None
+
+    @patch("airflow.providers.standard.triggers.hitl.HITLTrigger", autospec=True)
+    @patch("airflow.sdk.execution_time.hitl.upsert_hitl_detail")
+    @patch("airflow.providers.common.ai.operators.llm.PydanticAIHook", autospec=True)
+    def test_execute_with_approval_defers(
+        self, mock_hook_cls, mock_upsert, mock_trigger_cls, make_mock_run_result
+    ):
+        """When require_approval=True, execute() defers after generating and validating SQL."""
+
+        mock_hook_cls.get_hook.return_value.create_agent.return_value = _make_mock_agent(
+            "SELECT id FROM users WHERE active", make_mock_run_result
+        )
+
+        op = LLMSQLQueryOperator(
+            task_id="sql_approval",
+            prompt="Get active users",
+            llm_conn_id="my_llm",
+            schema_context="Table: users\nColumns: id INT, active BOOLEAN",
+            require_approval=True,
+        )
+        ctx = _make_context()
+
+        with pytest.raises(ApprovalPauseSignal) as exc_info:
+            op.execute(context=ctx)
+
+        assert exc_info.value.method_name == "execute_complete"
+        assert exc_info.value.kwargs["generated_output"] == "SELECT id FROM users WHERE active"
+        mock_upsert.assert_called_once()
+
+    @patch("airflow.providers.standard.triggers.hitl.HITLTrigger", autospec=True)
+    @patch("airflow.sdk.execution_time.hitl.upsert_hitl_detail")
+    @patch("airflow.providers.common.ai.operators.llm.PydanticAIHook", autospec=True)
+    def test_execute_with_approval_validates_before_deferring(
+        self, mock_hook_cls, mock_upsert, mock_trigger_cls, make_mock_run_result
+    ):
+        """SQL validation runs before defer_for_approval; unsafe SQL is blocked."""
+        mock_hook_cls.get_hook.return_value.create_agent.return_value = _make_mock_agent(
+            "DROP TABLE users", make_mock_run_result
+        )
+
+        op = LLMSQLQueryOperator(
+            task_id="sql_unsafe",
+            prompt="Drop it",
+            llm_conn_id="my_llm",
+            require_approval=True,
+        )
+        ctx = _make_context()
+
+        with pytest.raises(SQLSafetyError, match="not allowed"):
+            op.execute(context=ctx)
+
+        mock_upsert.assert_not_called()
+
+    @patch("airflow.providers.standard.triggers.hitl.HITLTrigger", autospec=True)
+    @patch("airflow.sdk.execution_time.hitl.upsert_hitl_detail")
+    @patch("airflow.providers.common.ai.operators.llm.PydanticAIHook", autospec=True)
+    def test_execute_with_approval_and_modifications(
+        self, mock_hook_cls, mock_upsert, mock_trigger_cls, make_mock_run_result
+    ):
+        """allow_modifications=True passes editable params."""
+
+        mock_hook_cls.get_hook.return_value.create_agent.return_value = _make_mock_agent(
+            "SELECT 1", make_mock_run_result
+        )
+
+        op = LLMSQLQueryOperator(
+            task_id="sql_mod",
+            prompt="test",
+            llm_conn_id="my_llm",
+            require_approval=True,
+            allow_modifications=True,
+        )
+        ctx = _make_context()
+
+        with pytest.raises(ApprovalPauseSignal):
+            op.execute(context=ctx)
+
+        upsert_kwargs = mock_upsert.call_args[1]
+        assert "output" in upsert_kwargs["params"]
+
+    @patch("airflow.providers.standard.triggers.hitl.HITLTrigger", autospec=True)
+    @patch("airflow.sdk.execution_time.hitl.upsert_hitl_detail")
+    @patch("airflow.providers.common.ai.operators.llm.PydanticAIHook", autospec=True)
+    def test_execute_with_approval_and_timeout(
+        self, mock_hook_cls, mock_upsert, mock_trigger_cls, make_mock_run_result
+    ):
+        """approval_timeout is propagated to the trigger."""
+
+        mock_hook_cls.get_hook.return_value.create_agent.return_value = _make_mock_agent(
+            "SELECT 1", make_mock_run_result
+        )
+        timeout = timedelta(minutes=30)
+
+        op = LLMSQLQueryOperator(
+            task_id="sql_timeout",
+            prompt="test",
+            llm_conn_id="my_llm",
+            require_approval=True,
+            approval_timeout=timeout,
+        )
+        ctx = _make_context()
+
+        with pytest.raises(ApprovalPauseSignal) as exc_info:
+            op.execute(context=ctx)
+
+        if AIRFLOW_V_3_3_PLUS:
+            assert exc_info.value.timeout == timeout
+        else:
+            assert mock_trigger_cls.call_args[1]["timeout_datetime"] is not None
+
+    @patch("airflow.providers.common.ai.operators.llm.PydanticAIHook", autospec=True)
+    def test_execute_without_approval_returns_sql(self, mock_hook_cls, make_mock_run_result):
+        """When require_approval=False, execute() returns the SQL directly."""
+        mock_hook_cls.get_hook.return_value.create_agent.return_value = _make_mock_agent(
+            "SELECT 1", make_mock_run_result
+        )
+
+        op = LLMSQLQueryOperator(
+            task_id="no_approval",
+            prompt="test",
+            llm_conn_id="my_llm",
+            require_approval=False,
+        )
+        result = op.execute(context=MagicMock())
+
+        assert result == "SELECT 1"
+
+    @patch("airflow.providers.standard.triggers.hitl.HITLTrigger", autospec=True)
+    @patch("airflow.sdk.execution_time.hitl.upsert_hitl_detail")
+    @patch("airflow.providers.common.ai.operators.llm.PydanticAIHook", autospec=True)
+    def test_execute_strips_code_fences_before_deferring(
+        self, mock_hook_cls, mock_upsert, mock_trigger_cls, make_mock_run_result
+    ):
+        """Markdown code fences are stripped from LLM output before deferring."""
+
+        mock_hook_cls.get_hook.return_value.create_agent.return_value = _make_mock_agent(
+            "```sql\nSELECT 1\n```", make_mock_run_result
+        )
+
+        op = LLMSQLQueryOperator(
+            task_id="strip_test",
+            prompt="test",
+            llm_conn_id="my_llm",
+            require_approval=True,
+        )
+        ctx = _make_context()
+
+        with pytest.raises(ApprovalPauseSignal) as exc_info:
+            op.execute(context=ctx)
+
+        assert exc_info.value.kwargs["generated_output"] == "SELECT 1"
+
+    def test_execute_complete_approved(self):
+        """execute_complete returns SQL when approved."""
+        op = LLMSQLQueryOperator(task_id="t", prompt="p", llm_conn_id="c")
+        event = {"chosen_options": ["Approve"], "responded_by_user": {"id": "u1", "name": "admin"}}
+
+        result = op.execute_complete({}, generated_output="SELECT * FROM orders", event=event)
+
+        assert result == "SELECT * FROM orders"
+
+    def test_execute_complete_rejected(self):
+        """execute_complete raises HITLRejectException when SQL is rejected."""
+        op = LLMSQLQueryOperator(task_id="t", prompt="p", llm_conn_id="c")
+        event = {"chosen_options": ["Reject"], "responded_by_user": {"id": "u1", "name": "dba"}}
+        from airflow.providers.standard.exceptions import HITLRejectException
+
+        with pytest.raises(HITLRejectException, match="Output was rejected by the reviewer"):
+            op.execute_complete({}, generated_output="SELECT 1", event=event)
+
+    def test_execute_complete_with_error(self):
+        """execute_complete raises on error event."""
+        from airflow.providers.standard.exceptions import HITLTimeoutError
+
+        op = LLMSQLQueryOperator(task_id="t", prompt="p", llm_conn_id="c")
+        event = {"error": "timeout expired", "error_type": "timeout"}
+
+        with pytest.raises(HITLTimeoutError, match="Approval timed out"):
+            op.execute_complete({}, generated_output="SELECT 1", event=event)
+
+    def test_execute_complete_with_modified_sql(self):
+        """execute_complete returns modified SQL when reviewer edits it."""
+        op = LLMSQLQueryOperator(task_id="t", prompt="p", llm_conn_id="c", allow_modifications=True)
+        event = {
+            "chosen_options": ["Approve"],
+            "responded_by_user": {"id": "u1", "name": "dba"},
+            "params_input": {"output": "SELECT id, name FROM users LIMIT 10"},
+        }
+
+        result = op.execute_complete({}, generated_output="SELECT * FROM users", event=event)
+
+        assert result == "SELECT id, name FROM users LIMIT 10"
+
+    def test_execute_complete_revalidates_modified_sql(self):
+        """execute_complete re-validates SQL when the reviewer modifies it."""
+        op = LLMSQLQueryOperator(task_id="t", prompt="p", llm_conn_id="c", allow_modifications=True)
+        event = {
+            "chosen_options": ["Approve"],
+            "responded_by_user": {"id": "u1", "name": "john"},
+            "params_input": {"output": "DROP TABLE users"},
+        }
+
+        with pytest.raises(SQLSafetyError, match="not allowed"):
+            op.execute_complete({}, generated_output="SELECT 1", event=event)
+
+    def test_execute_complete_no_modifications_ignores_edits(self):
+        """When allow_modifications=False, params will be empty so params_input is empty too."""
+        op = LLMSQLQueryOperator(task_id="t", prompt="p", llm_conn_id="c")
+        event = {
+            "chosen_options": ["Approve"],
+            "responded_by_user": {"id": "u1", "name": "john"},
+            "params_input": {},
+        }
+
+        result = op.execute_complete({}, generated_output="SELECT 1", event=event)
+
+        assert result == "SELECT 1"
+
+
+def test_decision_policy_with_a_bar_is_rejected_at_construction():
+    """The operator runs its own execute without the gate; accepting the policy would silently ignore it."""
+    with pytest.raises(ValueError, match="LLMSQLQueryOperator does not support decision_policy"):
+        LLMSQLQueryOperator(
+            task_id="t", prompt="p", llm_conn_id="c", decision_policy=DecisionPolicy(min_confidence=0.7)
+        )
+    # A policy without a bar is the default and stays accepted.
+    LLMSQLQueryOperator(task_id="t", prompt="p", llm_conn_id="c", decision_policy=DecisionPolicy())

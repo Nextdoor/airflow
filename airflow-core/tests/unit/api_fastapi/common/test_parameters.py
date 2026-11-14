@@ -1,0 +1,717 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+from __future__ import annotations
+
+import re
+from datetime import UTC, datetime
+from types import SimpleNamespace
+from typing import Annotated
+from unittest import mock
+
+import pytest
+from fastapi import Depends, FastAPI, HTTPException
+from sqlalchemy import Column, MetaData, String, Table, create_engine, select
+from sqlalchemy.orm import aliased
+
+from airflow.api_fastapi.common.parameters import (
+    FilterParam,
+    RangeFilter,
+    SortParam,
+    _PrefixSearchParam,
+    _SearchParam,
+    datetime_range_filter_factory,
+    filter_param_factory,
+)
+from airflow.api_fastapi.common.parameters.asset import _AssetDependencyFilter, _ConsumingAssetFilter
+from airflow.api_fastapi.common.parameters.dag import _OwnersFilter
+from airflow.api_fastapi.common.parameters.range import NullableDatetimeRangeFilter
+from airflow.api_fastapi.common.parameters.search import (
+    _escape_like_pattern,
+    _PrefixPatternParam,
+    _TaskDisplayNamePrefixPatternParam,
+    regex_param_factory,
+)
+from airflow.models import DagModel, DagRun, Log
+from airflow.models.asset import AssetEvent
+from airflow.models.errors import ParseImportError
+from airflow.models.taskinstance import TaskInstance
+
+from tests_common.test_utils.config import conf_vars
+
+
+class TestFilterParam:
+    def test_filter_param_factory_description(self):
+        app = FastAPI()  # Create a FastAPI app to test OpenAPI generation
+        expected_descriptions = {
+            "dag_id": "Filter by Dag ID Description",
+            "task_id": "Filter by Task ID Description",
+            "map_index": None,  # No description for map_index
+            "run_id": "Filter by Run ID Description",
+        }
+
+        @app.get("/test")
+        def test_route(
+            dag_id: Annotated[
+                FilterParam[str | None],
+                Depends(
+                    filter_param_factory(Log.dag_id, str | None, description="Filter by Dag ID Description")
+                ),
+            ],
+            task_id: Annotated[
+                FilterParam[str | None],
+                Depends(
+                    filter_param_factory(Log.task_id, str | None, description="Filter by Task ID Description")
+                ),
+            ],
+            map_index: Annotated[
+                FilterParam[int | None],
+                Depends(filter_param_factory(Log.map_index, int | None)),
+            ],
+            run_id: Annotated[
+                FilterParam[str | None],
+                Depends(
+                    filter_param_factory(
+                        DagRun.run_id, str | None, description="Filter by Run ID Description"
+                    )
+                ),
+            ],
+        ):
+            return {"message": "test"}
+
+        # Get the OpenAPI spec
+        openapi_spec = app.openapi()
+
+        # Check if the description is in the parameters
+        parameters = openapi_spec["paths"]["/test"]["get"]["parameters"]
+        for param_name, expected_description in expected_descriptions.items():
+            param = next((p for p in parameters if p.get("name") == param_name), None)
+            assert param is not None, f"{param_name} parameter not found in OpenAPI"
+
+            if expected_description is None:
+                assert "description" not in param, (
+                    f"Description should not be present in {param_name} parameter"
+                )
+            else:
+                assert "description" in param, f"Description not found in {param_name} parameter"
+                assert param["description"] == expected_description, (
+                    f"Expected description '{expected_description}', got '{param['description']}'"
+                )
+
+
+class TestSortParam:
+    def test_sort_columns_and_primary_key_use_the_selected_alias(self):
+        rows = select(DagRun).subquery("filtered_runs")
+        entity = aliased(DagRun, rows)
+        param = SortParam(["run_id"], entity).set_value(["run_id"])
+
+        query = param.to_orm(select(entity))
+
+        assert all(column.table is rows for _, column, _ in param.get_resolved_columns())
+        assert "ORDER BY filtered_runs.run_id ASC, filtered_runs.id ASC" in str(query)
+
+    def test_compound_sort_requires_named_expressions_for_cursor_values(self):
+        param = SortParam(["id"], DagRun, {"position": [DagRun.id + 1]}).set_value(["position"])
+        with pytest.raises(ValueError, match="Compound sort expressions must have labels"):
+            param.get_resolved_columns()
+
+    def test_compound_sort_uses_expression_label_for_cursor_values(self):
+        param = SortParam(["id"], DagRun, {"position": [(DagRun.id + 1).label("position")]}).set_value(
+            ["position"]
+        )
+        assert [name for name, _, _ in param.get_resolved_columns()] == ["position", "id"]
+        assert param.row_value(SimpleNamespace(position=5, id=4), "position") == 5
+
+    def test_sort_param_max_number_of_filers(self):
+        param = SortParam([], None, None)
+        n_filters = param.MAX_SORT_PARAMS + 1
+        param.value = [f"filter_{i}" for i in range(n_filters)]
+
+        with pytest.raises(
+            HTTPException,
+            match=re.escape(
+                f"400: Ordering with more than {param.MAX_SORT_PARAMS} parameters is not allowed. Provided: {param.value}"
+            ),
+        ):
+            param.to_orm(None)
+
+    def test_aliased_sort_resolves_row_value_via_to_replace(self):
+        """
+        Cursor encoding must read the sort value through ``to_replace`` when the
+        user-facing sort name is an alias (e.g. ``dag_run_id`` → ``run_id``). A naive
+        ``getattr(row, user_facing_name)`` would silently yield ``None`` and break
+        keyset pagination on the next page.
+        """
+        param = SortParam(["id", "run_id"], DagRun, {"dag_run_id": "run_id"}).set_value(["dag_run_id"])
+        attr_names = [name for name, _col, _desc in param.get_resolved_columns()]
+        assert attr_names == ["dag_run_id", "id"]
+
+        row = SimpleNamespace(run_id="manual__2026-04-22", id=42)
+        assert param.row_value(row, "dag_run_id") == "manual__2026-04-22"
+        assert param.row_value(row, "id") == 42
+
+    def test_row_value_column_form_to_replace_resolves_via_row_attribute(self):
+        """
+        Column-form ``to_replace`` resolves through the primary model's attribute so
+        association proxies (e.g. ``TaskInstance.run_after``) are usable for cursor encoding.
+        """
+        param = SortParam(["dag_id"], DagModel, {"last_run_state": DagRun.state}).set_value(
+            ["last_run_state"]
+        )
+        row = SimpleNamespace(id="test_dag", last_run_state="success")
+        assert param.row_value(row, "last_run_state") == "success"
+
+    def test_row_value_column_form_to_replace_raises_when_attribute_absent(self):
+        """
+        Column-form ``to_replace`` must raise ``NotImplementedError`` (not return ``None``)
+        when the primary model exposes no such attribute. A ``None`` cursor token would cause
+        the next-page ``WHERE`` to compare against ``NULL`` and silently drop rows.
+        """
+        param = SortParam(
+            ["dag_id"], DagModel, {"data_interval_start": DagRun.data_interval_start}
+        ).set_value(["data_interval_start"])
+        row = SimpleNamespace(id="test_dag")  # deliberately no data_interval_start attribute
+        with pytest.raises(NotImplementedError, match="data_interval_start"):
+            param.row_value(row, "data_interval_start")
+
+    def test_primary_key_is_not_duplicated_when_alias_maps_to_pk(self):
+        """Sorting by an alias that resolves to the PK must not append the PK a second time."""
+        param = SortParam(["id"], ParseImportError, {"import_error_id": "id"}).set_value(["import_error_id"])
+        resolved = param.get_resolved_columns()
+        assert [name for name, _col, _desc in resolved] == ["import_error_id"]
+
+    def test_dynamic_depends_returns_independent_instances(self):
+        """Each call to the inner closure must produce a separate SortParam instance.
+
+        Two concurrent requests with different order_by values must not share state —
+        a mutation on one must not affect the other.
+        """
+        sort_param = SortParam(["id", "run_id", "logical_date"], DagRun, {"dag_run_id": "run_id"})
+        inner = sort_param.dynamic_depends(default="id")
+
+        instance_a = inner(order_by=["logical_date"])
+        instance_b = inner(order_by=["run_id"])
+
+        assert instance_a is not instance_b
+        assert instance_a.value == ["logical_date"]
+        assert instance_b.value == ["run_id"]
+        # Resolving one must not affect the other.
+        cols_a = [name for name, _col, _desc in instance_a.get_resolved_columns()]
+        cols_b = [name for name, _col, _desc in instance_b.get_resolved_columns()]
+        assert cols_a[0] == "logical_date"
+        assert cols_b[0] == "run_id"
+
+
+def _compile(statement):
+    return str(statement.compile(compile_kwargs={"literal_binds": True})).lower()
+
+
+def _has_ilike(sql: str, term: str) -> bool:
+    """Return True if ``sql`` contains an ILIKE (or dialect-equivalent) match for ``%term%``."""
+    return f"'%{term.lower()}%'" in sql
+
+
+class TestSearchParam:
+    """Substring search (``ILIKE '%term%'``) — full-match, case-insensitive."""
+
+    def test_to_orm_single_value(self):
+        param = _SearchParam(DagModel.dag_id).set_value("example_bash")
+        statement = select(DagModel)
+        statement = param.to_orm(statement)
+
+        sql = _compile(statement)
+        assert _has_ilike(sql, "example_bash")
+
+    def test_to_orm_none_value_is_noop(self):
+        """A ``None`` value with ``skip_none`` leaves the statement unchanged."""
+        param = _SearchParam(DagModel.dag_id).set_value(None)
+        statement = select(DagModel)
+        result = param.to_orm(statement)
+        assert result is statement
+
+    def test_to_orm_tilde_alias_matches_all(self):
+        """``~`` is aliased to ``%`` so the ILIKE expression matches all rows."""
+        param = _SearchParam(DagModel.dag_id)
+        aliased = param.transform_aliases("~")
+        param.set_value(aliased)
+        statement = select(DagModel)
+        statement = param.to_orm(statement)
+
+        sql = _compile(statement)
+        assert _has_ilike(sql, "%")
+
+    def test_to_orm_multiple_values_or(self):
+        """Test search with multiple terms using the pipe | operator."""
+        param = _SearchParam(DagModel.dag_id).set_value("example_bash | example_python")
+        statement = select(DagModel)
+        statement = param.to_orm(statement)
+
+        sql = _compile(statement)
+        assert "or" in sql
+        assert _has_ilike(sql, "example_bash")
+        assert _has_ilike(sql, "example_python")
+
+    def test_to_orm_pipe_with_trailing_pipe(self):
+        """Test that a trailing pipe is ignored and only the valid term is searched."""
+        param = _SearchParam(DagModel.dag_id).set_value("example_bash|")
+        statement = select(DagModel)
+        statement = param.to_orm(statement)
+
+        sql = _compile(statement)
+        assert _has_ilike(sql, "example_bash")
+        assert " or " not in sql
+
+    def test_to_orm_pipe_with_leading_pipe(self):
+        """Test that a leading pipe is ignored and only the valid term is searched."""
+        param = _SearchParam(DagModel.dag_id).set_value("|example_bash")
+        statement = select(DagModel)
+        statement = param.to_orm(statement)
+
+        sql = _compile(statement)
+        assert _has_ilike(sql, "example_bash")
+        assert " or " not in sql
+
+    def test_to_orm_pipe_as_or_false_treats_pipe_as_literal(self):
+        """With ``pipe_as_or=False``, the pipe character is passed through literally."""
+        param = _SearchParam(DagModel.dag_id, pipe_as_or=False).set_value("2026-01-01|us")
+        statement = select(DagModel)
+        statement = param.to_orm(statement)
+
+        sql = _compile(statement)
+        assert _has_ilike(sql, "2026-01-01|us")
+        assert " or " not in sql
+
+    def test_to_orm_pipe_as_or_false_tilde_alias_still_works(self):
+        """``pipe_as_or=False`` must not interfere with the ``~`` → ``%`` alias."""
+        param = _SearchParam(DagModel.dag_id, pipe_as_or=False)
+        param.set_value(param.transform_aliases("~"))
+        statement = select(DagModel)
+        statement = param.to_orm(statement)
+
+        sql = _compile(statement)
+        assert _has_ilike(sql, "%")
+
+
+class TestEscapeLikePattern:
+    """The escape helper turns user input into a literal substring pattern.
+
+    Filter parameters that do *not* document wildcard semantics must call this so a user-supplied
+    ``%`` or ``_`` does not widen the match beyond the filter's intent. Search parameters that
+    explicitly expose wildcard semantics (see ``_SearchParam``) deliberately do not call it.
+    """
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("plain", "plain"),
+            ("a%b", r"a\%b"),
+            ("a_b", r"a\_b"),
+            (r"a\b", r"a\\b"),
+            (r"a\%b", r"a\\\%b"),
+            ("%_\\", r"\%\_\\"),
+            ("", ""),
+        ],
+    )
+    def test_escapes_metacharacters(self, raw, expected):
+        assert _escape_like_pattern(raw) == expected
+
+
+class TestNonSearchFilterEscaping:
+    """``_OwnersFilter`` / ``_AssetDependencyFilter`` / ``_ConsumingAssetFilter`` escape ``%`` and ``_``.
+
+    Compile-time check: the rendered SQL must wrap the *escaped* user value in ``%...%`` and
+    declare an ``ESCAPE`` clause so the database treats user-supplied wildcards literally.
+    """
+
+    def test_owners_filter_escapes_user_wildcards(self):
+        param = _OwnersFilter().set_value(["100%_alice"])
+        statement = param.to_orm(select(DagModel))
+        sql = _compile(statement)
+        assert r"'%100\%\_alice%'" in sql
+        assert "escape" in sql
+
+    def test_asset_dependency_filter_escapes_user_wildcards(self):
+        param = _AssetDependencyFilter().set_value("ledger_%")
+        statement = param.to_orm(select(DagModel))
+        sql = _compile(statement)
+        assert r"'%ledger\_\%%'" in sql
+        assert "escape" in sql
+
+    def test_consuming_asset_filter_escapes_user_wildcards(self):
+        param = _ConsumingAssetFilter().set_value("foo_%bar")
+        statement = param.to_orm(select(DagRun))
+        sql = _compile(statement)
+        assert r"'%foo\_\%bar%'" in sql
+        assert "escape" in sql
+
+    def test_search_param_does_not_escape_user_wildcards(self):
+        """Counter-test: ``_SearchParam`` deliberately passes wildcards through."""
+        param = _SearchParam(DagModel.dag_id).set_value("foo_%bar")
+        statement = param.to_orm(select(DagModel))
+        sql = _compile(statement)
+        # Raw user wildcards are present, not the escaped form.
+        assert "'%foo_%bar%'" in sql
+
+
+class TestPrefixSearchParam:
+    """Prefix search using range comparison (``attribute >= lower AND < upper``)."""
+
+    def test_to_orm_single_value(self):
+        param = _PrefixSearchParam(DagModel.dag_id).set_value("example_bash")
+        statement = select(DagModel)
+        statement = param.to_orm(statement)
+
+        sql = _compile(statement)
+        assert "dag_id >= 'example_bash'" in sql
+        assert "dag_id < 'example_basi'" in sql
+
+    def test_prefix_range_upper_boundary(self):
+        """Prefix range bumps the last alphanumeric character."""
+        assert _PrefixPatternParam._prefix_range_upper("xy") == "xz"
+        assert _PrefixPatternParam._prefix_range_upper("test_dag") == "test_dah"
+        assert _PrefixPatternParam._prefix_range_upper("") is None
+
+    def test_prefix_range_upper_strips_trailing_punctuation(self):
+        """Trailing non-alphanumeric characters are dropped before bumping."""
+        assert _PrefixPatternParam._prefix_range_upper("test_") == "tesu"
+        assert _PrefixPatternParam._prefix_range_upper("s3://") == "s4"
+        assert _PrefixPatternParam._prefix_range_upper("bbc!!") == "bbd"
+        # All-punctuation → no usable range
+        assert _PrefixPatternParam._prefix_range_upper("///") is None
+
+    def test_prefix_range_upper_cascades_past_non_alnum_bump(self):
+        """If bumping would produce a non-alphanumeric char, strip and retry."""
+        # 'z' → '{' (non-alphanumeric), so fall back to incrementing the previous char.
+        assert _PrefixPatternParam._prefix_range_upper("abz") == "ac"
+        # 'Z' → '[' (non-alphanumeric), so fall back.
+        assert _PrefixPatternParam._prefix_range_upper("abZ") == "ac"
+        # '9' → ':' (non-alphanumeric), so fall back.
+        assert _PrefixPatternParam._prefix_range_upper("a9") == "b"
+
+    def test_to_orm_strips_trailing_underscore_prefix(self):
+        """``'test_'`` is treated as the prefix ``'test'`` so the range is locale-safe."""
+        param = _PrefixSearchParam(DagModel.dag_id).set_value("test_")
+        statement = select(DagModel)
+        statement = param.to_orm(statement)
+
+        sql = _compile(statement)
+        assert "dag_id >= 'test'" in sql
+        assert "dag_id < 'tesu'" in sql
+
+    def test_to_orm_empty_value_matches_all(self):
+        """An empty value matches all non-null rows (used via the ``~`` alias)."""
+        param = _PrefixSearchParam(DagModel.dag_id).set_value("")
+        statement = select(DagModel)
+        statement = param.to_orm(statement)
+
+        sql = _compile(statement)
+        assert "is not null" in sql
+
+    def test_to_orm_all_punctuation_value_matches_all(self):
+        """A term with no alphanumeric characters also degenerates to the ``~`` behavior."""
+        param = _PrefixSearchParam(DagModel.dag_id).set_value("///")
+        statement = select(DagModel)
+        statement = param.to_orm(statement)
+
+        sql = _compile(statement)
+        assert "is not null" in sql
+
+    def test_to_orm_tilde_alias_matches_all(self):
+        param = _PrefixSearchParam(DagModel.dag_id)
+        aliased = param.transform_aliases("~")
+        param.set_value(aliased)
+        statement = select(DagModel)
+        statement = param.to_orm(statement)
+
+        sql = _compile(statement)
+        assert "is not null" in sql
+
+    def test_to_orm_multiple_values_or(self):
+        param = _PrefixSearchParam(DagModel.dag_id).set_value("example_bash | example_python")
+        statement = select(DagModel)
+        statement = param.to_orm(statement)
+
+        sql = _compile(statement)
+        assert "or" in sql
+        assert "example_bash" in sql
+        assert "example_python" in sql
+
+    def test_to_orm_none_value_is_noop(self):
+        param = _PrefixSearchParam(DagModel.dag_id).set_value(None)
+        statement = select(DagModel)
+        result = param.to_orm(statement)
+        assert result is statement
+
+    def test_to_orm_none_value_is_noop_when_skip_none_false(self):
+        """With ``skip_none=False`` the filter slot is required by the route but the
+        predicate must still be a no-op when the caller didn't provide a value."""
+        param = _PrefixSearchParam(DagModel.dag_id, skip_none=False).set_value(None)
+        statement = select(DagModel)
+        result = param.to_orm(statement)
+        assert result is statement
+
+    def test_to_orm_pipe_as_or_false_treats_pipe_as_literal(self):
+        """With ``pipe_as_or=False``, the pipe character is part of the prefix and not an OR delimiter."""
+        param = _PrefixSearchParam(DagModel.dag_id, pipe_as_or=False).set_value("2026-01-01|us")
+        statement = select(DagModel)
+        statement = param.to_orm(statement)
+
+        sql = _compile(statement)
+        # Use " or " (with spaces) to avoid false positives from column-name substrings like "owners".
+        assert " or " not in sql
+        # Range scan uses the full composite-key value as the lower bound.
+        assert "2026-01-01|us" in sql
+
+    def test_to_orm_narrows_the_range_with_a_leading_substring(self):
+        """The index-friendly bounds are wider than the prefix, so an equality pins the prefix down."""
+        param = _PrefixSearchParam(DagModel.dag_id).set_value("dag_9")
+        statement = param.to_orm(select(DagModel))
+
+        sql = _compile(statement)
+        # '9' bumps to ':' (non-alphanumeric), so the upper bound comes from the shorter 'dag'.
+        assert "dag_id >= 'dag_9'" in sql
+        assert "dag_id < 'dah'" in sql
+        assert "substr(dag.dag_id, 1, 5) = 'dag_9'" in sql
+
+    def test_to_orm_pipe_as_or_false_tilde_alias_still_works(self):
+        """``pipe_as_or=False`` must not interfere with the ``~`` → empty alias."""
+        param = _PrefixSearchParam(DagModel.dag_id, pipe_as_or=False)
+        param.set_value(param.transform_aliases("~"))
+        statement = select(DagModel)
+        statement = param.to_orm(statement)
+
+        sql = _compile(statement)
+        assert "is not null" in sql
+
+
+class TestPrefixSearchParamOnARealEngine:
+    """
+    Run the predicate against SQLite so the rows it lets through are checked, not just the SQL.
+
+    Every term below computes an upper bound wider than the term itself, so the bounds alone
+    would also return the rows that are missing from each ``expected`` list.
+    """
+
+    NAMES = [
+        "dag_9",
+        "dag_99",
+        "dag_abc",
+        "dagz9",
+        "dagZ1",
+        "a9",
+        "aa",
+        "abz",
+        "abz1",
+        "ab~",
+        "z1",
+        "zz",
+        "{a",
+    ]
+
+    @pytest.fixture
+    def select_names(self):
+        table = Table("prefix_probe", MetaData(), Column("name", String(64), primary_key=True))
+        engine = create_engine("sqlite://")
+        table.metadata.create_all(engine)
+        with engine.connect() as conn:
+            conn.execute(table.insert(), [{"name": name} for name in self.NAMES])
+
+            def run(term: str) -> list[str]:
+                param = _PrefixSearchParam(table.c.name).set_value(term)
+                return sorted(row[0] for row in conn.execute(param.to_orm(select(table.c.name))))
+
+            yield run
+
+    @pytest.mark.parametrize(
+        ("term", "expected"),
+        [
+            # 'dagz9' pins down that the user's '_' is literal, not a single-character wildcard.
+            ("dag_9", ["dag_9", "dag_99"]),
+            # Differs from 'dagz9' only in case, which the bounds distinguish and so must the
+            # predicate narrowing them.
+            ("dagZ", ["dagZ1"]),
+            ("a9", ["a9"]),
+            ("abz", ["abz", "abz1"]),
+            # 'z' cascades down to no upper bound at all.
+            ("z", ["z1", "zz"]),
+            # Documented trade-off, unchanged: a trailing '_' is stripped, so 'dag_' means 'dag'.
+            ("dag_", ["dagZ1", "dag_9", "dag_99", "dag_abc", "dagz9"]),
+        ],
+    )
+    def test_only_values_with_the_prefix_come_back(self, select_names, term, expected):
+        assert select_names(term) == expected
+
+
+class TestTaskDisplayNamePrefixPatternParam:
+    """Prefix filter splits on NULL override so ``task_id`` can use indexes."""
+
+    def test_to_orm_uses_task_id_when_override_null(self):
+        param = _TaskDisplayNamePrefixPatternParam().set_value("test_task_hello")
+        statement = select(TaskInstance)
+        statement = param.to_orm(statement)
+
+        sql = _compile(statement)
+        assert "task_display_name is null" in sql
+        assert "task_id >=" in sql
+        assert "task_id <" in sql
+        assert "task_display_name is not null" in sql
+
+    def test_to_orm_narrows_both_branches_with_a_leading_substring(self):
+        """Both sides of the ``IS NULL`` split need the prefix predicate, not only the bounds."""
+        param = _TaskDisplayNamePrefixPatternParam().set_value("task_9")
+        statement = param.to_orm(select(TaskInstance))
+
+        sql = _compile(statement)
+        assert "substr(task_instance.task_id, 1, 6) = 'task_9'" in sql
+        assert "substr(task_instance.task_display_name, 1, 6) = 'task_9'" in sql
+
+    def test_to_orm_empty_matches_all(self):
+        param = _TaskDisplayNamePrefixPatternParam().set_value("")
+        statement = select(TaskInstance)
+        statement = param.to_orm(statement)
+
+        sql = _compile(statement)
+        assert "true" in sql or "1 = 1" in sql
+
+
+def _make_datetime_filter(filter_name, model=TaskInstance, attribute_name=None, **kwargs):
+    """Call datetime_range_filter_factory outside FastAPI by supplying None for all omitted bounds."""
+    defaults = dict(lower_bound_gte=None, lower_bound_gt=None, upper_bound_lte=None, upper_bound_lt=None)
+    defaults.update(kwargs)
+    return datetime_range_filter_factory(filter_name, model, attribute_name)(**defaults)
+
+
+class TestDatetimeRangeFilterFactory:
+    """datetime_range_filter_factory dispatches to NullableDatetimeRangeFilter for start/end dates."""
+
+    def test_start_date_returns_nullable_filter(self):
+        rf = _make_datetime_filter("start_date")
+        assert isinstance(rf, NullableDatetimeRangeFilter)
+
+    def test_end_date_returns_nullable_filter(self):
+        rf = _make_datetime_filter("end_date")
+        assert isinstance(rf, NullableDatetimeRangeFilter)
+
+    def test_aliased_filter_name_returns_plain_filter(self):
+        """dag_run_start_date uses attribute_name='start_date' via outer join; NULL means 'no run',
+        not 'currently running', so it must return a plain RangeFilter to avoid inflating counts."""
+        rf = _make_datetime_filter("dag_run_start_date", model=DagRun, attribute_name="start_date")
+        assert type(rf) is RangeFilter
+
+    def test_aliased_end_date_returns_plain_filter(self):
+        """dag_run_end_date uses attribute_name='end_date' via outer join; must return plain RangeFilter."""
+        rf = _make_datetime_filter("dag_run_end_date", model=DagRun, attribute_name="end_date")
+        assert type(rf) is RangeFilter
+
+    def test_other_column_returns_plain_filter(self):
+        rf = _make_datetime_filter("queued_dttm")
+        assert type(rf) is RangeFilter
+
+    def test_lower_bound_does_not_include_now(self):
+        """NULL branch on lower bounds passes unconditionally — no now() call."""
+        bound = datetime(2026, 5, 3, 12, 0, 0, tzinfo=UTC)
+        rf = _make_datetime_filter("start_date", lower_bound_gte=bound)
+        sql = _compile(rf.to_orm(select(TaskInstance)))
+        assert "is null" in sql
+        assert "now()" not in sql
+        assert "coalesce" not in sql
+
+    @pytest.mark.parametrize("lower_bound_name", ["lower_bound_gte", "lower_bound_gt"])
+    def test_null_lower_bound_clause_is_added_to_null_branch(self, lower_bound_name):
+        """Custom NULL lower-bound clause is ANDed with the attribute IS NULL check."""
+        bound = datetime(2026, 5, 3, 12, 0, 0, tzinfo=UTC)
+        depends = datetime_range_filter_factory(
+            "start_date",
+            DagRun,
+            null_lower_bound_clause=DagRun.end_date.is_(None),
+        )
+        bounds = dict(lower_bound_gte=None, lower_bound_gt=None, upper_bound_lte=None, upper_bound_lt=None)
+        bounds[lower_bound_name] = bound
+        rf = depends(**bounds)
+
+        sql = _compile(rf.to_orm(select(DagRun)))
+
+        assert "start_date is null" in sql
+        assert "end_date is null" in sql
+        assert "start_date is null and" in sql
+
+    def test_upper_bound_includes_now_for_running_tasks(self):
+        """NULL branch on upper bounds uses now() to proxy the in-progress task's current time."""
+        bound = datetime(2026, 5, 3, 12, 0, 0, tzinfo=UTC)
+        rf = _make_datetime_filter("end_date", upper_bound_lte=bound)
+        sql = _compile(rf.to_orm(select(TaskInstance)))
+        assert "is null" in sql
+        assert "now()" in sql
+        assert "coalesce" not in sql
+
+    def test_no_coalesce_for_start_date(self):
+        bound = datetime(2026, 5, 3, 12, 0, 0, tzinfo=UTC)
+        rf = _make_datetime_filter("start_date", upper_bound_lte=bound)
+        sql = _compile(rf.to_orm(select(TaskInstance)))
+        assert "coalesce" not in sql
+
+
+class TestRegexParamFactory:
+    """The regexp filter dependency must apply the query timeout itself (callers can't forget)."""
+
+    @staticmethod
+    def _depends():
+        return regex_param_factory(AssetEvent.partition_key, "partition_key_regexp_pattern")
+
+    def test_dependency_applies_timeout_when_pattern_provided(self):
+        session = mock.MagicMock()
+        with conf_vars({("api", "regexp_query_timeout"): "30"}):
+            with mock.patch(
+                "airflow.api_fastapi.common.parameters.search.apply_regex_query_timeout"
+            ) as apply_mock:
+                gen = self._depends()(session=session, value="^us")
+                param = next(gen)
+                apply_mock.assert_called_once_with(session)
+                assert param.value == "^us"
+                with pytest.raises(StopIteration):
+                    next(gen)
+
+    def test_dependency_skips_timeout_without_pattern(self):
+        session = mock.MagicMock()
+        with conf_vars({("api", "regexp_query_timeout"): "30"}):
+            with mock.patch(
+                "airflow.api_fastapi.common.parameters.search.apply_regex_query_timeout"
+            ) as apply_mock:
+                gen = self._depends()(session=session, value=None)
+                param = next(gen)
+                apply_mock.assert_not_called()
+                assert param.value is None
+                with pytest.raises(StopIteration):
+                    next(gen)
+
+    def test_dependency_rejects_pattern_when_disabled(self):
+        session = mock.MagicMock()
+        with conf_vars({("api", "regexp_query_timeout"): "0"}):
+            gen = self._depends()(session=session, value="^us")
+            with pytest.raises(HTTPException) as exc:
+                next(gen)
+        assert exc.value.status_code == 400
+        assert "disabled" in exc.value.detail
+
+    def test_dependency_rejects_invalid_regex(self):
+        session = mock.MagicMock()
+        with conf_vars({("api", "regexp_query_timeout"): "30"}):
+            gen = self._depends()(session=session, value="[invalid(")
+            with pytest.raises(HTTPException) as exc:
+                next(gen)
+        assert exc.value.status_code == 400
+        assert "Invalid regular expression" in exc.value.detail

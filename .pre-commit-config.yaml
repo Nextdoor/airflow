@@ -15,252 +15,786 @@
 # specific language governing permissions and limitations
 # under the License.
 ---
-default_stages: [commit, push]
+default_stages: [pre-commit, pre-push]
+default_install_hook_types: [pre-commit, commit-msg]
+minimum_prek_version: '0.4.8'
 default_language_version:
-  python: python3
-  node: 18.6.0
-minimum_pre_commit_version: "2.0.0"
+  python: ">=3.11"
+  node: 22.19.0
+  golang: 1.25.0
+default_env:
+  # Unless overridden, no hook defined in this file should change the resolutions in uv.lock; they use
+  # the committed ones. Hooks in nested configs do not inherit this and must pass --frozen to uv themselves.
+  UV_FROZEN: "1"
+exclude: ^.*/.*_vendor/
+# Hooks with `priority: 1000` run in parallel, after every other hook in this file. Only the hooks
+# listed in scripts/ci/prek/check_prek_parallel_hooks.py may set a priority.
 repos:
   - repo: meta
     hooks:
       - id: identity
-        name: Print input to the static check hooks for troubleshooting
+        name: Print checked files
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        description: Print input to the static check hooks for troubleshooting
       - id: check-hooks-apply
         name: Check if all hooks apply to the repository
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
   - repo: https://github.com/thlorenz/doctoc.git
-    rev: v2.2.0
+    rev: 59dcae910a6ad4bbe8711275b854e3cd5c30f08b  # frozen: v2.5.0
     hooks:
       - id: doctoc
-        name: Add TOC for md and rst files
+        name: Add TOC for Markdown and RST files
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
         files:
-          ^CONTRIBUTING\.md$|^README\.md$|^UPDATING.*\.md$|^chart/UPDATING.*\.md$|^dev/.*\.md$|^dev/.*\.rst$
-        exclude: ^airflow/_vendor/
+          (?x)
+          ^README\.md$|
+          ^UPDATING.*\.md$|
+          ^chart/UPDATING.*\.md$|
+          ^dev/.*\.md$|
+          ^dev/.*\.rst$|
+          ^docs/README\.md$|
+          ^\.github/.*\.md$|
+          ^airflow-core/tests/system/README\.md$
+        exclude:
+            (?x)
+            .github/PULL_REQUEST_TEMPLATE\.md$|
+            .github/instructions/|
+            .github/skills/
         args:
           - "--maxlevel"
           - "2"
   - repo: https://github.com/Lucas-C/pre-commit-hooks
-    rev: v1.3.1
+    rev: ad1b27d73581aa16cca06fc4a0761fc563ffe8e8  # frozen: v1.5.6
     hooks:
       - id: insert-license
         name: Add license for all SQL files
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
         files: \.sql$
         exclude: |
           (?x)
           ^\.github/|
-          ^airflow/_vendor/
+          ^java-sdk/gradlew$|
+          ^java-sdk/gradlew\.bat$|
+          ^java-sdk/gradle/|
+          ^scripts/ci/license-templates/
         args:
           - --comment-style
           - "/*||*/"
           - --license-filepath
-          - license-templates/LICENSE.txt
+          - scripts/ci/license-templates/LICENSE.txt
           - --fuzzy-match-generates-todo
       - id: insert-license
-        name: Add license for all rst files
-        exclude: ^\.github/.*$|^airflow/_vendor/|newsfragments/.*\.rst$
+        name: Add license for all RST files
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
         args:
           - --comment-style
           - "||"
           - --license-filepath
-          - license-templates/LICENSE.rst
+          - scripts/ci/license-templates/LICENSE.rst
           - --fuzzy-match-generates-todo
         files: \.rst$
+        exclude:
+          (?x)
+          ^\.github/.*$|
+          newsfragments/.*\.rst$|
+          ^scripts/ci/license-templates/
       - id: insert-license
-        name: Add license for all CSS/JS/PUML/TS/TSX files
-        files: \.(css|js|puml|ts|tsx|jsx)$
-        exclude: ^\.github/.*$|^airflow/_vendor/
+        name: Add license for CSS/JS/JSX/PUML/TS/TSX
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        files: \.(css|jsx?|puml|tsx?)$
+        exclude: ^\.github/.*$|ui/openapi-gen/|www/openapi-gen/|.*/dist/.*
         args:
           - --comment-style
           - "/*!| *| */"
           - --license-filepath
-          - license-templates/LICENSE.txt
+          - scripts/ci/license-templates/LICENSE.txt
           - --fuzzy-match-generates-todo
       - id: insert-license
-        name: Add license for all JINJA template files
-        files: ^airflow/www/templates/.*\.html$
-        exclude: ^\.github/.*$|^airflow/_vendor/
-        args:
-          - --comment-style
-          - "{#||#}"
-          - --license-filepath
-          - license-templates/LICENSE.txt
-          - --fuzzy-match-generates-todo
-      - id: insert-license
-        name: Add license for all shell files
-        exclude: ^\.github/.*$|^airflow/_vendor/|^dev/breeze/autocomplete/.*$
+        name: Add license for all Shell files
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        exclude: ^\.github/.*$|^dev/breeze/autocomplete/.*$
         files: \.bash$|\.sh$
         args:
           - --comment-style
           - "|#|"
           - --license-filepath
-          - license-templates/LICENSE.txt
+          - scripts/ci/license-templates/LICENSE.txt
+          - --fuzzy-match-generates-todo
+      - id: insert-license
+        name: Add license for all toml files
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        exclude: ^\.github/.*$|^dev/breeze/autocomplete/.*$
+        files: \.toml$
+        args:
+          - --comment-style
+          - "|#|"
+          - --license-filepath
+          - scripts/ci/license-templates/LICENSE.txt
           - --fuzzy-match-generates-todo
       - id: insert-license
         name: Add license for all Python files
-        exclude: ^\.github/.*$|^airflow/_vendor/
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        exclude: ^\.github/.*$|^.*/_vendor/.*$|^airflow-ctl/.*/.*generated\.py$
         files: \.py$|\.pyi$
         args:
           - --comment-style
           - "|#|"
           - --license-filepath
-          - license-templates/LICENSE.txt
+          - scripts/ci/license-templates/LICENSE.txt
           - --fuzzy-match-generates-todo
       - id: insert-license
         name: Add license for all XML files
-        exclude: ^\.github/.*$|^airflow/_vendor/
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        exclude: ^\.github/.*$
         files: \.xml$
         args:
           - --comment-style
           - "<!--||-->"
           - --license-filepath
-          - license-templates/LICENSE.txt
+          - scripts/ci/license-templates/LICENSE.txt
           - --fuzzy-match-generates-todo
       - id: insert-license
-        name: Add license for all YAML files
-        exclude: ^\.github/.*$|^airflow/_vendor/
+        name: Add license for all YAML files except Helm templates
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        exclude: >
+          (?x)
+          ^\.github/.*$|
+          ^chart/templates/.*|
+          .*reproducible_build\.yaml$|
+          ^.*/v2.*\.yaml$|
+          ^.*/openapi/_private_ui.*\.yaml$|
+          ^.*/pnpm-lock\.yaml$|
+          .*-generated\.yaml$
         types: [yaml]
-        files: \.yml$|\.yaml$
+        files: \.ya?ml$
         args:
           - --comment-style
           - "|#|"
           - --license-filepath
-          - license-templates/LICENSE.txt
+          - scripts/ci/license-templates/LICENSE.txt
           - --fuzzy-match-generates-todo
       - id: insert-license
-        name: Add license for all md files
+        name: Add license for all Markdown files
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
         files: \.md$
-        exclude: ^\.github/.*$|PROVIDER_CHANGES.*\.md$|^airflow/_vendor/
         args:
           - --comment-style
           - "<!--|| -->"
           - --license-filepath
-          - license-templates/LICENSE.txt
+          - scripts/ci/license-templates/LICENSE.txt
           - --fuzzy-match-generates-todo
+        exclude:
+          (?x)
+          ^\.github/.*\.md$|
+          ^\.claude/|
+          ^\.agents/|
+          ^(?:.*/)?AGENTS\.md$|
+          ^(?:.*/)?CLAUDE\.md$|
+          ^(?:.*/)?SKILL\.md$|
+          ^scripts/ci/license-templates/
+      - id: insert-license
+        name: Add short license for agentic Markdown files
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        args:
+          - --comment-style
+          - "||"
+          - --license-filepath
+          - scripts/ci/license-templates/SHORT_LICENSE.md
+          - --detect-license-in-X-top-lines
+          - '30'
+          - --fuzzy-match-generates-todo
+        files:
+          (?x)
+          ^\.github/.*\.md$|
+          ^\.claude/|
+          ^\.agents/|
+          ^(?:.*/)?AGENTS\.md$|
+          ^(?:.*/)?CLAUDE\.md$|
+          ^(?:.*/)?SKILL\.md$
+        exclude:
+          (?x)
+          ^scripts/ci/license-templates/
       - id: insert-license
         name: Add license for all other files
-        exclude: ^\.github/.*$|^airflow/_vendor/
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
         args:
           - --comment-style
           - "|#|"
           - --license-filepath
-          - license-templates/LICENSE.txt
+          - scripts/ci/license-templates/LICENSE.txt
           - --fuzzy-match-generates-todo
-        files: >
-          \.cfg$|\.conf$|\.ini$|\.ldif$|\.properties$|\.readthedocs$|\.service$|\.tf$|Dockerfile.*$
+        files: |
+          (?x)
+          \.cfg$|
+          \.conf$|
+          \.ini$|
+          \.ldif$|
+          \.properties$|
+          \.service$|
+          \.tf$|
+          Dockerfile.*$
+        exclude:
+          (?x)
+          ^\.github/.*$|
+          ^scripts/ci/license-templates/
   - repo: local
     hooks:
-      - id: update-common-sql-api-stubs
-        name: Check and update common.sql API stubs
-        entry: ./scripts/ci/pre_commit/pre_commit_update_common_sql_api_stubs.py
+      # Hooks with `priority: 1000` start in the order they appear in this file. This hook takes the
+      # longest of them, so it comes first. Because it needs the CI image, it would normally go in the
+      # CI image section at the end of this file. Its priority still makes it run after every hook that
+      # has no priority.
+      - id: check-template-fields-valid
+        name: Check templated fields mapped in operators/sensors
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        priority: 1000
         language: python
-        files: ^scripts/ci/pre_commit/pre_commit_update_common_sql_api\.py|^airflow/providers/common/sql/.*\.pyi?$
-        additional_dependencies: ['rich>=12.4.4', 'mypy==0.971', 'black==22.12.0', 'jinja2']
+        entry: ./scripts/ci/prek/check_template_fields.py
+        files: ^(providers/[^/]+|airflow-core)/src/airflow/(.*/)?(sensors|operators)/.*\.py$
+        require_serial: true
+      - id: check-min-python-version
+        name: Check minimum Python version
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/check_min_python_version.py
+        language: python
+        require_serial: true
+      - id: update-notice-year
+        name: Update NOTICE files to current year (manual)
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/update_notice_year.py
+        stages: ['manual']
+        language: python
         pass_filenames: false
         require_serial: true
-      - id: update-black-version
-        name: Update black versions everywhere
-        entry: ./scripts/ci/pre_commit/pre_commit_update_black_version.py
+      - id: check-notice-files
+        name: Check NOTICE files for current year and ASF references
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/check_notice_files.py
         language: python
-        files: ^.pre-commit-config.yaml$
+        files: ^.*NOTICE$
+      - id: check-version-consistency
+        name: Check version consistency
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/check_version_consistency.py
+        language: python
+        files: >
+          (?x)
+          ^airflow-core/src/airflow/__init__\.py$|
+          ^airflow-core/pyproject\.toml$|
+          ^task-sdk/src/airflow/sdk/__init__\.py$|
+          ^pyproject\.toml$
+        pass_filenames: false
+        require_serial: true
+      - id: check-applies-to-roots-in-sync
+        name: Check plugin applies_to destination tables stay in sync
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        description: "The UI mirrors plugins_manager's destination -> record map; drift silently widens plugin scope"
+        entry: ./scripts/ci/prek/check_applies_to_roots_in_sync.py
+        language: python
+        files: >
+          (?x)
+          ^airflow-core/src/airflow/plugins_manager\.py$|
+          ^airflow-core/src/airflow/ui/src/utils/pluginAppliesTo\.ts$
+        pass_filenames: false
+        require_serial: true
+      - id: check-ci-workflows-in-sync
+        name: Check ci-arm.yml and ci-amd.yml stay in sync
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/check_ci_workflows_in_sync.py
+        language: python
+        files: ^\.github/workflows/ci-(arm|amd)\.yml$
+        pass_filenames: false
+        require_serial: true
+      - id: check-fork-ci-gate-config
+        name: Check fork CI gate configuration is valid and pilot instants are in the future
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/check_fork_ci_gate_config.py
+        language: python
+        files: ^\.github/fork-ci-gate\.toml$|^dev/breeze/src/airflow_breeze/utils/fork_ci_gate\.py$|^\.asf\.yaml$
+        pass_filenames: false
         additional_dependencies: ['pyyaml']
+      - id: check-java-sdk-version-in-sync
+        name: Check Java SDK JDK version is consistent across build files
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/check_java_sdk_version_in_sync.py
+        language: python
+        files: >
+          (?x)
+          ^\.github/workflows/ci-(arm|amd)\.yml$|
+          ^\.github/workflows/codeql-analysis\.yml$|
+          ^java-sdk/buildSrc/src/main/kotlin/airflow-jvm-conventions\.gradle\.kts$|
+          ^scripts/docker/install_os_dependencies\.sh$|
+          ^Dockerfile$|
+          ^Dockerfile\.ci$
         pass_filenames: false
         require_serial: true
-      - id: ruff
-        name: ruff
+      - id: sync-java-sdk-docs
+        name: Sync the Java SDK quick start and version across the user-facing docs
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/sync_java_sdk_docs.py
         language: python
+        files: >
+          (?x)
+          ^airflow-core/docs/authoring-and-scheduling/language-sdks/java\.rst$|
+          ^java-sdk/README\.md$|
+          ^java-sdk/sdk/module\.md$|
+          ^scripts/ci/prek/sync_java_sdk_docs\.py$
+        additional_dependencies: ['rich>=13.6.0']
+        pass_filenames: false
+      - id: sync-java-sdk-supervisor-schema
+        name: Sync Java SDK supervisor schema with the distribution that owns it
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        description: "Copy task-sdk's supervisor schema when Java SDK's vendored schema.json drifts"
+        entry: ./scripts/ci/prek/sync_java_sdk_supervisor_schema.py
+        language: python
+        pass_filenames: false
+        files: >
+          (?x)
+          ^task-sdk/src/airflow/sdk/execution_time/schema/schema\.json$|
+          ^task-sdk/src/airflow/sdk/execution_time/schema/versions/v\d{4}_\d{2}_\d{2}\.py$|
+          ^java-sdk/gradle\.properties$|
+          ^java-sdk/sdk/schema/schema\.json$|
+          ^scripts/ci/prek/sync_java_sdk_supervisor_schema\.py$
+      - id: regenerate-java-sdk-verification-metadata
+        name: Regenerate the Java SDK dependency verification metadata
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        description: "Drop trusted checksums that no Java SDK build task resolves any more"
+        entry: ./scripts/ci/prek/regenerate_java_sdk_verification_metadata.py
+        language: python
+        pass_filenames: false
+        # example/ and scala_spark_example/ are separate builds this metadata does
+        # not cover, so their build files are excluded.
+        files: >
+          (?x)
+          ^java-sdk/build\.gradle\.kts$|
+          ^java-sdk/buildSrc/.*$|
+          ^java-sdk/gradle\.properties$|
+          ^java-sdk/gradle/libs\.versions\.toml$|
+          ^java-sdk/gradle/verification-metadata\.xml$|
+          ^java-sdk/gradle/wrapper/gradle-wrapper\.properties$|
+          ^java-sdk/settings\.gradle\.kts$|
+          ^scripts/ci/prek/regenerate_java_sdk_verification_metadata\.py$|
+          ^java-sdk/(?!example/|scala_spark_example/)[^/]+/(?:build\.gradle\.kts|gradle\.properties)$
+      - id: update-java-sdk-readme-matrix
+        name: Update the Java SDK compatibility matrix in java-sdk/README.md and Dokka module doc
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/update_java_sdk_readme_matrix.py
+        language: python
+        files: >
+          (?x)
+          ^java-sdk/capabilities\.yaml$|
+          ^java-sdk/gradle\.properties$|
+          ^java-sdk/README\.md$|
+          ^java-sdk/sdk/module\.md$|
+          ^scripts/ci/prek/lang_sdk_compat_matrix\.py$|
+          ^scripts/ci/prek/update_java_sdk_readme_matrix\.py$
+        additional_dependencies: ['PyYAML>=6.0', 'rich>=13.6.0']
+        pass_filenames: false
         require_serial: true
-        pass_filenames: true
-        # Since ruff makes use of multiple cores we _purposefully_ don't run this in docker so it can use the
-        # host CPU to it's fullest
-        entry: ruff --fix --no-update-check --force-exclude
-        additional_dependencies: ['ruff==0.0.226']
-        files: \.pyi?$
-        exclude: ^airflow/_vendor/
-  - repo: https://github.com/psf/black
-    rev: 22.12.0
-    hooks:
-      - id: black
-        name: Run black (python formatter)
-        args: [--config=./pyproject.toml]
-        exclude: ^airflow/_vendor/|^airflow/contrib/
-  - repo: https://github.com/asottile/blacken-docs
-    rev: v1.12.1
+      - id: update-ts-sdk-readme-matrix
+        name: Update the TypeScript SDK compatibility matrix in ts-sdk/README.md
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/update_ts_sdk_readme_matrix.py
+        language: python
+        files: >
+          (?x)
+          ^ts-sdk/capabilities\.yaml$|
+          ^ts-sdk/src/generated/supervisor\.ts$|
+          ^ts-sdk/README\.md$|
+          ^scripts/ci/prek/lang_sdk_compat_matrix\.py$|
+          ^scripts/ci/prek/update_ts_sdk_readme_matrix\.py$
+        additional_dependencies: ['PyYAML>=6.0', 'rich>=13.6.0']
+        pass_filenames: false
+        require_serial: true
+      - id: sync-ts-sdk-schemas
+        name: Sync TypeScript SDK vendored schemas with the distributions that own them
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        description: "Copy airflow-core's Dag schema and the Task SDK's supervisor schema when TS SDK's vendored copies drift"
+        entry: ./scripts/ci/prek/sync_ts_sdk_schemas.py
+        language: python
+        pass_filenames: false
+        # Triggered by the Python sources, not just the vendored copies, so a schema change
+        # (e.g. a new supervisor comms message) refreshes the vendored copy and regenerates the
+        # types in the same commit, the way sync-go-sdk-schemas already does for the Go SDK.
+        # The script itself is listed so a change to its paths or report logic re-runs it.
+        files: >
+          (?x)
+          ^airflow-core/src/airflow/serialization/schema\.json$|
+          ^task-sdk/src/airflow/sdk/execution_time/schema/schema\.json$|
+          ^ts-sdk/schema/.*\.json$|
+          ^scripts/ci/prek/sync_ts_sdk_schemas\.py$
+      - id: sync-java-sdk-dag-schema
+        name: Sync Java SDK Dag serialization schema with airflow-core
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        description: "Copy airflow-core's serialization schema when Java SDK's vendored dag-schema.json drifts"
+        entry: ./java-sdk/gradlew -p ./java-sdk :sdk:syncDagSchema -PfailOnDagSchemaDrift
+        language: system
+        pass_filenames: false
+        # Runs on every commit: a stale vendored copy is exactly the drift that broke a
+        # vendored Go copy unnoticed (see sync-go-sdk-schemas below), so this fails
+        # loudly instead of silently falling behind. -PfailOnDagSchemaDrift is what makes
+        # it fail here; generateDagDsl's own dependency on this same task never passes it,
+        # so an ordinary in-repo build keeps refreshing the copy without breaking on a
+        # schema someone is mid-edit on. The task refreshes the file and fails when it
+        # had to, so `git add` the refreshed copy and recommit.
+        files: >
+          (?x)
+          ^airflow-core/src/airflow/serialization/schema\.json$|
+          ^java-sdk/sdk/schema/dag-schema\.json$
+      - id: sync-go-sdk-schemas
+        name: Sync Go SDK vendored schemas with the distributions that own them
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        description: "Copy airflow-core's Dag schema and task-sdk's supervisor schema when go-sdk's vendored copies drift"
+        entry: ./scripts/ci/prek/sync_go_sdk_schemas.py
+        language: python
+        pass_filenames: false
+        # Runs on every commit: it used to be manual, "a go-sdk maintainer's deliberate
+        # step," so a Python-only schema change could ship with the vendored Go copy
+        # silently left behind — no hook caught it, because this one was never invoked
+        # and check-go-sdk-generated-drift below only watched the Go side. This refreshes
+        # the copy and fails when it had to, so `git add` the refreshed file(s) and
+        # recommit; check-go-sdk-generated-drift then catches the generated code that
+        # needs regenerating from the refreshed copy.
+        files: >
+          (?x)
+          ^airflow-core/src/airflow/serialization/schema\.json$|
+          ^task-sdk/src/airflow/sdk/execution_time/schema/schema\.json$|
+          ^go-sdk/schema/.*\.json$|
+          ^scripts/ci/prek/sync_go_sdk_schemas\.py$
+      - id: check-go-sdk-generated-drift
+        name: Check Go SDK generated files against the schemas they generate from
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        description: "Regenerate the Dag specs and the coordinator-protocol models, and fail when a committed file differs"
+        entry: ./scripts/ci/prek/check_go_sdk_generated_drift.py
+        # golang so prek provisions the toolchain the generators need, the way the
+        # other checks that shell out to `go` in go-sdk get theirs.
+        language: golang
+        # Also triggered by the Python schemas themselves, not just the vendored copies:
+        # sync-go-sdk-schemas (which runs first, see hook order above) refreshes the
+        # vendored copy in the same commit a Python schema changes, and this regenerates
+        # from whatever that copy now holds, so the two together catch both a stale copy
+        # and generated code that copy was never regenerated from.
+        files: >
+          (?x)
+          ^airflow-core/src/airflow/serialization/schema\.json$|
+          ^task-sdk/src/airflow/sdk/execution_time/schema/schema\.json$|
+          ^go-sdk/schema/.*\.json$|
+          ^go-sdk/airflow/spec\.gen\.go$|
+          ^go-sdk/airflow/spec_fields\.gen\.go$|
+          ^go-sdk/airflow/spec\.go$|
+          ^go-sdk/internal/genspec/.*\.go$|
+          ^go-sdk/internal/genlicense/.*\.go$|
+          ^go-sdk/pkg/execution/genmodels/.*\.go$|
+          ^scripts/ci/prek/check_go_sdk_generated_drift\.py$
+        pass_filenames: false
+        require_serial: true
+      - id: check-go-version-in-sync
+        name: Check Go toolchain version is consistent across build files
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/check_go_version_in_sync.py
+        language: python
+        files: >
+          (?x)
+          ^go-sdk/go\.mod$|
+          ^kubernetes-tests/lang_sdk/go_example/go\.mod$|
+          ^\.github/workflows/ci-(arm|amd)\.yml$|
+          ^airflow-e2e-tests/tests/airflow_e2e_tests/constants\.py$|
+          ^dev/breeze/src/airflow_breeze/commands/kubernetes_commands\.py$|
+          ^go-sdk/\.pre-commit-config\.yaml$|
+          ^\.pre-commit-config\.yaml$
+        pass_filenames: false
+        require_serial: true
+      - id: update-go-sdk-readme-matrix
+        name: Update the Go SDK compatibility matrix in go-sdk/README.md
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/update_go_sdk_readme_matrix.py
+        language: python
+        files: >
+          (?x)
+          ^go-sdk/capabilities\.yaml$|
+          ^go-sdk/pkg/execution/messages\.go$|
+          ^go-sdk/README\.md$|
+          ^scripts/ci/prek/lang_sdk_compat_matrix\.py$|
+          ^scripts/ci/prek/update_go_sdk_readme_matrix\.py$
+        additional_dependencies: ['PyYAML>=6.0', 'rich>=13.6.0']
+        pass_filenames: false
+        require_serial: true
+      - id: update-lang-sdk-central-matrix
+        name: Update the consolidated Language SDK compatibility matrix
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/update_lang_sdk_central_matrix.py
+        language: python
+        files: >
+          (?x)
+          ^(go|java|ts)-sdk/capabilities\.yaml$|
+          ^airflow-core/docs/authoring-and-scheduling/language-sdks/index\.rst$|
+          ^scripts/ci/prek/lang_sdk_compat_matrix\.py$|
+          ^scripts/ci/prek/update_lang_sdk_central_matrix\.py$
+        additional_dependencies: ['PyYAML>=6.0', 'rich>=13.6.0']
+        pass_filenames: false
+        require_serial: true
+      - id: check-go-example-mod-tidy
+        name: Check lang-SDK Go example module is tidy against the Go SDK
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/check_go_example_mod_tidy.py
+        # golang so prek provisions the toolchain the check needs: static checks run on a
+        # runner whose preinstalled toolchains are wiped to free disk space, and the SDK's
+        # own `go mod tidy` hook gets its Go the same way.
+        language: golang
+        # The example module keeps its own copy of the SDK's indirect requirements
+        # (it resolves the SDK through a `replace`), so a dependency moving in
+        # go-sdk/go.mod leaves it stale. Watching both modules' manifests is enough:
+        # any new requirement in the SDK necessarily lands in go-sdk/go.mod first.
+        files: >
+          (?x)
+          ^go-sdk/go\.(mod|sum)$|
+          ^kubernetes-tests/lang_sdk/go_example/go\.(mod|sum)$
+        pass_filenames: false
+        require_serial: true
+      - id: check-partition-mapper-defaults-in-sync
+        name: Check partition-mapper core/SDK sync (FanOutMapper table + SegmentWindow/FixedKeyMapper)
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/check_partition_mapper_defaults_in_sync.py
+        language: python
+        files: >
+          (?x)
+          ^airflow-core/src/airflow/partition_mappers/temporal\.py$|
+          ^airflow-core/src/airflow/partition_mappers/window\.py$|
+          ^airflow-core/src/airflow/partition_mappers/fixed_key\.py$|
+          ^task-sdk/src/airflow/sdk/definitions/partition_mappers/temporal\.py$|
+          ^task-sdk/src/airflow/sdk/definitions/partition_mappers/window\.py$|
+          ^task-sdk/src/airflow/sdk/definitions/partition_mappers/fixed_key\.py$
+        pass_filenames: false
+        require_serial: true
+      - id: check-window-in-sync
+        name: Check Window definitions stay in sync (core/SDK)
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/check_window_in_sync.py
+        language: python
+        files: >
+          (?x)
+          ^airflow-core/src/airflow/partition_mappers/window\.py$|
+          ^task-sdk/src/airflow/sdk/definitions/partition_mappers/window\.py$
+        pass_filenames: false
+        require_serial: true
+      - id: sync-uv-min-version-markers
+        name: Sync `# sync-uv-min-version` markers with [tool.uv] required-version
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/sync_uv_min_version_markers.py
+        language: python
+        # Hook reads pyproject.toml itself; the file list selects places that may carry
+        # the `# sync-uv-min-version` marker. Any new test/file using the marker should
+        # be added here.
+        files: >
+          (?x)
+          ^pyproject\.toml$|
+          ^dev/breeze/src/airflow_breeze/utils/check_release_files\.py$|
+          ^dev/breeze/tests/test_environment_check\.py$
+        require_serial: true
+      - id: check-distribution-gitignore
+        name: Check distribution .gitignore files have *.iml
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/check_distribution_gitignore.py
+        language: python
+        files: >
+          (?x)
+          ^.*/\.gitignore$|
+          ^\.gitignore$|
+          ^.*/pyproject\.toml$|
+          ^pyproject\.toml$
+        pass_filenames: false
+        require_serial: true
+      - id: upgrade-important-versions
+        name: Upgrade important versions (manual)
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+          UV_FROZEN: "0"
+        entry: ./scripts/ci/prek/upgrade_important_versions.py
+        stages: ['manual']
+        language: python
+        files: >
+          (?x)
+          ^\.pre-commit-config\.yaml$|
+          ^\.github/\.pre-commit-config\.yaml$|
+          ^scripts/ci/prek/upgrade_important_versions\.py$
+        pass_filenames: false
+        require_serial: true
+      - id: upgrade-dependency-floors
+        name: Upgrade curated dependency floors (manual)
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+          UV_FROZEN: "0"
+        entry: ./scripts/ci/prek/upgrade_dependency_floors.py
+        stages: ['manual']
+        language: python
+        files: >
+          (?x)
+          ^pyproject\.toml$|
+          ^scripts/ci/prek/upgrade_dependency_floors\.py$
+        pass_filenames: false
+        require_serial: true
+        additional_dependencies: ['packaging>=25', 'requests>=2.31.0', 'rich>=13.6.0']
+  - repo: https://github.com/adamchainz/blacken-docs
+    rev: fda77690955e9b63c6687d8806bafd56a526e45f  # frozen: 1.20.0
     hooks:
       - id: blacken-docs
-        name: Run black on python code blocks in documentation files
+        name: Run black on docs
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
         args:
           - --line-length=110
-          - --target-version=py37
-          - --target-version=py38
-          - --target-version=py39
-          - --target-version=py310
-        alias: black
-        additional_dependencies: [black==22.12.0]
+          - --target-version=py311
+          - --target-version=py312
+          - --target-version=py313
+        alias: blacken-docs
+        additional_dependencies:
+         - 'black==26.1.0'
+        exclude: >
+          (?x)
+          ^\.agents/skills/aip-user-stories
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.4.0
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c  # frozen: v6.0.0
     hooks:
       - id: check-merge-conflict
         name: Check that merge conflicts are not being committed
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
       - id: debug-statements
         name: Detect accidentally committed debug statements
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        priority: 1000
       - id: check-builtin-literals
-        name: Require literal syntax when initializing Python builtin types
-        exclude: ^airflow/_vendor/
+        name: Require literal syntax when initializing builtins
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        priority: 1000
       - id: detect-private-key
         name: Detect if private key is added to the repository
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        exclude: ^providers/ssh/docs/connections/ssh\.rst$
       - id: end-of-file-fixer
         name: Make sure that there is an empty line at the end
-        exclude: ^airflow/_vendor/|^docs/apache-airflow/img/.*\.dot|^docs/apache-airflow/img/.*\.sha256
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        exclude: >
+          (?x)
+          ^airflow-core/docs/img/.*\.dot|
+          ^airflow-core/docs/img/.*\.sha256|
+          .*/dist/.*|
+          LICENSES-ui\.txt$|
+          .*/openapi-gen/.*
       - id: mixed-line-ending
         name: Detect if mixed line ending is used (\r vs. \r\n)
-        exclude: ^airflow/_vendor/
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
       - id: check-executables-have-shebangs
         name: Check that executables have shebang
-        exclude: ^airflow/_vendor/
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
       - id: check-xml
         name: Check XML files with xmllint
-        exclude: ^airflow/_vendor/
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        exclude: >
+          (?x)
+          ^scripts/ci/docker-compose/gremlin/.
       - id: trailing-whitespace
         name: Remove trailing whitespace at end of line
-        exclude: ^airflow/_vendor/|^images/breeze/output.*$|^docs/apache-airflow/img/.*\.dot|^docs/apache-airflow/img/.*\.dot
-      - id: fix-encoding-pragma
-        name: Remove encoding header from python files
-        exclude: ^airflow/_vendor/
-        args:
-          - --remove
-      - id: pretty-format-json
-        name: Format json files
-        args:
-          - --autofix
-          - --no-sort-keys
-          - --indent
-          - "4"
-        files: ^chart/values\.schema\.json$|^chart/values_schema\.schema\.json$
-        pass_filenames: true
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        exclude: >
+          (?x)
+          ^airflow-core/docs/img/.*\.dot$|
+          ^dev/breeze/doc/images/output.*$|
+          ^.*/openapi-gen/.*$|
+          ^airflow-ctl/docs/images/.*\.svg$
   - repo: https://github.com/pre-commit/pygrep-hooks
-    rev: v1.9.0
+    rev: 3a6eb0fadf60b3cccfd80bad9dbb6fae7e47b316  # frozen: v1.10.0
     hooks:
       - id: rst-backticks
         name: Check if RST files use double backticks for code
-        exclude: ^airflow/_vendor/
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
       - id: python-no-log-warn
         name: Check if there are no deprecate log warn
-        exclude: ^airflow/_vendor/
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        priority: 1000
   - repo: https://github.com/adrienverge/yamllint
-    rev: v1.28.0
+    rev: cba56bcde1fdd01c1deb3f945e69764c291a6530  # frozen: v1.38.0
     hooks:
       - id: yamllint
         name: Check YAML files with yamllint
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        priority: 1000
         entry: yamllint -c yamllint-config.yml --strict
         types: [yaml]
-        exclude: ^.*init_git_sync\.template\.yaml$|^.*airflow\.template\.yaml$|^chart/(?:templates|files)/.*\.yaml$|openapi/.*\.yaml$|^\.pre-commit-config\.yaml$|^airflow/_vendor/
+        exclude: >
+          (?x)
+          ^.*airflow\.template\.yaml$|
+          ^.*init_git_sync\.template\.yaml$|
+          ^chart/(?:templates|files)/.*\.yaml$|
+          ^chart/tests/chart_utils/keda.sh_scaledobjects\.yaml$|
+          ^chart/tests/chart_utils/gateway.networking.k8s.io_httproutes\.yaml$|
+          .*/v1.*\.yaml$|
+          ^.*openapi.*\.yaml$|
+          ^\.pre-commit-config\.yaml$|
+          ^.*reproducible_build\.yaml$|
+          ^.*pnpm-lock\.yaml$|
+          ^.*-generated\.yaml$
   - repo: https://github.com/ikamensh/flynt
-    rev: '0.77'
+    rev: 97be693bf18bc2f050667dd282d243e2824b81e2  # frozen: 1.0.6
     hooks:
       - id: flynt
         name: Run flynt string format converter for Python
-        exclude: |
-          (?x)
-          ^airflow/_vendor/
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        # flynt's own hook manifest sets require_serial: true, and this line overrides it. flynt
+        # writes only the files that prek passes to it. prek gives each file to exactly one batch,
+        # so the batches can run in parallel.
+        require_serial: false
         args:
          # If flynt detects too long text it ignores it. So we set a very large limit to make it easy
          # to split the text by hand. Too long lines are detected by flake8 (below),
@@ -268,168 +802,385 @@ repos:
          - --line-length
          - '99999'
   - repo: https://github.com/codespell-project/codespell
-    rev: v2.2.2
+    rev: 57b21406f092110c18776e39b0bda50d37c945c8  # frozen: v2.4.3
     hooks:
       - id: codespell
-        name: Run codespell to check for common misspellings in files
+        name: Run codespell
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        priority: 1000
+        description: Run codespell to check for common misspellings in files
         entry: bash -c 'echo "If you think that this failure is an error, consider adding the word(s)
           to the codespell dictionary at docs/spelling_wordlist.txt.
           The word(s) should be in lowercase." && exec codespell "$@"' --
         language: python
         types: [text]
-        exclude: ^airflow/_vendor/|^RELEASE_NOTES\.txt$|^airflow/www/static/css/material-icons\.css$|^images/.*$|^.*package-lock.json$
+        exclude: >
+          (?x)
+          material-icons\.css$|
+          ^images/.*$|
+          ^RELEASE_NOTES\.txt$|
+          ^.*package-lock\.json$|
+          ^.*/kinglear\.txt$|
+          ^.*pnpm-lock\.yaml$|
+          ^java-sdk/gradle/verification-metadata\.xml$|
+          .*/dist/.*|
+          ^airflow-core/src/airflow/ui/public/i18n/locales/(?!en/).+/|
+          ^\.agents/skills/airflow-translations/|
+          ^scripts/docker/keys/.*\.asc$
         args:
           - --ignore-words=docs/spelling_wordlist.txt
-          - --skip=docs/*/commits.rst,airflow/providers/*/*.rst,*.lock,INTHEWILD.md,*.min.js,docs/apache-airflow/tutorial/pipeline_example.csv,airflow/www/*.log
+          - --skip=providers/.*/src/airflow/providers/*/*.rst,providers/*/docs/changelog.rst,docs/*/commits.rst,providers/*/docs/commits.rst,providers/*/*/docs/commits.rst,docs/apache-airflow/tutorial/pipeline_example.csv,*.min.js,*.lock,INTHEWILD.md,*.svg
           - --exclude-file=.codespellignorelines
-  - repo: local
+  - repo: https://github.com/woodruffw/zizmor-pre-commit
+    rev: 06a39750ec31860bb44f2acf67182c40016cd1e7  # frozen: v1.32.0
     hooks:
+      - id: zizmor
+        name: Run zizmor to check for github workflow syntax errors
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        priority: 1000
+        types: [yaml]
+        files: ^\.github/workflows/.*$|^\.github/actions/.*$
+        require_serial: true
+        entry: zizmor
+  - repo: https://github.com/lycheeverse/lychee
+    rev: d119b686aba77707bb4fc2037bdce3eea0ccaee6  # frozen: nightly
+    hooks:
+      # Use the upstream `lychee-docker` variant rather than the script-based
+      # `lychee` hook because the prebuilt lychee binaries that the script
+      # downloads are linked against newer glibc than ubuntu-22.04 runners
+      # ship with (`GLIBC_2.38` / `GLIBC_2.39` not found at runtime). The
+      # docker variant runs the official `lycheeverse/lychee` image, which
+      # bundles its own libc and is portable across runners.
+      - id: lychee-docker
+        name: Check internal Markdown links with lychee (offline mode)
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        priority: 1000
+        description: >-
+          Validate intra-repo links in Markdown files (relative paths, anchors,
+          and fragments) without making any HTTP requests. Auto-generated client
+          docs are excluded because they are regenerated from OpenAPI specs.
+        types: [markdown]
+        args:
+          - --offline
+          - --no-progress
+          - --root-dir
+          - .
+          - --include-fragments
+        exclude: |
+          (?x)
+          ^clients/python/|
+          ^.*/openapi-gen/|
+          ^.*/node_modules/|
+          ^\.build/|
+          ^generated/|
+          ^\.apache-magpie-overrides/
+  - repo: local
+    # Note that this is the 2nd "local" repo group in the .pre-commit-config.yaml file. This is because
+    # we try to minimize the number of passes that must happen to apply some of the changes
+    # done by prek-hooks. Some of the prek hooks not only check for errors but also fix them. This means
+    # that output from an earlier prek hook becomes input to another prek hook. Splitting the local
+    # scripts of our and adding some other non-local prek hook in-between allows us to handle such
+    # changes quickly - especially when we want the early modifications from the first local group
+    # to be applied before the non-local prek hooks are run
+    hooks:
+      - id: check-shared-distributions-structure
+        name: Check shared distributions structure
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/check_shared_distributions_structure.py
+        language: python
+        pass_filenames: false
+        files: >
+          (?x)
+          ^shared/.*$|
+          ^.*/pyproject\.toml$|
+          ^.*/_shared/.*$|
+          ^airflow-core/.*\.py$|
+          ^task-sdk/.*\.py$
+      - id: check-shared-distributions-usage
+        name: Check shared distributions usage
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/check_shared_distributions_usage.py
+        language: python
+        pass_filenames: false
+        files: ^shared/.*$|^.*/pyproject.toml$|^.*/_shared/.*$
+      - id: check-airflow-imports-in-shared
+        name: Check for core/sdk imports in shared libraries
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/check_airflow_imports_in_shared.py
+        language: python
+        pass_filenames: true
+        files: ^shared/.*/src/.*\.py$
+        exclude: |
+          (?x)
+          ^shared/listeners/src/airflow_shared/listeners/spec/taskinstance\.py$|
+          ^shared/logging/src/airflow_shared/logging/remote\.py$|
+          ^shared/observability/src/airflow_shared/observability/metrics/stats\.py$|
+          ^shared/secrets_backend/src/airflow_shared/secrets_backend/base\.py$
+      - id: check-test-only-imports-in-src
+        name: Check for test-only imports in production source
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        priority: 1000
+        entry: ./scripts/ci/prek/check_test_only_imports_in_src.py
+        language: python
+        pass_filenames: true
+        files: >
+          (?x)
+          ^airflow-core/src/.*\.py$|
+          ^airflow-ctl/src/.*\.py$|
+          ^providers/.*/src/.*\.py$|
+          ^task-sdk/src/.*\.py$|
+          ^shared/.*/src/.*\.py$
+      - id: check-secrets-search-path-sync
+        name: Check sync between sdk and core
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/check_secrets_search_path_sync.py
+        language: python
+        pass_filenames: false
+        files: ^airflow-core/src/airflow/secrets/base_secrets\.py$|^task-sdk/src/airflow/sdk/execution_time/secrets/__init__\.py$
+      - id: check-registry-types-json-sync
+        name: Check registry types.json in sync with types.py
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/check_registry_types_json_sync.py
+        language: python
+        pass_filenames: false
+        files: ^dev/registry/registry_tools/types\.py$|^registry/src/_data/types\.json$
+      - id: ruff
+        name: Run 'ruff' for extremely fast Python linting
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        description: "Run 'ruff' for extremely fast Python linting"
+        entry: ruff check --force-exclude
+        language: python
+        types_or: [python, pyi]
+        args: [--fix]
+        require_serial: true
+        additional_dependencies: ['ruff==0.17.3']
+        exclude: ^airflow-core/tests/unit/dags/test_imports\.py$|^performance/tests/test_.*\.py$
+      - id: ruff-format
+        name: Run 'ruff format'
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        description: "Run 'ruff format' for extremely fast Python formatting"
+        entry: ./scripts/ci/prek/ruff_format.py
+        language: python
+        types_or: [python, pyi]
+        args: []
+        require_serial: true
+        exclude: ^airflow-core/tests/unit/dags/test_imports\.py$
       - id: replace-bad-characters
         name: Replace bad characters
-        entry: ./scripts/ci/pre_commit/pre_commit_replace_bad_characters.py
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/replace_bad_characters.py
         language: python
         types: [file, text]
-        exclude: ^airflow/_vendor/|^clients/gen/go\.sh$|^\.gitmodules$
-        additional_dependencies: ['rich>=12.4.4']
-      - id: lint-openapi
-        name: Lint OpenAPI using spectral
-        language: docker_image
-        entry: stoplight/spectral lint -r ./scripts/ci/spectral_rules/connexion.yml
-        files: ^airflow/api_connexion/openapi/
-      - id: lint-openapi
-        name: Lint OpenAPI using openapi-spec-validator
-        entry: openapi-spec-validator --schema 3.0.0
-        language: python
-        additional_dependencies: ['openapi-spec-validator']
-        files: ^airflow/api_connexion/openapi/
+        exclude: >
+          (?x)
+          ^clients/gen/go\.sh$|
+          ^\.gitmodules$|
+          ^airflow-core/src/airflow/ui/openapi-gen/|
+          ^airflow-core/src/airflow/api_fastapi/auth/managers/simple/ui/openapi-gen/|
+          ^providers/edge3/src/airflow/providers/edge3/plugins/www/openapi-gen/|
+          ^devel-common/src/sphinx_exts/airflow_spelling\.py$|
+          ^devel-common/tests/unit/sphinx_exts/test_airflow_spelling\.py$|
+          .*/dist/.*|
+          \.go$|
+          /go\.(mod|sum)$
       - id: lint-dockerfile
-        name: Lint dockerfile
+        name: Lint Dockerfile
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        priority: 1000
         language: python
-        entry: ./scripts/ci/pre_commit/pre_commit_lint_dockerfile.py
+        entry: ./scripts/ci/prek/lint_dockerfile.py
         files: Dockerfile.*$
         pass_filenames: true
         require_serial: true
-      - id: check-setup-order
-        name: Check order of dependencies in setup.cfg and setup.py
+      - id: check-airflow-bug-report-template
+        name: Sort airflow-bug-report provider list
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
         language: python
-        files: ^setup\.cfg$|^setup\.py$
-        pass_filenames: false
-        entry: ./scripts/ci/pre_commit/pre_commit_check_order_setup.py
-        additional_dependencies: ['rich>=12.4.4']
-      - id: check-extra-packages-references
-        name: Checks setup extra packages
-        description: Checks if all the libraries in setup.py are listed in extra-packages-ref.rst file
-        language: python
-        files: ^setup\.py$|^docs/apache-airflow/extra-packages-ref\.rst$
-        pass_filenames: false
-        entry: ./scripts/ci/pre_commit/pre_commit_check_setup_extra_packages_ref.py
-        additional_dependencies: ['rich>=12.4.4']
-      - id: check-airflow-provider-compatibility
-        name: Check compatibility of Providers with Airflow
-        entry: ./scripts/ci/pre_commit/pre_commit_check_provider_airflow_compatibility.py
-        language: python
-        pass_filenames: true
-        files: ^airflow/providers/.*\.py$
-        additional_dependencies: ['rich>=12.4.4']
+        files: ^\.github/ISSUE_TEMPLATE/1-airflow_bug_report\.yml$
+        require_serial: true
+        entry: ./scripts/ci/prek/check_airflow_bug_report_template.py
       - id: update-local-yml-file
         name: Update mounts in the local yml file
-        entry: ./scripts/ci/pre_commit/pre_commit_local_yml_mounts.py
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/local_yml_mounts.py
         language: python
         files: ^dev/breeze/src/airflow_breeze/utils/docker_command_utils\.py$|^scripts/ci/docker_compose/local\.yml$
         pass_filenames: false
-        additional_dependencies: ['rich>=12.4.4']
-      - id: update-providers-dependencies
-        name: Update cross-dependencies for providers packages
-        entry: ./scripts/ci/pre_commit/pre_commit_update_providers_dependencies.py
-        language: python
-        files: ^airflow/providers/.*\.py$|^tests/providers/.*\.py$|^tests/system/providers/.*\.py$|^airflow/providers/.*/provider.yaml$
-        pass_filenames: false
-        additional_dependencies: ['setuptools', 'rich>=12.4.4', 'pyyaml']
-      - id: update-extras
-        name: Update extras in documentation
-        entry: ./scripts/ci/pre_commit/pre_commit_insert_extras.py
-        language: python
-        files: ^setup\.py$|^INSTALL$|^CONTRIBUTING\.rst$
-        pass_filenames: false
       - id: check-extras-order
-        name: Check order of extras in Dockerfile
-        entry: ./scripts/ci/pre_commit/pre_commit_check_order_dockerfile_extras.py
+        name: Check order of extras in Dockerfile and sync its defaults to the docs
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/check_order_dockerfile_extras.py
         language: python
-        files: ^Dockerfile$
+        files: ^Dockerfile$|^docker-stack-docs/build-arg-ref\.rst$
         pass_filenames: false
-        additional_dependencies: ['rich>=12.4.4']
+      - id: generate-airflow-diagrams
+        name: Generate airflow diagrams
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/generate_airflow_diagrams.py
+        language: python
+        files: >
+          (?x)
+          ^airflow-core/docs/.*/diagram_[^/]*\.py$|
+          ^contributing-docs/images/diagram_[^/]*\.py$|
+          ^docs/images/.*\.py$|
+          ^airflow-ctl/docs/images/diagrams/.*\.py$
+        pass_filenames: true
+      - id: prevent-deprecated-sqlalchemy-usage
+        name: Prevent deprecated sqlalchemy usage
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        priority: 1000
+        entry: ./scripts/ci/prek/prevent_deprecated_sqlalchemy_usage.py
+        language: python
+        files: >
+            (?x)
+            ^airflow-core/.*\.py$|
+            ^airflow-ctl.*\.py$|
+            ^airflow-ctl-tests.*\.py|
+            ^dev/.*\.py$|
+            ^devel-common/.*\.py|
+            ^providers/.*\.py$|
+            ^task-sdk.*\.py$|
+            ^task-sdk-integration-tests.*\.py
+        pass_filenames: true
       - id: update-supported-versions
         name: Updates supported versions in documentation
-        entry: ./scripts/ci/pre_commit/pre_commit_supported_versions.py
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/supported_versions.py
         language: python
-        files: ^scripts/ci/pre_commit/pre_commit_supported_versions\.py$|^README\.md$|^docs/apache-airflow/supported-versions\.rst$
+        files: ^airflow-core/docs/installation/supported-versions\.rst$|^scripts/ci/prek/supported_versions\.py$|^README\.md$
         pass_filenames: false
-        additional_dependencies: ['tabulate']
+      - id: generate-api-permissions-doc
+        name: Generate REST API permission reference documentation
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/extract_permissions.py
+        language: python
+        files: >
+          (?x)
+          ^airflow-core/src/airflow/api_fastapi/core_api/routes/public/.*\.py$|
+          ^airflow-core/src/airflow/api_fastapi/core_api/security\.py$|
+          ^scripts/ci/prek/extract_permissions\.py$|
+          ^airflow-core/docs/security/api_permissions_ref\.rst$
+        pass_filenames: false
+      - id: generate-fab-permissions-doc
+        name: Generate FAB auth manager REST API permission table
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/fab_permissions_doc.py
+        language: python
+        files: >
+          (?x)
+          ^airflow-core/src/airflow/api_fastapi/core_api/routes/public/.*\.py$|
+          ^airflow-core/src/airflow/api_fastapi/core_api/security\.py$|
+          ^providers/fab/src/airflow/providers/fab/auth_manager/fab_auth_manager\.py$|
+          ^providers/fab/src/airflow/providers/fab/auth_manager/security_manager/override\.py$|
+          ^providers/fab/src/airflow/providers/fab/www/security/permissions\.py$|
+          ^scripts/ci/prek/extract_permissions\.py$|
+          ^scripts/ci/prek/fab_permissions_doc\.py$|
+          ^providers/fab/docs/auth-manager/access-control\.rst$
+        pass_filenames: false
+      - id: update-tested-versions
+        name: Update tested Python/DB/Kubernetes versions in docs
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/update_tested_versions.py
+        language: python
+        files: ^airflow-core/docs/installation/prerequisites\.rst$|^README\.md$|^dev/breeze/src/airflow_breeze/global_constants\.py$|^scripts/ci/prek/update_tested_versions\.py$|^scripts/ci/prek/common_prek_utils\.py$
+        pass_filenames: false
       - id: check-revision-heads-map
         name: Check that the REVISION_HEADS_MAP is up-to-date
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
         language: python
-        entry: ./scripts/ci/pre_commit/pre_commit_version_heads_map.py
+        entry: ./scripts/ci/prek/check_revision_heads_map.py
         pass_filenames: false
-        additional_dependencies: ['packaging']
+        files: >
+          (?x)
+          ^scripts/ci/prek/version_heads_map\.py$|
+          ^airflow-core/src/airflow/migrations/versions/.*$|
+          ^airflow-core/src/airflow/migrations/versions|
+          ^airflow-core/src/airflow/utils/db\.py$
       - id: update-version
-        name: Update version to the latest version in the documentation
-        entry: ./scripts/ci/pre_commit/pre_commit_update_versions.py
+        name: Update versions in docs
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/update_versions.py
         language: python
-        files: ^docs
+        files: ^docs|^airflow-core/src/airflow/__init__\.py$|.*/pyproject\.toml$
         pass_filenames: false
       - id: check-pydevd-left-in-code
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
         language: pygrep
         name: Check for pydevd debug statements accidentally left
         entry: "pydevd.*settrace\\("
         pass_filenames: true
         files: \.py$
-      - id: check-links-to-example-dags-do-not-use-hardcoded-versions
-        name: Check that example dags do not use hard-coded version numbers
-        description: The links to example dags should use |version| as version specification
-        language: pygrep
-        entry: >
-          (?i)
-          .*https://github.*[0-9]/tests/system/providers|
-          .*https://github.*/main/tests/system/providers|
-          .*https://github.*/master/tests/system/providers|
-          .*https://github.*/main/airflow/providers/.*/example_dags/|
-          .*https://github.*/master/airflow/providers/.*/example_dags/
-        pass_filenames: true
-        files: ^docs/apache-airflow-providers-.*\.rst
       - id: check-safe-filter-usage-in-html
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
         language: pygrep
         name: Don't use safe in templates
         description: the Safe filter is error-prone, use Markup() in code instead
         entry: "\\|\\s*safe"
         files: \.html$
         pass_filenames: true
-      - id: check-no-providers-in-core-examples
+      - id: check-urlparse-usage-in-code
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
         language: pygrep
-        name: No providers imports in core example DAGs
-        description: The core example DAGs have no dependencies other than core Airflow
-        entry: "^\\s*from airflow\\.providers.*"
-        pass_filenames: true
-        files: ^airflow/example_dags/.*\.py$
-      - id: check-no-relative-imports
-        language: pygrep
-        name: No relative imports
-        description: Airflow style is to use absolute imports only (except docs building)
-        entry: "^\\s*from\\s+\\."
+        name: Don't use urlparse in code
+        description: urlparse is not recommended, use urlsplit() in code instead
+        entry: "^\\s*from urllib\\.parse import ((\\|, )(urlparse\\|urlunparse))+$"
         pass_filenames: true
         files: \.py$
-        exclude: ^tests/|^airflow/_vendor/|^docs/
-      - id: check-only-new-session-with-provide-session
-        name: Check NEW_SESSION is only used with @provide_session
+      - id: check-ci-gate-needs
+        name: Check the CI passed gate job needs every CI job
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        description: Auto-merge waits for "CI passed"; a job missing from its needs could fail without stopping a merge
+        entry: ./scripts/ci/prek/check_ci_gate_needs.py
         language: python
-        entry: ./scripts/ci/pre_commit/pre_commit_new_session_in_provide_session.py
+        pass_filenames: false
+        files: ^\.github/workflows/ci-amd\.yml$|^scripts/ci/prek/check_ci_gate_needs\.py$
+      - id: check-auth-manager-mock-targets
+        name: Patch SimpleAuthManager, not BaseAuthManager, for methods it overrides
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        description: The API test client uses SimpleAuthManager, so patching an overridden BaseAuthManager method has no effect
+        entry: ./scripts/ci/prek/check_auth_manager_mock_targets.py
+        language: python
         pass_filenames: true
-        files: ^airflow/.+\.py$
+        files: ^airflow-core/tests/unit/api_fastapi/.*\.py$
+        exclude: ^airflow-core/tests/unit/api_fastapi/auth/managers/simple/
       - id: check-for-inclusive-language
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        priority: 1000
         language: pygrep
         name: Check for language that we do not accept as community
         description: Please use more appropriate words for community documentation.
         entry: >
-          (?i)
+          (?ix)
           (black|white)[_-]?list|
           \bshe\b|
           \bhe\b|
@@ -442,248 +1193,509 @@ repos:
         pass_filenames: true
         exclude: >
           (?x)
-          ^airflow/www/fab_security/manager.py$|
-          ^airflow/www/static/|
-          ^airflow/providers/|
-          ^tests/providers/apache/cassandra/hooks/test_cassandra.py$|
-          ^tests/integration/providers/apache/cassandra/hooks/test_cassandra.py$|
-          ^tests/system/providers/apache/spark/example_spark_dag.py$|
-          ^docs/apache-airflow-providers-apache-cassandra/connections/cassandra.rst$|
-          ^docs/apache-airflow-providers-apache-hive/commits.rst$|
-          ^airflow/api_connexion/openapi/v1.yaml$|
-          ^tests/cli/commands/test_webserver_command.py$|
-          ^airflow/cli/commands/webserver_command.py$|
-          ^airflow/config_templates/default_airflow.cfg$|
-          ^airflow/config_templates/config.yml$|
-          ^docs/*.*$|
-          ^tests/providers/|
-          ^.pre-commit-config\.yaml$|
+          ^README\.md$|
+          ^pyproject\.toml$|
+          ^generated/PYPI_README\.md$|
+          ^airflow-core/src/airflow/ui/public/i18n/README\.md$|
+          ^airflow-core/docs/.*commits\.rst$|
+          ^airflow-core/src/airflow/api_fastapi/auth/managers/simple/ui/pnpm-lock\.yaml$|
+          ^airflow-core/src/airflow/api_fastapi/gunicorn_config\.py$|
+          ^airflow-core/src/airflow/cli/commands/api_server_command\.py$|
+          ^airflow-core/src/airflow/api_fastapi/gunicorn_monitor\.py$|
+          ^airflow-core/src/airflow/cli/commands/local_commands/fastapi_api_command\.py$|
+          ^airflow-core/src/airflow/config_templates/|
+          ^airflow-core/src/airflow/models/baseoperator\.py$|
+          ^airflow-core/src/airflow/operators/__init__\.py$|
+          ^airflow-core/src/airflow/serialization/serialized_objects\.py$|
+          ^airflow-core/src/airflow/ui/openapi-gen/|
+          ^airflow-core/src/airflow/ui/pnpm-lock\.yaml$|
+          ^providers/common/ai/src/airflow/providers/common/ai/plugins/www/pnpm-lock\.yaml$|
+          ^airflow-core/src/airflow/ui/public/i18n/locales/(?!en/)|
+          ^airflow-core/src/airflow/ui/src/i18n/config\.ts$|
+          ^airflow-core/src/airflow/ui/src/i18n/dayjsLocale\.ts$|
+          ^\.agents/skills/airflow-translations/|
+          ^airflow-core/src/airflow/utils/db\.py$|
+          ^airflow-core/src/airflow/utils/trigger_rule\.py$|
+          ^airflow-core/tests/|
+          ^java-sdk/gradlew$|
+          ^java-sdk/gradlew\.bat$|
+          ^java-sdk/gradle|
+          ^java-sdk/scala_spark_example/src/main/scala/org/apache/airflow/example/ScalaSparkExample\.scala$|
+          ^task-sdk/tests/|
+          ^.*changelog\.(rst|txt)$|
+          ^.*CHANGELOG\.(rst|txt)$|
+          ^chart/values.schema\.json$|
+          ^.*commits\.(rst|txt)$|
+          ^.*/conf_constants\.py$|
+          ^.*/conf\.py$|
+          ^contributing-docs/03_contributors_quick_start\.rst$|
+          ^dev/|
+          ^devel-common/src/docs/README\.rst$|
+          ^devel-common/src/sphinx_exts/removemarktransform\.py|
+          ^devel-common/src/tests_common/test_utils/db\.py|
+          .*/dist/.*|
+          ^docs/apache-airflow-providers-amazon/secrets-backends/aws-ssm-parameter-store\.rst$|
+          git|
+          ^chart/tests/chart_utils/helm_template_generator\.py$|
+          package-lock\.json$|
+          ^.*\.(png|gif|jp[e]?g|svg|tgz|lock|woff2?)$|
+          ^\.pre-commit-config\.yaml$|
+          ^.*/provider_conf\.py$|
+          ^providers/\.pre-commit-config\.yaml$|
+          ^providers/amazon/src/airflow/providers/amazon/aws/hooks/emr\.py$|
+          ^providers/amazon/src/airflow/providers/amazon/aws/operators/emr\.py$|
+          ^providers/.*/get_provider_info\.py$|
+          ^providers/.*/provider\.yaml$|
+          ^providers/apache/cassandra/src/airflow/providers/apache/cassandra/hooks/cassandra\.py$|
+          ^providers/apache/hdfs/docs/connections\.rst$|
+          ^providers/apache/hive/src/airflow/providers/apache/hive/operators/hive_stats\.py$|
+          ^providers/apache/hive/src/airflow/providers/apache/hive/transfers/vertica_to_hive\.py$|
+          ^providers/apache/kafka/docs/connections/kafka\.rst$|
+          ^providers/apache/spark/docs/decorators/pyspark\.rst$|
+          ^providers/apache/spark/docs/connections/spark-submit.rst$|
+          ^providers/apache/spark/docs/operators\.rst$|
+          ^providers/apache/spark/src/airflow/providers/apache/spark/decorators/|
+          ^providers/apache/spark/src/airflow/providers/apache/spark/hooks/|
+          ^providers/apache/spark/src/airflow/providers/apache/spark/operators/|
+          ^providers/cncf/kubernetes/docs/operators\.rst$|
+          ^providers/common/sql/tests/provider_tests/common/sql/operators/test_sql_execute\.py$|
+          ^providers/edge3/src/airflow/providers/edge3/plugins/www/pnpm-lock.yaml$|
+          ^providers/exasol/src/airflow/providers/exasol/hooks/exasol\.py$|
+          ^providers/fab/docs/auth-manager/webserver-authentication\.rst$|
+          ^providers/fab/src/airflow/providers/fab/auth_manager/security_manager/|
+          ^providers/fab/src/airflow/providers/fab/www/static/|
+          ^providers/fab/src/airflow/providers/fab/www/templates/|
+          ^providers/google/docs/operators/cloud/kubernetes_engine\.rst$|
+          ^providers/google/src/airflow/providers/google/cloud/hooks/bigquery\.py$|
+          ^providers/google/src/airflow/providers/google/cloud/operators/cloud_build\.py$|
+          ^providers/google/src/airflow/providers/google/cloud/operators/dataproc\.py$|
+          ^providers/google/src/airflow/providers/google/cloud/operators/mlengine\.py$|
+          ^providers/keycloak/src/airflow/providers/keycloak/cli/definition.py|
+          ^providers/microsoft/azure/docs/connections/azure_cosmos\.rst$|
+          ^providers/microsoft/azure/src/airflow/providers/microsoft/azure/hooks/cosmos\.py$|
+          ^providers/microsoft/winrm/src/airflow/providers/microsoft/winrm/hooks/winrm\.py$|
+          ^providers/microsoft/winrm/src/airflow/providers/microsoft/winrm/operators/winrm\.py$|
+          ^providers/opsgenie/src/airflow/providers/opsgenie/hooks/opsgenie\.py$|
+          ^providers/redis/src/airflow/providers/redis/provider\.yaml$|
+          ^providers/.*/tests/|
+          .rat-excludes|
           ^.*RELEASE_NOTES\.rst$|
-          ^.*CHANGELOG\.txt$|^.*CHANGELOG\.rst$|
-          git
-      - id: check-base-operator-partial-arguments
-        name: Check BaseOperator and partial() arguments
+          ^scripts/ci/docker-compose/integration-keycloak\.yml$|
+          ^scripts/ci/docker-compose/keycloak/keycloak-entrypoint\.sh$|
+          ^scripts/ci/prek/upgrade_important_versions.py$|
+          ^scripts/ci/prek/download_k8s_schemas\.py$|
+          ^scripts/ci/prek/vendor_k8s_json_schema\.py$
+      - id: check-template-context-variable-in-sync
+        name: Sync template context variable refs
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
         language: python
-        entry: ./scripts/ci/pre_commit/pre_commit_base_operator_partial_arguments.py
-        pass_filenames: false
-        files: ^airflow/models/(?:base|mapped)operator\.py$
-      - id: check-init-decorator-arguments
-        name: Check model __init__ and decorator arguments are in sync
-        language: python
-        entry: ./scripts/ci/pre_commit/pre_commit_sync_init_decorator.py
-        pass_filenames: false
-        files: ^airflow/models/dag\.py$|^airflow/(?:decorators|utils)/task_group.py$
+        entry: ./scripts/ci/prek/check_template_context_variable_in_sync.py
+        files:
+          (?x)
+          ^airflow-core/src/airflow/models/taskinstance\.py$|
+          ^task-sdk/src/airflow/sdk/definitions/context\.py$|
+          ^airflow-core/docs/templates-ref\.rst$
       - id: check-base-operator-usage
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
         language: pygrep
-        name: Check BaseOperator[Link] core imports
-        description: Make sure BaseOperator[Link] is imported from airflow.models.baseoperator in core
-        entry: "from airflow\\.models import.* BaseOperator"
+        name: Check BaseOperator core imports
+        description: Make sure BaseOperator is imported from airflow.models.baseoperator in core
+        entry: "from airflow\\.models import.* BaseOperator\\b"
         files: \.py$
         pass_filenames: true
         exclude: >
           (?x)
-          ^airflow/decorators/.*$|
-          ^airflow/hooks/.*$|
-          ^airflow/operators/.*$|
-          ^airflow/sensors/.*$|
-          ^airflow/providers/.*$|
-          ^dev/provider_packages/.*$
+          ^airflow-core/src/airflow/decorators/.*$|
+          ^airflow-core/src/airflow/hooks/.*$|
+          ^airflow-core/src/airflow/operators/.*$|
+          ^providers/.*$
       - id: check-base-operator-usage
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
         language: pygrep
-        name: Check BaseOperator[Link] other imports
-        description: Make sure BaseOperator[Link] is imported from airflow.models outside of core
-        entry: "from airflow\\.models\\.baseoperator import.* BaseOperator"
+        name: Check BaseOperatorLink core imports
+        description: Make sure BaseOperatorLink is not imported from airflow.models in core
+        entry: "^\\s*from airflow\\.models\\.baseoperatorlink import BaseOperatorLink\\b"
+        files: \.py$
         pass_filenames: true
-        files: >
+        exclude: >
           (?x)
-          ^airflow/providers/.*\.py$
-        exclude: ^airflow/_vendor/
-      - id: check-decorated-operator-implements-custom-name
-        name: Check @task decorator implements custom_operator_name
-        language: python
-        entry: ./scripts/ci/pre_commit/pre_commit_decorator_operator_implements_custom_name.py
-        pass_filenames: true
-        files: ^airflow/.*\.py$
+          ^airflow-core/src/airflow/decorators/.*$|
+          ^airflow-core/src/airflow/hooks/.*$|
+          ^airflow-core/src/airflow/operators/.*$|
+          ^providers/.*/src/airflow/providers/.*$|
+          ^providers/.*/src/airflow/providers/standard/sensors/.*$
       - id: check-core-deprecation-classes
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
         language: pygrep
-        name: Verify using of dedicated Airflow deprecation classes in core
+        name: Verify usage of Airflow deprecation classes in core
         entry: category=DeprecationWarning|category=PendingDeprecationWarning
         files: \.py$
-        exclude: ^airflow/configuration.py|^airflow/providers|^scripts/in_container/verify_providers.py
+        exclude: >
+          (?x)
+          ^airflow-core/src/airflow/configuration\.py$|
+          ^airflow-core/tests/.*$|
+          ^providers/.*/src/airflow/providers/|
+          ^scripts/in_container/verify_providers\.py$|
+          ^providers/.*/tests/.*$|
+          ^scripts/tests/.*$|
+          ^devel-common/
         pass_filenames: true
       - id: check-provide-create-sessions-imports
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
         language: pygrep
-        name: Check provide_session and create_session imports
-        description: provide_session and create_session should be imported from airflow.utils.session
-          to avoid import cycles.
-        entry: "from airflow\\.utils\\.db import.* (provide_session|create_session)"
+        name: Check session util imports
+        description: NEW_SESSION, provide_session, and create_session should be imported from airflow.utils.session to avoid import cycles.
+        entry: "from airflow\\.utils\\.db import.* (NEW_SESSION|provide_session|create_session)"
         files: \.py$
-        exclude: ^airflow/_vendor/
         pass_filenames: true
       - id: check-incorrect-use-of-LoggingMixin
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
         language: pygrep
         name: Make sure LoggingMixin is not used alone
         entry: "LoggingMixin\\(\\)"
         files: \.py$
-        exclude: ^airflow/_vendor/
-        pass_filenames: true
-      - id: check-daysago-import-from-utils
-        language: pygrep
-        name: Make sure days_ago is imported from airflow.utils.dates
-        entry: "(airflow\\.){0,1}utils\\.dates\\.days_ago"
-        files: \.py$
-        exclude: ^airflow/_vendor/
         pass_filenames: true
       - id: check-start-date-not-used-in-defaults
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
         language: pygrep
-        name: "'start_date' not to be defined in default_args in example_dags"
+        name: start_date not in default_args
         entry: "default_args\\s*=\\s*{\\s*(\"|')start_date(\"|')|(\"|')start_date(\"|'):"
         files: \.*example_dags.*\.py$
-        exclude: ^airflow/_vendor/
+        pass_filenames: true
+      - id: check-example-dag-tags
+        name: Check example DAGs carry the "example" tag
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/check_example_dag_tags.py
+        language: python
+        files: ^.*/example_dags/.*\.py$
+        pass_filenames: true
+      - id: check-example-dag-shell-commands
+        name: Check example Dags do not build shell commands from runtime values
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/check_example_dag_shell_commands.py
+        language: python
+        files: ^.*/example_dags/.*\.py$
         pass_filenames: true
       - id: check-apache-license-rat
         name: Check if licenses are OK for Apache
-        entry: ./scripts/ci/pre_commit/pre_commit_check_license.py
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        priority: 1000
+        entry: ./scripts/ci/prek/check_license.py
         language: python
-        files: ^.*LICENSE.*$|^.*LICENCE.*$
+        files: ^LICENSE$
         pass_filenames: false
-      - id: check-airflow-config-yaml-consistent
-        name: Checks for consistency between config.yml and default_config.cfg
+      - id: check-metrics-synced-with-registry
+        name: Check that metrics in the codebase are in sync with the metrics registry YAML file.
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        priority: 1000
+        entry: ./scripts/ci/prek/check_metrics_synced_with_the_registry.py
         language: python
-        entry: ./scripts/ci/pre_commit/pre_commit_yaml_to_cfg.py
-        files: config\.yml$|default_airflow\.cfg$|default\.cfg$
-        pass_filenames: false
+        files: \.py$|^shared/observability/src/airflow_shared/observability/metrics/metrics_template\.yaml$
+        exclude: ^(tests/|.*/tests/|airflow-core/src/airflow/observability/stats\.py$|task-sdk/src/airflow/sdk/observability/stats\.py$)
+        pass_filenames: true
         require_serial: true
-        additional_dependencies: ['pyyaml']
+        additional_dependencies: ["PyYAML>=6.0", "rich>=13.6.0"]
       - id: check-boring-cyborg-configuration
         name: Checks for Boring Cyborg configuration consistency
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
         language: python
-        entry: ./scripts/ci/pre_commit/pre_commit_boring_cyborg.py
+        entry: ./scripts/ci/prek/boring_cyborg.py
         pass_filenames: false
         require_serial: true
-        additional_dependencies: ['pyyaml', 'termcolor==1.1.0', 'wcmatch==8.2']
       - id: update-in-the-wild-to-be-sorted
         name: Sort INTHEWILD.md alphabetically
-        entry: ./scripts/ci/pre_commit/pre_commit_sort_in_the_wild.py
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/sort_in_the_wild.py
         language: python
         files: ^\.pre-commit-config\.yaml$|^INTHEWILD\.md$
         pass_filenames: false
         require_serial: true
+      - id: update-installed-providers-to-be-sorted
+        name: Sort and uniquify installed_providers.txt
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/sort_installed_providers.py
+        language: python
+        files: ^\.pre-commit-config\.yaml$|^.*_installed_providers\.txt$
+        pass_filenames: false
+        require_serial: true
       - id: update-spelling-wordlist-to-be-sorted
-        name: Sort alphabetically and uniquify spelling_wordlist.txt
-        entry: ./scripts/ci/pre_commit/pre_commit_sort_spelling_wordlist.py
+        name: Sort spelling_wordlist.txt
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/sort_spelling_wordlist.py
         language: python
         files: ^\.pre-commit-config\.yaml$|^docs/spelling_wordlist\.txt$
         require_serial: true
         pass_filenames: false
-      - id: lint-helm-chart
-        name: Lint Helm Chart
-        entry: ./scripts/ci/pre_commit/pre_commit_helm_lint.py
-        language: python
-        pass_filenames: false
-        files: ^chart
-        require_serial: true
-        additional_dependencies: ['rich>=12.4.4','requests']
-      - id: run-shellcheck
+      - id: shellcheck
         name: Check Shell scripts syntax correctness
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        priority: 1000
         language: docker_image
         entry: koalaman/shellcheck:v0.8.0 -x -a
-        files: ^.*\.sh$|^hooks/build$|^hooks/push$|\.bash$
+        files: \.(bash|sh)$|^hooks/build$|^hooks/push$
         exclude: ^dev/breeze/autocomplete/.*$
-      - id: lint-css
-        name: stylelint
-        entry: "stylelint"
-        language: node
-        files: ^airflow/www/.*\.(css|scss|sass)$
-        # Keep dependency versions in sync w/ airflow/www/package.json
-        additional_dependencies: ['stylelint@13.3.1', 'stylelint-config-standard@20.0.0']
-      - id: compile-www-assets
-        name: Compile www assets
-        language: node
-        stages: ['manual']
-        'types_or': [javascript, tsx, ts]
-        files: ^airflow/www/
-        entry: ./scripts/ci/pre_commit/pre_commit_compile_www_assets.py
-        pass_filenames: false
-        additional_dependencies: ['yarn@1.22.19']
-      - id: compile-www-assets-dev
-        name: Compile www assets in dev mode
-        language: node
-        stages: ['manual']
-        'types_or': [javascript, tsx, ts]
-        files: ^airflow/www/
-        entry: ./scripts/ci/pre_commit/pre_commit_compile_www_assets_dev.py
-        pass_filenames: false
-        additional_dependencies: ['yarn@1.22.19']
-      - id: check-providers-init-file-missing
-        name: Provider init file is missing
-        pass_filenames: false
-        always_run: true
-        entry: ./scripts/ci/pre_commit/pre_commit_check_providers_init.py
+      - id: check-integrations-list-consistent
+        name: Sync integrations list with docs
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/check_integrations_list.py
         language: python
-      - id: check-providers-subpackages-init-file-exist
-        name: Provider subpackage init files are there
-        pass_filenames: false
-        always_run: true
-        entry: ./scripts/ci/pre_commit/pre_commit_check_providers_subpackages_all_have_init.py
-        language: python
-        require_serial: true
-      - id: check-pre-commit-information-consistent
-        name: Update information re pre-commit hooks and verify ids and names
-        entry: ./scripts/ci/pre_commit/pre_commit_check_pre_commit_hooks.py
-        args:
-          - --max-length=64
-        language: python
-        files: ^\.pre-commit-config\.yaml$|^scripts/ci/pre_commit/pre_commit_check_pre_commit_hook_names\.py$
-        additional_dependencies: ['pyyaml', 'jinja2', 'black==22.12.0', 'tabulate', 'rich>=12.4.4']
+        files: ^scripts/ci/docker-compose/integration-.*\.yml$|^contributing-docs/testing/integration_tests\.rst$
         require_serial: true
         pass_filenames: false
-      - id: update-breeze-readme-config-hash
-        name: Update Breeze README.md with config files hash
+      - id: sync-translation-namespaces
+        name: Sync translation namespace file list
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/sync_translation_namespaces.py
         language: python
-        entry: ./scripts/ci/pre_commit/pre_commit_update_breeze_config_hash.py
-        files: dev/breeze/setup.py|dev/breeze/setup.cfg|dev/breeze/pyproject.toml|dev/breeze/README.md
+        files: >
+          (?x)
+          ^airflow-core/src/airflow/ui/public/i18n/locales/en/.*\.json$|
+          ^\.agents/skills/airflow-translations/SKILL\.md$
         pass_filenames: false
+      - id: generate-agent-skills
+        name: Sync AGENTS.md commands from contributing docs
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/generate_agent_skills.py
+        language: python
+        files: >
+          (?x)
+          ^contributing-docs/.*\.rst$|
+          ^AGENTS\.md$|
+          ^scripts/ci/prek/generate_agent_skills\.py$
+        pass_filenames: false
+        additional_dependencies: ['pyyaml', 'rich>=13.6.0']
+      - id: check-documented-commands
+        name: Check documented breeze and prek commands exist
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/check_documented_commands.py
+        language: python
+        files: >
+          (?x)
+          ^AGENTS\.md$|
+          ^contributing-docs/.*\.rst$|
+          ^dev/breeze/src/airflow_breeze/commands/|
+          ^(?:.*/)?\.pre-commit-config\.yaml$|
+          ^scripts/ci/prek/check_documented_commands\.py$
+        pass_filenames: false
+        require_serial: true
+        additional_dependencies: ['pyyaml', 'rich>=13.6.0']
+      # The three skill-eval hooks below are skipped by id in .github/actions/install-prek/action.yml
+      # (their node environments are ~3.5 GB and never run in CI). Renaming one silently re-enables
+      # its installation there, so update the action alongside any id change.
+      - id: run-skill-eval
+        name: Run skill-eval against AGENTS.md and cases
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./dev/skill-evals/eval.py
+        language: node
+        language_version: '22.22.0'
+        additional_dependencies: ['promptfoo@0.121.17', '@anthropic-ai/claude-agent-sdk@0.3.185']
+        stages: ['manual']
+        files: >
+          (?x)
+          ^AGENTS\.md$|
+          ^dev/skill-evals/
+        pass_filenames: false
+        require_serial: true
+        verbose: true
+      - id: run-skill-eval-codex
+        name: Run skill-eval against AGENTS.md and cases (Codex runtime)
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        # Kept separate from run-skill-eval so only contributors who actually run
+        # the Codex arm build an env carrying the Codex CLI binary. promptfoo
+        # bundles its own @openai/codex-sdk, but that build ships a binary whose
+        # Developer ID certificate Apple has revoked — macOS kills it on exec —
+        # so a notarized version has to be installed explicitly.
+        entry: env AGENT_RUNTIME=codex ./dev/skill-evals/eval.py
+        language: node
+        language_version: '22.22.0'
+        additional_dependencies:
+          - 'promptfoo@0.121.17'
+          - '@openai/codex-sdk@0.144.6'
+        stages: ['manual']
+        files: >
+          (?x)
+          ^AGENTS\.md$|
+          ^dev/skill-evals/
+        pass_filenames: false
+        require_serial: true
+        verbose: true
+      - id: view-skill-eval
+        name: View skill-eval results in browser (manual)
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: env PROMPTFOO_CONFIG_DIR=.build/promptfoo promptfoo view
+        language: node
+        language_version: '22.22.0'
+        additional_dependencies: ['promptfoo@0.121.17', '@anthropic-ai/claude-agent-sdk@0.3.185']
+        stages: ['manual']
+        files: >
+          (?x)
+          ^AGENTS\.md$|
+          ^dev/skill-evals/
+        pass_filenames: false
+        require_serial: true
+      - id: check-eval-hash
+        name: Verify skill-eval ran on current AGENTS.md and cases
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/check_eval_hash.py
+        language: python
+        files: >
+          (?x)
+          ^AGENTS\.md$|
+          ^dev/skill-evals/cases/|
+          ^dev/skill-evals/last-eval-hash\.txt$
+        pass_filenames: false
+      - id: update-pyproject-toml
+        name: Update Airflow's meta-package pyproject.toml
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        language: python
+        entry: ./scripts/ci/prek/update_airflow_pyproject_toml.py
+        files: >
+          (?x)
+          ^.*/pyproject\.toml$|
+          ^scripts/ci/prek/update_airflow_pyproject_toml\.py$|
+          ^providers/.*/pyproject\.toml$|
+          ^providers/.*/provider\.yaml$
+        pass_filenames: false
+        require_serial: true
+      - id: check-excluded-provider-markers
+        name: Check excluded-provider python_version and platform markers in pyproject.toml
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        language: python
+        entry: ./scripts/ci/prek/check_excluded_provider_markers.py
+        files: >
+          (?x)
+          ^pyproject\.toml$|
+          ^providers/.*/provider\.yaml$
+        pass_filenames: false
+        require_serial: true
+        additional_dependencies: ['packaging>=25', 'pyyaml', 'rich>=13.6.0']
+      - id: check-provider-config-fallback-defaults
+        name: Check provider_config_fallback_defaults.cfg is in sync with provider.yaml files
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        language: python
+        entry: ./scripts/ci/prek/check_provider_config_fallback_defaults.py
+        files: >
+          (?x)
+          ^airflow-core/src/airflow/config_templates/provider_config_fallback_defaults\.cfg$|
+          ^providers/.*/provider\.yaml$|
+          ^scripts/ci/prek/check_provider_config_fallback_defaults\.py$
+        pass_filenames: false
+        require_serial: true
+        additional_dependencies: ['pyyaml', 'rich>=13.6.0']
+      - id: check-dependency-lower-bounds
+        name: Check that dependencies in pyproject.toml have lower bounds
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        language: python
+        entry: ./scripts/ci/prek/check_dependency_lower_bounds.py
+        files: (^|/)pyproject\.toml$
+        require_serial: true
+        additional_dependencies: ['packaging>=25', 'rich>=13.6.0']
+      - id: update-reproducible-source-date-epoch
+        name: Update Source Date Epoch for reproducible builds
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        language: python
+        entry: ./scripts/ci/prek/update_source_date_epoch.py
+        files: ^RELEASE_NOTES\.rst$|^chart/RELEASE_NOTES\.rst$
         require_serial: true
       - id: check-breeze-top-dependencies-limited
-        name: Breeze should have small number of top-level dependencies
+        name: Check top-level breeze deps
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        description: Breeze should have small number of top-level dependencies
         language: python
         entry: ./scripts/tools/check_if_limited_dependencies.py
         files: ^dev/breeze/.*$
         pass_filenames: false
         require_serial: true
-        additional_dependencies: ['click', 'rich>=12.4.4']
       - id: check-system-tests-present
         name: Check if system tests have required segments of code
-        entry: ./scripts/ci/pre_commit/pre_commit_check_system_tests.py
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/check_system_tests.py
         language: python
-        files: ^tests/system/.*/example_[^/]*.py$
-        exclude: ^tests/system/providers/google/cloud/bigquery/example_bigquery_queries\.py$
+        files: ^.*/tests/system/.*/example_[^/]*\.py$
         pass_filenames: true
-        additional_dependencies: ['rich>=12.4.4']
+      - id: generate-pypi-readme
+        name: Generate PyPI README
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/generate_pypi_readme.py
+        language: python
+        files: ^README\.md$
+        pass_filenames: false
+      - id: sync-provider-readme
+        name: Sync provider README.rst Requirements table with pyproject.toml
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        description: |
+          Provider README.rst files are regenerated from pyproject.toml at distribution-build
+          time. Between releases, dependency bumps in pyproject.toml do not propagate to the
+          committed README, leading to drift. This hook re-renders the Requirements table from
+          the current pyproject.toml whenever the latter changes.
+        entry: ./scripts/ci/prek/sync_provider_readme.py
+        language: python
+        files: ^providers/.*/pyproject\.toml$
+        pass_filenames: true
       - id: lint-markdown
         name: Run markdownlint
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        priority: 1000
         description: Checks the style of Markdown files.
         entry: markdownlint
         language: node
         types: [markdown]
         files: \.(md|mdown|markdown)$
-        additional_dependencies: ['markdownlint-cli']
+        exclude: |
+          (?x)
+          ^\.apache-magpie-overrides/
+        additional_dependencies: ['markdownlint-cli@0.38.0']
       - id: lint-json-schema
-        name: Lint JSON Schema files with JSON Schema
-        entry: ./scripts/ci/pre_commit/pre_commit_json_schema.py
+        name: Lint JSON Schema files
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/lint_json_schema.py
         args:
-          - --spec-url
-          - https://json-schema.org/draft-07/schema
+          - --spec-file
+          - scripts/ci/prek/draft7_schema.json
         language: python
         pass_filenames: true
         files: .*\.schema\.json$
-        exclude: ^airflow/_vendor/
         require_serial: true
-        additional_dependencies: ['jsonschema>=3.2.0,<5.0', 'PyYAML==5.3.1', 'requests==2.25.0']
       - id: lint-json-schema
-        name: Lint NodePort Service with JSON Schema
-        entry: ./scripts/ci/pre_commit/pre_commit_json_schema.py
+        name: Lint NodePort Service
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/lint_json_schema.py
         args:
           - --spec-url
           - https://raw.githubusercontent.com/yannh/kubernetes-json-schema/master/v1.20.2-standalone/service-v1.json
@@ -691,202 +1703,377 @@ repos:
         pass_filenames: true
         files: ^scripts/ci/kubernetes/nodeport\.yaml$
         require_serial: true
-        additional_dependencies: ['jsonschema>=3.2.0,<5.0', 'PyYAML==5.3.1', 'requests==2.25.0']
       - id: lint-json-schema
-        name: Lint Docker compose files with JSON Schema
-        entry: ./scripts/ci/pre_commit/pre_commit_json_schema.py
+        name: Lint Docker compose files
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/lint_json_schema.py
         args:
           - --spec-url
           - https://raw.githubusercontent.com/compose-spec/compose-spec/master/schema/compose-spec.json
         language: python
         pass_filenames: true
         files: ^scripts/ci/docker-compose/.+\.ya?ml$|docker-compose\.ya?ml$
+        exclude: >
+          (?x)
+          ^scripts/ci/docker-compose/grafana/.|
+          ^scripts/ci/docker-compose/gremlin/.|
+          ^scripts/ci/docker-compose/.+-config\.ya?ml$
         require_serial: true
-        additional_dependencies: ['jsonschema>=3.2.0,<5.0', 'PyYAML==5.3.1', 'requests==2.25.0']
-      - id: lint-json-schema
-        name: Lint chart/values.schema.json file with JSON Schema
-        entry: ./scripts/ci/pre_commit/pre_commit_json_schema.py
-        args:
-          - --spec-file
-          - chart/values_schema.schema.json
-          - chart/values.schema.json
-        language: python
-        pass_filenames: false
-        files: ^chart/values\.schema\.json$|^chart/values_schema\.schema\.json$
-        require_serial: true
-        additional_dependencies: ['jsonschema>=3.2.0,<5.0', 'PyYAML==5.3.1', 'requests==2.25.0']
-      - id: update-vendored-in-k8s-json-schema
-        name: Vendor k8s definitions into values.schema.json
-        entry: ./scripts/ci/pre_commit/pre_commit_vendor_k8s_json_schema.py
-        language: python
-        files: ^chart/values\.schema\.json$
-        additional_dependencies: ['requests==2.25.0']
-      - id: lint-json-schema
-        name: Lint chart/values.yaml file with JSON Schema
-        entry: ./scripts/ci/pre_commit/pre_commit_json_schema.py
-        args:
-          - --enforce-defaults
-          - --spec-file
-          - chart/values.schema.json
-          - chart/values.yaml
-        language: python
-        pass_filenames: false
-        files: ^chart/values\.yaml$|^chart/values\.schema\.json$
-        require_serial: true
-        additional_dependencies: ['jsonschema>=3.2.0,<5.0', 'PyYAML==5.3.1', 'requests==2.25.0']
-      - id: lint-json-schema
-        name: Lint airflow/config_templates/config.yml file with JSON Schema
-        entry: ./scripts/ci/pre_commit/pre_commit_json_schema.py
-        args:
-          - --spec-file
-          - airflow/config_templates/config.yml.schema.json
-        language: python
-        pass_filenames: true
-        files: ^airflow/config_templates/config\.yml$
-        require_serial: true
-        additional_dependencies: ['jsonschema>=3.2.0,<5.0', 'PyYAML==5.3.1', 'requests==2.25.0']
       - id: check-persist-credentials-disabled-in-github-workflows
-        name: Check that workflow files have persist-credentials disabled
-        entry: ./scripts/ci/pre_commit/pre_commit_checkout_no_credentials.py
+        name: Check persistent creds in workflow files
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        description: Check that workflow files have persist-credentials disabled
+        entry: ./scripts/ci/prek/checkout_no_credentials.py
         language: python
         pass_filenames: true
         files: ^\.github/workflows/.*\.yml$
-        exclude: ^\.github/workflows/sync_authors\.yml$
-        additional_dependencies: ['PyYAML', 'rich>=12.4.4']
       - id: check-docstring-param-types
         name: Check that docstrings do not specify param types
-        entry: ./scripts/ci/pre_commit/pre_commit_docstring_param_type.py
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/docstring_param_type.py
         language: python
         pass_filenames: true
         files: \.py$
-        exclude: ^airflow/_vendor/
-        additional_dependencies: ['rich>=12.4.4']
-      - id: lint-chart-schema
-        name: Lint chart/values.schema.json file
-        entry: ./scripts/ci/pre_commit/pre_commit_chart_schema.py
-        language: python
-        pass_filenames: false
-        files: ^chart/values\.schema\.json$
-        require_serial: true
+      - id: check-zip-file-is-not-committed
+        name: Check no zip files are committed
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        description: Zip files are not allowed in the repository
+        language: fail
+        entry: |
+          Zip files are not allowed in the repository as they are hard to
+          track and have security implications. Please remove the zip file from the repository.
+        files: \.zip$
       - id: update-inlined-dockerfile-scripts
         name: Inline Dockerfile and Dockerfile.ci scripts
-        entry: ./scripts/ci/pre_commit/pre_commit_inline_scripts_in_docker.py
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/inline_scripts_in_docker.py
         language: python
         pass_filenames: false
-        files: ^Dockerfile$|^Dockerfile.ci$|^scripts/docker/.*$
+        files: ^Dockerfile$|^Dockerfile\.ci$|^scripts/docker/.*$
+        require_serial: true
+      - id: update-docker-gpg-keys
+        name: Update Docker build GPG keys (manual)
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/update_docker_gpg_keys.py
+        stages: ['manual']
+        language: python
+        pass_filenames: false
+        files: ^scripts/docker/keys/.*$|^scripts/ci/prek/update_docker_gpg_keys\.py$
         require_serial: true
       - id: check-changelog-has-no-duplicates
         name: Check changelogs for duplicate entries
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
         language: python
-        files: CHANGELOG\.txt$|CHANGELOG\.rst$
-        entry: ./scripts/ci/pre_commit/pre_commit_changelog_duplicates.py
+        files: changelog\.(rst|txt)$
+        entry: ./scripts/ci/prek/changelog_duplicates.py
+        pass_filenames: true
+      - id: check-no-conventional-commit-message
+        name: Check commit message is not Conventional Commits style
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        description: "Reject feat:/fix:/chore: style commit subjects - Airflow uses plain prose"
+        language: python
+        entry: ./scripts/ci/prek/check_no_conventional_commit_message.py
+        stages: [commit-msg]
+        always_run: true
+        pass_filenames: true
+      - id: check-changelog-format
+        name: Check changelog format
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        language: python
+        files: changelog\.(rst|txt)$
+        entry: ./scripts/ci/prek/check_changelog_format.py
         pass_filenames: true
       - id: check-newsfragments-are-valid
         name: Check newsfragments are valid
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
         language: python
-        files: newsfragments/.*\.rst
-        entry: ./scripts/ci/pre_commit/pre_commit_newsfragments.py
+        files: newsfragments/.*\.rst$
+        entry: ./scripts/ci/prek/newsfragments.py
         pass_filenames: true
         # We sometimes won't have newsfragments in the repo, so always run it so `check-hooks-apply` passes
         # This is fast, so not too much downside
         always_run: true
       - id: update-breeze-cmd-output
-        name: Update output of breeze commands in BREEZE.rst
-        entry: ./scripts/ci/pre_commit/pre_commit_breeze_cmd_line.py
+        name: Update breeze docs
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        description: Update output of breeze commands in Breeze documentation
+        entry: ./scripts/ci/prek/breeze_cmd_line.py
         language: python
-        files: ^BREEZE\.rst$|^dev/breeze/.*$|^\.pre-commit-config\.yaml$
+        files: >
+          (?x)
+          ^dev/breeze/.*$|
+          ^\.pre-commit-config\.yaml$|
+          ^scripts/ci/prek/breeze_cmd_line\.py$$
         require_serial: true
         pass_filenames: false
-        additional_dependencies: ['rich>=12.4.4', 'rich-click>=1.5', 'inputimeout']
       - id: check-example-dags-urls
         name: Check that example dags url include provider versions
-        entry: ./scripts/ci/pre_commit/pre_commit_update_example_dags_paths.py
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/update_example_dags_paths.py
         language: python
         pass_filenames: true
-        files: ^docs/.*index\.rst$|^docs/.*example-dags\.rst$
-        additional_dependencies: ['rich>=12.4.4', 'pyyaml']
+        files:
+          (?x)
+          ^airflow-core/docs/.*example-dags\.rst$|
+          ^airflow-core/docs/.*index\.rst$|
+          ^docs/.*index\.rst$
         always_run: true
-      - id: check-system-tests-tocs
-        name: Check that system tests is properly added
-        entry: ./scripts/ci/pre_commit/pre_commit_check_system_tests_hidden_in_index.py
-        language: python
-        pass_filenames: true
-        files: ^docs/apache-airflow-providers-[^/]*/index\.rst$
-        additional_dependencies: ['rich>=12.4.4', 'pyyaml']
       - id: check-lazy-logging
         name: Check that all logging methods are lazy
-        entry: ./scripts/ci/pre_commit/pre_commit_check_lazy_logging.py
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        priority: 1000
+        entry: ./scripts/ci/prek/check_lazy_logging.py
         language: python
         pass_filenames: true
         files: \.py$
-        exclude: ^airflow/_vendor/
-        additional_dependencies: ['rich>=12.4.4', 'astor']
-      - id: create-missing-init-py-files-tests
-        name: Create missing init.py files in tests
-        entry: ./scripts/ci/pre_commit/pre_commit_check_init_in_tests.py
+      - id: check-xcom-model-columns
+        name: Check XComModel columns are read through xcom_entity, not directly in SQLAlchemy queries
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        priority: 1000
+        entry: ./scripts/ci/prek/check_xcom_model_columns.py
         language: python
-        additional_dependencies: ['rich>=12.4.4']
+        pass_filenames: true
+        files: ^(airflow-core|providers/.*)/src/airflow/.*\.py$
+        exclude: ^airflow-core/src/airflow/(models/xcom\.py|api_fastapi/common/parameters/xcom\.py)$
+      - id: check-no-new-airflow-exceptions
+        name: Check that no new raise AirflowException usages are added
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/check_new_airflow_exception_usage.py
+        language: python
+        pass_filenames: true
+        files: ^(airflow-core|airflow-ctl|task-sdk|providers|shared)/.*\.py$
+      - id: check-no-new-provide-session-positional
+        name: Check that no new @provide_session functions declare `session` positionally
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/check_provide_session_kwargs.py
+        language: python
+        pass_filenames: true
+        files: ^(airflow-core|providers)/.*\.py$|^scripts/ci/prek/known_provide_session_positional\.txt$|^scripts/ci/prek/check_provide_session_kwargs\.py$
+      - id: check-no-new-airflow-core-utils-modules
+        name: Check that no new modules are added under airflow-core/src/airflow/utils
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/check_no_new_airflow_core_utils_modules.py
+        language: python
         pass_filenames: false
-        files: ^tests/.*\.py$
-      - id: ts-compile-and-lint-javascript
-        name: TS types generation and ESLint against current UI files
-        language: node
-        'types_or': [javascript, tsx, ts, yaml]
-        files: ^airflow/www/static/js/|^airflow/api_connexion/openapi/v1.yaml
-        entry: ./scripts/ci/pre_commit/pre_commit_www_lint.py
-        additional_dependencies: ['yarn@1.22.19']
+        files: ^airflow-core/src/airflow/utils/[^/]+$|^scripts/ci/prek/known_airflow_core_utils_modules\.txt$|^scripts/ci/prek/check_no_new_airflow_core_utils_modules\.py$
+      - id: check-mapped-column-nullable-annotations
+        name: Check that nullable mapped_column attributes are annotated Mapped[X | None]
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/check_mapped_column_nullable_annotations.py
+        language: python
+        pass_filenames: true
+        files: >
+          (?x)
+          ^airflow-core/src/airflow/(models|jobs)/.*\.py$|
+          ^providers/edge3/src/airflow/providers/edge3/models/.*\.py$|
+          ^providers/fab/src/airflow/providers/fab/auth_manager/models/.*\.py$|
+          ^scripts/ci/prek/check_mapped_column_nullable_annotations\.py$
+      - id: bandit
+        name: bandit
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        priority: 1000
+        description: "Bandit is a tool for finding common security issues in Python code"
+        entry: bandit
+        language: python
+        language_version: python3
+        types: [python]
+        additional_dependencies: ['bandit==1.7.6']
+        require_serial: true
+        files: ^airflow-core/src/airflow/.*  # TODO Expand this to more than just airflow-core
+        exclude:
+          airflow/example_dags/.*
+        args:
+          - "--skip"
+          - "B101,B301,B324,B403,B404,B603"
+          - "--severity-level"
+          - "high"  # TODO: remove this line when we fix all the issues
+      - id: check-k8s-schemas-published
+        name: Check K8s schemas are published on airflow.apache.org
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/check_k8s_schemas_published.py
+        language: python
         pass_filenames: false
-        ## ADD MOST PRE-COMMITS ABOVE THAT LINE
-        # The below pre-commits are those requiring CI image to be built
-      - id: run-mypy
-        name: Run mypy for dev
-        language: python
-        entry: ./scripts/ci/pre_commit/pre_commit_mypy.py
-        files: ^dev/.*\.py$
+        files: ^dev/breeze/src/airflow_breeze/global_constants\.py$
         require_serial: true
-        additional_dependencies: ['rich>=12.4.4', 'inputimeout']
-      - id: run-mypy
-        name: Run mypy for core
-        language: python
-        entry: ./scripts/ci/pre_commit/pre_commit_mypy.py --namespace-packages
-        files: \.py$
-        exclude: ^provider_packages|^docs|^airflow/_vendor/|^airflow/providers|^airflow/migrations|^dev|^tests/system/providers|^tests/providers
-        require_serial: true
-        additional_dependencies: ['rich>=12.4.4', 'inputimeout']
-      - id: run-mypy
-        name: Run mypy for providers
-        language: python
-        entry: ./scripts/ci/pre_commit/pre_commit_mypy.py --namespace-packages
-        files: ^airflow/providers/.*\.py$|^tests/system/providers/\*.py|^tests/providers/\*.py
-        require_serial: true
-        additional_dependencies: ['rich>=12.4.4', 'inputimeout']
-      - id: run-mypy
-        name: Run mypy for /docs/ folder
-        language: python
-        entry: ./scripts/ci/pre_commit/pre_commit_mypy.py
-        files: ^docs/.*\.py$
-        exclude: ^docs/rtd-deprecation
-        require_serial: true
-        additional_dependencies: ['rich>=12.4.4', 'inputimeout']
-      - id: check-provider-yaml-valid
-        name: Validate provider.yaml files
-        entry: ./scripts/ci/pre_commit/pre_commit_check_provider_yaml_files.py
-        language: python
-        files: ^airflow/providers/.*/provider.yaml$
-        additional_dependencies: ['rich>=12.4.4', 'inputimeout', 'markdown-it-py']
-        require_serial: true
-      - id: update-migration-references
-        name: Update migration ref doc
-        language: python
-        entry: ./scripts/ci/pre_commit/pre_commit_migration_reference.py
+        # This is a fast regular hook that runs when any pyproject.toml changes.
+        # It runs `uv lock --check`, so the lock is verified against pyproject.toml but never
+        # rewritten during a commit. If a pyproject.toml change makes the lock stale, the hook
+        # fails and the contributor must run `uv lock` explicitly and commit the refreshed
+        # uv.lock — which keeps lock updates intentional and reviewable. UV_FROZEN is disabled
+        # because under it `--check` only validates the lock, it does not detect staleness.
+      - id: update-uv-lock
+        name: Update uv.lock
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+          UV_FROZEN: "0"
+        entry: uv lock --check
+        language: system
+        files: >
+          (?x)
+          (^|/)pyproject\.toml$|
+          ^uv\.lock$
         pass_filenames: false
-        files: ^airflow/migrations/versions/.*\.py$|^docs/apache-airflow/migrations-ref\.rst$
-        additional_dependencies: ['rich>=12.4.4', 'inputimeout', 'markdown-it-py']
-      - id: update-er-diagram
-        name: Update ER diagram
+        require_serial: true
+      - id: mypy-devel-common
+        name: Run mypy for devel-common
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
         language: python
-        entry: ./scripts/ci/pre_commit/pre_commit_update_er_diagram.py
+        entry: ./scripts/ci/prek/run_mypy_full_dist_local_venv_or_breeze_in_ci.py devel-common
         pass_filenames: false
-        files: ^airflow/migrations/versions/.*\.py$|^docs/apache-airflow/migrations-ref\.rst$
-        additional_dependencies: ['rich>=12.4.4']
-        ## ONLY ADD PRE-COMMITS HERE THAT REQUIRE CI IMAGE
+        files: ^.*\.py$
+        require_serial: true
+      - id: check-shared-mypy-hooks
+        name: Every shared/<dist> has a mypy-shared-<dist> prek hook
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        language: python
+        entry: ./scripts/ci/prek/check_shared_mypy_hooks.py
+        pass_filenames: false
+        files: ^shared/.*|^scripts/ci/prek/check_shared_mypy_hooks\.py$
+        require_serial: true
+      - id: check-prek-hooks-pycache-prefix
+        name: Every prek hook writes Python bytecode outside the source tree
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        language: python
+        entry: ./scripts/ci/prek/check_prek_hooks_pycache_prefix.py
+        pass_filenames: false
+        files: (^|/)\.pre-commit-config\.yaml$|^scripts/ci/prek/check_prek_hooks_pycache_prefix\.py$
+      - id: check-prek-parallel-hooks
+        name: Only audited hooks run in parallel in the root prek config
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        language: python
+        entry: ./scripts/ci/prek/check_prek_parallel_hooks.py
+        pass_filenames: false
+        files: ^\.pre-commit-config\.yaml$|^scripts/ci/prek/check_prek_parallel_hooks\.py$
+      - id: check-migration-patterns
+        name: Check migration files for anti-patterns and style (MIG001-MIG004)
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/check_migration_patterns.py
+        language: python
+        pass_filenames: true
+        files: ^airflow-core/src/airflow/migrations/versions/.*\.py$
+        additional_dependencies: [rich>=13.6.0]
+        require_serial: true
+      ## ADD MOST PREK HOOK ABOVE THAT LINE
+      # The below prek hooks are those requiring CI image to be built
+      ## ONLY ADD PREK HOOKS HERE THAT REQUIRE CI IMAGE
+      - id: check-execution-api-versions
+        name: Check execution API datamodel changes have corresponding version updates
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/check_execution_api_versions.py
+        language: python
+        pass_filenames: true
+        files: ^airflow-core/src/airflow/api_fastapi/execution_api/(datamodels|versions)/.*\.py$
+        require_serial: true
+      - id: generate-supervisor-schemas-snapshot
+        name: Regenerate supervisor schema snapshot
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/generate_supervisor_schemas_snapshot.py
+        language: python
+        pass_filenames: false
+        files: ^(task-sdk/src/airflow/sdk/execution_time/(comms\.py|schema/.*\.py)|airflow-core/src/airflow/dag_processing/processor\.py)$
+        require_serial: true
+      - id: check-supervisor-schemas-versions
+        name: Check supervisor schema changes have corresponding version updates
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/check_supervisor_schemas_versions.py
+        language: python
+        pass_filenames: true
+        files: ^(task-sdk/src/airflow/sdk/execution_time/(comms\.py|schema/.*\.py)|airflow-core/src/airflow/dag_processing/processor\.py)$
+        require_serial: true
+      - id: generate-yaml-importer-schema-snapshot
+        name: Regenerate YAML DAG importer schema snapshot
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: uv run -p 3.12 --frozen --no-progress --project task-sdk -s scripts/ci/prek/generate_yaml_importer_schema.py
+        language: python
+        pass_filenames: false
+        files: ^task-sdk/src/airflow/sdk/importers/yaml_importer/(models|parser|versions/.*)\.py$
+        require_serial: true
+      - id: check-yaml-importer-schema-versions
+        name: Check YAML DAG importer schema changes have corresponding version updates
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        entry: ./scripts/ci/prek/check_yaml_importer_schema_versions.py
+        language: python
+        pass_filenames: true
+        files: ^task-sdk/src/airflow/sdk/importers/yaml_importer/(models\.py|schema\.json|versions/.*\.py)$
+        require_serial: true
+      - id: generate-tasksdk-datamodels
+        name: Generate Datamodels for TaskSDK client
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        language: python
+        entry: uv run -p 3.12 --no-progress --active --group codegen --package apache-airflow-task-sdk --directory task-sdk -s dev/generate_task_sdk_models.py
+        pass_filenames: false
+        files: ^airflow-core/src/airflow/api_fastapi/execution_api/.*\.py$
+        require_serial: true
+      - id: generate-airflowctl-datamodels
+        name: Generate Datamodels for AirflowCTL
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        language: python
+        entry: >
+          bash -c '
+          uv run -p 3.12 --no-dev --no-progress --active --group codegen --package apache-airflow-ctl --directory airflow-ctl/ datamodel-codegen &&
+           uv run -p 3.12 --no-dev --no-progress --active --group codegen --package apache-airflow-ctl --directory airflow-ctl/ datamodel-codegen --input="../airflow-core/src/airflow/api_fastapi/auth/managers/simple/openapi/v2-simple-auth-manager-generated.yaml" --output="src/airflowctl/api/datamodels/auth_generated.py"'
+        pass_filenames: false
+        files:
+          (?x)
+          ^airflow-core/src/airflow/api_fastapi/core_api/datamodels/.*\.py$|
+          ^airflow-core/src/airflow/api_fastapi/auth/managers/simple/(datamodels|routes|services|openapi)/.*\.py$
+        require_serial: true
+      - id: check-contextmanager-class-decorators
+        name: Check for problematic context manager class decorators
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        priority: 1000
+        entry: ./scripts/ci/prek/check_contextmanager_class_decorators.py
+        language: python
+        files: .*test.*\.py$
+        pass_filenames: true
+      - id: ktlint
+        name: Run ktlint format
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        description: "Use ktlint (via Gradle) to format Kotlin and Java files"
+        entry: ./java-sdk/gradlew -p ./java-sdk ktlintFormat
+        language: system
+        pass_filenames: false
+        files: ^java-sdk/.*$
+      - id: spotless
+        name: Run spotless apply
+        env:
+          PYTHONPYCACHEPREFIX: .build/pycache
+        description: "Use spotless (via Gradle) to format Java files"
+        entry: ./java-sdk/gradlew -p ./java-sdk spotlessApply
+        language: system
+        pass_filenames: false
+        files: ^java-sdk/.*\.java$

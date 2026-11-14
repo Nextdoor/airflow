@@ -1,0 +1,1362 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+import logging
+import os
+from datetime import datetime, timedelta
+from pathlib import Path
+from unittest import mock
+from unittest.mock import MagicMock, patch
+from uuid import UUID, uuid4
+
+import pytest
+import time_machine
+from sqlalchemy import delete, event, select
+
+from airflow.executors.workloads import BundleInfo, ExecuteTask
+from airflow.jobs.job import Job
+from airflow.jobs.scheduler_job_runner import SchedulerJobRunner
+from airflow.models.taskinstance import TaskInstance
+from airflow.providers.common.compat.sdk import Stats, TaskInstanceKey, conf, timezone
+from airflow.providers.edge3.executors.edge_executor import EdgeExecutor
+from airflow.providers.edge3.models.edge_job import EdgeJobModel
+from airflow.providers.edge3.models.edge_logs import EdgeLogsModel
+from airflow.providers.edge3.models.edge_worker import EdgeWorkerModel, EdgeWorkerState
+from airflow.providers.edge3.models.types import EXECUTE_CALLBACK_TAG
+from airflow.providers.edge3.worker_api.routes.jobs import state as set_job_state
+from airflow.utils.session import create_session
+from airflow.utils.state import TaskInstanceState
+
+from tests_common.test_utils.asserts import assert_queries_count
+from tests_common.test_utils.compat import EmptyOperator
+from tests_common.test_utils.config import conf_vars
+from tests_common.test_utils.version_compat import AIRFLOW_V_3_2_PLUS, AIRFLOW_V_3_3_PLUS
+
+if AIRFLOW_V_3_3_PLUS:
+    from airflow.executors.workloads import CallbackFetchMethod, ExecuteCallback, TaskInstanceDTO
+    from airflow.executors.workloads.callback import CallbackDTO
+    from airflow.utils.state import CallbackState
+
+pytestmark = pytest.mark.db_test
+
+# Patch the ExecutorLoader class object bound at import time by the module that calls init_executors()
+# (Job before Airflow 3.2, SchedulerJobRunner since), not the one currently in
+# airflow.executors.executor_loader: tests in other providers (e.g. cncf.kubernetes, celery) reload() that
+# module, which replaces the class there, so a patch via the module path never reaches the scheduler.
+SCHEDULER_EXECUTOR_LOADER = (
+    "airflow.jobs.scheduler_job_runner.ExecutorLoader"
+    if AIRFLOW_V_3_2_PLUS
+    else "airflow.jobs.job.ExecutorLoader"
+)
+
+
+@pytest.mark.parametrize(
+    "uuid_executor",
+    [
+        False,
+        pytest.param(
+            True,
+            marks=pytest.mark.skipif(
+                not hasattr(EdgeExecutor, "get_task_key"),
+                reason="UUID executor contract requires a supporting Airflow version",
+            ),
+        ),
+    ],
+)
+def test_tracking_projects_keys_and_only_needed_commands(session, monkeypatch, uuid_executor):
+    monkeypatch.setattr(EdgeExecutor, "supports_task_instance_uuid", uuid_executor)
+    executor = EdgeExecutor()
+    executor.team_name = "projection"
+    legacy_command = '{"ti":{"id":"00000000-0000-0000-0000-000000000002"}}'
+    callback_id = str(UUID(int=3))
+    rows = [
+        EdgeJobModel(
+            dag_id=dag_id,
+            task_id=task_id,
+            run_id=run_id,
+            try_number=try_number,
+            map_index=-1,
+            task_instance_id=task_instance_id,
+            command=command,
+            state=state,
+            team_name=team,
+            queue="default",
+            concurrency_slots=1,
+        )
+        for dag_id, task_id, run_id, try_number, task_instance_id, command, state, team in [
+            ("dag", "uuid", "run", 1, str(UUID(int=1)), "invalid", TaskInstanceState.QUEUED, "projection"),
+            ("dag", "legacy", "run", 1, "", legacy_command, TaskInstanceState.QUEUED, "projection"),
+            (
+                EXECUTE_CALLBACK_TAG,
+                callback_id,
+                f"{EXECUTE_CALLBACK_TAG}-{callback_id}",
+                0,
+                "",
+                "invalid",
+                TaskInstanceState.QUEUED,
+                "projection",
+            ),
+            (
+                EXECUTE_CALLBACK_TAG,
+                "task",
+                "run",
+                1,
+                str(UUID(int=4)),
+                "invalid",
+                TaskInstanceState.QUEUED,
+                "projection",
+            ),
+            ("dag", "other_team", "run", 1, str(UUID(int=5)), "invalid", TaskInstanceState.QUEUED, "other"),
+            (
+                "dag",
+                "finished",
+                "run",
+                1,
+                str(UUID(int=6)),
+                "invalid",
+                TaskInstanceState.SUCCESS,
+                "projection",
+            ),
+        ]
+    ]
+    session.add_all(rows)
+    session.flush()
+    expected = {executor._job_key(job) for job in rows[:4]}
+    statements = []
+
+    def capture(execution):
+        statements.append(execution.statement)
+
+    event.listen(session, "do_orm_execute", capture)
+    try:
+        with assert_queries_count(1, session=session):
+            assert executor._get_tracked_job_keys(session, (TaskInstanceState.QUEUED,)) == expected
+    finally:
+        event.remove(session, "do_orm_execute", capture)
+
+    assert len(statements) == 1
+    fetched = session.connection().execute(statements[0]).all()
+    assert {job.task_id: job.command for job in fetched} == {
+        "uuid": None,
+        "legacy": legacy_command if uuid_executor else None,
+        callback_id: "invalid" if uuid_executor else None,
+        "task": None,
+    }
+
+
+class TestEdgeExecutor:
+    @pytest.fixture(autouse=True)
+    def setup_test_cases(self, monkeypatch):
+        monkeypatch.setattr(EdgeExecutor, "supports_task_instance_uuid", False)
+        with create_session() as session:
+            session.execute(delete(EdgeJobModel))
+
+    def get_test_executor(self, pool_slots=1):
+        key = TaskInstanceKey(
+            dag_id="test_dag", run_id="test_run", task_id="test_task", map_index=-1, try_number=1
+        )
+        ti = MagicMock()
+        ti.pool_slots = pool_slots
+        ti.dag_run.dag_id = key.dag_id
+        ti.dag_run.run_id = key.run_id
+        ti.dag_run.start_date = datetime(2021, 1, 1)
+        executor = EdgeExecutor()
+        executor.queued_tasks[key] = [None, None, None, ti]
+
+        return (executor, key)
+
+    @pytest.mark.parametrize(
+        ("executor_kwargs", "job_team_name", "expected_tags"),
+        [
+            ({}, None, {}),
+            pytest.param(
+                {"team_name": "team_a"},
+                "team_a",
+                {"team_name": "team_a"},
+                marks=pytest.mark.skipif(
+                    not AIRFLOW_V_3_2_PLUS, reason="team_name is only available in Airflow 3.2+"
+                ),
+            ),
+        ],
+    )
+    @patch(f"{Stats.__module__}.Stats.incr")
+    def test_sync_orphaned_tasks(self, mock_stats_incr, executor_kwargs, job_team_name, expected_tags):
+        executor = EdgeExecutor(**executor_kwargs)
+
+        delta_to_purge = timedelta(minutes=conf.getint("edge", "job_fail_purge") + 1)
+        delta_to_orphaned_config_name = "task_instance_heartbeat_timeout"
+
+        delta_to_orphaned = timedelta(seconds=conf.getint("scheduler", delta_to_orphaned_config_name) + 1)
+
+        with create_session() as session:
+            for task_id, state, last_update in [
+                (
+                    "started_running_orphaned",
+                    TaskInstanceState.RUNNING,
+                    timezone.utcnow() - delta_to_orphaned,
+                ),
+                ("started_removed", TaskInstanceState.REMOVED, timezone.utcnow() - delta_to_purge),
+            ]:
+                session.add(
+                    EdgeJobModel(
+                        dag_id="test_dag",
+                        task_id=task_id,
+                        run_id="test_run",
+                        map_index=-1,
+                        try_number=1,
+                        state=state,
+                        queue="default",
+                        command="mock",
+                        concurrency_slots=1,
+                        last_update=last_update,
+                        team_name=job_team_name,
+                    )
+                )
+                session.commit()
+
+        expected_tags = {
+            "dag_id": "test_dag",
+            "queue": "default",
+            "state": "failed",
+            "task_id": "started_running_orphaned",
+            **expected_tags,
+        }
+        executor.sync()
+
+        mock_stats_incr.assert_called_with(
+            "edge_worker.ti.finish",
+            tags=expected_tags,
+        )
+        assert mock_stats_incr.call_count == 1
+
+        with create_session() as session:
+            jobs = session.scalars(select(EdgeJobModel)).all()
+            assert len(jobs) == 1
+            assert jobs[0].task_id == "started_running_orphaned"
+            assert jobs[0].state == TaskInstanceState.REMOVED
+
+    @pytest.mark.skipif(not AIRFLOW_V_3_2_PLUS, reason="team_name is only available in Airflow 3.2+")
+    @pytest.mark.parametrize(
+        ("team_name", "expected_tags"),
+        [
+            ("team_a", {"team_name": "team_a"}),
+            (None, {}),
+        ],
+    )
+    @patch(f"{Stats.__module__}.Stats.timer")
+    def test_sync_duration_metric_tags_team_name(self, mock_stats_timer, team_name, expected_tags):
+        executor = EdgeExecutor(team_name=team_name)
+
+        with (
+            mock.patch.object(executor, "_update_orphaned_jobs", return_value=False),
+            mock.patch.object(executor, "_purge_jobs", return_value=False),
+            mock.patch.object(executor, "_check_worker_liveness", return_value=False),
+        ):
+            executor.sync(session=MagicMock())
+
+        mock_stats_timer.assert_called_once_with(
+            "edge_executor.sync.duration",
+            tags=expected_tags,
+        )
+
+    @patch("airflow.providers.edge3.executors.edge_executor.EdgeExecutor.running_state")
+    @patch("airflow.providers.edge3.executors.edge_executor.EdgeExecutor.success")
+    @patch("airflow.providers.edge3.executors.edge_executor.EdgeExecutor.fail")
+    def test_sync(self, mock_fail, mock_success, mock_running_state):
+        executor = EdgeExecutor()
+
+        def remove_from_running(key: TaskInstanceKey):
+            executor.running.remove(key)
+
+        mock_success.side_effect = remove_from_running
+        mock_fail.side_effect = remove_from_running
+
+        delta_to_purge = timedelta(minutes=conf.getint("edge", "job_fail_purge") + 1)
+
+        # Prepare some data
+        with create_session() as session:
+            for task_id, state, last_update in [
+                ("started_running", TaskInstanceState.RUNNING, timezone.utcnow()),
+                ("started_success", TaskInstanceState.SUCCESS, timezone.utcnow() - delta_to_purge),
+                ("started_failed", TaskInstanceState.FAILED, timezone.utcnow() - delta_to_purge),
+            ]:
+                session.add(
+                    EdgeJobModel(
+                        dag_id="test_dag",
+                        task_id=task_id,
+                        run_id="test_run",
+                        map_index=-1,
+                        try_number=1,
+                        state=state,
+                        queue="default",
+                        concurrency_slots=1,
+                        command="mock",
+                        last_update=last_update,
+                    )
+                )
+                key = TaskInstanceKey(
+                    dag_id="test_dag", run_id="test_run", task_id=task_id, map_index=-1, try_number=1
+                )
+                executor.running.add(key)
+                session.commit()
+        assert len(executor.running) == 3
+
+        executor.sync()
+
+        with create_session() as session:
+            jobs = session.scalars(select(EdgeJobModel)).all()
+            assert len(session.scalars(select(EdgeJobModel)).all()) == 1
+            assert jobs[0].task_id == "started_running"
+            assert jobs[0].state == TaskInstanceState.RUNNING
+
+        assert len(executor.running) == 1
+        mock_running_state.assert_called_once()
+        mock_success.assert_called_once()
+        mock_fail.assert_called_once()
+
+        # Any test another round with one new run
+        mock_running_state.reset_mock()
+        mock_success.reset_mock()
+        mock_fail.reset_mock()
+
+        with create_session() as session:
+            task_id = "started_running2"
+            state = TaskInstanceState.RUNNING
+            session.add(
+                EdgeJobModel(
+                    dag_id="test_dag",
+                    task_id=task_id,
+                    run_id="test_run",
+                    map_index=-1,
+                    try_number=1,
+                    state=state,
+                    concurrency_slots=1,
+                    queue="default",
+                    command="mock",
+                    last_update=timezone.utcnow(),
+                )
+            )
+            key = TaskInstanceKey(
+                dag_id="test_dag", run_id="test_run", task_id=task_id, map_index=-1, try_number=1
+            )
+            executor.running.add(key)
+            session.commit()
+        assert len(executor.running) == 2
+
+        executor.sync()
+
+        assert len(executor.running) == 2
+        mock_running_state.assert_called_once()  # because we reported already first run, new run calling
+        mock_success.assert_not_called()  # because we reported already, not running anymore
+        mock_fail.assert_not_called()  # because we reported already, not running anymore
+        mock_running_state.reset_mock()
+
+        executor.sync()
+
+        assert len(executor.running) == 2
+        # Now none is called as we called before already
+        mock_running_state.assert_not_called()
+        mock_success.assert_not_called()
+        mock_fail.assert_not_called()
+
+    def test_sync_active_worker(self):
+        executor = EdgeExecutor()
+
+        # Prepare some data
+        with create_session() as session:
+            # Clear existing workers to avoid unique constraint violation
+            session.execute(delete(EdgeWorkerModel))
+            session.commit()
+
+            # Add workers with different states
+            for worker_name, state, last_heartbeat in [
+                (
+                    "inactive_timed_out_worker",
+                    EdgeWorkerState.IDLE,
+                    datetime(2023, 1, 1, 0, 59, 0, tzinfo=timezone.utc),
+                ),
+                ("active_worker", EdgeWorkerState.IDLE, datetime(2023, 1, 1, 0, 59, 10, tzinfo=timezone.utc)),
+                (
+                    "offline_worker",
+                    EdgeWorkerState.OFFLINE,
+                    datetime(2023, 1, 1, 0, 59, 10, tzinfo=timezone.utc),
+                ),
+                (
+                    "offline_maintenance_worker",
+                    EdgeWorkerState.OFFLINE_MAINTENANCE,
+                    datetime(2023, 1, 1, 0, 59, 10, tzinfo=timezone.utc),
+                ),
+            ]:
+                ewm = EdgeWorkerModel(
+                    worker_name=worker_name,
+                    state=state,
+                    last_update=last_heartbeat,
+                    queues="",
+                    first_online=timezone.utcnow(),
+                )
+                ewm.sysinfo = {"status": logging.INFO, "status_text": "I am good, sun is shining 🌞"}
+                session.add(ewm)
+                session.commit()
+
+        with time_machine.travel(datetime(2023, 1, 1, 1, 0, 0, tzinfo=timezone.utc), tick=False):
+            with conf_vars({("edge", "heartbeat_interval"): "10"}):
+                executor.sync()
+
+        with create_session() as session:
+            for worker in session.scalars(select(EdgeWorkerModel)).all():
+                print(worker.worker_name)
+                if "maintenance_" in worker.worker_name:
+                    assert worker.state == EdgeWorkerState.OFFLINE_MAINTENANCE
+                elif "offline_" in worker.worker_name:
+                    assert worker.state == EdgeWorkerState.OFFLINE
+                elif "inactive_" in worker.worker_name:
+                    assert worker.state == EdgeWorkerState.UNKNOWN
+                    assert worker.sysinfo
+                    assert worker.sysinfo["status"] == logging.NOTSET
+                    assert "status_text" not in worker.sysinfo
+                else:
+                    assert worker.state == EdgeWorkerState.IDLE
+                    assert worker.sysinfo
+                    assert worker.sysinfo["status"] == logging.INFO
+                    assert "status_text" in worker.sysinfo
+
+    def test_revoke_task(self):
+        """Test that revoke_task removes task from executor and database."""
+        executor = EdgeExecutor()
+        key = TaskInstanceKey(
+            dag_id="test_dag", run_id="test_run", task_id="test_task", map_index=-1, try_number=1
+        )
+
+        # Create a mock task instance
+        ti = MagicMock()
+        ti.key = key
+        ti.dag_id = "test_dag"
+        ti.task_id = "test_task"
+        ti.run_id = "test_run"
+        ti.map_index = -1
+        ti.try_number = 1
+
+        # Add task to executor's internal state
+        executor.running.add(key)
+        executor.queued_tasks[key] = [None, None, None, ti]
+        executor.last_reported_state[key] = TaskInstanceState.QUEUED
+
+        # Add corresponding job to database
+        with create_session() as session:
+            session.add(
+                EdgeJobModel(
+                    dag_id="test_dag",
+                    task_id="test_task",
+                    run_id="test_run",
+                    map_index=-1,
+                    try_number=1,
+                    state=TaskInstanceState.QUEUED,
+                    queue="default",
+                    command="mock",
+                    concurrency_slots=1,
+                )
+            )
+            session.commit()
+
+        # Verify job exists before revoke
+        with create_session() as session:
+            jobs = session.scalars(select(EdgeJobModel)).all()
+            assert len(jobs) == 1
+
+        # Revoke the task
+        executor.revoke_task(ti=ti)
+
+        # Verify task is removed from executor's internal state
+        assert key not in executor.running
+        assert key not in executor.queued_tasks
+        assert key not in executor.last_reported_state
+
+        # Verify job is removed from database
+        with create_session() as session:
+            jobs = session.scalars(select(EdgeJobModel)).all()
+            assert len(jobs) == 0
+
+    def test_revoke_task_nonexistent(self):
+        """Test that revoke_task handles non-existent tasks gracefully."""
+        executor = EdgeExecutor()
+        key = TaskInstanceKey(
+            dag_id="nonexistent_dag",
+            run_id="nonexistent_run",
+            task_id="nonexistent_task",
+            map_index=-1,
+            try_number=1,
+        )
+
+        # Create a mock task instance
+        ti = MagicMock()
+        ti.key = key
+        ti.dag_id = "nonexistent_dag"
+        ti.task_id = "nonexistent_task"
+        ti.run_id = "nonexistent_run"
+        ti.map_index = -1
+        ti.try_number = 1
+
+        # Revoke a task that doesn't exist (should not raise error)
+        executor.revoke_task(ti=ti)
+
+        # Verify nothing breaks
+        assert key not in executor.running
+        assert key not in executor.queued_tasks
+
+    def test_try_adopt_task_instances_keeps_caller_session_open(self):
+        key = TaskInstanceKey(
+            dag_id="test_dag", run_id="test_run", task_id="test_task", map_index=-1, try_number=1
+        )
+        with create_session() as session:
+            session.add(
+                EdgeJobModel(
+                    dag_id="test_dag",
+                    task_id="test_task",
+                    run_id="test_run",
+                    map_index=-1,
+                    try_number=1,
+                    state=TaskInstanceState.QUEUED,
+                    queue="default",
+                    command="mock",
+                    concurrency_slots=1,
+                )
+            )
+            session.commit()
+        executor = EdgeExecutor()
+
+        # The scheduler calls try_adopt_task_instances() without a session and keeps using the objects
+        # it loaded into its own scoped session.
+        with create_session() as session:
+            job = session.scalar(select(EdgeJobModel))
+            executor.try_adopt_task_instances([mock.Mock(spec=TaskInstance, key=key)])
+
+            assert job in session
+        assert executor.running == {key}
+
+    @mock.patch(f"{SCHEDULER_EXECUTOR_LOADER}.init_executors", autospec=True)
+    def test_scheduler_restart_adopts_queued_edge_task(self, mock_init_executors, dag_maker, session):
+        with dag_maker("test_dag", session=session):
+            EmptyOperator(task_id="test_task")
+        dag_run = dag_maker.create_dagrun()
+        previous_scheduler_job = Job()
+        restarted_scheduler_job = Job()
+        session.add_all([previous_scheduler_job, restarted_scheduler_job])
+        session.flush()
+        ti = dag_run.get_task_instance("test_task", session=session)
+        ti.state = TaskInstanceState.QUEUED
+        ti.queued_by_job_id = previous_scheduler_job.id
+        session.add(
+            EdgeJobModel(
+                dag_id=ti.dag_id,
+                task_id=ti.task_id,
+                run_id=ti.run_id,
+                map_index=ti.map_index,
+                try_number=ti.try_number,
+                state=TaskInstanceState.QUEUED,
+                queue="default",
+                command="mock",
+                concurrency_slots=1,
+            )
+        )
+        session.commit()
+        # A restarted scheduler loads the task instance from the database, not from this session.
+        session.expunge_all()
+        executor = EdgeExecutor()
+        mock_init_executors.return_value = [executor]
+
+        SchedulerJobRunner(job=restarted_scheduler_job, num_runs=0).adopt_or_reset_orphaned_tasks()
+
+        ti.refresh_from_db(session=session)
+        assert ti.state == TaskInstanceState.QUEUED
+        assert ti.queued_by_job_id == restarted_scheduler_job.id
+        assert executor.running == {ti.key}
+
+
+class TestEdgeExecutorMultiTeam:
+    """Tests for multi-team (AIP-67) support in EdgeExecutor."""
+
+    @pytest.fixture(autouse=True)
+    def setup_test_cases(self, monkeypatch):
+        monkeypatch.setattr(EdgeExecutor, "supports_task_instance_uuid", False)
+        with create_session() as session:
+            session.execute(delete(EdgeJobModel))
+            session.execute(delete(EdgeWorkerModel))
+            session.commit()
+
+    def test_global_executor_without_team_name(self):
+        """Test that global executor (no team) works correctly."""
+        executor = EdgeExecutor()
+
+        assert hasattr(executor, "conf")
+        assert executor.team_name is None
+        if AIRFLOW_V_3_2_PLUS:
+            assert executor.conf.team_name is None
+
+    @pytest.mark.skipif(not AIRFLOW_V_3_2_PLUS, reason="The tests should be skipped for Airflow < 3.2")
+    def test_executor_with_team_name(self):
+        """Test that executor with team_name has correct conf setup."""
+        team_name = "test_team"
+        executor = EdgeExecutor(team_name=team_name)
+
+        assert hasattr(executor, "conf")
+        assert executor.team_name == team_name
+        assert executor.conf.team_name == team_name
+
+    @pytest.mark.skipif(not AIRFLOW_V_3_2_PLUS, reason="The tests should be skipped for Airflow < 3.2")
+    def test_multiple_team_executors_isolation(self):
+        """Test that multiple team executors can coexist with isolated resources."""
+        team_a_executor = EdgeExecutor(parallelism=2, team_name="team_a")
+        team_b_executor = EdgeExecutor(parallelism=3, team_name="team_b")
+
+        assert team_a_executor.running is not team_b_executor.running
+        assert team_a_executor.queued_tasks is not team_b_executor.queued_tasks
+        assert team_a_executor.last_reported_state is not team_b_executor.last_reported_state
+
+        if AIRFLOW_V_3_2_PLUS:
+            assert team_a_executor.conf.team_name == "team_a"
+            assert team_b_executor.conf.team_name == "team_b"
+
+        assert team_a_executor.parallelism == 2
+        assert team_b_executor.parallelism == 3
+
+    @pytest.mark.skipif(not AIRFLOW_V_3_2_PLUS, reason="The tests should be skipped for Airflow < 3.2")
+    def test_team_config_used_in_check_worker_liveness(self):
+        """Test that _check_worker_liveness reads config from self.conf, not global conf."""
+        team_name = "test_team"
+        executor = EdgeExecutor(team_name=team_name)
+
+        team_env_key_prefix = f"AIRFLOW__{team_name.upper()}___EDGE__"
+        test_key_values = [
+            "heartbeat_interval",
+            "task_instance_heartbeat_timeout",
+            "job_success_purge",
+            "job_fail_purge",
+        ]
+        for test_key_value in test_key_values:
+            with mock.patch.dict(os.environ, {f"{team_env_key_prefix}{test_key_value.upper()}": "100"}):
+                value = executor.conf.getint("edge", test_key_value)
+                assert value == 100
+
+    @pytest.mark.skipif(not AIRFLOW_V_3_2_PLUS, reason="The tests should be skipped for Airflow < 3.2")
+    def test_purge_jobs_filters_by_team_name(self):
+        """Test that _purge_jobs only purges jobs belonging to its team."""
+        executor_a = EdgeExecutor(team_name="team_a")
+
+        delta_to_purge = timedelta(minutes=conf.getint("edge", "job_fail_purge") + 1)
+
+        with create_session() as session:
+            for team in ["team_a", "team_b"]:
+                session.add(
+                    EdgeJobModel(
+                        dag_id="test_dag",
+                        task_id=f"task_{team}",
+                        run_id="test_run",
+                        map_index=-1,
+                        try_number=1,
+                        state=TaskInstanceState.FAILED,
+                        queue="default",
+                        command="mock",
+                        concurrency_slots=1,
+                        last_update=timezone.utcnow() - delta_to_purge,
+                        team_name=team,
+                    )
+                )
+            session.commit()
+
+        with create_session() as session:
+            executor_a._purge_jobs(session)
+            session.commit()
+
+        with create_session() as session:
+            remaining_jobs = session.scalars(select(EdgeJobModel)).all()
+            assert len(remaining_jobs) == 1
+            assert remaining_jobs[0].team_name == "team_b"
+
+    @pytest.mark.skipif(not AIRFLOW_V_3_2_PLUS, reason="The tests should be skipped for Airflow < 3.2")
+    def test_update_orphaned_jobs_filters_by_team_name(self):
+        """Test that _update_orphaned_jobs only checks jobs belonging to its team."""
+        executor_a = EdgeExecutor(team_name="team_a")
+
+        heartbeat_timeout = conf.getint("scheduler", "task_instance_heartbeat_timeout")
+        delta_to_orphaned = timedelta(seconds=heartbeat_timeout + 1)
+
+        with create_session() as session:
+            for team in ["team_a", "team_b"]:
+                session.add(
+                    EdgeJobModel(
+                        dag_id="test_dag",
+                        task_id=f"task_{team}",
+                        run_id="test_run",
+                        map_index=-1,
+                        try_number=1,
+                        state=TaskInstanceState.RUNNING,
+                        queue="default",
+                        command="mock",
+                        concurrency_slots=1,
+                        last_update=timezone.utcnow() - delta_to_orphaned,
+                        team_name=team,
+                    )
+                )
+            session.commit()
+
+        with create_session() as session:
+            executor_a._update_orphaned_jobs(session)
+            session.commit()
+
+        with create_session() as session:
+            jobs = session.scalars(select(EdgeJobModel)).all()
+            jobs_by_team = {job.team_name: job for job in jobs}
+            assert jobs_by_team["team_a"].state != TaskInstanceState.RUNNING
+            assert jobs_by_team["team_b"].state == TaskInstanceState.RUNNING
+
+    @pytest.mark.skipif(not AIRFLOW_V_3_2_PLUS, reason="The tests should be skipped for Airflow < 3.2")
+    def test_check_worker_liveness_filters_by_team_name(self):
+        """Test that _check_worker_liveness only resets workers belonging to its team."""
+        executor_a = EdgeExecutor(team_name="team_a")
+
+        with create_session() as session:
+            for worker_name, team in [
+                ("worker_team_a", "team_a"),
+                ("worker_team_b", "team_b"),
+            ]:
+                session.add(
+                    EdgeWorkerModel(
+                        worker_name=worker_name,
+                        state=EdgeWorkerState.IDLE,
+                        last_update=datetime(2023, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
+                        queues=["default"],
+                        first_online=timezone.utcnow(),
+                        team_name=team,
+                    )
+                )
+            session.commit()
+
+        with time_machine.travel(datetime(2023, 1, 1, 1, 0, 0, tzinfo=timezone.utc), tick=False):
+            with conf_vars({("edge", "heartbeat_interval"): "10"}):
+                with (
+                    create_session() as session,
+                    patch(
+                        "airflow.providers.edge3.executors.edge_executor.reset_metrics"
+                    ) as mock_reset_metrics,
+                ):
+                    executor_a._check_worker_liveness(session)
+                    session.commit()
+
+        mock_reset_metrics.assert_called_once_with("worker_team_a", team_name="team_a")
+
+        with create_session() as session:
+            workers = {w.worker_name: w for w in session.scalars(select(EdgeWorkerModel)).all()}
+            assert workers["worker_team_a"].state == EdgeWorkerState.UNKNOWN
+            assert workers["worker_team_b"].state == EdgeWorkerState.IDLE
+
+    @pytest.mark.skipif(not AIRFLOW_V_3_2_PLUS, reason="The tests should be skipped for Airflow < 3.2")
+    def test_no_team_executor_processes_all_jobs(self):
+        """Test that an executor without team_name processes only job has no team_name."""
+        executor = EdgeExecutor()
+
+        delta_to_purge = timedelta(minutes=conf.getint("edge", "job_fail_purge") + 1)
+
+        with create_session() as session:
+            for team in ["team_a", "team_b", None]:
+                session.add(
+                    EdgeJobModel(
+                        dag_id="test_dag",
+                        task_id=f"task_{team}",
+                        run_id="test_run",
+                        map_index=-1,
+                        try_number=1,
+                        state=TaskInstanceState.FAILED,
+                        queue="default",
+                        command="mock",
+                        concurrency_slots=1,
+                        last_update=timezone.utcnow() - delta_to_purge,
+                        team_name=team,
+                    )
+                )
+            session.commit()
+
+        with create_session() as session:
+            executor._purge_jobs(session)
+            session.commit()
+
+        with create_session() as session:
+            remaining_jobs = session.scalars(select(EdgeJobModel)).all()
+            assert len(remaining_jobs) == 2
+
+    def test_purging_all_coordinate_siblings_removes_logs(self):
+        executor = EdgeExecutor()
+        with create_session() as session:
+            session.execute(delete(EdgeLogsModel))
+            for identity in (UUID(int=1), UUID(int=2)):
+                session.add(
+                    EdgeJobModel(
+                        dag_id="dag",
+                        task_id="task",
+                        run_id="run",
+                        map_index=-1,
+                        try_number=1,
+                        task_instance_id=str(identity),
+                        state=TaskInstanceState.SUCCESS,
+                        queue="default",
+                        concurrency_slots=1,
+                        command="mock",
+                        last_update=timezone.utcnow() - timedelta(days=1),
+                    )
+                )
+            session.add(
+                EdgeLogsModel(
+                    dag_id="dag",
+                    task_id="task",
+                    run_id="run",
+                    map_index=-1,
+                    try_number=1,
+                    log_chunk_time=timezone.utcnow(),
+                    log_chunk_data="remove",
+                )
+            )
+            session.flush()
+            assert executor._purge_jobs(session)
+            session.flush()
+            assert session.scalars(select(EdgeJobModel)).all() == []
+            assert session.scalars(select(EdgeLogsModel)).all() == []
+
+
+@pytest.mark.skipif(not AIRFLOW_V_3_3_PLUS, reason="ExecuteTypeBody union requires Airflow 3.3+")
+class _WorkloadFactory:
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        with create_session() as session:
+            session.execute(delete(EdgeJobModel))
+            session.commit()
+
+    def _make_execute_task(
+        self, task_id: str = "test_task", dag_id: str = "test_dag", priority_weight: int = 1
+    ) -> ExecuteTask:
+        ti = TaskInstanceDTO(
+            id=uuid4(),
+            dag_version_id=uuid4(),
+            task_id=task_id,
+            dag_id=dag_id,
+            run_id="test_run",
+            try_number=1,
+            map_index=-1,
+            pool_slots=1,
+            queue="default",
+            priority_weight=priority_weight,
+        )
+        return ExecuteTask(
+            ti=ti,
+            dag_rel_path=Path("test_dag.py"),
+            token="test_token",
+            bundle_info=BundleInfo(name="test_bundle", version="1.0"),
+            log_path="test.log",
+        )
+
+    def _make_execute_callback(self) -> ExecuteCallback:
+        callback = CallbackDTO(
+            id=str(uuid4()),
+            fetch_method=CallbackFetchMethod.IMPORT_PATH,
+            data={"path": "builtins.dict", "kwargs": {"a": 1, "b": 2, "c": 3}},
+        )
+        return ExecuteCallback(
+            callback=callback,
+            dag_rel_path=Path("test.py"),
+            bundle_info=BundleInfo(name="test_bundle", version="1.0"),
+            token="test_token",
+            log_path="test.log",
+        )
+
+
+class TestQueueWorkload(_WorkloadFactory):
+    @pytest.fixture(autouse=True)
+    def legacy_executor(self, monkeypatch):
+        monkeypatch.setattr(EdgeExecutor, "supports_task_instance_uuid", False)
+
+    def test_queue_workload_execute_task(self):
+        executor = EdgeExecutor()
+        workload = self._make_execute_task()
+
+        with create_session() as session:
+            executor.queue_workload(workload, session=session)
+
+        with create_session() as session:
+            job = session.scalar(select(EdgeJobModel))
+            assert job is not None
+            assert job.dag_id == "test_dag"
+            assert job.task_id == "test_task"
+            assert job.run_id == "test_run"
+            assert job.state == TaskInstanceState.QUEUED
+            assert '"type":"ExecuteTask"' in job.command or '"type": "ExecuteTask"' in job.command
+
+    @pytest.mark.parametrize("make_workload", ["_make_execute_task", "_make_execute_callback"])
+    def test_queue_workload_occupies_an_executor_slot(self, make_workload):
+        executor = EdgeExecutor()
+        workload = getattr(self, make_workload)()
+
+        with create_session() as session:
+            executor.queue_workload(workload, session=session)
+            session.commit()
+
+        assert workload.key in executor.running
+        assert executor.slots_available == executor.parallelism - 1
+
+        # The slot stays taken while the job waits in the queue for a worker to pick it up.
+        executor.sync()
+
+        assert workload.key in executor.running
+        assert executor.slots_available == executor.parallelism - 1
+
+    @pytest.mark.parametrize("make_workload", ["_make_execute_task", "_make_execute_callback"])
+    @pytest.mark.parametrize(
+        ("job_state", "reported_state"),
+        [
+            (TaskInstanceState.RUNNING, "running"),
+            (TaskInstanceState.SUCCESS, "success"),
+            (TaskInstanceState.FAILED, "failed"),
+            (TaskInstanceState.UP_FOR_RETRY, "failed"),
+        ],
+    )
+    def test_sync_reports_state_of_queued_workload(self, make_workload, job_state, reported_state):
+        executor = EdgeExecutor()
+        workload = getattr(self, make_workload)()
+
+        with create_session() as session:
+            executor.queue_workload(workload, session=session)
+            session.commit()
+        executor.sync()
+
+        with create_session() as session:
+            session.scalar(select(EdgeJobModel)).state = job_state
+            session.commit()
+
+        executor.sync()
+
+        reported_states = TaskInstanceState if isinstance(workload, ExecuteTask) else CallbackState
+        assert executor.get_event_buffer() == {workload.key: (reported_states(reported_state), None)}
+
+    def test_sync_keeps_slot_while_worker_claims_job(self):
+        executor = EdgeExecutor()
+        workload = self._make_execute_task()
+
+        with create_session() as session:
+            executor.queue_workload(workload, session=session)
+            session.commit()
+
+        # The fetch endpoint parks a claimed job in RESTARTING until the worker reports RUNNING.
+        with create_session() as session:
+            session.scalar(select(EdgeJobModel)).state = TaskInstanceState.RESTARTING
+            session.commit()
+        executor.sync()
+
+        assert executor.get_event_buffer() == {}
+        assert workload.ti.key in executor.running
+        assert executor.slots_available == executor.parallelism - 1
+
+        with create_session() as session:
+            session.scalar(select(EdgeJobModel)).state = TaskInstanceState.RUNNING
+            session.commit()
+        executor.sync()
+
+        assert executor.get_event_buffer() == {workload.ti.key: (TaskInstanceState.RUNNING, None)}
+
+    def test_sync_reports_job_that_finishes_after_being_marked_removed(self):
+        executor = EdgeExecutor()
+        workload = self._make_execute_callback()
+
+        with create_session() as session:
+            executor.queue_workload(workload, session=session)
+            session.commit()
+
+        # When a callback job runs past the heartbeat timeout, _update_orphaned_jobs() marks it REMOVED.
+        for job_state in (TaskInstanceState.REMOVED, TaskInstanceState.SUCCESS):
+            with create_session() as session:
+                session.scalar(select(EdgeJobModel)).state = job_state
+                session.commit()
+            executor.sync()
+
+        assert executor.get_event_buffer() == {workload.key: (CallbackState.SUCCESS, None)}
+
+    @pytest.mark.parametrize(
+        "unhandled_state",
+        [TaskInstanceState.SCHEDULED, TaskInstanceState.DEFERRED, TaskInstanceState.UP_FOR_RESCHEDULE],
+    )
+    def test_sync_frees_slot_of_job_in_state_purge_never_handles(self, unhandled_state):
+        executor = EdgeExecutor()
+        workload = self._make_execute_task()
+
+        with create_session() as session:
+            executor.queue_workload(workload, session=session)
+            session.commit()
+
+        # _update_orphaned_jobs() copies the task instance state into the job, whatever that state is.
+        with create_session() as session:
+            session.scalar(select(EdgeJobModel)).state = unhandled_state
+            session.commit()
+        executor.sync()
+
+        assert workload.key not in executor.running
+        assert executor.slots_available == executor.parallelism
+
+    def test_task_in_dag_named_after_callback_tag_keeps_its_task_key(self):
+        executor = EdgeExecutor()
+        workload = self._make_execute_task(dag_id=EXECUTE_CALLBACK_TAG)
+
+        with create_session() as session:
+            executor.queue_workload(workload, session=session)
+            session.commit()
+        executor.sync()
+
+        assert workload.key in executor.running
+
+        with create_session() as session:
+            session.scalar(select(EdgeJobModel)).state = TaskInstanceState.RUNNING
+            session.commit()
+        executor.sync()
+
+        assert executor.get_event_buffer() == {workload.key: (TaskInstanceState.RUNNING, None)}
+
+    @pytest.mark.parametrize(
+        "finished_state", [TaskInstanceState.SUCCESS, TaskInstanceState.FAILED, TaskInstanceState.REMOVED]
+    )
+    def test_try_adopt_task_instances_restores_slots_from_edge_job(self, finished_state):
+        executor = EdgeExecutor()
+        queued = self._make_execute_task()
+        finished = self._make_execute_task(task_id="finished")
+        with create_session() as session:
+            executor.queue_workload(queued, session=session)
+            executor.queue_workload(finished, session=session)
+            session.commit()
+        with create_session() as session:
+            finished_job = session.scalar(select(EdgeJobModel).where(EdgeJobModel.task_id == "finished"))
+            finished_job.state = finished_state
+            session.commit()
+
+        restarted_executor = EdgeExecutor()
+        queued_ti = mock.Mock(spec=TaskInstance, key=queued.key)
+        finished_ti = mock.Mock(spec=TaskInstance, key=finished.key)
+        orphaned_ti = mock.Mock(
+            spec=TaskInstance,
+            key=TaskInstanceKey(
+                dag_id="test_dag", task_id="orphan", run_id="test_run", try_number=1, map_index=-1
+            ),
+        )
+
+        not_adopted = restarted_executor.try_adopt_task_instances([queued_ti, finished_ti, orphaned_ti])
+
+        assert not_adopted == [finished_ti, orphaned_ti]
+        assert restarted_executor.running == {queued.key}
+        assert restarted_executor.slots_available == restarted_executor.parallelism - 1
+
+    def test_queue_workload_execute_task_existing_job(self):
+        executor = EdgeExecutor()
+        workload = self._make_execute_task()
+
+        with create_session() as session:
+            executor.queue_workload(workload, session=session)
+        with create_session() as session:
+            executor.queue_workload(workload, session=session)
+
+        with create_session() as session:
+            jobs = session.scalars(select(EdgeJobModel)).all()
+            assert len(jobs) == 1
+            assert jobs[0].state == TaskInstanceState.QUEUED
+
+    def test_queue_workload_stores_task_priority_weight(self):
+        executor = EdgeExecutor()
+
+        with create_session() as session:
+            executor.queue_workload(self._make_execute_task(priority_weight=42), session=session)
+        with create_session() as session:
+            assert session.scalar(select(EdgeJobModel)).priority_weight == 42
+
+        with create_session() as session:
+            executor.queue_workload(self._make_execute_task(priority_weight=7), session=session)
+        with create_session() as session:
+            assert session.scalar(select(EdgeJobModel)).priority_weight == 7
+
+    def test_queue_workload_execute_callback(self):
+        executor = EdgeExecutor()
+        workload = self._make_execute_callback()
+
+        with create_session() as session:
+            executor.queue_workload(workload, session=session)
+
+        with create_session() as session:
+            job = session.scalar(select(EdgeJobModel))
+            assert job is not None
+            assert job.dag_id == EXECUTE_CALLBACK_TAG
+            assert job.task_id == workload.callback.id
+            assert job.run_id == f"{EXECUTE_CALLBACK_TAG}-{workload.callback.id}"
+            assert job.state == TaskInstanceState.QUEUED
+            assert '"type":"ExecuteCallback"' in job.command or '"type": "ExecuteCallback"' in job.command
+
+    def test_queue_workload_stores_command_longer_than_2048_chars(self):
+        executor = EdgeExecutor()
+        workload = self._make_execute_callback()
+        workload.callback.data["kwargs"]["context"] = {"dag_run": {"conf": {"payload": "x" * 4096}}}
+
+        with create_session() as session:
+            executor.queue_workload(workload, session=session)
+
+        with create_session() as session:
+            job = session.scalar(select(EdgeJobModel))
+            assert job is not None
+            assert job.command == workload.model_dump_json()
+
+    def test_queue_workload_execute_callback_existing_job(self):
+        executor = EdgeExecutor()
+        workload = self._make_execute_callback()
+
+        with create_session() as session:
+            executor.queue_workload(workload, session=session)
+        with create_session() as session:
+            executor.queue_workload(workload, session=session)
+
+        with create_session() as session:
+            jobs = session.scalars(select(EdgeJobModel)).all()
+            assert len(jobs) == 1
+            assert jobs[0].state == TaskInstanceState.QUEUED
+
+    def test_queue_workload_unknown_type_raises(self):
+        executor = EdgeExecutor()
+        with create_session() as session:
+            with pytest.raises(TypeError, match="Don't know how to queue workload"):
+                executor.queue_workload(MagicMock(spec=[]), session=session)
+
+
+@pytest.mark.skipif(
+    not hasattr(EdgeExecutor, "get_task_key"),
+    reason="UUID executor contract requires a supporting Airflow version",
+)
+class TestUUIDTaskIdentity(_WorkloadFactory):
+    @pytest.fixture(autouse=True)
+    def uuid_executor(self, monkeypatch):
+        monkeypatch.setattr(EdgeExecutor, "supports_task_instance_uuid", True)
+
+    @pytest.mark.parametrize("terminal_state", [TaskInstanceState.SUCCESS, TaskInstanceState.FAILED])
+    @pytest.mark.parametrize("selected", [0, 1])
+    def test_same_coordinate_jobs_report_their_own_uuid(self, terminal_state, selected):
+        first = self._make_execute_task()
+        first.ti.id = UUID(int=1)
+        second = first.model_copy(update={"ti": first.ti.model_copy(update={"id": UUID(int=2)})})
+        target, sibling = (first, second) if selected == 0 else (second, first)
+        executor = EdgeExecutor()
+        target_key, sibling_key = executor.get_task_key(target.ti), executor.get_task_key(sibling.ti)
+        with create_session() as session:
+            executor.queue_workload(first, session=session)
+            executor.queue_workload(second, session=session)
+            session.flush()
+            assert len(session.scalars(select(EdgeJobModel)).all()) == 2
+            assert executor.running == {target_key, sibling_key}
+            set_job_state(
+                dag_id=target.ti.dag_id,
+                task_id=target.ti.task_id,
+                run_id=target.ti.run_id,
+                try_number=1,
+                map_index=-1,
+                state=terminal_state,
+                session=session,
+                task_instance_id=target.ti.id,
+            )
+            session.flush()
+            persisted = {job.task_instance_id: job.state for job in session.scalars(select(EdgeJobModel))}
+            assert persisted == {
+                str(target.ti.id): terminal_state,
+                str(sibling.ti.id): TaskInstanceState.QUEUED,
+            }
+            executor._purge_jobs(session)
+        assert executor.get_event_buffer(dag_ids={target.ti.dag_id}) == {target_key: (terminal_state, None)}
+        assert executor.running == {sibling_key}
+
+    def test_adoption_and_revocation_match_uuid(self):
+        workload = self._make_execute_task()
+        replacement = workload.ti.model_copy(update={"id": uuid4()})
+        executor = EdgeExecutor()
+        with create_session() as session:
+            executor.queue_workload(workload, session=session)
+            session.commit()
+            adopter = EdgeExecutor()
+            assert adopter.try_adopt_task_instances([workload.ti, replacement]) == [replacement]
+            adopter.revoke_task(ti=replacement, session=session)
+            assert session.scalar(select(EdgeJobModel)) is not None
+            adopter.revoke_task(ti=workload.ti, session=session)
+            session.flush()
+            assert session.scalar(select(EdgeJobModel)) is None
+            assert not adopter.running
+
+    def test_legacy_worker_report_cannot_complete_new_uuid_job(self, monkeypatch):
+        first = self._make_execute_task()
+        second = first.model_copy(update={"ti": first.ti.model_copy(update={"id": uuid4()})})
+        executor = EdgeExecutor()
+        with create_session() as session:
+            monkeypatch.setattr(EdgeExecutor, "supports_task_instance_uuid", False)
+            executor.queue_workload(first, session=session)
+            session.commit()
+            monkeypatch.setattr(EdgeExecutor, "supports_task_instance_uuid", True)
+            adopter = EdgeExecutor()
+            assert adopter.try_adopt_task_instances([first.ti]) == []
+            adopter.queue_workload(second, session=session)
+            session.flush()
+            set_job_state(
+                dag_id=first.ti.dag_id,
+                task_id=first.ti.task_id,
+                run_id=first.ti.run_id,
+                try_number=1,
+                map_index=-1,
+                state=TaskInstanceState.SUCCESS,
+                session=session,
+            )
+            session.flush()
+            adopter._purge_jobs(session)
+        assert adopter.get_event_buffer() == {
+            adopter.get_task_key(first.ti): (TaskInstanceState.SUCCESS, None)
+        }
+        assert adopter.running == {adopter.get_task_key(second.ti)}
+
+    def test_resuming_legacy_attempt_reuses_its_job_row(self, monkeypatch):
+        workload = self._make_execute_task()
+        with create_session() as session:
+            monkeypatch.setattr(EdgeExecutor, "supports_task_instance_uuid", False)
+            EdgeExecutor().queue_workload(workload, session=session)
+            session.flush()
+            job = session.scalar(select(EdgeJobModel))
+            job.state = TaskInstanceState.SUCCESS
+            session.flush()
+            monkeypatch.setattr(EdgeExecutor, "supports_task_instance_uuid", True)
+            executor = EdgeExecutor()
+            executor.queue_workload(workload, session=session)
+            session.flush()
+            assert len(session.scalars(select(EdgeJobModel)).all()) == 1
+            assert job.task_instance_id == ""
+            assert job.state == TaskInstanceState.QUEUED
+            executor._purge_jobs(session)
+            assert executor.running == {executor.get_task_key(workload.ti)}
+            assert executor.get_event_buffer() == {}
+
+    @pytest.mark.parametrize("revoke_last", [False, True])
+    def test_purging_retired_job_keeps_logs_while_coordinate_sibling_exists(self, revoke_last):
+        first = self._make_execute_task()
+        second = first.model_copy(update={"ti": first.ti.model_copy(update={"id": uuid4()})})
+        executor = EdgeExecutor()
+        with create_session() as session:
+            session.execute(delete(EdgeLogsModel))
+            executor.queue_workload(first, session=session)
+            executor.queue_workload(second, session=session)
+            session.flush()
+            retired = session.scalar(
+                select(EdgeJobModel).where(EdgeJobModel.task_instance_id == str(first.ti.id))
+            )
+            retired.state = TaskInstanceState.SUCCESS
+            retired.last_update = timezone.utcnow() - timedelta(days=1)
+            session.add(
+                EdgeLogsModel(
+                    dag_id=first.ti.dag_id,
+                    task_id=first.ti.task_id,
+                    run_id=first.ti.run_id,
+                    try_number=1,
+                    map_index=-1,
+                    log_chunk_time=timezone.utcnow(),
+                    log_chunk_data="keep",
+                )
+            )
+            session.flush()
+            executor._purge_jobs(session)
+            session.flush()
+            assert session.scalar(select(EdgeLogsModel)).log_chunk_data == "keep"
+            assert session.scalars(select(EdgeJobModel)).one().task_instance_id == str(second.ti.id)
+            if revoke_last:
+                executor.revoke_task(ti=second.ti, session=session)
+                assert session.scalar(select(EdgeJobModel)) is None
+                assert session.scalar(select(EdgeLogsModel)) is None
+                assert not executor.running
+            else:
+                session.execute(delete(EdgeLogsModel))
+
+    @pytest.mark.parametrize("legacy_job", [False, True])
+    @pytest.mark.parametrize("state", [TaskInstanceState.RUNNING, TaskInstanceState.SUCCESS])
+    def test_orphaned_job_uses_attempt_uuid(
+        self, create_task_instance, session, monkeypatch, legacy_job, state
+    ):
+        ti = create_task_instance(state=state)
+        ti.try_number = 1
+        session.flush()
+        workload = ExecuteTask.make(ti, bundle_info=BundleInfo(name="testing"))
+        executor = EdgeExecutor()
+        if legacy_job:
+            monkeypatch.setattr(EdgeExecutor, "supports_task_instance_uuid", False)
+        executor.queue_workload(workload, session=session)
+        session.commit()
+        monkeypatch.setattr(EdgeExecutor, "supports_task_instance_uuid", True)
+        executor = EdgeExecutor()
+        assert executor.try_adopt_task_instances([ti]) == []
+        key = executor.get_task_key(ti)
+        job = session.scalar(select(EdgeJobModel))
+        job.state = TaskInstanceState.RUNNING
+        job.last_update = timezone.utcnow() - timedelta(
+            seconds=conf.getint("scheduler", "task_instance_heartbeat_timeout") + 1
+        )
+        session.flush()
+        assert executor._update_orphaned_jobs(session)
+        assert job.state == state
+        executor._purge_jobs(session)
+        assert executor.get_event_buffer(dag_ids={ti.dag_id}) == {key: (state, None)}
+        assert executor.running == ({key} if state == TaskInstanceState.RUNNING else set())
+
+    @pytest.mark.parametrize("legacy_job", [False, True])
+    def test_retired_orphan_releases_its_slot_without_changing_retry(
+        self, create_task_instance, session, monkeypatch, legacy_job
+    ):
+        ti = create_task_instance(state=TaskInstanceState.RUNNING)
+        ti.task.retries = 1
+        ti.try_number = 1
+        ti.max_tries = 1
+        session.commit()
+        workload = ExecuteTask.make(ti, bundle_info=BundleInfo(name="testing"))
+        executor = EdgeExecutor()
+        old_key = executor.get_task_key(ti)
+        if legacy_job:
+            monkeypatch.setattr(EdgeExecutor, "supports_task_instance_uuid", False)
+        executor.queue_workload(workload, session=session)
+        session.commit()
+        monkeypatch.setattr(EdgeExecutor, "supports_task_instance_uuid", True)
+        executor = EdgeExecutor()
+        assert executor.try_adopt_task_instances([ti]) == []
+        retired = session.scalar(select(EdgeJobModel))
+        retired.state = TaskInstanceState.RUNNING
+        retired.last_update = timezone.utcnow() - timedelta(
+            seconds=conf.getint("scheduler", "task_instance_heartbeat_timeout") + 1
+        )
+        session.flush()
+        ti = ti.handle_failure("worker lost", session=session)
+        session.refresh(ti)
+        assert ti.id != workload.ti.id
+        assert ti.state == TaskInstanceState.UP_FOR_RETRY
+        ti.state = TaskInstanceState.RUNNING
+        replacement = ExecuteTask.make(ti, bundle_info=BundleInfo(name="testing"))
+        executor.queue_workload(replacement, session=session)
+        session.flush()
+        new_key = executor.get_task_key(ti)
+        assert executor.running == {old_key, new_key}
+        assert executor._update_orphaned_jobs(session)
+        assert retired.state == TaskInstanceState.REMOVED
+        assert executor.running == {new_key}
+        assert old_key not in executor.last_reported_state
+        executor._purge_jobs(session)
+        assert executor.running == {new_key}
+        assert executor.get_event_buffer() == {}
+        assert ti.state == TaskInstanceState.RUNNING

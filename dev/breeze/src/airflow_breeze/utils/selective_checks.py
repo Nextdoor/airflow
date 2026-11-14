@@ -16,249 +16,1128 @@
 # under the License.
 from __future__ import annotations
 
+import ast
+import difflib
+import itertools
 import json
+import math
 import os
+import re
 import sys
-from enum import Enum
+import tomllib
+from collections import defaultdict
+from collections.abc import Callable
+from enum import Enum, auto
+from functools import cached_property, wraps
+from pathlib import Path
+from typing import Any, TypeVar
 
-from airflow_breeze.utils.exclude_from_matrix import excluded_combos
-from airflow_breeze.utils.github_actions import get_ga_output
-from airflow_breeze.utils.kubernetes_utils import get_kubernetes_python_combos
-from airflow_breeze.utils.path_utils import AIRFLOW_SOURCES_ROOT
-
-if sys.version_info >= (3, 8):
-    from functools import cached_property
-else:
-    # noinspection PyUnresolvedReferences
-    from cached_property import cached_property
-
-from functools import lru_cache
-from re import match
-from typing import Any, Dict, List, TypeVar
-
+from airflow_breeze.branch_defaults import AIRFLOW_BRANCH, DEFAULT_AIRFLOW_CONSTRAINTS_BRANCH
 from airflow_breeze.global_constants import (
     ALL_PYTHON_MAJOR_MINOR_VERSIONS,
+    ALL_TEST_TYPE,
+    APACHE_AIRFLOW_GITHUB_REPOSITORY,
+    CI_AMD_PLATFORM,
+    CI_ARM_PLATFORM,
+    COMMITTERS,
     CURRENT_KUBERNETES_VERSIONS,
-    CURRENT_MSSQL_VERSIONS,
     CURRENT_MYSQL_VERSIONS,
     CURRENT_POSTGRES_VERSIONS,
     CURRENT_PYTHON_MAJOR_MINOR_VERSIONS,
     DEFAULT_KUBERNETES_VERSION,
-    DEFAULT_MSSQL_VERSION,
     DEFAULT_MYSQL_VERSION,
     DEFAULT_POSTGRES_VERSION,
     DEFAULT_PYTHON_MAJOR_MINOR_VERSION,
+    DISABLE_TESTABLE_INTEGRATIONS_FROM_ARM,
+    DISABLE_TESTABLE_INTEGRATIONS_FROM_CI,
     HELM_VERSION,
+    JAVA_SDK_VERSION,
     KIND_VERSION,
+    LOW_DEP_TEST_TYPES_PER_JOB_ON_RUNS_ON,
+    NUMBER_OF_CORE_SLICES,
+    NUMBER_OF_CORE_SLICES_ON_RUNS_ON,
+    NUMBER_OF_LOW_DEP_SLICES,
+    PROVIDER_TEST_SPLITS,
+    PROVIDERS_COMPATIBILITY_TESTS_MATRIX,
+    PUBLIC_AMD_RUNNERS,
+    PUBLIC_ARM_RUNNERS,
+    RUNS_ON_AMD_IN_MEMORY_RUNNER_TEMPLATE,
+    RUNS_ON_AMD_RUNNER_TEMPLATE,
+    RUNS_ON_ARM_IN_MEMORY_RUNNER_TEMPLATE,
+    RUNS_ON_ARM_RUNNER_TEMPLATE,
+    TESTABLE_CORE_INTEGRATIONS,
+    TESTABLE_PROVIDERS_INTEGRATION_OWNERS,
+    TESTABLE_PROVIDERS_INTEGRATIONS,
     GithubEvents,
-    SelectiveUnitTestTypes,
-    all_selective_test_types,
+    SelectiveAirflowCtlTestType,
+    SelectiveCoreTestType,
+    SelectiveProvidersTestType,
+    SelectiveTaskSdkTestType,
+    SelectiveTestType,
+    all_helm_test_packages,
+    all_selective_core_test_types,
+    get_airflow_version,
+    get_provider_split_test_types,
+    providers_test_type,
 )
-from airflow_breeze.utils.console import get_stderr_console
+from airflow_breeze.utils.console import console_print, get_console
+from airflow_breeze.utils.exclude_from_matrix import excluded_combos
+from airflow_breeze.utils.fork_compare import get_upstream_file
+from airflow_breeze.utils.functools_cache import clearable_cache
+from airflow_breeze.utils.import_graph import find_reachable_providers
+from airflow_breeze.utils.kubernetes_utils import get_kubernetes_python_combos
+from airflow_breeze.utils.packages import get_available_distributions, get_suspended_provider_ids
+from airflow_breeze.utils.path_utils import (
+    AIRFLOW_DEVEL_COMMON_PATH,
+    AIRFLOW_PROVIDERS_ROOT_PATH,
+    AIRFLOW_ROOT_PATH,
+)
+from airflow_breeze.utils.provider_dependencies import get_provider_dependencies, get_related_providers
+from airflow_breeze.utils.run_utils import run_command
 
-FULL_TESTS_NEEDED_LABEL = "full tests needed"
+ALL_VERSIONS_LABEL = "all versions"
+CANARY_LABEL = "canary"
 DEBUG_CI_RESOURCES_LABEL = "debug ci resources"
+DEFAULT_VERSIONS_ONLY_LABEL = "default versions only"
+DISABLE_IMAGE_CACHE_LABEL = "disable image cache"
+FORCE_PIP_LABEL = "force pip"
+FULL_TESTS_NEEDED_LABEL = "full tests needed"
+IMPORT_GRAPH_NARROWING_LABEL = "import graph narrowing"
+INCLUDE_SUCCESS_OUTPUTS_LABEL = "include success outputs"
+LATEST_VERSIONS_ONLY_LABEL = "latest versions only"
+NON_COMMITTER_BUILD_LABEL = "non committer build"
+UPGRADE_TO_NEWER_DEPENDENCIES_LABEL = "upgrade to newer dependencies"
+USE_PUBLIC_RUNNERS_LABEL = "use public runners"
+USE_SELF_HOSTED_RUNNERS_LABEL = "use self-hosted runners"
+ALLOW_PROVIDER_DEPENDENCY_BUMP_LABEL = "allow provider dependency bump"
+SKIP_COMMON_COMPAT_CHECK_LABEL = "skip common compat check"
+AREA_E2E_TESTS_LABEL = "area:e2e-tests"
+AREA_KUBERNETES_TESTS_LABEL = "area:kubernetes-tests"
+
+# Providers split into their own test type, see _extract_long_provider_tests. Every other provider runs
+# in one shared ``Providers[-amazon,celery,google,standard]`` test type on canary builds.
+LONG_RUNNING_TEST_PROVIDERS = ["amazon", "celery", "google", "standard"]
+# Providers whose DB tests leave process-global core state behind (``importlib.reload()`` of
+# ``airflow.executors.executor_loader``, which swaps the ``ExecutorLoader`` class object and refills its
+# module-level caches). DB tests of one test type run in a single pytest process, with provider test
+# folders in sorted order, so every provider sorting after one of these inherits that state on canary.
+# A PR that changes such a later provider runs these providers in the same test type too, otherwise
+# isolation failures in the changed tests surface only after merge. Non-DB tests share one xdist pool
+# across all test types, so no deterministic order exists there to reproduce.
+PROVIDERS_WITH_PROCESS_GLOBAL_TEST_SIDE_EFFECTS = ["cncf.kubernetes"]
+
+ALL_CI_SELECTIVE_TEST_TYPES = "API Always CLI Core Other Serialization"
+
+ALL_PROVIDERS_SELECTIVE_TEST_TYPES = (
+    "Providers[-amazon,google,standard] Providers[amazon] Providers[google] Providers[standard]"
+)
 
 
 class FileGroupForCi(Enum):
-    ENVIRONMENT_FILES = "environment_files"
-    PYTHON_PRODUCTION_FILES = "python_scans"
-    JAVASCRIPT_PRODUCTION_FILES = "javascript_scans"
-    API_TEST_FILES = "api_test_files"
-    API_CODEGEN_FILES = "api_codegen_files"
-    HELM_FILES = "helm_files"
-    SETUP_FILES = "setup_files"
-    DOC_FILES = "doc_files"
-    WWW_FILES = "www_files"
-    SYSTEM_TEST_FILES = "system_tests"
-    KUBERNETES_FILES = "kubernetes_files"
-    ALL_PYTHON_FILES = "all_python_files"
-    ALL_SOURCE_FILES = "all_sources_for_tests"
+    ENVIRONMENT_FILES = auto()
+    PYTHON_PRODUCTION_FILES = auto()
+    JAVASCRIPT_PRODUCTION_FILES = auto()
+    ALWAYS_TESTS_FILES = auto()
+    API_FILES = auto()
+    GIT_PROVIDER_FILES = auto()
+    STANDARD_PROVIDER_FILES = auto()
+    API_CODEGEN_FILES = auto()
+    HELM_FILES = auto()
+    KUSTOMIZE_OVERLAYS_FILES = auto()
+    DEPENDENCY_FILES = auto()
+    DOC_FILES = auto()
+    TEXT_NON_DOC_FILES = auto()
+    UI_FILES = auto()
+    UI_OPENAPI_FILES = auto()
+    SYSTEM_TEST_FILES = auto()
+    KUBERNETES_FILES = auto()
+    TASK_SDK_FILES = auto()
+    TASK_SDK_INTEGRATION_TEST_FILES = auto()
+    AGENT_FRAMEWORK_FILES = auto()
+    GO_SDK_FILES = auto()
+    GO_SDK_CONFORMANCE_FILES = auto()
+    JAVA_SDK_FILES = auto()
+    JAVA_SDK_CONFORMANCE_FILES = auto()
+    TS_SDK_FILES = auto()
+    TS_SDK_CONFORMANCE_FILES = auto()
+    TS_SDK_DOCS_FILES = auto()
+    AIRFLOW_CTL_FILES = auto()
+    AIRFLOW_CTL_INTEGRATION_TEST_FILES = auto()
+    BREEZE_INTEGRATION_TEST_FILES = auto()
+    REMOTE_LOGGING_E2E_SHARED_FILES = auto()
+    REMOTE_LOGGING_E2E_S3_FILES = auto()
+    REMOTE_LOGGING_E2E_ELASTICSEARCH_FILES = auto()
+    REMOTE_LOGGING_E2E_OPENSEARCH_FILES = auto()
+    EVENT_DRIVEN_E2E_FILES = auto()
+    JAVA_SDK_E2E_FILES = auto()
+    GO_SDK_E2E_FILES = auto()
+    OPENLINEAGE_E2E_FILES = auto()
+    OPENLINEAGE_E2E_COMPAT_FILES = auto()
+    TS_SDK_E2E_FILES = auto()
+    YAML_DAG_E2E_FILES = auto()
+    LANG_SDK_XCOM_E2E_FILES = auto()
+    ALL_PYPROJECT_TOML_FILES = auto()
+    ALL_PYTHON_FILES = auto()
+    ALL_SOURCE_FILES = auto()
+    ALL_AIRFLOW_PYTHON_FILES = auto()
+    ALL_AIRFLOW_CTL_PYTHON_FILES = auto()
+    ALL_PROVIDERS_PYTHON_FILES = auto()
+    ALL_PROVIDERS_DISTRIBUTION_CONFIG_FILES = auto()
+    ALL_DEV_PYTHON_FILES = auto()
+    ALL_DEVEL_COMMON_PYTHON_FILES = auto()
+    ALL_SCRIPTS_PYTHON_FILES = auto()
+    ALL_HELM_TESTS_PYTHON_FILES = auto()
+    ALL_AIRFLOW_E2E_TESTS_PYTHON_FILES = auto()
+    ALL_DOCKER_TESTS_PYTHON_FILES = auto()
+    ALL_KUBERNETES_TESTS_PYTHON_FILES = auto()
+    ALL_PROVIDER_YAML_FILES = auto()
+    TESTS_UTILS_FILES = auto()
+    ASSET_FILES = auto()
+    UNIT_TEST_FILES = auto()
+    DEVEL_TOML_FILES = auto()
+    SCRIPTS_FILES = auto()
+    UV_LOCK_FILE = auto()
+    PREK_FILES = auto()
+    OS_DEPENDENCIES_FILES = auto()
+    KERBEROS_FILES = auto()
+    OTEL_FILES = auto()
+    CELERY_FILES = auto()
+    IMAGE_BUILD_FILES = auto()
+    DOCS_PUBLISH_FILES = auto()
+    SHARED_DISTRIBUTION_FILES = auto()
+    UI_I18N_FILES = auto()
+    COMPAT_TESTS_HIDDEN_FILES = auto()
 
 
-T = TypeVar("T", FileGroupForCi, SelectiveUnitTestTypes)
+class AllProvidersSentinel:
+    pass
 
 
-class HashableDict(Dict[T, List[str]]):
+ALL_PROVIDERS_SENTINEL = AllProvidersSentinel()
+
+T = TypeVar("T", FileGroupForCi, SelectiveTestType)
+
+
+class HashableDict(dict[T, list[str]]):
     def __hash__(self):
         return hash(frozenset(self))
 
 
-CI_FILE_GROUP_MATCHES = HashableDict(
+# Core and Task SDK sources specific to the native Lang-SDK Dag path: routing a file to a
+# coordinator, parsing it through the coordinator's runtime, validating the serialized Dag,
+# and reading its source. Shared Dag processing files are left to the canary run.
+LANG_SDK_NATIVE_DAG_PARSING_FILES = (
+    r"^airflow-core/src/airflow/dag_processing/(importer_routing|lang_sdk_processor)\.py$",
+    r"^airflow-core/src/airflow/models/dagcode\.py$",
+    r"^airflow-core/src/airflow/serialization/serialized_objects\.py$",
+    r"^task-sdk/src/airflow/sdk/coordinators/_dag_importer\.py$",
+    r"^task-sdk/src/airflow/sdk/execution_time/coordinator\.py$",
+    r"^task-sdk/src/airflow/sdk/importers/.*",
+)
+
+# What every language SDK's serialization conformance check compares the SDK against: Airflow's
+# serializer and schema, and the shared harness. They do not force full_tests_needed, so each SDK's
+# conformance group lists them next to the SDK's own files.
+LANG_SDK_CONFORMANCE_SHARED_FILES = (
+    r"^airflow-core/src/airflow/serialization/serialized_objects\.py$",
+    r"^airflow-core/src/airflow/serialization/schema\.json$",
+    r"^scripts/ci/lang_sdk_serialization/.*",
+)
+
+# Where Breeze reads the version of each distribution: its tests and the published-docs version check.
+VERSION_FILES = (
+    r"^airflow-core/src/airflow/__init__\.py$",
+    r"^task-sdk/src/airflow/sdk/__init__\.py$",
+    r"^airflow-ctl/src/airflowctl/__init__\.py$",
+    r"^chart/Chart\.yaml$",
+)
+
+CI_FILE_GROUP_MATCHES: HashableDict[FileGroupForCi] = HashableDict(
     {
         FileGroupForCi.ENVIRONMENT_FILES: [
-            r"^.github/workflows",
-            r"^dev/breeze",
-            r"^dev/.*\.py$",
+            # Only workflows that actually run or configure the test suite force the full
+            # matrix. Non-test workflows (security scans, doc publishing, notifications,
+            # backporting, stale/calendar bots, …) cannot affect test outcomes, so they
+            # are excluded here to avoid accidental full-matrix runs.
+            r"^\.github/workflows/(?!("
+            r"asf-allowlist-check|automatic-backport|backport-cli|ci-duration-monitor|ci-notification|"
+            r"codeql-analysis|e2e-flaky-tests-report|milestone-tag-assistant|notify-uv-lock-conflicts|"
+            r"publish-docs-to-s3|recheck-old-bug-report|scheduled-verify-release-calendar|stale"
+            r")\.yml$)",
+            r"^dev/breeze/src",
+            r"^dev/breeze/pyproject\.toml",
+            r"^dev/breeze/uv\.lock",
+            r"^dev/(?!breeze/tests/).*\.py$",
             r"^Dockerfile",
-            r"^scripts",
-            r"^setup.py",
-            r"^setup.cfg",
-            r"^generated/provider_dependencies.json$",
+            r"^scripts/ci/docker-compose",
+            r"^scripts/ci/kubernetes",
+            # NOTE: scripts/ci/prek (static-check hooks) is intentionally NOT here. prek
+            # hooks drive static checks, not the test matrix, so they must not force the
+            # full matrix. They still build the CI image via FileGroupForCi.PREK_FILES
+            # below (so mypy-scripts and all static checks still run).
+            r"^scripts/docker",
+            r"^scripts/in_container",
+        ],
+        FileGroupForCi.BREEZE_INTEGRATION_TEST_FILES: [
+            r"^dev/breeze/src/.*",
+            r"^dev/breeze/tests/.*_integration\.py",
+            r"^dev/breeze/pyproject\.toml",
+            r"^dev/breeze/uv\.lock",
+        ],
+        FileGroupForCi.REMOTE_LOGGING_E2E_SHARED_FILES: [
+            r"^airflow-core/src/airflow/config_templates/airflow_local_settings\.py$",
+            r"^airflow-core/src/airflow/logging/.*",
+            r"^airflow-core/src/airflow/logging_config\.py$",
+            r"^airflow-core/src/airflow/api_fastapi/core_api/routes/public/log\.py$",
+            r"^airflow-core/src/airflow/api_fastapi/core_api/datamodels/log\.py$",
+            r"^airflow-core/src/airflow/utils/log/.*",
+            r"^airflow-e2e-tests/.*",
+            r"^shared/logging/.*",
+        ],
+        FileGroupForCi.REMOTE_LOGGING_E2E_S3_FILES: [
+            r"^airflow-e2e-tests/tests/airflow_e2e_tests/remote_log_tests/.*",
+            r"^providers/amazon/src/airflow/providers/amazon/aws/log/s3_task_handler\.py$",
+        ],
+        FileGroupForCi.REMOTE_LOGGING_E2E_ELASTICSEARCH_FILES: [
+            r"^airflow-e2e-tests/tests/airflow_e2e_tests/remote_log_elasticsearch_tests/.*",
+            r"^providers/elasticsearch/.*",
+        ],
+        FileGroupForCi.REMOTE_LOGGING_E2E_OPENSEARCH_FILES: [
+            r"^airflow-e2e-tests/tests/airflow_e2e_tests/remote_log_opensearch_tests/.*",
+            r"^providers/opensearch/.*",
+        ],
+        FileGroupForCi.EVENT_DRIVEN_E2E_FILES: [
+            r"^airflow-e2e-tests/tests/airflow_e2e_tests/event_driven_tests/.*",
+            r"^airflow-e2e-tests/tests/airflow_e2e_tests/dags/example_event_driven\.py$",
+            r"^airflow-e2e-tests/docker/kafka/.*",
+            r"^airflow-e2e-tests/docker/kafka\.yml$",
+            r"^providers/apache/kafka/.*",
+            r"^providers/common/messaging/.*",
+        ],
+        FileGroupForCi.JAVA_SDK_E2E_FILES: [
+            # `.md` excluded — doc-only edits do not affect the Gradle build.
+            r"^java-sdk/(?!.*\.md$).*",
+            r"^airflow-e2e-tests/java-test-bundle/.*",
+            r"^airflow-e2e-tests/java-native-bundle/.*",
+            r"^airflow-e2e-tests/tests/airflow_e2e_tests/java_sdk_tests/.*",
+            r"^airflow-e2e-tests/docker/java\.yml$",
+            r"^airflow-e2e-tests/docker/Dockerfile\.java$",
+            r"^task-sdk/src/airflow/sdk/coordinators/_subprocess\.py$",
+            r"^task-sdk/src/airflow/sdk/coordinators/java/.*",
+            *LANG_SDK_NATIVE_DAG_PARSING_FILES,
+        ],
+        FileGroupForCi.GO_SDK_E2E_FILES: [
+            # `.md` excluded — doc-only edits do not affect the Go build or e2e tests.
+            r"^go-sdk/(?!.*\.md$).*",
+            r"^airflow-e2e-tests/tests/airflow_e2e_tests/go_sdk_tests/.*",
+            r"^airflow-e2e-tests/docker/go\.yml$",
+            r"^task-sdk/src/airflow/sdk/coordinators/_subprocess\.py$",
+            r"^task-sdk/src/airflow/sdk/coordinators/executable/.*",
+        ],
+        FileGroupForCi.OPENLINEAGE_E2E_FILES: [
+            r"^airflow-e2e-tests/tests/airflow_e2e_tests/openlineage_tests/.*",
+            r"^airflow-e2e-tests/docker/openlineage\.yml$",
+            r"^providers/openlineage/.*",
+            r"^providers/common/compat/.*",
+            r"^providers/common/io/.*",
+            r"^providers/common/sql/.*",
+        ],
+        FileGroupForCi.OPENLINEAGE_E2E_COMPAT_FILES: [
+            # run_openlineage_e2e_compat_tests ignores full_tests_needed. A file that drives the compat setup
+            # belongs here even when it also forces the full matrix, as the compat workflow does.
+            r"^\.github/workflows/openlineage-e2e-compat-tests\.yml$",
+            r"^airflow-e2e-tests/tests/airflow_e2e_tests/conftest\.py$",
+            r"^airflow-e2e-tests/tests/airflow_e2e_tests/constants\.py$",
+            r"^airflow-e2e-tests/docker/openlineage-compat\.Dockerfile$",
+            r"^airflow-e2e-tests/docker/openlineage-compat-db\.yml$",
+        ],
+        FileGroupForCi.TS_SDK_E2E_FILES: [
+            # API documentation entry points and Markdown do not affect runtime e2e tests.
+            r"^ts-sdk/(?!api-docs/)(?!.*\.md$).*",
+            r"^airflow-e2e-tests/tests/airflow_e2e_tests/ts_sdk_tests/.*",
+            r"^airflow-e2e-tests/docker/ts\.yml$",
+            r"^task-sdk/src/airflow/sdk/coordinators/_subprocess\.py$",
+            r"^task-sdk/src/airflow/sdk/coordinators/node/.*",
+            *LANG_SDK_NATIVE_DAG_PARSING_FILES,
+        ],
+        FileGroupForCi.YAML_DAG_E2E_FILES: [
+            r"^airflow-e2e-tests/tests/airflow_e2e_tests/yaml_dag_tests/.*",
+            r"^airflow-e2e-tests/yaml-dags/.*",
+            r"^airflow-e2e-tests/docker/yaml-dag\.yml$",
+            # The mode runs the Dag's one code task on the Go example bundle, so the handler
+            # it registers counts, but the rest of the Go SDK is the go_sdk mode's business.
+            r"^go-sdk/example/bundle/yamldag/.*",
+            r"^go-sdk/example/bundle/main\.go$",
+            r"^task-sdk/src/airflow/sdk/coordinators/_subprocess\.py$",
+            r"^task-sdk/src/airflow/sdk/coordinators/executable/.*",
+            *LANG_SDK_NATIVE_DAG_PARSING_FILES,
+        ],
+        FileGroupForCi.LANG_SDK_XCOM_E2E_FILES: [
+            # The coordinator-side backend, the base XCom class it calls, the object storage backend,
+            # and the mode's own compose override and tests. The language SDKs themselves are the
+            # business of their own e2e modes.
+            r"^task-sdk/src/airflow/sdk/coordinators/_xcom_backend\.py$",
+            r"^task-sdk/src/airflow/sdk/bases/xcom\.py$",
+            r"^providers/common/io/src/airflow/providers/common/io/xcom/.*",
+            r"^airflow-e2e-tests/docker/lang-sdk-xcom-object-storage\.yml$",
+            r"^airflow-e2e-tests/tests/airflow_e2e_tests/lang_sdk_xcom_object_storage_tests/.*",
         ],
         FileGroupForCi.PYTHON_PRODUCTION_FILES: [
-            r"^airflow/.*\.py",
-            r"^setup.py",
+            # Production Python source the runtime ships — excludes tests, docs,
+            # dev tooling, and generated files within those trees. Used by
+            # `run_python_scans` (SAST/SCA target) to decide whether the security
+            # scans need to run.
+            #
+            # `example_dags/` are illustrative, not shipped runtime code, so they
+            # are excluded from the SAST target. They are still selected for their
+            # own tests via the broader `ALL_AIRFLOW_PYTHON_FILES` /
+            # `ALL_PROVIDERS_PYTHON_FILES` groups, so excluding them here only
+            # affects the SAST target, not test selection. The `(?:.*/)?` covers
+            # both airflow-core's top-level `airflow/example_dags/` and the nested
+            # `providers/<name>/.../example_dags/` layout.
+            r"^airflow-core/src/airflow/(?!(?:.*/)?example_dags/)(?!.*/(?:openapi-gen|i18n/locales)/).*\.py$",
+            r"^task-sdk/src/airflow/(?!.*_generated\.py$).*\.py$",
+            r"^airflow-ctl/src/airflowctl/(?!.*generated\.py$).*\.py$",
+            r"^providers/(?:[^/]+/)+src/(?!(?:.*/)?example_dags/).*\.py$",
+            r"^shared/[^/]+/src/.*\.py$",
+            r"^pyproject\.toml$",
+            r"^hatch_build\.py$",
         ],
         FileGroupForCi.JAVASCRIPT_PRODUCTION_FILES: [
-            r"^airflow/.*\.[jt]sx?",
-            r"^airflow/.*\.lock",
+            # Exclude the openapi-gen tree and translation bundles — those are
+            # generated / data files that ride under the same prefixes but
+            # carry no behavioral risk and would otherwise distort the
+            # production-code line-count gate.
+            r"^airflow-core/src/airflow/(?!.*/(?:openapi-gen|i18n/locales)/).*\.[jt]sx?$",
+            r"^airflow-core/src/airflow/.*\.lock$",
+            r"^airflow-core/src/airflow/ui/(?!.*/(?:openapi-gen|i18n/locales)/).*\.yaml$",
+            r"^airflow-core/src/airflow/api_fastapi/auth/managers/simple/ui/.*\.yaml$",
         ],
-        FileGroupForCi.API_TEST_FILES: [
-            r"^airflow/api/",
-            r"^airflow/api_connexion/",
+        FileGroupForCi.API_FILES: [
+            r"^airflow-core/src/airflow/api/",
+            r"^airflow-core/src/airflow/api_fastapi/",
+            r"^airflow-core/tests/unit/api/",
+            r"^airflow-core/tests/unit/api_fastapi/",
+        ],
+        FileGroupForCi.GIT_PROVIDER_FILES: [
+            r"^providers/git/src/",
+        ],
+        FileGroupForCi.STANDARD_PROVIDER_FILES: [
+            r"^providers/standard/src/",
         ],
         FileGroupForCi.API_CODEGEN_FILES: [
-            r"^airflow/api_connexion/openapi/v1\.yaml",
+            r"^airflow-core/src/airflow/api_fastapi/core_api/openapi/.*generated\.yaml",
             r"^clients/gen",
         ],
         FileGroupForCi.HELM_FILES: [
             r"^chart",
-            r"^airflow/kubernetes",
-            r"^tests/kubernetes",
-            r"^tests/charts",
+            r"^airflow-core/src/airflow/kubernetes",
+            r"^airflow-core/tests/unit/kubernetes",
         ],
-        FileGroupForCi.SETUP_FILES: [
-            r"^pyproject.toml",
-            r"^setup.cfg",
-            r"^setup.py",
-            r"^generated/provider_dependencies.json$",
-            r"^airflow/providers/.*/provider.yaml$",
+        # `^chart/` (under HELM_FILES) is intentionally NOT reused
+        # — the overlays don't care about every chart-template edit,
+        # only their own files.
+        FileGroupForCi.KUSTOMIZE_OVERLAYS_FILES: [
+            r"^chart/kustomize-overlays/",
+            r"^chart/tests/overlay_tests/",
+            r"^chart/templates/",
+            r"^chart/files/",
+            r"^scripts/ci/prek/build_kustomize_overlays\.py$",
+            r"^dev/breeze/src/airflow_breeze/commands/kubernetes_commands\.py$",
+            r"^dev/breeze/src/airflow_breeze/commands/kubernetes_kustomize_commands\.py$",
+            r"^\.github/workflows/kustomize-overlays-tests\.yml$",
         ],
         FileGroupForCi.DOC_FILES: [
             r"^docs",
-            r"^airflow/.*\.py$",
+            r"^devel-common/src/docs",
+            r"^devel-common/src/sphinx_exts",
+            r"^\.github/SECURITY\.md",
+            r"^providers/.*/docs/",
+            r"^providers/.*/src/.*\.py$",
+            r"^providers/.*/tests/system/.*\.py$",
+            r"^providers-summary-docs",
+            r"^docker-stack-docs",
             r"^chart",
-            r"^providers",
-            r"^tests/system",
+            r"^task-sdk/docs/",
+            r"^task-sdk/src/.*\.py$",
+            r"^task-sdk/tests/.*\.py$",
+            r"^airflow-core/docs/",
+            r"^airflow-core/src/.*\.py$",
+            r"^airflow-core/tests/system/.*\.py$",
+            r"^airflow-ctl/docs",
+            r"^airflow-ctl/src/.*\.py$",
+            r"^airflow-ctl/tests/.*\.py$",
+            r"^dev/mypy/docs/",
+            r"^dev/mypy/src/.*\.py$",
+            r"^dev/mypy/RELEASE_NOTES\.rst$",
+            r"^dev/mypy/pyproject\.toml$",
             r"^CHANGELOG\.txt",
-            r"^airflow/config_templates/config\.yml",
-            r"^chart/RELEASE_NOTES\.txt",
+            r"^airflow-core/src/airflow/config_templates/config\.yml",
+            r"^chart/RELEASE_NOTES\.rst",
             r"^chart/values\.schema\.json",
             r"^chart/values\.json",
+            r"^RELEASE_NOTES\.rst",
         ],
-        FileGroupForCi.WWW_FILES: [
-            r"^airflow/www/.*\.ts[x]?$",
-            r"^airflow/www/.*\.js[x]?$",
-            r"^airflow/www/[^/]+\.json$",
-            r"^airflow/www/.*\.lock$",
+        FileGroupForCi.TEXT_NON_DOC_FILES: [
+            r"^.*\.txt",
+            r"^.*\.md",
+        ],
+        FileGroupForCi.UI_FILES: [
+            r"^airflow-core/src/airflow/ui/",
+            r"^airflow-core/src/airflow/api_fastapi/auth/managers/simple/ui/",
+        ],
+        # The OpenAPI spec yamls that are inputs of the UI client codegen. Must cover the UNION of
+        # the openapi `files:` triggers of `ts-compile-lint-ui` and
+        # `ts-compile-lint-simple-auth-manager-ui` in `airflow-core/.pre-commit-config.yaml` —
+        # selective checks skip the two hooks as one unit, so this group is a strict superset of
+        # the first hook's triggers; do not "re-sync" it down to a single hook. A spec-only change
+        # (e.g. `_private_ui.yaml`) must not skip those hooks, otherwise a stale committed client
+        # masks type errors in CI (https://github.com/apache/airflow/pull/68919).
+        FileGroupForCi.UI_OPENAPI_FILES: [
+            r"^airflow-core/src/airflow/api_fastapi/core_api/openapi/.*\.yaml",
+            r"^airflow-core/src/airflow/api_fastapi/auth/managers/simple/openapi/.*\.yaml",
         ],
         FileGroupForCi.KUBERNETES_FILES: [
             r"^chart",
-            r"^kubernetes_tests",
-            r"^airflow/providers/cncf/kubernetes/",
-            r"^tests/providers/cncf/kubernetes/",
-            r"^tests/system/providers/cncf/kubernetes/",
+            r"^kubernetes-tests",
+            r"^providers/cncf/kubernetes/",
         ],
         FileGroupForCi.ALL_PYTHON_FILES: [
-            r"\.py$",
+            r".*\.py$",
+        ],
+        FileGroupForCi.ALL_AIRFLOW_PYTHON_FILES: [
+            r"^airflow-core/.*\.py$",
+        ],
+        FileGroupForCi.ALL_AIRFLOW_CTL_PYTHON_FILES: [
+            r"^airflow-ctl/.*\.py$",
+        ],
+        FileGroupForCi.ALL_PROVIDERS_PYTHON_FILES: [
+            r"^providers/.*\.py$",
+        ],
+        FileGroupForCi.ALL_PROVIDERS_DISTRIBUTION_CONFIG_FILES: [
+            r"^providers/.*/pyproject\.toml$",
+            r"^providers/.*/provider\.yaml$",
+            r"^providers/\.pre-commit-config\.yaml$",
+        ],
+        FileGroupForCi.ALL_DEV_PYTHON_FILES: [
+            r"^dev/.*\.py$",
+        ],
+        FileGroupForCi.ALL_DEVEL_COMMON_PYTHON_FILES: [
+            r"^devel-common/.*\.py$",
+        ],
+        FileGroupForCi.ALL_SCRIPTS_PYTHON_FILES: [
+            r"^scripts/.*\.py$",
+        ],
+        FileGroupForCi.ALL_HELM_TESTS_PYTHON_FILES: [
+            r"^chart/tests/.*\.py$",
+        ],
+        FileGroupForCi.ALL_AIRFLOW_E2E_TESTS_PYTHON_FILES: [
+            r"^airflow-e2e-tests/.*\.py$",
+        ],
+        FileGroupForCi.ALL_DOCKER_TESTS_PYTHON_FILES: [
+            r"^docker-tests/.*\.py$",
+        ],
+        FileGroupForCi.ALL_KUBERNETES_TESTS_PYTHON_FILES: [
+            r"^kubernetes-tests/.*\.py$",
         ],
         FileGroupForCi.ALL_SOURCE_FILES: [
-            "^.pre-commit-config.yaml$",
-            "^airflow",
-            "^chart",
-            "^tests",
-            "^kubernetes_tests",
+            r"^.pre-commit-config.yaml$",
+            r"^airflow-core/src/.*",
+            r"^airflow-core/tests/.*",
+            r"^airflow-ctl/src/.*",
+            r"^airflow-ctl/tests/.*",
+            r"^chart/templates/.*",
+            r"^providers/.*/src/.*",
+            r"^providers/.*/tests/.*",
+            r"^shared/.*\.py$",
+            r"^task-sdk/src/.*",
+            r"^task-sdk/tests/.*",
+            r"^devel-common/src/.*",
+            r"^devel-common/tests/.*",
+            r"^chart/tests/.*",
+            r"^kubernetes-tests/tests/.*",
+            r"^docker-tests/tests/.*",
         ],
         FileGroupForCi.SYSTEM_TEST_FILES: [
-            "^tests/system/",
+            r"^airflow-core/tests/system/",
+        ],
+        FileGroupForCi.ALWAYS_TESTS_FILES: [
+            r"^airflow-core/tests/unit/always/",
+        ],
+        FileGroupForCi.ALL_PROVIDER_YAML_FILES: [
+            r".*/provider\.yaml$",
+        ],
+        FileGroupForCi.ALL_PYPROJECT_TOML_FILES: [
+            r".*pyproject\.toml$",
+        ],
+        FileGroupForCi.TESTS_UTILS_FILES: [
+            r"^devel-common/src/tests_common/.*\.py$",
+        ],
+        FileGroupForCi.TASK_SDK_FILES: [
+            r"^task-sdk/src/airflow/sdk/.*\.py$",
+            r"^task-sdk/tests/.*\.py$",
+        ],
+        FileGroupForCi.TASK_SDK_INTEGRATION_TEST_FILES: [
+            r"^task-sdk-integration-tests/.*\.py$",
+        ],
+        FileGroupForCi.AGENT_FRAMEWORK_FILES: [
+            # The framework adapters sit on the framework-neutral tools, which sit on the toolsets,
+            # so any code change in the provider can break them, and so can a change to common.sql,
+            # which the SQL toolset uses, or to the locked versions the job holds the framework to.
+            # The job's own script and workflow are ENVIRONMENT_FILES, which run everything.
+            r"^providers/common/ai/(src|tests)/.*\.py$",
+            r"^providers/common/ai/pyproject\.toml$",
+            r"^providers/common/sql/src/.*\.py$",
+            r"^uv\.lock$",
+        ],
+        FileGroupForCi.GO_SDK_FILES: [
+            # `.md` excluded — doc-only edits do not affect the Go build or tests, but
+            # everything else (go.mod, go.sum, build config) must trigger the unit tests.
+            r"^go-sdk/(?!.*\.md$).*",
+        ],
+        FileGroupForCi.GO_SDK_CONFORMANCE_FILES: [
+            # The Go SDK, plus what its serialization conformance check compares it against:
+            # Airflow's serializer and schema, and the shared harness.
+            r"^go-sdk/(?!.*\.md$).*",
+            *LANG_SDK_CONFORMANCE_SHARED_FILES,
+        ],
+        FileGroupForCi.JAVA_SDK_FILES: [
+            # `.md` excluded — doc-only edits do not affect the Gradle build.
+            r"^java-sdk/(?!.*\.md$).*",
+        ],
+        FileGroupForCi.JAVA_SDK_CONFORMANCE_FILES: [
+            # The Java SDK, plus what its serialization conformance check compares it against:
+            # Airflow's serializer and schema, and the shared harness.
+            r"^java-sdk/(?!.*\.md$).*",
+            *LANG_SDK_CONFORMANCE_SHARED_FILES,
+        ],
+        FileGroupForCi.TS_SDK_DOCS_FILES: [
+            # TypeDoc renders the reference from the SDK sources and category entry points,
+            # and the landing page is authored in ts-sdk/docs — unlike TS_SDK_FILES, `.md`
+            # counts here. tsconfig.json and package.json are included too: docs/tsconfig.json
+            # `extends` the former, and the latter pins the `@msgpack/msgpack` version the
+            # checked program depends on.
+            r"^ts-sdk/api-docs/.*",
+            r"^ts-sdk/docs/.*",
+            r"^ts-sdk/src/.*",
+            r"^ts-sdk/tsconfig\.json$",
+            r"^ts-sdk/package\.json$",
+        ],
+        FileGroupForCi.TS_SDK_FILES: [
+            # Documentation entry points and `.md` files do not affect the generated
+            # supervisor schema or the unit tests. `ts-sdk/docs/` is excluded too — it is the
+            # docs toolchain's own package, with its own tests that vitest does not run.
+            r"^ts-sdk/(?!api-docs/)(?!docs/)(?!.*\.md$).*",
+        ],
+        FileGroupForCi.TS_SDK_CONFORMANCE_FILES: [
+            # The TS SDK, plus what its serialization conformance check compares it against:
+            # Airflow's serializer and schema, and the shared harness.
+            r"^ts-sdk/(?!api-docs/)(?!docs/)(?!.*\.md$).*",
+            *LANG_SDK_CONFORMANCE_SHARED_FILES,
+        ],
+        FileGroupForCi.ASSET_FILES: [
+            r"^airflow-core/src/airflow/assets/",
+            r"^airflow-core/src/airflow/models/assets/",
+            r"^airflow-core/src/airflow/datasets/",
+            r"^task-sdk/src/airflow/sdk/definitions/asset/",
+        ],
+        FileGroupForCi.UNIT_TEST_FILES: [
+            r"^airflow-core/tests/unit/",
+            r"^task-sdk/tests/",
+            r"^providers/.*/tests/unit/",
+            r"^dev/breeze/tests/",
+            r"^airflow-ctl/tests/",
+        ],
+        FileGroupForCi.AIRFLOW_CTL_FILES: [
+            r"^airflow-ctl/src/airflowctl/.*\.py$",
+            r"^airflow-ctl/tests/.*\.py$",
+        ],
+        FileGroupForCi.AIRFLOW_CTL_INTEGRATION_TEST_FILES: [
+            r"^airflow-ctl-tests/.*\.py$",
+        ],
+        FileGroupForCi.DEVEL_TOML_FILES: [
+            r"^devel-common/pyproject\.toml$",
+        ],
+        FileGroupForCi.SCRIPTS_FILES: [
+            r"^scripts/ci/.*\.py$",
+            r"^scripts/cov/.*\.py$",
+            r"^scripts/tools/.*\.py$",
+            r"^scripts/tests/.*\.py$",
+        ],
+        FileGroupForCi.PREK_FILES: [
+            r"^scripts/ci/prek",
+        ],
+        # The inputs install_os_dependencies.sh hashes into its marker, apart from the build args.
+        FileGroupForCi.OS_DEPENDENCIES_FILES: [
+            r"^scripts/docker/install_os_dependencies\.sh$",
+            r"^scripts/docker/common\.sh$",
+            r"^scripts/docker/install_(mysql|mssql|postgres)\.sh$",
+            r"^scripts/docker/keys/",
+        ],
+        FileGroupForCi.UV_LOCK_FILE: [
+            r"^uv\.lock$",
+        ],
+        FileGroupForCi.KERBEROS_FILES: [
+            r"^airflow-core/src/airflow/security/kerberos\.py$",
+            r"^airflow-core/src/airflow/cli/commands/kerberos_command\.py$",
+        ],
+        FileGroupForCi.OTEL_FILES: [
+            r"^airflow-core/src/airflow/observability/.*",
+            r"^shared/observability/src/airflow_shared/observability/.*",
+            # The otel integration tests assert the exact span hierarchy that
+            # task_runner emits, so changes to either must exercise the integration.
+            r"^airflow-core/tests/integration/otel/.*",
+            r"^task-sdk/src/airflow/sdk/execution_time/task_runner\.py$",
+        ],
+        FileGroupForCi.CELERY_FILES: [
+            # Core executor sources - redis is celery's broker/result backend, so the
+            # core "redis" integration is exercised when the executor framework changes.
+            r"^airflow-core/src/airflow/executors/.*",
+        ],
+        # The CI image is built from these before the sources are copied in; any other change reuses the
+        # cached layers, so the build-time check has nothing new to measure. Breeze's FILES_FOR_REBUILD_CHECK
+        # are these or ENVIRONMENT_FILES. The build first regenerates the provider dependencies with the
+        # prek script, which is not an ENVIRONMENT_FILES match.
+        FileGroupForCi.IMAGE_BUILD_FILES: [
+            r"^scripts/ci/prek/(common_prek_utils|update_providers_dependencies)\.py$",
+            r"^Dockerfile",
+            r"^\.dockerignore$",
+            r"^scripts/docker/",
+            r".*hatch_build\.py$",
+            r"^generated/",
+            r"^uv\.lock$",
+            r".*pyproject\.toml$",
+        ],
+        # What publishing the built docs and validating their versions depends on. A docstring change
+        # rebuilds the docs but cannot change what is published.
+        FileGroupForCi.DOCS_PUBLISH_FILES: [
+            r"^docs/",
+            r"^.*/docs/",
+            r"^providers-summary-docs/",
+            r"^docker-stack-docs/",
+            r".*/provider\.yaml$",
+            r".*/changelog\.rst$",
+            r"^RELEASE_NOTES\.rst$",
+            r"^chart/RELEASE_NOTES\.rst$",
+            r".*pyproject\.toml$",
+            r"^devel-common/src/sphinx_exts/",
+            *VERSION_FILES,
+        ],
+        # The shared distributions' tests install devel-common as their test dependency, and with it the
+        # local apache-airflow-mypy distribution in dev/mypy.
+        FileGroupForCi.SHARED_DISTRIBUTION_FILES: [
+            r"^shared/",
+            r"^devel-common/",
+            r"^dev/mypy/",
+            r"^pyproject\.toml$",
+            r"^uv\.lock$",
+        ],
+        FileGroupForCi.UI_I18N_FILES: [
+            r"^airflow-core/src/airflow/ui/public/i18n/",
+        ],
+        # The provider compatibility tests install the released Airflow and Task SDK from PyPI and run with
+        # the two source trees hidden (scripts/ci/docker-compose/remove-sources.yml). They do not collect the
+        # Task SDK tests or read these docs. On the host, Breeze reads the version files and non-Python files
+        # of the source trees, and prek reads any nested config, so the docs match by document type only.
+        FileGroupForCi.COMPAT_TESTS_HIDDEN_FILES: [
+            r"^airflow-core/src/(?!airflow/__init__\.py$).*\.py$",
+            r"^task-sdk/src/(?!airflow/sdk/__init__\.py$).*\.py$",
+            r"^task-sdk/tests/.*\.py$",
+            r"^(airflow-core|task-sdk)/docs/.*\.(rst|md|txt|png|gif|svg|jpe?g|puml|md5sum|csv)$",
+            r"^airflow-core/newsfragments/[^/]+\.rst$",
         ],
     }
 )
 
+# Maps each testable core integration to the file group whose change should trigger it.
+# "redis" maps to celery/core-executor sources (redis is celery's broker/result backend).
+TESTABLE_CORE_INTEGRATION_FILE_GROUPS = {
+    "kerberos": FileGroupForCi.KERBEROS_FILES,
+    "otel": FileGroupForCi.OTEL_FILES,
+    "redis": FileGroupForCi.CELERY_FILES,
+}
 
-TEST_TYPE_MATCHES = HashableDict(
+PYTHON_OPERATOR_FILES = [
+    r"^providers/tests/standard/operators/test_python.py",
+]
+
+TEST_TYPE_MATCHES: HashableDict[SelectiveTestType] = HashableDict(
     {
-        SelectiveUnitTestTypes.API: [
-            r"^airflow/api",
-            r"^airflow/api_connexion",
-            r"^tests/api",
-            r"^tests/api_connexion",
+        SelectiveCoreTestType.API: [
+            r"^airflow-core/src/airflow/api/",
+            r"^airflow-core/src/airflow/api_fastapi/",
+            r"^airflow-core/tests/unit/api/",
+            r"^airflow-core/tests/unit/api_fastapi/",
         ],
-        SelectiveUnitTestTypes.CLI: [
-            r"^airflow/cli",
-            r"^tests/cli",
+        SelectiveCoreTestType.CLI: [
+            r"^airflow-core/src/airflow/cli/",
+            r"^airflow-core/tests/unit/cli/",
         ],
-        SelectiveUnitTestTypes.PROVIDERS: [
-            "^airflow/providers/",
-            "^tests/providers/",
+        SelectiveProvidersTestType.PROVIDERS: [
+            r"^providers/.*/src/airflow/providers/",
+            r"^providers/.*/tests/",
         ],
-        SelectiveUnitTestTypes.WWW: ["^airflow/www", "^tests/www"],
+        SelectiveTaskSdkTestType.TASK_SDK: [
+            r"^task-sdk/src/",
+            r"^task-sdk/tests/",
+        ],
+        SelectiveCoreTestType.SERIALIZATION: [
+            r"^airflow-core/src/airflow/serialization/",
+            r"^airflow-core/tests/unit/serialization/",
+        ],
+        SelectiveAirflowCtlTestType.AIRFLOW_CTL: [
+            r"^airflow-ctl/src/",
+            r"^airflow-ctl/tests/",
+        ],
     }
 )
 
-TESTS_PROVIDERS_ROOT = AIRFLOW_SOURCES_ROOT / "tests" / "providers"
-SYSTEM_TESTS_PROVIDERS_ROOT = AIRFLOW_SOURCES_ROOT / "tests" / "system" / "providers"
-AIRFLOW_PROVIDERS_ROOT = AIRFLOW_SOURCES_ROOT / "airflow" / "providers"
 
-
-def find_provider_affected(changed_file: str) -> str | None:
-    file_path = AIRFLOW_SOURCES_ROOT / changed_file
-    # is_relative_to is only available in Python 3.9 - we should simplify this check when we are Python 3.9+
-    for provider_root in (TESTS_PROVIDERS_ROOT, SYSTEM_TESTS_PROVIDERS_ROOT, AIRFLOW_PROVIDERS_ROOT):
-        try:
-            file_path.relative_to(provider_root)
-            relative_base_path = provider_root
-            break
-        except ValueError:
-            pass
-    else:
-        return None
-
+def find_provider_affected(changed_file: str, include_docs: bool) -> str | None:
+    file_path = AIRFLOW_ROOT_PATH / changed_file
+    if not include_docs:
+        for parent_dir_path in file_path.parents:
+            if parent_dir_path.name == "docs" and (parent_dir_path.parent / "provider.yaml").exists():
+                # Skip Docs changes if include_docs is not set
+                return None
+    # Find if the path under src/system tests/tests belongs to provider or is a common code across
+    # multiple providers
     for parent_dir_path in file_path.parents:
-        if parent_dir_path == relative_base_path:
+        if parent_dir_path == AIRFLOW_PROVIDERS_ROOT_PATH:
+            # We have not found any provider specific path up to the root of the provider base folder
             break
-        relative_path = parent_dir_path.relative_to(relative_base_path)
-        if (AIRFLOW_PROVIDERS_ROOT / relative_path / "provider.yaml").exists():
-            return str(parent_dir_path.relative_to(relative_base_path)).replace(os.sep, ".")
-    # If we got here it means that some "common" files were modified. so we need to test all Providers
-    return "Providers"
+        if parent_dir_path.is_relative_to(AIRFLOW_PROVIDERS_ROOT_PATH):
+            relative_path = parent_dir_path.relative_to(AIRFLOW_PROVIDERS_ROOT_PATH)
+            # check if this path belongs to a specific provider
+            if (parent_dir_path / "provider.yaml").exists():
+                # new providers structure
+                return str(relative_path).replace(os.sep, ".")
+    if file_path.is_relative_to(AIRFLOW_DEVEL_COMMON_PATH):
+        # if devel-common changes, we want to run tests for all providers, as they might start failing
+        return "Providers"
+    return None
 
 
-def add_dependent_providers(
-    providers: set[str], provider_to_check: str, dependencies: dict[str, dict[str, list[str]]]
-):
-    for provider, provider_info in dependencies.items():
-        # Providers that use this provider
-        if provider_to_check in provider_info["cross-providers-deps"]:
-            providers.add(provider)
-        # and providers we use directly
-        for dep_name in dependencies[provider_to_check]["cross-providers-deps"]:
-            providers.add(dep_name)
+def _match_files_with_regexps(files: tuple[str, ...], matched_files, matching_regexps):
+    for file in files:
+        if any(re.match(regexp, file) for regexp in matching_regexps):
+            matched_files.append(file)
 
 
-def find_all_providers_affected(changed_files: tuple[str, ...]) -> set[str]:
-    all_providers: set[str] = set()
-    for changed_file in changed_files:
-        provider = find_provider_affected(changed_file)
-        if provider == "Providers":
-            return set()
-        if provider is not None:
-            all_providers.add(provider)
-    dependencies = json.loads((AIRFLOW_SOURCES_ROOT / "generated" / "provider_dependencies.json").read_text())
-    for provider in list(all_providers):
-        add_dependent_providers(all_providers, provider, dependencies)
-    return all_providers
+@clearable_cache
+def _matching_files(
+    files: tuple[str, ...], match_group: FileGroupForCi | SelectiveTestType, match_dict: HashableDict
+) -> list[str]:
+    matched_files: list[str] = []
+    match_regexps = match_dict[match_group]
+    _match_files_with_regexps(files, matched_files, match_regexps)
+    count = len(matched_files)
+    if count > 0:
+        console_print(f"[warning]{match_group} matched {count} files.[/]")
+        console_print(matched_files)
+    else:
+        console_print(f"[warning]{match_group} did not match any file.[/]")
+    return matched_files
+
+
+TESTS_COMMON_SOURCE_ROOT = "devel-common/src/"
+TESTS_COMMON_PYTEST_PLUGIN = "devel-common/src/tests_common/pytest_plugin.py"
+# Only in these trees does a changed test file select the job that runs it; narrowing to an importer
+# elsewhere (e2e, python client, core integration, docker-tests) would skip tests the full matrix ran.
+TEST_HELPER_IMPORTER_ROOTS = (
+    "airflow-core/tests/system/",
+    "airflow-core/tests/unit/",
+    "airflow-ctl/tests/",
+    "airflow-ctl-tests/",
+    "kubernetes-tests/",
+    "providers/",
+    "shared/",
+    "task-sdk/tests/",
+    "task-sdk-integration-tests/",
+)
+
+
+def _imports_module(text: str, module: str, importer_package: str | None = None) -> bool:
+    """
+    Whether ``text`` imports ``module``.
+
+    ``importer_package`` is the dotted package of the importing file; relative imports are only resolved
+    when it is given.
+    """
+    package, _, name = module.rpartition(".")
+    if (
+        not re.search(rf"\b{re.escape(module)}\b", text)
+        and not (f"from {package} import" in text and re.search(rf"\b{re.escape(name)}\b", text))
+        and not (importer_package and re.search(r"^\s*from \.", text, re.MULTILINE))
+    ):
+        return False
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return True
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(alias.name == module or alias.name.startswith(f"{module}.") for alias in node.names):
+                return True
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0:
+                imported = node.module
+            elif importer_package:
+                base_parts = importer_package.split(".")
+                base = ".".join(base_parts[: len(base_parts) - (node.level - 1)])
+                imported = f"{base}.{node.module}" if node.module else base
+            else:
+                continue
+            if not imported:
+                continue
+            if imported == module or imported.startswith(f"{module}."):
+                return True
+            if imported == package and any(alias.name == name for alias in node.names):
+                return True
+    # Dotted references outside import statements, e.g. `pytest_plugins` entries.
+    return re.search(rf"\b{re.escape(module)}\b", text) is not None
+
+
+@clearable_cache
+def _find_test_helper_importers(helper: str) -> frozenset[str] | None:
+    """
+    Return the files outside ``tests_common`` that import ``helper``, directly or through other helpers.
+
+    ``None`` means the change cannot be narrowed down to its importers: the helper is loaded for every
+    test run (the pytest plugin, anything it imports, conftest and package ``__init__`` modules), it
+    no longer exists, the importers could not be searched, or an importer lies outside
+    ``TEST_HELPER_IMPORTER_ROOTS``.
+    """
+    if (
+        helper == TESTS_COMMON_PYTEST_PLUGIN
+        or Path(helper).name in ("conftest.py", "__init__.py")
+        or not (AIRFLOW_ROOT_PATH / helper).is_file()
+    ):
+        return None
+    importers: set[str] = set()
+    seen = {helper}
+    pending = [helper]
+    while pending:
+        module = pending.pop()[len(TESTS_COMMON_SOURCE_ROOT) :].removesuffix(".py").replace("/", ".")
+        result = run_command(
+            ["git", "grep", "-l", "-F", "-w", module.rpartition(".")[2], "--", "*.py"],
+            capture_output=True,
+            text=True,
+            cwd=AIRFLOW_ROOT_PATH,
+            check=False,
+            dry_run_override=False,
+        )
+        # git grep exits with 1 when nothing matches; anything else means the search did not happen.
+        if result.returncode not in (0, 1):
+            return None
+        for candidate in result.stdout.splitlines():
+            # CI never runs dev/ or scripts/ files as tests, and a dev/ importer would match
+            # ENVIRONMENT_FILES and force the full test matrix.
+            if candidate in seen or candidate.startswith(("dev/", "scripts/")):
+                continue
+            in_tests_common = candidate.startswith(f"{TESTS_COMMON_SOURCE_ROOT}tests_common/")
+            importer_package = (
+                str(Path(candidate[len(TESTS_COMMON_SOURCE_ROOT) :]).parent).replace("/", ".")
+                if in_tests_common
+                else None
+            )
+            text = (AIRFLOW_ROOT_PATH / candidate).read_text(errors="replace")
+            if not _imports_module(text, module, importer_package):
+                continue
+            seen.add(candidate)
+            if in_tests_common:
+                if candidate == TESTS_COMMON_PYTEST_PLUGIN or Path(candidate).name in (
+                    "conftest.py",
+                    "__init__.py",
+                ):
+                    return None
+                pending.append(candidate)
+            elif candidate.startswith(TEST_HELPER_IMPORTER_ROOTS):
+                importers.add(candidate)
+            else:
+                return None
+    return frozenset(importers)
+
+
+def _split_list(input_list, n) -> list[list[str]]:
+    """
+    Splits input_list into exactly n sub-lists, distributing items as evenly as possible.
+
+    Note: This cannot be replaced with itertools.batched (Python 3.12+) as it creates
+    batches of a fixed SIZE, whereas this function creates a fixed NUMBER of groups.
+
+    Args:
+        input_list: List to split
+        n: Number of sub-lists to create (output will always have exactly n lists)
+
+    Returns:
+        List containing exactly n sub-lists with items distributed as evenly as possible.
+        Some sub-lists may be empty if n > len(input_list).
+
+    Example:
+        >>> _split_list([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 3)
+        [[1, 2, 3, 4], [5, 6, 7], [8, 9, 10]]
+    """
+    it = iter(input_list)
+    return [
+        list(itertools.islice(it, i))
+        for i in [len(input_list) // n + (1 if x < len(input_list) % n else 0) for x in range(n)]
+    ]
+
+
+def _strip_test_side_effect_providers(test_type: str) -> str:
+    """Drop the test side-effect providers so the description names the providers selected for the change."""
+    if not test_type.startswith("Providers[") or test_type.startswith("Providers[-"):
+        return test_type
+    providers = test_type.removeprefix("Providers[").removesuffix("]").split(",")
+    selected = [p for p in providers if p not in PROVIDERS_WITH_PROCESS_GLOBAL_TEST_SIDE_EFFECTS]
+    return ",".join(selected or providers)
+
+
+def _get_test_type_description(provider_test_types: list[str]) -> str:
+    if not provider_test_types:
+        return ""
+    first_provider = _strip_test_side_effect_providers(provider_test_types[0])
+    last_provider = _strip_test_side_effect_providers(provider_test_types[-1])
+    if first_provider.startswith("Providers["):
+        first_provider = first_provider.replace("Providers[", "").replace("]", "")
+    if last_provider.startswith("Providers["):
+        last_provider = last_provider.replace("Providers[", "").replace("]", "")
+    description = (
+        f"{first_provider[:13]}...{last_provider[:13]}"
+        if first_provider != last_provider
+        else (first_provider[:29])
+    )
+    # The description ends up in artifact names (via JOB_ID), which must not contain ":".
+    return description.replace(":", "-")
+
+
+def _get_test_list_as_json(list_of_list_of_types: list[list[str]]) -> list[dict[str, str]] | None:
+    if len(list_of_list_of_types) == 1 and len(list_of_list_of_types[0]) == 0:
+        return None
+    return [
+        {"description": _get_test_type_description(list_of_types), "test_types": " ".join(list_of_types)}
+        for list_of_types in list_of_list_of_types
+    ]
+
+
+# The release branches of a single component (the Helm chart, airflow-ctl) only ever get backports of that
+# component, so CI there runs that component's tests, whatever changed, and nothing else. Per branch prefix,
+# the outputs decorated with `_scoped_to_component_branch` that run: True forces one on, None leaves it to
+# its usual computation, and an output missing from the table is off. Static checks still run, and docs
+# too where the CI image is built. The PROD image is built for those tests alone:
+# `run_generic_prod_image_tests` stays off.
+COMPONENT_BRANCH_OUTPUTS: dict[str, dict[str, bool | None]] = {
+    "chart": {
+        "run_helm_tests": True,
+        "run_kubernetes_tests": True,
+        "run_kustomize_overlays_tests": None,
+        # Helm unit tests run in the CI image; Kubernetes tests deploy the PROD image.
+        "ci_image_build": True,
+        "prod_image_build": True,
+    },
+    # The airflow-ctl tests run in a local virtualenv, so no image is built: static checks run on the host
+    # and the integration tests, which need the PROD image, do not run.
+    "airflow-ctl": {
+        "run_airflow_ctl_tests": True,
+    },
+}
+# The documentation built on a component's branch, when documentation changed. Docs build in the CI image,
+# so a component without an image builds none.
+COMPONENT_BRANCH_DOCS = {"chart": "helm-chart"}
+# The release branches of each component, as in the pull_request branch filters of ci-amd.yml. A feature
+# branch named after a component, say chart/fix-ingress, is not one of them.
+COMPONENT_BRANCH_PATTERNS = {
+    "chart": re.compile(r"^chart/v\d+-\d+x-(test|stable)$"),
+    "airflow-ctl": re.compile(r"^airflow-ctl/v\d+-\d+-(test|stable)$"),
+}
+
+
+def _scoped_to_component_branch(func: Callable[[SelectiveChecks], bool]) -> Callable[[SelectiveChecks], bool]:
+    """Restrict an output deciding whether a test job runs to the component of a component branch."""
+
+    @wraps(func)
+    def wrapper(self: SelectiveChecks) -> bool:
+        component = self._component_branch
+        if component is None:
+            return func(self)
+        outputs = COMPONENT_BRANCH_OUTPUTS[component]
+        if func.__name__ not in outputs:
+            return False
+        forced = outputs[func.__name__]
+        return func(self) if forced is None else forced
+
+    wrapper.scoped_to_component_branch = True  # type: ignore[attr-defined]
+    return wrapper
 
 
 class SelectiveChecks:
-    __HASHABLE_FIELDS = {"_files", "_default_branch", "_commit_ref", "_pr_labels", "_github_event"}
+    __HASHABLE_FIELDS = {
+        "_files",
+        "_default_branch",
+        "_commit_ref",
+        "_pr_labels",
+        "_github_event",
+        "_fork_push",
+        "_fork_changes_truncated",
+        "_fork_merge_base",
+    }
 
     def __init__(
         self,
         files: tuple[str, ...] = (),
-        default_branch="main",
-        default_constraints_branch="constraints-main",
+        default_branch=AIRFLOW_BRANCH,
+        default_constraints_branch=DEFAULT_AIRFLOW_CONSTRAINTS_BRANCH,
         commit_ref: str | None = None,
         pr_labels: tuple[str, ...] = (),
         github_event: GithubEvents = GithubEvents.PULL_REQUEST,
+        github_repository: str = APACHE_AIRFLOW_GITHUB_REPOSITORY,
+        github_actor: str = "",
+        github_context_dict: dict[str, Any] | None = None,
+        platform: str = CI_AMD_PLATFORM,
+        selective_tests_on_push: bool = False,
+        fork_push: bool = False,
+        fork_changes_truncated: bool = False,
+        fork_merge_base: str | None = None,
     ):
+        """
+        :param fork_push: the push happened in a contributor fork (AIP-120); ``files`` are the
+            changes against apache/airflow and the run is selected like a pull request.
+        :param fork_changes_truncated: the compare API capped the changed files of a fork push.
+        :param fork_merge_base: the apache/airflow commit a fork push is compared with; previous
+            versions of changed files are read there instead of from the pushed commit's parent.
+        """
         self._files = files
+        # A changed test helper selects the tests that import it, as if those test files had changed;
+        # only helpers that cannot be narrowed to their importers still force the full set of tests.
+        self._test_helpers_forcing_full_tests: tuple[str, ...] = ()
+        self._test_helpers_replaced_by_importers: tuple[str, ...] = ()
+        helper_importers: set[str] = set()
+        for helper in _matching_files(files, FileGroupForCi.TESTS_UTILS_FILES, CI_FILE_GROUP_MATCHES):
+            importers = _find_test_helper_importers(helper)
+            if importers is None:
+                self._test_helpers_forcing_full_tests += (helper,)
+            else:
+                self._test_helpers_replaced_by_importers += (helper,)
+                helper_importers |= importers
+        self._test_helper_importers = frozenset(helper_importers - set(files))
+        if helper_importers:
+            self._files = tuple(sorted(set(files) | helper_importers))
         self._default_branch = default_branch
         self._default_constraints_branch = default_constraints_branch
         self._commit_ref = commit_ref
         self._pr_labels = pr_labels
         self._github_event = github_event
+        self._github_repository = github_repository
+        self._github_actor = github_actor
+        self._github_context_dict = github_context_dict or {}
+        self._platform = platform
+        self._selective_tests_on_push = selective_tests_on_push
+        self._fork_push = fork_push
+        self._fork_changes_truncated = fork_changes_truncated
+        self._fork_merge_base = fork_merge_base
+        self._new_toml: dict[str, Any] = {}
+        self._old_toml: dict[str, Any] = {}
 
     def __important_attributes(self) -> tuple[Any, ...]:
         return tuple(getattr(self, f) for f in self.__HASHABLE_FIELDS)
@@ -272,20 +1151,55 @@ class SelectiveChecks:
         )
 
     def __str__(self) -> str:
+        from airflow_breeze.utils.github import get_ga_output
+
         output = []
         for field_name in dir(self):
             if not field_name.startswith("_"):
-                output.append(get_ga_output(field_name, getattr(self, field_name)))
+                value = getattr(self, field_name)
+                if value is not None:
+                    output.append(get_ga_output(field_name, value))
         return "\n".join(output)
 
-    default_python_version = DEFAULT_PYTHON_MAJOR_MINOR_VERSION
     default_postgres_version = DEFAULT_POSTGRES_VERSION
     default_mysql_version = DEFAULT_MYSQL_VERSION
-    default_mssql_version = DEFAULT_MSSQL_VERSION
 
     default_kubernetes_version = DEFAULT_KUBERNETES_VERSION
     default_kind_version = KIND_VERSION
     default_helm_version = HELM_VERSION
+    java_sdk_version = JAVA_SDK_VERSION
+
+    @cached_property
+    def latest_versions_only(self) -> bool:
+        return LATEST_VERSIONS_ONLY_LABEL in self._pr_labels
+
+    @cached_property
+    def _target_branch(self) -> str:
+        """The branch a pull request targets, or the branch a push or a dispatched run is on."""
+        return self._github_context_dict.get("base_ref") or self._github_context_dict.get("ref_name") or ""
+
+    @cached_property
+    def _component_branch(self) -> str | None:
+        """The component in COMPONENT_BRANCH_OUTPUTS whose release branch the run targets, if any."""
+        # A push in a fork is selected against apache/airflow's main, whatever its branch is called.
+        if self._fork_push:
+            return None
+        return next(
+            (
+                component
+                for component, pattern in COMPONENT_BRANCH_PATTERNS.items()
+                if pattern.match(self._target_branch)
+            ),
+            None,
+        )
+
+    @cached_property
+    def default_python_version(self) -> str:
+        return (
+            CURRENT_PYTHON_MAJOR_MINOR_VERSIONS[-1]
+            if LATEST_VERSIONS_ONLY_LABEL in self._pr_labels
+            else DEFAULT_PYTHON_MAJOR_MINOR_VERSION
+        )
 
     @cached_property
     def default_branch(self) -> str:
@@ -295,19 +1209,115 @@ class SelectiveChecks:
     def default_constraints_branch(self) -> str:
         return self._default_constraints_branch
 
+    def _get_full_run_events(self) -> list[GithubEvents]:
+        # Only `ci-amd.yml` / `ci-arm.yml` opt in: other push-triggered workflows (constraints, image
+        # cache) rely on a push selecting all Python versions.
+        if self._selective_tests_on_push:
+            return [GithubEvents.SCHEDULE, GithubEvents.WORKFLOW_DISPATCH]
+        return [GithubEvents.PUSH, GithubEvents.SCHEDULE, GithubEvents.WORKFLOW_DISPATCH]
+
+    def _get_previous_file_content(self, path: str) -> str | None:
+        if self._fork_merge_base:
+            return get_upstream_file(path=path, ref=self._fork_merge_base)
+        result = run_command(
+            ["git", "show", f"{self._commit_ref}^:{path}"],
+            capture_output=True,
+            text=True,
+            cwd=AIRFLOW_ROOT_PATH,
+            check=False,
+        )
+        return result.stdout if result.returncode == 0 else None
+
+    def _is_pull_request_like(self) -> bool:
+        return self._github_event == GithubEvents.PULL_REQUEST or self._fork_push
+
+    def _should_run_all_tests_and_versions(self) -> bool:
+        if self._fork_changes_truncated:
+            console_print("[warning]Running everything because the fork change set is truncated[/]")
+            return True
+        if not self._fork_push and self._github_event in self._get_full_run_events():
+            if self.only_text_non_doc_files_changed and self._github_event == GithubEvents.PUSH:
+                console_print(
+                    f"[warning]Only text non doc files changed in {self._github_event}, skip full tests[/]"
+                )
+                return False
+            console_print(f"[warning]Running everything because event is {self._github_event}[/]")
+            return True
+        if not self._commit_ref:
+            console_print("[warning]Running everything in all versions as commit is missing[/]")
+            return True
+        if self.pyproject_toml_changed:
+            console_print("[warning]Running everything with all versions: changed pyproject.toml[/]")
+            return True
+        return False
+
+    @cached_property
+    def all_versions(self) -> bool:
+        if DEFAULT_VERSIONS_ONLY_LABEL in self._pr_labels:
+            return False
+        if LATEST_VERSIONS_ONLY_LABEL in self._pr_labels:
+            return False
+        if ALL_VERSIONS_LABEL in self._pr_labels:
+            return True
+        if self._should_run_all_tests_and_versions():
+            return True
+        return False
+
     @cached_property
     def full_tests_needed(self) -> bool:
-        if not self._commit_ref:
-            get_stderr_console().print("[warning]Running everything as commit is missing[/]")
+        if self._should_run_all_tests_and_versions():
             return True
-        if self._github_event in [GithubEvents.PUSH, GithubEvents.SCHEDULE, GithubEvents.WORKFLOW_DISPATCH]:
-            get_stderr_console().print(f"[warning]Full tests needed because event is {self._github_event}[/]")
+        if self._matching_files(
+            FileGroupForCi.ENVIRONMENT_FILES,
+            CI_FILE_GROUP_MATCHES,
+        ):
+            console_print("[warning]Running full set of tests because env files changed[/]")
             return True
-        if len(self._matching_files(FileGroupForCi.ENVIRONMENT_FILES, CI_FILE_GROUP_MATCHES)) > 0:
-            get_stderr_console().print("[warning]Running everything because env files changed[/]")
+        if self._matching_files(
+            FileGroupForCi.API_CODEGEN_FILES,
+            CI_FILE_GROUP_MATCHES,
+        ):
+            # Only the API *contract* changing (the generated OpenAPI spec, or the
+            # client generator) ripples broadly — to the UI codegen, the generated
+            # clients, and every consumer — so it warrants the full matrix. Plain
+            # API source/test edits that leave the committed spec untouched do not:
+            # a prek hook regenerates and verifies the spec, so an unchanged spec
+            # reliably means an unchanged contract. Those edits still run the `API`
+            # test type and the `fab` provider (via `run_api_tests`); they just no
+            # longer drag in the whole provider matrix.
+            console_print(
+                "[warning]Running full set of tests because the API contract "
+                "(generated OpenAPI spec / client generator) changed[/]"
+            )
+            return True
+        if self._matching_files(
+            FileGroupForCi.GIT_PROVIDER_FILES,
+            CI_FILE_GROUP_MATCHES,
+        ):
+            # TODO(potiuk): remove me when we get rid of the dependency
+            console_print(
+                "[warning]Running full set of tests because git provider files changed "
+                "and for now we have core tests depending on them.[/]"
+            )
+            return True
+        if self._matching_files(
+            FileGroupForCi.STANDARD_PROVIDER_FILES,
+            CI_FILE_GROUP_MATCHES,
+        ):
+            # TODO(potiuk): remove me when we get rid of the dependency
+            console_print(
+                "[warning]Running full set of tests because standard provider files changed "
+                "and for now we have core tests depending on them.[/]"
+            )
+            return True
+        if self._test_helpers_forcing_full_tests:
+            console_print(
+                "[warning]Running full set of tests because test helpers that cannot be narrowed to their "
+                f"importers changed: {', '.join(self._test_helpers_forcing_full_tests)}[/]"
+            )
             return True
         if FULL_TESTS_NEEDED_LABEL in self._pr_labels:
-            get_stderr_console().print(
+            console_print(
                 "[warning]Full tests needed because "
                 f"label '{FULL_TESTS_NEEDED_LABEL}' is in  {self._pr_labels}[/]"
             )
@@ -316,11 +1326,11 @@ class SelectiveChecks:
 
     @cached_property
     def python_versions(self) -> list[str]:
-        return (
-            CURRENT_PYTHON_MAJOR_MINOR_VERSIONS
-            if self.full_tests_needed
-            else [DEFAULT_PYTHON_MAJOR_MINOR_VERSION]
-        )
+        if self.all_versions:
+            return CURRENT_PYTHON_MAJOR_MINOR_VERSIONS
+        if self.latest_versions_only:
+            return [CURRENT_PYTHON_MAJOR_MINOR_VERSIONS[-1]]
+        return [DEFAULT_PYTHON_MAJOR_MINOR_VERSION]
 
     @cached_property
     def python_versions_list_as_string(self) -> str:
@@ -328,11 +1338,16 @@ class SelectiveChecks:
 
     @cached_property
     def all_python_versions(self) -> list[str]:
-        return (
-            ALL_PYTHON_MAJOR_MINOR_VERSIONS
-            if self.full_tests_needed
-            else [DEFAULT_PYTHON_MAJOR_MINOR_VERSION]
-        )
+        """
+        All python versions include all past python versions available in previous branches
+        Even if we remove them from the main version. This is needed to make sure we can cherry-pick
+        changes from main to the previous branch.
+        """
+        if self.all_versions:
+            return ALL_PYTHON_MAJOR_MINOR_VERSIONS
+        if self.latest_versions_only:
+            return [CURRENT_PYTHON_MAJOR_MINOR_VERSIONS[-1]]
+        return [DEFAULT_PYTHON_MAJOR_MINOR_VERSION]
 
     @cached_property
     def all_python_versions_list_as_string(self) -> str:
@@ -340,15 +1355,19 @@ class SelectiveChecks:
 
     @cached_property
     def postgres_versions(self) -> list[str]:
-        return CURRENT_POSTGRES_VERSIONS if self.full_tests_needed else [DEFAULT_POSTGRES_VERSION]
+        if self.all_versions:
+            return CURRENT_POSTGRES_VERSIONS
+        if self.latest_versions_only:
+            return [CURRENT_POSTGRES_VERSIONS[-1]]
+        return [DEFAULT_POSTGRES_VERSION]
 
     @cached_property
     def mysql_versions(self) -> list[str]:
-        return CURRENT_MYSQL_VERSIONS if self.full_tests_needed else [DEFAULT_MYSQL_VERSION]
-
-    @cached_property
-    def mssql_versions(self) -> list[str]:
-        return CURRENT_MSSQL_VERSIONS if self.full_tests_needed else [DEFAULT_MSSQL_VERSION]
+        if self.all_versions:
+            return CURRENT_MYSQL_VERSIONS
+        if self.latest_versions_only:
+            return [CURRENT_MYSQL_VERSIONS[-1]]
+        return [DEFAULT_MYSQL_VERSION]
 
     @cached_property
     def kind_version(self) -> str:
@@ -359,44 +1378,26 @@ class SelectiveChecks:
         return HELM_VERSION
 
     @cached_property
-    def providers_package_format_exclude(self) -> list[dict[str, str]]:
-        # Exclude sdist format unless full tests are run
-        return [{"package-format": "sdist"}] if not self.full_tests_needed else []
-
-    @cached_property
     def postgres_exclude(self) -> list[dict[str, str]]:
-        if not self.full_tests_needed:
+        if not self.all_versions:
             # Only basic combination so we do not need to exclude anything
             return []
         return [
             # Exclude all combinations that are repeating python/postgres versions
-            {"python-version": python_version, "postgres-version": postgres_version}
+            {"python-version": python_version, "backend-version": postgres_version}
             for python_version, postgres_version in excluded_combos(
                 CURRENT_PYTHON_MAJOR_MINOR_VERSIONS, CURRENT_POSTGRES_VERSIONS
             )
         ]
 
     @cached_property
-    def mssql_exclude(self) -> list[dict[str, str]]:
-        if not self.full_tests_needed:
-            # Only basic combination so we do not need to exclude anything
-            return []
-        return [
-            # Exclude all combinations that are repeating python/mssql versions
-            {"python-version": python_version, "mssql-version": mssql_version}
-            for python_version, mssql_version in excluded_combos(
-                CURRENT_PYTHON_MAJOR_MINOR_VERSIONS, CURRENT_MSSQL_VERSIONS
-            )
-        ]
-
-    @cached_property
     def mysql_exclude(self) -> list[dict[str, str]]:
-        if not self.full_tests_needed:
+        if not self.all_versions:
             # Only basic combination so we do not need to exclude anything
             return []
         return [
             # Exclude all combinations that are repeating python/mysql versions
-            {"python-version": python_version, "mysql-version": mysql_version}
+            {"python-version": python_version, "backend-version": mysql_version}
             for python_version, mysql_version in excluded_combos(
                 CURRENT_PYTHON_MAJOR_MINOR_VERSIONS, CURRENT_MYSQL_VERSIONS
             )
@@ -408,198 +1409,1751 @@ class SelectiveChecks:
 
     @cached_property
     def kubernetes_versions(self) -> list[str]:
-        return CURRENT_KUBERNETES_VERSIONS if self.full_tests_needed else [DEFAULT_KUBERNETES_VERSION]
+        if self.all_versions:
+            return CURRENT_KUBERNETES_VERSIONS
+        if self.latest_versions_only:
+            return [CURRENT_KUBERNETES_VERSIONS[-1]]
+        return [DEFAULT_KUBERNETES_VERSION]
 
     @cached_property
     def kubernetes_versions_list_as_string(self) -> str:
         return " ".join(self.kubernetes_versions)
 
     @cached_property
-    def kubernetes_combos(self) -> str:
+    def kubernetes_combos(self) -> list[str]:
         python_version_array: list[str] = self.python_versions_list_as_string.split(" ")
         kubernetes_version_array: list[str] = self.kubernetes_versions_list_as_string.split(" ")
         combo_titles, short_combo_titles, combos = get_kubernetes_python_combos(
             kubernetes_version_array, python_version_array
         )
-        return " ".join(short_combo_titles)
+        return short_combo_titles
 
-    def _match_files_with_regexps(self, matched_files, regexps):
-        for file in self._files:
-            for regexp in regexps:
-                if match(regexp, file):
-                    matched_files.append(file)
-                    break
+    @cached_property
+    def kubernetes_combos_list_as_string(self) -> str:
+        return " ".join(self.kubernetes_combos)
 
-    @lru_cache(maxsize=None)
-    def _matching_files(self, match_group: T, match_dict: dict[T, list[str]]) -> list[str]:
-        matched_files: list[str] = []
-        regexps = match_dict[match_group]
-        self._match_files_with_regexps(matched_files, regexps)
-        count = len(matched_files)
-        if count > 0:
-            get_stderr_console().print(f"[warning]{match_group} matched {count} files.[/]")
-            get_stderr_console().print(matched_files)
-        else:
-            get_stderr_console().print(f"[warning]{match_group} did not match any file.[/]")
-        return matched_files
+    def _matching_files(
+        self, match_group: FileGroupForCi | SelectiveTestType, match_dict: HashableDict
+    ) -> list[str]:
+        return _matching_files(self._files, match_group, match_dict)
 
     def _should_be_run(self, source_area: FileGroupForCi) -> bool:
         if self.full_tests_needed:
-            get_stderr_console().print(f"[warning]{source_area} enabled because we are running everything[/]")
+            console_print(f"[warning]{source_area} enabled because we are running everything[/]")
             return True
         matched_files = self._matching_files(source_area, CI_FILE_GROUP_MATCHES)
-        if len(matched_files) > 0:
-            get_stderr_console().print(
+        if matched_files:
+            console_print(
                 f"[warning]{source_area} enabled because it matched {len(matched_files)} changed files[/]"
             )
             return True
-        else:
-            get_stderr_console().print(
-                f"[warning]{source_area} disabled because it did not match any changed files[/]"
-            )
-            return False
+        console_print(f"[warning]{source_area} disabled because it did not match any changed files[/]")
+        return False
 
     @cached_property
-    def needs_python_scans(self) -> bool:
+    @_scoped_to_component_branch
+    def run_mypy_providers(self) -> bool:
+        # Non-provider mypy checks run as part of regular static checks (prek hooks).
+        # Only provider mypy needs a separate CI job (requires the CI Docker image with breeze).
+        return (
+            self._matching_files(FileGroupForCi.ALL_PROVIDERS_PYTHON_FILES, CI_FILE_GROUP_MATCHES)
+            or self._matching_files(
+                FileGroupForCi.ALL_PROVIDERS_DISTRIBUTION_CONFIG_FILES, CI_FILE_GROUP_MATCHES
+            )
+            or self._are_all_providers_affected()
+            or (
+                self._matching_files(FileGroupForCi.DEVEL_TOML_FILES, CI_FILE_GROUP_MATCHES)
+                and self._default_branch == "main"
+            )
+            or self.full_tests_needed
+        ) and self._default_branch == "main"
+
+    @cached_property
+    def run_python_scans(self) -> bool:
         return self._should_be_run(FileGroupForCi.PYTHON_PRODUCTION_FILES)
 
     @cached_property
-    def needs_javascript_scans(self) -> bool:
+    def run_javascript_scans(self) -> bool:
         return self._should_be_run(FileGroupForCi.JAVASCRIPT_PRODUCTION_FILES)
 
     @cached_property
-    def needs_api_tests(self) -> bool:
-        return self._should_be_run(FileGroupForCi.API_TEST_FILES)
+    @_scoped_to_component_branch
+    def run_api_tests(self) -> bool:
+        return self._should_be_run(FileGroupForCi.API_FILES)
 
     @cached_property
-    def needs_api_codegen(self) -> bool:
+    @_scoped_to_component_branch
+    def run_ol_tests(self) -> bool:
+        return self._should_be_run(FileGroupForCi.ASSET_FILES)
+
+    @cached_property
+    @_scoped_to_component_branch
+    def run_api_codegen(self) -> bool:
         return self._should_be_run(FileGroupForCi.API_CODEGEN_FILES)
 
     @cached_property
-    def run_www_tests(self) -> bool:
-        return self._should_be_run(FileGroupForCi.WWW_FILES)
+    def run_breeze_integration_tests(self) -> bool:
+        return self._should_be_run(FileGroupForCi.BREEZE_INTEGRATION_TEST_FILES)
 
     @cached_property
+    @_scoped_to_component_branch
+    def run_ui_tests(self) -> bool:
+        return self._should_be_run(FileGroupForCi.UI_FILES)
+
+    @cached_property
+    @_scoped_to_component_branch
+    def run_ui_e2e_tests(self) -> bool:
+        # E2E tests should not be triggered by derived full_tests_needed (push events,
+        # env file changes, large PRs, etc.) - only by explicit label or actual file changes.
+        if FULL_TESTS_NEEDED_LABEL in self._pr_labels:
+            console_print(
+                f"[warning]{FileGroupForCi.UI_FILES} e2e enabled because "
+                f"'{FULL_TESTS_NEEDED_LABEL}' label is set[/]"
+            )
+            return True
+        # The UI files of a truncated fork change set may be among the files the compare API
+        # did not list, so the file match below cannot rule them out.
+        if self._fork_changes_truncated:
+            console_print(
+                f"[warning]{FileGroupForCi.UI_FILES} e2e enabled because the fork change set is truncated[/]"
+            )
+            return True
+        matched_files = self._matching_files(FileGroupForCi.UI_FILES, CI_FILE_GROUP_MATCHES)
+        if matched_files:
+            console_print(
+                f"[warning]{FileGroupForCi.UI_FILES} e2e enabled because "
+                f"it matched {len(matched_files)} changed files[/]"
+            )
+            return True
+        console_print(
+            f"[warning]{FileGroupForCi.UI_FILES} e2e disabled because "
+            f"it did not match any changed files and no explicit label[/]"
+        )
+        return False
+
+    @cached_property
+    @_scoped_to_component_branch
+    def run_remote_logging_s3_e2e_tests(self) -> bool:
+        return self._should_be_run(FileGroupForCi.REMOTE_LOGGING_E2E_SHARED_FILES) or self._should_be_run(
+            FileGroupForCi.REMOTE_LOGGING_E2E_S3_FILES
+        )
+
+    @cached_property
+    @_scoped_to_component_branch
+    def run_remote_logging_elasticsearch_e2e_tests(self) -> bool:
+        return self._should_be_run(FileGroupForCi.REMOTE_LOGGING_E2E_SHARED_FILES) or self._should_be_run(
+            FileGroupForCi.REMOTE_LOGGING_E2E_ELASTICSEARCH_FILES
+        )
+
+    @cached_property
+    @_scoped_to_component_branch
+    def run_remote_logging_opensearch_e2e_tests(self) -> bool:
+        return self._should_be_run(FileGroupForCi.REMOTE_LOGGING_E2E_SHARED_FILES) or self._should_be_run(
+            FileGroupForCi.REMOTE_LOGGING_E2E_OPENSEARCH_FILES
+        )
+
+    @cached_property
+    @_scoped_to_component_branch
+    def run_event_driven_e2e_tests(self) -> bool:
+        return self._should_be_run(FileGroupForCi.EVENT_DRIVEN_E2E_FILES)
+
+    @cached_property
+    @_scoped_to_component_branch
+    def run_java_sdk_e2e_tests(self) -> bool:
+        return self._should_be_run(FileGroupForCi.JAVA_SDK_E2E_FILES)
+
+    @cached_property
+    @_scoped_to_component_branch
+    def run_go_sdk_e2e_tests(self) -> bool:
+        return self._should_be_run(FileGroupForCi.GO_SDK_E2E_FILES)
+
+    @cached_property
+    @_scoped_to_component_branch
+    def run_yaml_dag_e2e_tests(self) -> bool:
+        return self._should_be_run(FileGroupForCi.YAML_DAG_E2E_FILES)
+
+    @cached_property
+    @_scoped_to_component_branch
+    def run_lang_sdk_xcom_e2e_tests(self) -> bool:
+        return self._should_be_run(FileGroupForCi.LANG_SDK_XCOM_E2E_FILES)
+
+    @cached_property
+    @_scoped_to_component_branch
+    def run_openlineage_e2e_tests(self) -> bool:
+        return self._should_be_run(FileGroupForCi.OPENLINEAGE_E2E_FILES)
+
+    @cached_property
+    @_scoped_to_component_branch
+    def run_openlineage_e2e_compat_tests(self) -> bool:
+        # The older-Airflow matrix is costly. Like run_ui_e2e_tests, this check ignores full_tests_needed.
+        # Many changes that do not touch the compat setup also set full_tests_needed, for example changes to
+        # environment files or the API spec. So a PR that changes only breeze's e2e command does not run
+        # this matrix, and the next canary run tests that change.
+        if self._is_canary_run() or FULL_TESTS_NEEDED_LABEL in self._pr_labels:
+            return True
+        return bool(self._matching_files(FileGroupForCi.OPENLINEAGE_E2E_COMPAT_FILES, CI_FILE_GROUP_MATCHES))
+
+    @cached_property
+    @_scoped_to_component_branch
+    def run_ts_sdk_e2e_tests(self) -> bool:
+        return self._should_be_run(FileGroupForCi.TS_SDK_E2E_FILES)
+
+    @cached_property
+    @_scoped_to_component_branch
+    def run_amazon_tests(self) -> bool:
+        if self.providers_test_types_list_as_strings_in_json == "[]":
+            return False
+        return (
+            "amazon" in self.providers_test_types_list_as_strings_in_json
+            or "Providers" in self.providers_test_types_list_as_strings_in_json.split(" ")
+        )
+
+    @cached_property
+    @_scoped_to_component_branch
+    def run_task_sdk_tests(self) -> bool:
+        return self._should_be_run(FileGroupForCi.TASK_SDK_FILES)
+
+    @cached_property
+    @_scoped_to_component_branch
+    def run_task_sdk_integration_tests(self) -> bool:
+        return self._should_be_run(FileGroupForCi.TASK_SDK_FILES) or self._should_be_run(
+            FileGroupForCi.TASK_SDK_INTEGRATION_TEST_FILES
+        )
+
+    @cached_property
+    @_scoped_to_component_branch
+    def run_agent_framework_tests(self) -> bool:
+        # Providers are released from main only, as for skip_providers_tests.
+        if self._default_branch != "main":
+            return False
+        return self._should_be_run(FileGroupForCi.AGENT_FRAMEWORK_FILES)
+
+    @cached_property
+    @_scoped_to_component_branch
+    def run_go_sdk_tests(self) -> bool:
+        return self._should_be_run(FileGroupForCi.GO_SDK_FILES)
+
+    @cached_property
+    @_scoped_to_component_branch
+    def run_java_sdk_tests(self) -> bool:
+        return self._should_be_run(FileGroupForCi.JAVA_SDK_FILES)
+
+    @cached_property
+    @_scoped_to_component_branch
+    def run_ts_sdk_tests(self) -> bool:
+        return self._should_be_run(FileGroupForCi.TS_SDK_FILES)
+
+    @cached_property
+    @_scoped_to_component_branch
+    def run_ts_sdk_docs(self) -> bool:
+        return self._should_be_run(FileGroupForCi.TS_SDK_DOCS_FILES)
+
+    @cached_property
+    def lang_sdk_conformance_sdks(self) -> str:
+        """JSON list of the language SDKs whose serialization conformance check runs, as the matrix of its job."""
+        # No component branch runs it, as for the outputs scoped with _scoped_to_component_branch.
+        if self._component_branch is not None:
+            return json.dumps([])
+        groups = {
+            "go": FileGroupForCi.GO_SDK_CONFORMANCE_FILES,
+            "java": FileGroupForCi.JAVA_SDK_CONFORMANCE_FILES,
+            "ts": FileGroupForCi.TS_SDK_CONFORMANCE_FILES,
+        }
+        return json.dumps([sdk for sdk, group in groups.items() if self._should_be_run(group)])
+
+    @cached_property
+    @_scoped_to_component_branch
+    def run_airflow_ctl_tests(self) -> bool:
+        return self._should_be_run(FileGroupForCi.AIRFLOW_CTL_FILES)
+
+    @cached_property
+    @_scoped_to_component_branch
+    def run_airflow_ctl_integration_tests(self) -> bool:
+        return self._should_be_run(FileGroupForCi.AIRFLOW_CTL_FILES) or self._should_be_run(
+            FileGroupForCi.AIRFLOW_CTL_INTEGRATION_TEST_FILES
+        )
+
+    @cached_property
+    def run_scripts_tests(self) -> bool:
+        return self._should_be_run(FileGroupForCi.SCRIPTS_FILES)
+
+    @cached_property
+    @_scoped_to_component_branch
     def run_kubernetes_tests(self) -> bool:
+        if AREA_KUBERNETES_TESTS_LABEL in self._pr_labels:
+            console_print(
+                "[warning]Running Kubernetes tests because "
+                f"label '{AREA_KUBERNETES_TESTS_LABEL}' is in {self._pr_labels}[/]"
+            )
+            return True
         return self._should_be_run(FileGroupForCi.KUBERNETES_FILES)
 
     @cached_property
     def docs_build(self) -> bool:
+        if self._component_branch is not None and self._component_branch not in COMPONENT_BRANCH_DOCS:
+            return False
         return self._should_be_run(FileGroupForCi.DOC_FILES)
 
     @cached_property
-    def needs_helm_tests(self) -> bool:
+    @_scoped_to_component_branch
+    def run_helm_tests(self) -> bool:
         return self._should_be_run(FileGroupForCi.HELM_FILES) and self._default_branch == "main"
 
     @cached_property
-    def run_tests(self) -> bool:
+    @_scoped_to_component_branch
+    def run_kustomize_overlays_tests(self) -> bool:
+        """Gate for the kustomize-overlays smoke test CI job.
+
+        Distinct from ``run_helm_tests`` so an unrelated chart change
+        (e.g. a values.yaml tweak) does not pull in a 30-40 minute kind
+        cluster spin-up just to verify overlays it does not touch.
+        Trips on changes inside ``chart/kustomize-overlays/`` and the
+        narrow set of files that drive the runner; see
+        ``KUSTOMIZE_OVERLAYS_FILES`` in ``CI_FILE_GROUP_MATCHES``.
+        """
+        return self._should_be_run(FileGroupForCi.KUSTOMIZE_OVERLAYS_FILES) and self._default_branch == "main"
+
+    @cached_property
+    @_scoped_to_component_branch
+    def run_unit_tests(self) -> bool:
+        def _only_new_ui_files() -> bool:
+            all_source_files = set(
+                self._matching_files(FileGroupForCi.ALL_SOURCE_FILES, CI_FILE_GROUP_MATCHES)
+            )
+            new_ui_source_files = set(self._matching_files(FileGroupForCi.UI_FILES, CI_FILE_GROUP_MATCHES))
+            remaining_files = all_source_files - new_ui_source_files
+
+            if all_source_files and new_ui_source_files and not remaining_files:
+                return True
+            return False
+
+        if self.full_tests_needed:
+            return True
+        if self._is_canary_run():
+            return True
+        if _only_new_ui_files():
+            return False
+        # we should run all test
         return self._should_be_run(FileGroupForCi.ALL_SOURCE_FILES)
 
     @cached_property
-    def image_build(self) -> bool:
-        return self.run_tests or self.docs_build or self.run_kubernetes_tests
+    def run_system_tests(self) -> bool:
+        return self.run_unit_tests
 
-    def _select_test_type_if_matching(
-        self, test_types: set[str], test_type: SelectiveUnitTestTypes
-    ) -> list[str]:
+    @cached_property
+    def only_pyproject_toml_files_changed(self) -> bool:
+        return all(Path(file).name == "pyproject.toml" for file in self._files)
+
+    @cached_property
+    def only_text_non_doc_files_changed(self) -> bool:
+        text_non_doc_files = set(
+            self._matching_files(FileGroupForCi.TEXT_NON_DOC_FILES, CI_FILE_GROUP_MATCHES)
+        )
+        return len(self._files) > 0 and set(self._files) <= text_non_doc_files
+
+    @cached_property
+    @_scoped_to_component_branch
+    def ci_image_build(self) -> bool:
+        # in case pyproject.toml changed, CI image should be built - even if no build dependencies
+        # changes because some of our tests - those that need CI image might need to be run depending on
+        # changed rules for static checks that are part of the pyproject.toml file
+        return (
+            self.run_unit_tests
+            or self.docs_build
+            or self.run_kubernetes_tests
+            or self.run_ui_tests
+            or self.pyproject_toml_changed
+            or self.any_provider_yaml_or_pyproject_toml_changed
+            or self.prod_image_build
+            # prek hooks no longer force the full test matrix (they are static checks, not
+            # tests), but they still need the CI image so mypy-scripts and the image-based
+            # static checks run for a prek-only change.
+            or bool(self._matching_files(FileGroupForCi.PREK_FILES, CI_FILE_GROUP_MATCHES))
+        )
+
+    @cached_property
+    @_scoped_to_component_branch
+    def run_generic_basic_tests(self) -> bool:
+        """The standalone Airflow test, which runs for every change."""
+        return True
+
+    @cached_property
+    @_scoped_to_component_branch
+    def run_shared_distributions_tests(self) -> bool:
+        return self._should_be_run(FileGroupForCi.SHARED_DISTRIBUTION_FILES)
+
+    @cached_property
+    @_scoped_to_component_branch
+    def run_translation_check(self) -> bool:
+        return self._should_be_run(FileGroupForCi.UI_I18N_FILES)
+
+    @cached_property
+    def run_image_build_time_check(self) -> bool:
+        return self.ci_image_build and self._should_be_run(FileGroupForCi.IMAGE_BUILD_FILES)
+
+    @cached_property
+    def run_docs_publish(self) -> bool:
+        return self.docs_build and self._should_be_run(FileGroupForCi.DOCS_PUBLISH_FILES)
+
+    @cached_property
+    @_scoped_to_component_branch
+    def run_generic_prod_image_tests(self) -> bool:
+        """The tests of the PROD image itself, run whenever it is built: Docker Compose, the image-building
+        examples and the basic end-to-end tests."""
+        return self.prod_image_build
+
+    @cached_property
+    @_scoped_to_component_branch
+    def prod_image_build(self) -> bool:
+        if AREA_E2E_TESTS_LABEL in self._pr_labels:
+            console_print(
+                "[warning]Building the PROD image to run Airflow E2E tests because "
+                f"label '{AREA_E2E_TESTS_LABEL}' is in {self._pr_labels}[/]"
+            )
+            return True
+        return (
+            self.run_kubernetes_tests
+            or self.run_helm_tests
+            or self.run_kustomize_overlays_tests
+            or self.run_task_sdk_integration_tests
+            or self.run_airflow_ctl_integration_tests
+            or self.run_remote_logging_s3_e2e_tests
+            or self.run_remote_logging_elasticsearch_e2e_tests
+            or self.run_remote_logging_opensearch_e2e_tests
+            or self.run_event_driven_e2e_tests
+            or self.run_java_sdk_e2e_tests
+            or self.run_go_sdk_e2e_tests
+            or self.run_openlineage_e2e_tests
+            or self.run_openlineage_e2e_compat_tests
+            or self.run_ts_sdk_e2e_tests
+            or self.run_yaml_dag_e2e_tests
+            or self.run_lang_sdk_xcom_e2e_tests
+            or self.run_ui_e2e_tests
+        )
+
+    def _select_test_type_if_matching(self, test_types: set[str], test_type: SelectiveTestType) -> list[str]:
         matched_files = self._matching_files(test_type, TEST_TYPE_MATCHES)
         count = len(matched_files)
         if count > 0:
             test_types.add(test_type.value)
-            get_stderr_console().print(f"[warning]{test_type} added because it matched {count} files[/]")
+            console_print(f"[warning]{test_type} added because it matched {count} files[/]")
         return matched_files
 
-    def _get_test_types_to_run(self) -> list[str]:
+    def _are_all_providers_affected(self) -> bool:
+        # if "Providers" test is present in the list of tests, it means that we should run all providers tests
+        # prepare all providers packages and build all providers documentation
+        return "Providers" in self._get_providers_test_types_to_run()
+
+    def _fail_if_suspended_providers_affected(self) -> bool:
+        return "allow suspended provider changes" not in self._pr_labels
+
+    def _get_core_test_types_to_run(self) -> list[str]:
+        if self.full_tests_needed:
+            return list(all_selective_core_test_types())
+
         candidate_test_types: set[str] = {"Always"}
         matched_files: set[str] = set()
-        matched_files.update(
-            self._select_test_type_if_matching(candidate_test_types, SelectiveUnitTestTypes.WWW)
-        )
-        matched_files.update(
-            self._select_test_type_if_matching(candidate_test_types, SelectiveUnitTestTypes.PROVIDERS)
-        )
-        matched_files.update(
-            self._select_test_type_if_matching(candidate_test_types, SelectiveUnitTestTypes.CLI)
-        )
-        matched_files.update(
-            self._select_test_type_if_matching(candidate_test_types, SelectiveUnitTestTypes.API)
-        )
+        for test_type in SelectiveCoreTestType:
+            if test_type not in [
+                SelectiveCoreTestType.ALWAYS,
+                SelectiveCoreTestType.CORE,
+                SelectiveCoreTestType.OTHER,
+            ]:
+                matched_files.update(self._select_test_type_if_matching(candidate_test_types, test_type))
 
         kubernetes_files = self._matching_files(FileGroupForCi.KUBERNETES_FILES, CI_FILE_GROUP_MATCHES)
         system_test_files = self._matching_files(FileGroupForCi.SYSTEM_TEST_FILES, CI_FILE_GROUP_MATCHES)
         all_source_files = self._matching_files(FileGroupForCi.ALL_SOURCE_FILES, CI_FILE_GROUP_MATCHES)
-
-        remaining_files = (
-            set(all_source_files) - set(matched_files) - set(kubernetes_files) - set(system_test_files)
+        all_providers_source_files = self._matching_files(
+            FileGroupForCi.ALL_PROVIDERS_PYTHON_FILES, CI_FILE_GROUP_MATCHES
         )
+        all_providers_distribution_config_files = self._matching_files(
+            FileGroupForCi.ALL_PROVIDERS_DISTRIBUTION_CONFIG_FILES, CI_FILE_GROUP_MATCHES
+        )
+        test_always_files = self._matching_files(FileGroupForCi.ALWAYS_TESTS_FILES, CI_FILE_GROUP_MATCHES)
+        test_ui_files = self._matching_files(FileGroupForCi.UI_FILES, CI_FILE_GROUP_MATCHES)
+
+        text_non_doc_files = self._matching_files(FileGroupForCi.TEXT_NON_DOC_FILES, CI_FILE_GROUP_MATCHES)
+        remaining_files = (
+            set(all_source_files)
+            - set(all_providers_source_files)
+            - set(all_providers_distribution_config_files)
+            - set(matched_files)
+            - set(text_non_doc_files)
+            - set(kubernetes_files)
+            - set(system_test_files)
+            - set(test_always_files)
+            - set(test_ui_files)
+        )
+        console_print(f"[warning]Remaining non test/always files: {len(remaining_files)}[/]")
         count_remaining_files = len(remaining_files)
+
+        for file in self._files:
+            if file.endswith("bash.py") and Path(file).parent.name == "operators":
+                candidate_test_types.add("Serialization")
+                candidate_test_types.add("Core")
+                break
         if count_remaining_files > 0:
-            get_stderr_console().print(
-                f"[warning]We should run all tests. There are {count_remaining_files} changed "
-                "files that seems to fall into Core/Other category[/]"
+            console_print(
+                f"[warning]We should run all core tests except providers."
+                f"There are {count_remaining_files} changed files that seems to fall "
+                f"into Core/Other category[/]"
             )
-            get_stderr_console().print(remaining_files)
-            candidate_test_types.update(all_selective_test_types())
+            console_print(remaining_files)
+            candidate_test_types.update(all_selective_core_test_types())
         else:
-            if "Providers" in candidate_test_types:
-                affected_providers = find_all_providers_affected(changed_files=self._files)
-                if len(affected_providers) != 0:
-                    candidate_test_types.remove("Providers")
-                    candidate_test_types.add(f"Providers[{','.join(sorted(affected_providers))}]")
-            get_stderr_console().print(
+            console_print(
                 "[warning]There are no core/other files. Only tests relevant to the changed files are run.[/]"
             )
-        sorted_candidate_test_types = list(sorted(candidate_test_types))
-        get_stderr_console().print("[warning]Selected test type candidates to run:[/]")
-        get_stderr_console().print(sorted_candidate_test_types)
+
+        # run core tests if any changes in serialization files
+        if SelectiveCoreTestType.SERIALIZATION.value in candidate_test_types:
+            candidate_test_types.add(SelectiveCoreTestType.CORE.value)
+
+        # sort according to predefined order
+        sorted_candidate_test_types = sorted(candidate_test_types)
+        console_print("[warning]Selected core test type candidates to run:[/]")
+        console_print(sorted_candidate_test_types)
+        return sorted_candidate_test_types
+
+    def _get_providers_test_types_to_run(self, split_to_individual_providers: bool = False) -> list[str]:
+        if self._default_branch != "main":
+            return []
+        if self.upgrade_to_newer_dependencies:
+            return ["Providers"]
+        if self.full_tests_needed or self.run_task_sdk_tests:
+            if split_to_individual_providers:
+                return list(providers_test_type())
+            return ["Providers"]
+        all_providers_source_files = self._matching_files(
+            FileGroupForCi.ALL_PROVIDERS_PYTHON_FILES, CI_FILE_GROUP_MATCHES
+        )
+        all_providers_distribution_config_files = self._matching_files(
+            FileGroupForCi.ALL_PROVIDERS_DISTRIBUTION_CONFIG_FILES, CI_FILE_GROUP_MATCHES
+        )
+        assets_source_files = self._matching_files(FileGroupForCi.ASSET_FILES, CI_FILE_GROUP_MATCHES)
+        if (
+            len(all_providers_source_files) == 0
+            and len(all_providers_distribution_config_files) == 0
+            and len(assets_source_files) == 0
+            and not self.run_api_tests
+        ):
+            # IF API tests are needed, that will trigger extra provider checks
+            return []
+        affected_providers = self._find_all_providers_affected(
+            include_docs=False,
+        )
+        candidate_test_types: set[str] = set()
+        if isinstance(affected_providers, AllProvidersSentinel):
+            if split_to_individual_providers:
+                for provider in get_available_distributions():
+                    candidate_test_types.add(f"Providers[{provider}]")
+            else:
+                candidate_test_types.add("Providers")
+        elif affected_providers:
+            suspended = set(get_suspended_provider_ids())
+            providers_to_test = self._narrow_providers_by_import_graph(
+                [p for p in affected_providers if p not in suspended]
+            )
+            if split_to_individual_providers:
+                for provider in providers_to_test:
+                    candidate_test_types.add(f"Providers[{provider}]")
+            elif providers_to_test:
+                providers_to_test = self._add_providers_sharing_test_process_state(
+                    providers_to_test, changed_providers=self._find_changed_providers(), suspended=suspended
+                )
+                candidate_test_types.add(f"Providers[{','.join(sorted(providers_to_test))}]")
+        sorted_candidate_test_types = sorted(candidate_test_types)
+        console_print("[warning]Selected providers test type candidates to run:[/]")
+        console_print(sorted_candidate_test_types)
         return sorted_candidate_test_types
 
     @cached_property
-    def test_types(self) -> str:
-        if not self.run_tests:
-            return ""
-        if self.full_tests_needed:
-            current_test_types = set(all_selective_test_types())
-        else:
-            current_test_types = set(self._get_test_types_to_run())
+    def _import_graph_narrowing_enabled(self) -> bool:
+        # Pushes to main stay coarse, so what a narrowed PR misses still fails before the next canary.
+        return self._is_pull_request_like() and (
+            IMPORT_GRAPH_NARROWING_LABEL in self._pr_labels
+            or os.environ.get("IMPORT_GRAPH_NARROWING", "").casefold() == "true"
+        )
+
+    def _narrow_providers_by_import_graph(self, providers: list[str]) -> list[str]:
+        """
+        Drop the upstream and downstream providers whose tests cannot import any changed file.
+
+        Off by default: the providers the import graph would drop are only printed (shadow mode), so
+        the gap can be measured from the build-info logs before the label or variable turns it on.
+        """
+        changed = self._find_changed_providers()
+        reachable = find_reachable_providers(AIRFLOW_ROOT_PATH, self._files, set(providers) - changed)
+        if reachable is None:
+            console_print("[info]Import graph narrowing: a changed file can be imported dynamically.[/]")
+            return providers
+        dropped = sorted(p for p in providers if p not in changed and p not in reachable)
+        if not self._import_graph_narrowing_enabled:
+            console_print(f"[info]Import graph narrowing (shadow mode) would drop providers: {dropped}[/]")
+            return providers
+        console_print(f"[info]Import graph narrowing dropped providers: {dropped}[/]")
+        return [p for p in providers if p not in dropped]
+
+    def _find_changed_providers(self) -> set[str]:
+        """Providers whose own files changed, without their upstream and downstream dependents."""
+        return {
+            provider
+            for changed_file in self._files
+            if (provider := find_provider_affected(changed_file, include_docs=False))
+            not in (None, "Providers")
+        }
+
+    @staticmethod
+    def _add_providers_sharing_test_process_state(
+        providers_to_test: list[str], *, changed_providers: set[str], suspended: set[str]
+    ) -> list[str]:
+        """
+        Add the providers from PROVIDERS_WITH_PROCESS_GLOBAL_TEST_SIDE_EFFECTS that precede a changed one.
+
+        Only providers whose own files changed count: a PR can make a provider's tests order-sensitive only
+        by changing that provider, and dependents pulled in for coverage keep their canary behaviour.
+        """
+
+        def get_test_folder(provider_id: str) -> str:
+            return provider_id.replace(".", "/")
+
+        changed_shared_process_providers = [
+            p for p in providers_to_test if p in changed_providers and p not in LONG_RUNNING_TEST_PROVIDERS
+        ]
+        if not changed_shared_process_providers:
+            return providers_to_test
+        last_folder = max(get_test_folder(p) for p in changed_shared_process_providers)
+        leaking_providers = [
+            p
+            for p in PROVIDERS_WITH_PROCESS_GLOBAL_TEST_SIDE_EFFECTS
+            if get_test_folder(p) < last_folder and p not in providers_to_test and p not in suspended
+        ]
+        return sorted([*providers_to_test, *leaking_providers])
+
+    @staticmethod
+    def _extract_long_provider_tests(current_test_types: set[str]):
+        """
+        In case there are Provider tests in the list of test to run - either in the form of
+        Providers or Providers[...] we subtract them from the test type,
+        and add them to the list of tests to run individually.
+
+        In case of Providers, we need to replace it with Providers[-<list_of_long_tests>], but
+        in case of Providers[list_of_tests] we need to remove the long tests from the list.
+
+        In case of celery tests we want to isolate them from the rest, because they seem to be hanging
+        infrequently when running together with other tests
+
+        :param current_test_types: The set of test types to run
+        """
+        for original_test_type in tuple(current_test_types):
+            if original_test_type == "Providers":
+                current_test_types.remove(original_test_type)
+                for long_test in LONG_RUNNING_TEST_PROVIDERS:
+                    current_test_types.add(f"Providers[{long_test}]")
+                current_test_types.add(f"Providers[-{','.join(LONG_RUNNING_TEST_PROVIDERS)}]")
+            elif original_test_type.startswith("Providers["):
+                provider_tests_to_run = (
+                    original_test_type.replace("Providers[", "").replace("]", "").split(",")
+                )
+                if any(long_test in provider_tests_to_run for long_test in LONG_RUNNING_TEST_PROVIDERS):
+                    current_test_types.remove(original_test_type)
+                    for long_test in LONG_RUNNING_TEST_PROVIDERS:
+                        if long_test in provider_tests_to_run:
+                            current_test_types.add(f"Providers[{long_test}]")
+                            provider_tests_to_run.remove(long_test)
+                    current_test_types.add(f"Providers[{','.join(provider_tests_to_run)}]")
+
+    @cached_property
+    def core_test_types_list_as_strings_in_json(self) -> str | None:
+        if not self.run_unit_tests:
+            return None
+        current_test_types = sorted(set(self._get_core_test_types_to_run()))
+        number_of_slices = NUMBER_OF_CORE_SLICES_ON_RUNS_ON if self._is_on_runs_on else NUMBER_OF_CORE_SLICES
+        if len(current_test_types) <= number_of_slices:
+            return json.dumps(_get_test_list_as_json([current_test_types]))
+        list_of_list_of_types = _split_list(current_test_types, number_of_slices)
+        return json.dumps(_get_test_list_as_json(list_of_list_of_types))
+
+    @cached_property
+    def _platform_excluded_providers(self) -> set[str]:
+        """Provider ids that opt out of the current platform via provider.yaml.
+
+        Mirrors the ``excluded-python-versions`` mechanism but keyed by Docker platform
+        string (e.g. ``linux/arm64``) so providers whose native dependencies are unavailable
+        on a given architecture can be removed from the test matrix at planning time.
+        """
+        excluded: set[str] = set()
+        for provider_id, provider_info in get_provider_dependencies().items():
+            if self._platform in provider_info.get("excluded-platforms", []):
+                excluded.add(provider_id)
+        return excluded
+
+    def _filter_platform_excluded_test_types(self, current_test_types: set[str]) -> None:
+        """Rewrite ``Providers[...]`` entries in-place to honor ``excluded-platforms``.
+
+        Handles three shapes produced upstream:
+
+        * ``Providers[foo]`` — dropped entirely when ``foo`` is excluded.
+        * ``Providers[a,foo,b]`` — rewritten to ``Providers[a,b]``; dropped if empty.
+        * ``Providers[-amazon,celery,google,standard]`` (negative, "all except") —
+          excluded providers are appended to the negation so they remain skipped.
+        """
+        excluded = self._platform_excluded_providers
+        if not excluded:
+            return
+        for original in tuple(current_test_types):
+            if not original.startswith("Providers[") or not original.endswith("]"):
+                continue
+            inner = original[len("Providers[") : -1]
+            if inner.startswith("-"):
+                negated = [p for p in inner[1:].split(",") if p]
+                additions = sorted(p for p in excluded if p not in negated)
+                if not additions:
+                    continue
+                current_test_types.remove(original)
+                current_test_types.add(f"Providers[-{','.join(sorted(negated + additions))}]")
+                continue
+            providers_in = [p for p in inner.split(",") if p]
+            kept = [p for p in providers_in if p not in excluded]
+            if kept == providers_in:
+                continue
+            current_test_types.remove(original)
+            if kept:
+                current_test_types.add(f"Providers[{','.join(kept)}]")
+
+    def _get_providers_test_types_for_branch(self) -> set[str]:
+        current_test_types = set(self._get_providers_test_types_to_run())
         if self._default_branch != "main":
             test_types_to_remove: set[str] = set()
             for test_type in current_test_types:
                 if test_type.startswith("Providers"):
-                    get_stderr_console().print(
+                    console_print(
                         f"[warning]Removing {test_type} because the target branch "
                         f"is {self._default_branch} and not main[/]"
                     )
                     test_types_to_remove.add(test_type)
             current_test_types = current_test_types - test_types_to_remove
-        return " ".join(sorted(current_test_types))
+        return current_test_types
+
+    @cached_property
+    def providers_test_types_list_as_strings_in_json(self) -> str:
+        if not self.run_unit_tests:
+            return "[]"
+        current_test_types = self._get_providers_test_types_for_branch()
+        self._extract_long_provider_tests(current_test_types)
+        self._filter_platform_excluded_test_types(current_test_types)
+        return json.dumps(_get_test_list_as_json([sorted(current_test_types)]))
+
+    @cached_property
+    def providers_split_test_types_list_as_strings_in_json(self) -> str:
+        """Provider test types for the jobs running them in parallel in the CI image.
+
+        On RunsOn every provider (and every part of a split provider) is a test type of its own, in one
+        job: one serial pytest per provider keeps the 32 CPUs of the runner busy, where grouped providers
+        would leave the job waiting on the large "all other providers" group. The compatibility tests keep
+        the grouped list, as each of their test types installs an Airflow version first.
+        """
+        if not self.run_unit_tests:
+            return "[]"
+        if self._is_on_runs_on and self._get_providers_test_types_for_branch():
+            return json.dumps(_get_test_list_as_json([sorted(self._get_individual_providers_list())]))
+        return self.providers_test_types_list_as_strings_in_json
+
+    @cached_property
+    def providers_xdist_test_types_list_as_strings_in_json(self) -> str:
+        """Provider test types for the xdist jobs, which run them all in one pytest, so none is split out."""
+        if not self.run_unit_tests:
+            return "[]"
+        current_test_types = self._get_providers_test_types_for_branch()
+        if "Providers" in current_test_types and self._platform_excluded_providers:
+            current_test_types.remove("Providers")
+            current_test_types.add(f"Providers[-{','.join(sorted(self._platform_excluded_providers))}]")
+        self._filter_platform_excluded_test_types(current_test_types)
+        return json.dumps(_get_test_list_as_json([sorted(current_test_types)]))
+
+    def _get_individual_providers_list(self):
+        current_test_types = set(self._get_providers_test_types_to_run(split_to_individual_providers=True))
+        if "Providers" in current_test_types:
+            current_test_types.remove("Providers")
+            current_test_types.update(
+                {f"Providers[{provider}]" for provider in get_available_distributions(include_not_ready=True)}
+            )
+        self._filter_platform_excluded_test_types(current_test_types)
+        if not self._is_on_runs_on:
+            return current_test_types
+        for provider_id in PROVIDER_TEST_SPLITS:
+            if f"Providers[{provider_id}]" in current_test_types:
+                current_test_types.remove(f"Providers[{provider_id}]")
+                current_test_types.update(get_provider_split_test_types(provider_id))
+        return current_test_types
+
+    @cached_property
+    def individual_providers_test_types_list_as_strings_in_json(self) -> str | None:
+        """Splits the list of test types into several lists of strings (to run them in parallel)."""
+        if not self.run_unit_tests:
+            return None
+        current_test_types = sorted(self._get_individual_providers_list())
+        if not current_test_types:
+            return None
+        number_of_slices = (
+            math.ceil(len(current_test_types) / LOW_DEP_TEST_TYPES_PER_JOB_ON_RUNS_ON)
+            if self._is_on_runs_on
+            else NUMBER_OF_LOW_DEP_SLICES
+        )
+        if len(current_test_types) < number_of_slices:
+            return json.dumps(_get_test_list_as_json([current_test_types]))
+        list_of_list_of_types = _split_list(current_test_types, number_of_slices)
+        return json.dumps(_get_test_list_as_json(list_of_list_of_types))
+
+    @cached_property
+    def include_success_outputs(
+        self,
+    ) -> bool:
+        return INCLUDE_SUCCESS_OUTPUTS_LABEL in self._pr_labels
 
     @cached_property
     def basic_checks_only(self) -> bool:
-        return not self.image_build
+        return not self.ci_image_build
+
+    @staticmethod
+    def _print_diff(old_lines: list[str], new_lines: list[str]):
+        diff = "\n".join(line for line in difflib.ndiff(old_lines, new_lines) if line and line[0] in "+-?")
+        console_print(diff)
+
+    @cached_property
+    def any_provider_yaml_or_pyproject_toml_changed(self) -> bool:
+        if not self._commit_ref:
+            console_print("[warning]Cannot determine changes as commit is missing[/]")
+            return False
+        for file in self._files:
+            path_file = Path(file)
+            if path_file.name == "provider.yaml" or path_file.name == "pyproject.toml":
+                return True
+        return False
+
+    @cached_property
+    def pyproject_toml_changed(self) -> bool:
+        if not self._commit_ref:
+            console_print("[warning]Cannot determine pyproject.toml changes as commit is missing[/]")
+            return False
+        if "pyproject.toml" not in self._files:
+            return False
+        new_result = run_command(
+            ["git", "show", f"{self._commit_ref}:pyproject.toml"],
+            capture_output=True,
+            text=True,
+            cwd=AIRFLOW_ROOT_PATH,
+            check=False,
+        )
+        if new_result.returncode != 0:
+            console_print(
+                f"[warning]Cannot determine pyproject.toml changes. "
+                f"Could not get pyproject.toml from {self._commit_ref}[/]"
+            )
+            return False
+        old_content = self._get_previous_file_content("pyproject.toml")
+        if old_content is None:
+            console_print(
+                "[warning]Cannot determine pyproject.toml changes. Could not get its previous version[/]"
+            )
+            return False
+        self._new_toml = tomllib.loads(new_result.stdout)
+        self._old_toml = tomllib.loads(old_content)
+        return True
+
+    @cached_property
+    def is_uv_lock_update(self) -> bool:
+        """True when uv.lock changed — used to gate constraint branch commits on push."""
+        if len(self._matching_files(FileGroupForCi.UV_LOCK_FILE, CI_FILE_GROUP_MATCHES)) > 0:
+            console_print("[warning]uv.lock file changed[/]")
+            return True
+        return False
 
     @cached_property
     def upgrade_to_newer_dependencies(self) -> bool:
-        return len(
-            self._matching_files(FileGroupForCi.SETUP_FILES, CI_FILE_GROUP_MATCHES)
-        ) > 0 or self._github_event in [GithubEvents.PUSH, GithubEvents.SCHEDULE]
+        # The dependency upgrade summary runs in the CI image.
+        if not self.ci_image_build:
+            return False
+        if len(self._matching_files(FileGroupForCi.ALL_PYPROJECT_TOML_FILES, CI_FILE_GROUP_MATCHES)) > 0:
+            console_print("[warning]Upgrade to newer dependencies: Dependency files changed[/]")
+            return True
+        # A dispatched run is a full run, like a scheduled canary: on release branches it replaces the
+        # push runs that used to update the constraints after a dependency backport.
+        if self._github_event in (GithubEvents.SCHEDULE, GithubEvents.WORKFLOW_DISPATCH):
+            console_print(f"[warning]Upgrade to newer dependencies: {self._github_event} event[/]")
+            return True
+        if UPGRADE_TO_NEWER_DEPENDENCIES_LABEL in self._pr_labels:
+            console_print(
+                f"[warning]Upgrade to newer dependencies: Label '{UPGRADE_TO_NEWER_DEPENDENCIES_LABEL}' "
+                f"in {self._pr_labels}[/]"
+            )
+            return True
+        return False
 
     @cached_property
-    def docs_filter(self) -> str:
+    def generate_pypi_constraints(self) -> bool:
+        # Without a dependency or tooling change this resolution only reports on the state of PyPI,
+        # which the canary runs cover. Their dependency report and `update-constraints` read its output.
+        if not self.ci_image_build:
+            return False
         return (
-            ""
-            if self._default_branch == "main"
-            else "--package-filter apache-airflow --package-filter docker-stack"
+            self.upgrade_to_newer_dependencies
+            or self.is_uv_lock_update
+            or self.full_tests_needed
+            or self._is_canary_run()
         )
 
     @cached_property
-    def skip_pre_commits(self) -> str:
-        return "identity" if self._default_branch == "main" else "identity,check-airflow-2-2-compatibility"
+    def generate_constraints(self) -> bool:
+        # The PROD image build reads the source-providers constraints the job always generates.
+        return self.generate_pypi_constraints or self.prod_image_build
 
     @cached_property
-    def cache_directive(self) -> str:
-        return "disabled" if self._github_event == GithubEvents.SCHEDULE else "registry"
+    def docs_list_as_string(self) -> str | None:
+        _ALL_DOCS_LIST = ""
+        if not self.docs_build:
+            return None
+        if self._component_branch is not None:
+            return COMPONENT_BRANCH_DOCS[self._component_branch]
+        if self._default_branch != "main":
+            return "apache-airflow docker-stack"
+        if self.full_tests_needed:
+            return _ALL_DOCS_LIST
+        providers_affected = self._find_all_providers_affected(
+            include_docs=True,
+        )
+        if (
+            isinstance(providers_affected, AllProvidersSentinel)
+            or "docs/conf.py" in self._files
+            or "docs/build_docs.py" in self._files
+            or self._are_all_providers_affected()
+        ):
+            return _ALL_DOCS_LIST
+        packages = []
+        # Core and Task SDK release together, so either side's docs may link to a page in the
+        # other that is not published yet. Building both resolves those links locally.
+        core_or_task_sdk_changed = any(
+            file.startswith(
+                ("airflow-core/src/airflow/", "airflow-core/docs/", "task-sdk/src/", "task-sdk/docs/")
+            )
+            for file in self._files
+        )
+        if core_or_task_sdk_changed:
+            packages.append("apache-airflow")
+        if any(file.startswith("providers-summary-docs/") for file in self._files):
+            packages.append("apache-airflow-providers")
+        if any(file.startswith("chart/") for file in self._files):
+            packages.append("helm-chart")
+        if any(file.startswith("docker-stack-docs") for file in self._files):
+            packages.append("docker-stack")
+        if core_or_task_sdk_changed:
+            packages.append("task-sdk")
+        if any(file.startswith("airflow-ctl/") for file in self._files):
+            packages.append("apache-airflow-ctl")
+        if any(file.startswith("dev/mypy/") for file in self._files):
+            packages.append("apache-airflow-mypy")
+        if providers_affected:
+            suspended = set(get_suspended_provider_ids())
+            for provider in providers_affected:
+                pkg = provider.replace("-", ".")
+                if pkg not in suspended:
+                    packages.append(pkg)
+        return " ".join(packages)
+
+    @cached_property
+    def skip_prek_hooks(self) -> str:
+        prek_hooks_to_skip = set()
+        prek_hooks_to_skip.add("identity")
+        if self._default_branch != "main":
+            # Skip those tests on all "release" branches
+            prek_hooks_to_skip.update(
+                (
+                    "compile-fab-assets",
+                    "generate-openapi-spec-fab",
+                    "check-airflow-providers-bug-report-template",
+                    "check-airflow-provider-compatibility",
+                    "check-extra-packages-references",
+                    "check-provider-yaml-valid",
+                    "lint-helm-chart",
+                    "validate-operators-init",
+                )
+            )
+
+        if self.full_tests_needed:
+            # when full tests are needed, we do not want to skip any checks and we should
+            # run all the prek hooks just to be sure everything is ok when some structural changes occurred
+            return ",".join(sorted(prek_hooks_to_skip))
+        if not (
+            self._matching_files(FileGroupForCi.UI_FILES, CI_FILE_GROUP_MATCHES)
+            # An API_CODEGEN_FILES disjunct would be unreachable here — matching that group
+            # forces full_tests_needed, and skip_prek_hooks returns early above in that case.
+            or self._matching_files(FileGroupForCi.UI_OPENAPI_FILES, CI_FILE_GROUP_MATCHES)
+        ):
+            prek_hooks_to_skip.add("ts-compile-lint-ui")
+            prek_hooks_to_skip.add("ts-compile-lint-simple-auth-manager-ui")
+        if not self._matching_files(FileGroupForCi.ALL_PYTHON_FILES, CI_FILE_GROUP_MATCHES):
+            prek_hooks_to_skip.add("flynt")
+        if not self._matching_files(
+            FileGroupForCi.HELM_FILES,
+            CI_FILE_GROUP_MATCHES,
+        ):
+            prek_hooks_to_skip.add("lint-helm-chart")
+        if not self._matching_files(FileGroupForCi.JAVA_SDK_FILES, CI_FILE_GROUP_MATCHES):
+            # ktlint and spotless run the java-sdk Gradle wrapper, which downloads the Gradle
+            # distribution on a cold cache. Skip both hooks when no java-sdk files changed, so
+            # unrelated PRs do not depend on a download that fails intermittently.
+            prek_hooks_to_skip.add("ktlint")
+            prek_hooks_to_skip.add("spotless")
+            # Rewriting the verification metadata resolves the entire Java SDK dependency graph
+            # from Maven Central. Skip it when no java-sdk files changed so unrelated PRs do not
+            # depend on that resolution.
+            prek_hooks_to_skip.add("regenerate-java-sdk-verification-metadata")
+        if not self._matching_files(FileGroupForCi.JAVA_SDK_CONFORMANCE_FILES, CI_FILE_GROUP_MATCHES):
+            # sync-java-sdk-dag-schema runs the Gradle wrapper too. This hook is skipped with
+            # JAVA_SDK_CONFORMANCE_FILES, not with ktlint, because that group includes airflow-core's
+            # schema.json. A PR that changes only schema.json can leave the Java SDK's copy of the
+            # schema out of date, and this hook detects the outdated copy.
+            prek_hooks_to_skip.add("sync-java-sdk-dag-schema")
+        if not self._matching_files(FileGroupForCi.TS_SDK_FILES, CI_FILE_GROUP_MATCHES):
+            # This hook regenerates ts-sdk/src/generated/supervisor.ts from the vendored schema
+            # and diffs it, so it is skipped when no ts-sdk/ files changed. A supervisor-schema
+            # change on the Python side is not deferred to a follow-up PR: sync-ts-sdk-schemas is
+            # triggered by that source, refreshes the vendored copy (a ts-sdk/ file), and fails on
+            # the PR that caused it, which is then what makes this check run.
+            prek_hooks_to_skip.add("check-ts-sdk-supervisor-schema")
+        if not (
+            self._matching_files(
+                FileGroupForCi.ALL_PROVIDERS_DISTRIBUTION_CONFIG_FILES, CI_FILE_GROUP_MATCHES
+            )
+            or self._matching_files(FileGroupForCi.ALL_PROVIDERS_PYTHON_FILES, CI_FILE_GROUP_MATCHES)
+            or self._matching_files(FileGroupForCi.PREK_FILES, CI_FILE_GROUP_MATCHES)
+        ):
+            # Skip provider validation only when none of these changed:
+            # - provider.yaml / pyproject.toml / providers/.pre-commit-config.yaml
+            # - provider Python files (validation walks all provider Python files)
+            # - prek scripts (the check script itself may have changed)
+            prek_hooks_to_skip.add("check-provider-yaml-valid")
+        # Non-provider mypy checks run as prek hooks in static checks.
+        # Skip them when their relevant files haven't changed, unless devel-common
+        # pyproject.toml changes on main (which affects all mypy checks).
+        if not (
+            self._matching_files(FileGroupForCi.DEVEL_TOML_FILES, CI_FILE_GROUP_MATCHES)
+            and self._default_branch == "main"
+        ):
+            if not self._matching_files(FileGroupForCi.ALL_AIRFLOW_PYTHON_FILES, CI_FILE_GROUP_MATCHES):
+                prek_hooks_to_skip.add("mypy-airflow-core")
+            if not self._matching_files(FileGroupForCi.ALL_DEV_PYTHON_FILES, CI_FILE_GROUP_MATCHES):
+                prek_hooks_to_skip.add("mypy-dev")
+            if not self._matching_files(FileGroupForCi.ALL_SCRIPTS_PYTHON_FILES, CI_FILE_GROUP_MATCHES):
+                prek_hooks_to_skip.add("mypy-scripts")
+            if not self._matching_files(FileGroupForCi.TASK_SDK_FILES, CI_FILE_GROUP_MATCHES):
+                prek_hooks_to_skip.add("mypy-task-sdk")
+            if not self._matching_files(FileGroupForCi.ALL_DEVEL_COMMON_PYTHON_FILES, CI_FILE_GROUP_MATCHES):
+                prek_hooks_to_skip.add("mypy-devel-common")
+            if not self._matching_files(FileGroupForCi.ALL_AIRFLOW_CTL_PYTHON_FILES, CI_FILE_GROUP_MATCHES):
+                prek_hooks_to_skip.add("mypy-airflow-ctl")
+            if not self._matching_files(
+                FileGroupForCi.AIRFLOW_CTL_INTEGRATION_TEST_FILES, CI_FILE_GROUP_MATCHES
+            ):
+                prek_hooks_to_skip.add("mypy-airflow-ctl-tests")
+            if not self._matching_files(FileGroupForCi.ALL_HELM_TESTS_PYTHON_FILES, CI_FILE_GROUP_MATCHES):
+                prek_hooks_to_skip.add("mypy-helm-tests")
+            if not self._matching_files(
+                FileGroupForCi.ALL_AIRFLOW_E2E_TESTS_PYTHON_FILES, CI_FILE_GROUP_MATCHES
+            ):
+                prek_hooks_to_skip.add("mypy-airflow-e2e-tests")
+            if not self._matching_files(
+                FileGroupForCi.TASK_SDK_INTEGRATION_TEST_FILES, CI_FILE_GROUP_MATCHES
+            ):
+                prek_hooks_to_skip.add("mypy-task-sdk-integration-tests")
+            if not self._matching_files(FileGroupForCi.ALL_DOCKER_TESTS_PYTHON_FILES, CI_FILE_GROUP_MATCHES):
+                prek_hooks_to_skip.add("mypy-docker-tests")
+            if not self._matching_files(
+                FileGroupForCi.ALL_KUBERNETES_TESTS_PYTHON_FILES, CI_FILE_GROUP_MATCHES
+            ):
+                prek_hooks_to_skip.add("mypy-kubernetes-tests")
+            # One mypy-shared-<dist> hook per shared/<dist> workspace member; each is only
+            # kept when that distribution's own files changed.
+            for dist in sorted(
+                p.name for p in (AIRFLOW_ROOT_PATH / "shared").iterdir() if (p / "pyproject.toml").exists()
+            ):
+                pattern = re.compile(rf"^shared/{re.escape(dist)}/.*\.py$")
+                if not any(pattern.match(f) for f in self._files):
+                    prek_hooks_to_skip.add(f"mypy-shared-{dist}")
+        return ",".join(sorted(prek_hooks_to_skip))
+
+    @cached_property
+    def skip_providers_tests(self) -> bool:
+        if self._default_branch != "main" or self._component_branch is not None:
+            return True
+        if self.full_tests_needed:
+            return False
+        if self._get_providers_test_types_to_run():
+            return False
+        if not self.run_unit_tests:
+            return True
+        return True
+
+    @cached_property
+    def docker_cache(self) -> str:
+        return "disabled" if DISABLE_IMAGE_CACHE_LABEL in self._pr_labels else "registry"
 
     @cached_property
     def debug_resources(self) -> bool:
         return DEBUG_CI_RESOURCES_LABEL in self._pr_labels
+
+    @cached_property
+    def disable_airflow_repo_cache(self) -> bool:
+        return self.docker_cache == "disabled"
+
+    @cached_property
+    def use_pinned_os_deps_images(self) -> bool:
+        # Only the label - not the DOCKER_CACHE=disabled retry of a failed image build - asks for the OS
+        # dependencies to be installed from scratch rather than taken from the pinned images.
+        if DISABLE_IMAGE_CACHE_LABEL in self._pr_labels:
+            return False
+        # Reinstalling on top of a pinned image exercises additions only: a package or client the change
+        # drops stays installed from the pinned layer, so the change is tested from the base image.
+        return not self._matching_files(FileGroupForCi.OS_DEPENDENCIES_FILES, CI_FILE_GROUP_MATCHES)
+
+    @cached_property
+    def helm_test_packages(self) -> str:
+        # A Helm test package takes about a minute under xdist on a RunsOn runner, against two to three
+        # minutes of preparing the image, so RunsOn runs all of them in one job.
+        if self._is_on_runs_on:
+            return json.dumps([ALL_TEST_TYPE])
+        return json.dumps(all_helm_test_packages())
+
+    @cached_property
+    def kustomize_overlay_names(self) -> str:
+        """JSON array of overlay names under chart/kustomize-overlays/ to smoke-test.
+
+        Auto-discovered from the filesystem: any directory under
+        ``chart/kustomize-overlays/`` with a ``STATUS.yaml`` that carries a
+        ``verify:`` block is included. Adding a new overlay therefore just
+        works in CI — no second list to maintain anywhere.
+        """
+        import yaml
+
+        overlays_dir = AIRFLOW_ROOT_PATH / "chart" / "kustomize-overlays"
+        names: list[str] = []
+        if overlays_dir.is_dir():
+            for status_path in sorted(overlays_dir.glob("*/STATUS.yaml")):
+                try:
+                    doc = yaml.safe_load(status_path.read_text()) or {}
+                except yaml.YAMLError:
+                    continue
+                if doc.get("verify"):
+                    names.append(status_path.parent.name)
+        return json.dumps(names)
+
+    @cached_property
+    def helm_test_kubernetes_versions(self) -> str:
+        default = CURRENT_KUBERNETES_VERSIONS[0]
+        if self.all_versions:
+            last = CURRENT_KUBERNETES_VERSIONS[-1]
+            versions = [default] if default == last else [default, last]
+        else:
+            versions = [default]
+        return json.dumps([v.lstrip("v") for v in versions])
+
+    @cached_property
+    def selected_providers_list_as_string(self) -> str | None:
+        if self._default_branch != "main":
+            return None
+        if self.full_tests_needed:
+            return ""
+        if self._are_all_providers_affected():
+            return ""
+        affected_providers = self._find_all_providers_affected(include_docs=True)
+        if not affected_providers:
+            return None
+        if isinstance(affected_providers, AllProvidersSentinel):
+            return ""
+        suspended = set(get_suspended_provider_ids())
+        return " ".join(sorted(p for p in affected_providers if p not in suspended))
+
+    @cached_property
+    def amd_runners(self) -> str:
+        return PUBLIC_AMD_RUNNERS
+
+    @cached_property
+    def arm_runners(self) -> str:
+        return PUBLIC_ARM_RUNNERS
+
+    @cached_property
+    def runner_type(self) -> str:
+        """Runner labels for the jobs of a CI run on this run's platform.
+
+        The RunsOn label is a template the jobs fill in with their size class.
+        """
+        # RunsOn needs the run id in the label; without one (e.g. a local run) the jobs would never start.
+        run_id = self._github_context_dict.get("run_id")
+        if not run_id or not self._use_runs_on_runners():
+            return PUBLIC_ARM_RUNNERS if self._platform == CI_ARM_PLATFORM else PUBLIC_AMD_RUNNERS
+        template = (
+            RUNS_ON_ARM_RUNNER_TEMPLATE if self._platform == CI_ARM_PLATFORM else RUNS_ON_AMD_RUNNER_TEMPLATE
+        )
+        return json.dumps([template.format(run_id=run_id)])
+
+    @cached_property
+    def _is_on_runs_on(self) -> bool:
+        # Reuses the routing decision of runner_type, which may have asked the GitHub API.
+        return self.runner_type not in (PUBLIC_AMD_RUNNERS, PUBLIC_ARM_RUNNERS)
+
+    @cached_property
+    def in_memory_runner_type(self) -> str:
+        """Runner labels like ``runner_type``, with docker on a RAM disk when the run is on RunsOn.
+
+        The repository variable ``USE_IN_MEMORY_DOCKER=false`` keeps docker on disk.
+        """
+        if not self._is_on_runs_on or os.environ.get("USE_IN_MEMORY_DOCKER", "").casefold() == "false":
+            return self.runner_type
+        template = (
+            RUNS_ON_ARM_IN_MEMORY_RUNNER_TEMPLATE
+            if self._platform == CI_ARM_PLATFORM
+            else RUNS_ON_AMD_IN_MEMORY_RUNNER_TEMPLATE
+        )
+        return json.dumps([template.format(run_id=self._github_context_dict["run_id"])])
+
+    def _use_runs_on_runners(self) -> bool:
+        """Whether this run should use the self-hosted RunsOn runners.
+
+        This only routes runs; it does not keep fork code off RunsOn. A ``pull_request`` run uses
+        the PR's own workflow files and breeze, so a fork can request a RunsOn label directly -
+        that restriction has to be enforced by the RunsOn stack and the repository's Actions
+        settings, not here. Routed there: pushes, schedules and dispatches, and PRs from
+        apache/airflow branches except bots' (e.g. Dependabot's and the ``ci-upgrade-*`` PRs),
+        except the backport PRs that ``cherry_picker`` opens as ``github-actions[bot]`` from
+        ``backport-*`` branches; a committer's merge or a dispatch by a user with write access started
+        those. A fork PR goes there while it carries the ``use self-hosted runners`` label, a
+        committer has approved its head commit and no committer's request for changes is outstanding.
+        The repository variable ``USE_PUBLIC_RUNNERS=true`` moves every run back to public runners.
+        """
+        if self._github_repository != APACHE_AIRFLOW_GITHUB_REPOSITORY:
+            return False
+        if os.environ.get("USE_PUBLIC_RUNNERS", "").casefold() == "true":
+            return False
+        if USE_PUBLIC_RUNNERS_LABEL in self._pr_labels:
+            return False
+        if self._github_event in [GithubEvents.PUSH, GithubEvents.SCHEDULE, GithubEvents.WORKFLOW_DISPATCH]:
+            return True
+        if self._github_event != GithubEvents.PULL_REQUEST:
+            return False
+        if USE_SELF_HOSTED_RUNNERS_LABEL in self._pr_labels and self._is_self_hosted_label_approved():
+            return True
+        if NON_COMMITTER_BUILD_LABEL in self._pr_labels:
+            return False
+        pull_request = self._github_context_dict.get("event", {}).get("pull_request", {})
+        # The PR author, not github.actor: a committer rebasing a Dependabot PR becomes the actor.
+        # The branch too: anyone can open their own PR from a Dependabot branch.
+        user = pull_request.get("user") or {}
+        head_ref = pull_request.get("head", {}).get("ref", "")
+        is_automatic_backport = user.get("login") == "github-actions[bot]" and head_ref.startswith(
+            "backport-"
+        )
+        if not is_automatic_backport and (user.get("type") == "Bot" or head_ref.startswith("dependabot/")):
+            return False
+        # A PR from a deleted fork has no head repo.
+        head_repo = (pull_request.get("head", {}).get("repo") or {}).get("full_name")
+        return head_repo == APACHE_AIRFLOW_GITHUB_REPOSITORY
+
+    def _is_self_hosted_label_approved(self) -> bool:
+        """Whether the PR still has the label, a committer approved its head commit and no committer's veto stands.
+
+        A re-run reuses the labels of its original event, so a later removal only shows in the PR
+        itself. The label outlives the commit it was added for, so on its own it would vouch for
+        every later push. A request for changes stays in force across pushes, as on GitHub, until
+        that committer reviews again or it is dismissed. Any failure to tell counts as "no".
+        """
+        # Lazy: breeze keeps its top-level imports minimal (check-breeze-top-dependencies-limited).
+        import requests
+
+        pull_request = self._github_context_dict.get("event", {}).get("pull_request", {})
+        head_sha = pull_request.get("head", {}).get("sha")
+        if not head_sha:
+            return False
+        pull_request_url = (
+            f"https://api.github.com/repos/{self._github_repository}/pulls/{pull_request.get('number')}"
+        )
+        headers = {"Accept": "application/vnd.github+json"}
+        if token := os.environ.get("GITHUB_TOKEN"):
+            headers["Authorization"] = f"Bearer {token}"
+        # Each reviewer's latest verdict, on the head commit and on any commit; a dismissed review is
+        # listed as DISMISSED in place, and comment-only reviews change nothing.
+        latest_on_head: dict[str, str] = {}
+        latest_overall: dict[str, str] = {}
+        try:
+            response = requests.get(pull_request_url, headers=headers, timeout=30)
+            response.raise_for_status()
+            if USE_SELF_HOSTED_RUNNERS_LABEL not in {label["name"] for label in response.json()["labels"]}:
+                console_print(
+                    f"[warning]Ignoring the {USE_SELF_HOSTED_RUNNERS_LABEL!r} label: the PR no longer has it"
+                )
+                return False
+            url: str | None = f"{pull_request_url}/reviews?per_page=100"
+            while url:
+                response = requests.get(url, headers=headers, timeout=30)
+                response.raise_for_status()
+                for review in response.json():
+                    if review.get("state") not in {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}:
+                        continue
+                    login = ((review.get("user") or {}).get("login") or "").casefold()
+                    latest_overall[login] = review["state"]
+                    if review.get("commit_id") == head_sha:
+                        latest_on_head[login] = review["state"]
+                url = response.links.get("next", {}).get("url")
+        # AttributeError / KeyError / TypeError: a 200 whose body is not the expected PR or list of reviews.
+        except (requests.RequestException, AttributeError, KeyError, TypeError) as e:
+            console_print(f"[warning]Could not read the labels and reviews of the PR: {e}")
+            return False
+        committers = {committer.casefold() for committer in COMMITTERS}
+        approved = any(latest_on_head.get(committer) == "APPROVED" for committer in committers)
+        vetoed = any(latest_overall.get(committer) == "CHANGES_REQUESTED" for committer in committers)
+        if approved and not vetoed:
+            return True
+        console_print(
+            f"[warning]Ignoring the {USE_SELF_HOSTED_RUNNERS_LABEL!r} label: "
+            f"the head commit {head_sha} is not approved by a committer, or a committer's request for "
+            "changes stands"
+        )
+        return False
+
+    @cached_property
+    @_scoped_to_component_branch
+    def has_migrations(self) -> bool:
+        return any([file.startswith("airflow-core/src/airflow/migrations/") for file in self._files])
+
+    @cached_property
+    @_scoped_to_component_branch
+    def run_providers_compatibility_tests(self) -> bool:
+        """False when every changed file is hidden from the provider compatibility tests.
+
+        A Task SDK change selects all providers, but the compatibility tests run them against released
+        Airflow and Task SDK distributions, so the result cannot differ from the last canary run.
+        """
+        if self.full_tests_needed or self.upgrade_to_newer_dependencies:
+            return True
+        hidden_files = self._matching_files(FileGroupForCi.COMPAT_TESTS_HIDDEN_FILES, CI_FILE_GROUP_MATCHES)
+        if self._files and set(hidden_files) == set(self._files):
+            console_print(
+                "[warning]Provider compatibility tests skipped: every changed file is hidden from them[/]"
+            )
+            return False
+        return True
+
+    @cached_property
+    def providers_compatibility_tests_matrix(self) -> str:
+        """Provider compatibility input matrix for the current run.
+
+        Filters out python versions that are not built. Also drops the entry whose
+        ``airflow-version`` matches the current branch version: on a ``vX-Y-test``
+        branch the just-bumped ``X.Y.0`` is added to the matrix by the version-bump
+        commit before it is released, so compat jobs that pull the released
+        ``apache/airflow:X.Y.0`` image/package would fail until GA. The entry starts
+        running again once the branch bumps to the next patch (``X.Y.1``) and ``X.Y.0``
+        is a real release.
+        """
+        current_airflow_version = get_airflow_version()
+        return json.dumps(
+            [
+                check
+                for check in PROVIDERS_COMPATIBILITY_TESTS_MATRIX
+                if check["python-version"] in self.python_versions
+                and check["airflow-version"] != current_airflow_version
+            ]
+        )
+
+    @cached_property
+    def excluded_providers_as_string(self) -> str:
+        providers_to_exclude = defaultdict(list)
+        for provider, provider_info in get_provider_dependencies().items():
+            if "excluded-python-versions" in provider_info:
+                for python_version in provider_info["excluded-python-versions"]:
+                    providers_to_exclude[python_version].append(provider)
+        sorted_providers_to_exclude = dict(
+            sorted(providers_to_exclude.items(), key=lambda item: int(item[0].split(".")[1]))
+        )  # ^ sort by Python minor version
+        return json.dumps(sorted_providers_to_exclude)
+
+    def _is_disabled_integration(self, integration: str) -> bool:
+        return integration in DISABLE_TESTABLE_INTEGRATIONS_FROM_CI or (
+            integration in DISABLE_TESTABLE_INTEGRATIONS_FROM_ARM and self._platform == CI_ARM_PLATFORM
+        )
+
+    @cached_property
+    def testable_core_integrations(self) -> list[str]:
+        if not self.run_unit_tests:
+            return []
+        if self.full_tests_needed or self._is_canary_run():
+            # All tests are running - exercise every core integration.
+            selected = list(TESTABLE_CORE_INTEGRATIONS)
+        else:
+            # Otherwise only run a core integration when its corresponding core sources changed.
+            selected = [
+                integration
+                for integration in TESTABLE_CORE_INTEGRATIONS
+                if self._should_be_run(TESTABLE_CORE_INTEGRATION_FILE_GROUPS[integration])
+            ]
+        return [integration for integration in selected if not self._is_disabled_integration(integration)]
+
+    @cached_property
+    def testable_providers_integrations(self) -> list[str]:
+        if not self.run_unit_tests:
+            return []
+        if self.full_tests_needed or self._is_canary_run():
+            # All tests are running - exercise every provider integration.
+            selected = list(TESTABLE_PROVIDERS_INTEGRATIONS)
+        else:
+            # Otherwise only run a provider integration when its owning provider is affected.
+            affected_providers = self._find_all_providers_affected(include_docs=False)
+            if isinstance(affected_providers, AllProvidersSentinel):
+                selected = list(TESTABLE_PROVIDERS_INTEGRATIONS)
+            elif affected_providers:
+                affected_set = set(affected_providers)
+                selected = [
+                    integration
+                    for integration in TESTABLE_PROVIDERS_INTEGRATIONS
+                    if TESTABLE_PROVIDERS_INTEGRATION_OWNERS.get(integration) in affected_set
+                ]
+            else:
+                # No providers affected by the change.
+                selected = []
+        return [integration for integration in selected if not self._is_disabled_integration(integration)]
+
+    @cached_property
+    def is_committer_build(self):
+        if NON_COMMITTER_BUILD_LABEL in self._pr_labels:
+            return False
+        # Forks have no self-hosted runners; a committer's fork push must stay on public runners.
+        if self._fork_push:
+            return False
+        return self._github_actor in COMMITTERS
+
+    def _find_all_providers_affected(self, include_docs: bool) -> list[str] | AllProvidersSentinel | None:
+        affected_providers: set[str] = set()
+
+        all_providers_affected = False
+        suspended_providers: set[str] = set()
+        for changed_file in self._files:
+            if changed_file in self._test_helpers_replaced_by_importers:
+                continue
+            provider = find_provider_affected(changed_file, include_docs=include_docs)
+            if provider == "Providers":
+                all_providers_affected = True
+            elif provider is not None:
+                if provider not in get_provider_dependencies():
+                    if changed_file not in self._test_helper_importers:
+                        suspended_providers.add(provider)
+                else:
+                    affected_providers.add(provider)
+        if self.run_api_tests:
+            affected_providers.add("fab")
+        if self.run_ol_tests:
+            affected_providers.add("openlineage")
+        if all_providers_affected:
+            return ALL_PROVIDERS_SENTINEL
+        if suspended_providers:
+            # We check for suspended providers only after we have checked if all providers are affected.
+            # No matter if we found that we are modifying a suspended provider individually,
+            # if all providers are
+            # affected, then it means that we are ok to proceed because likely we are running some kind of
+            # global refactoring that affects multiple providers including the suspended one. This is a
+            # potential escape hatch if someone would like to modify suspended provider,
+            # but it can be found at the review time and is anyway harmless as the provider will not be
+            # released nor tested nor used in CI anyway.
+            console_print("[yellow]You are modifying suspended providers.\n")
+            console_print(
+                "[info]Some providers modified by this change have been suspended, "
+                "and before attempting such changes you should fix the reason for suspension."
+            )
+            console_print(
+                "[info]When fixing it, you should set suspended = false in provider.yaml "
+                "to make changes to the provider."
+            )
+            console_print(f"Suspended providers: {suspended_providers}")
+            if self._fail_if_suspended_providers_affected():
+                console_print(
+                    "[error]This PR did not have `allow suspended provider changes`"
+                    " label set so it will fail."
+                )
+                sys.exit(1)
+            else:
+                console_print(
+                    "[info]This PR had `allow suspended provider changes` label set so it will continue"
+                )
+        if not affected_providers:
+            return None
+
+        for provider in list(affected_providers):
+            affected_providers.update(
+                get_related_providers(provider, upstream_dependencies=True, downstream_dependencies=True)
+            )
+        return sorted(affected_providers)
+
+    def _is_canary_run(self):
+        return (
+            self._github_event in self._get_full_run_events()
+            and self._github_repository == APACHE_AIRFLOW_GITHUB_REPOSITORY
+            and not self.only_text_non_doc_files_changed
+        ) or CANARY_LABEL in self._pr_labels
+
+    @cached_property
+    def force_pip(self):
+        return FORCE_PIP_LABEL in self._pr_labels
+
+    @cached_property
+    def shared_distributions_as_json(self):
+        return json.dumps([file.name for file in (AIRFLOW_ROOT_PATH / "shared").iterdir() if file.is_dir()])
+
+    @cached_property
+    def provider_dependency_bump(self) -> bool:
+        """Check for apache-airflow-providers dependency bumps in pyproject.toml files."""
+        # Only enforce on PRs targeting main. On release branches (e.g. v3-X-test)
+        # cherry-picks routinely bump provider dependency lower bounds, and the
+        # override label is meant for that flow on main.
+        if self._default_branch != "main":
+            return False
+        pyproject_files = self._matching_files(
+            FileGroupForCi.ALL_PYPROJECT_TOML_FILES,
+            CI_FILE_GROUP_MATCHES,
+        )
+        if not pyproject_files or not self._is_pull_request_like():
+            return False
+
+        violations = []
+        for pyproject_file in pyproject_files:
+            # Get the new version of the file
+            new_result = run_command(
+                ["git", "show", f"{self._commit_ref}:{pyproject_file}"],
+                capture_output=True,
+                text=True,
+                cwd=AIRFLOW_ROOT_PATH,
+                check=False,
+            )
+            if new_result.returncode != 0:
+                continue
+
+            old_content = self._get_previous_file_content(pyproject_file)
+            if old_content is None:
+                continue
+
+            try:
+                new_toml = tomllib.loads(new_result.stdout)
+                old_toml = tomllib.loads(old_content)
+            except Exception:
+                continue
+
+            # Check dependencies and optional-dependencies sections
+            for section in ["dependencies", "optional-dependencies"]:
+                if section not in new_toml.get("project", {}):
+                    continue
+
+                new_deps = new_toml["project"][section]
+                old_deps = old_toml.get("project", {}).get(section, {})
+
+                if isinstance(new_deps, dict):
+                    # Handle optional-dependencies which is a dict
+                    for group_name, deps_list in new_deps.items():
+                        old_deps_list = old_deps.get(group_name, []) if isinstance(old_deps, dict) else []
+                        violations.extend(
+                            SelectiveChecks._check_provider_deps_in_list(
+                                deps_list, old_deps_list, pyproject_file, f"{section}.{group_name}"
+                            )
+                        )
+                elif isinstance(new_deps, list):
+                    # Handle dependencies which is a list
+                    old_deps_list = old_deps if isinstance(old_deps, list) else []
+                    violations.extend(
+                        SelectiveChecks._check_provider_deps_in_list(
+                            new_deps, old_deps_list, pyproject_file, section
+                        )
+                    )
+
+        if violations:
+            if ALLOW_PROVIDER_DEPENDENCY_BUMP_LABEL in self._pr_labels:
+                console_print(
+                    "[warning]The 'allow provider dependency bump' label is set. "
+                    "Bypassing provider dependency check."
+                )
+                return True
+
+            console_print(
+                "[error]Provider dependency version bumps detected that should only be "
+                "performed by Release Managers![/]"
+            )
+            console_print()
+            for violation in violations:
+                console_print(f"[error]  - {violation}[/]")
+            console_print()
+            console_print(
+                "[warning]Only Release Managers should change >= conditions for apache-airflow-providers "
+                "dependencies.[/]\n\nIf you want to refer to a future version of the dependency, please add a "
+                "comment [info]'# use next version'[/info] in the line of the dependency instead.\n"
+            )
+            console_print()
+            console_print(
+                f"[warning]If this change is intentional and approved, please set the label on the PR:[/]\n\n"
+                f"'[info]{ALLOW_PROVIDER_DEPENDENCY_BUMP_LABEL}[/]\n"
+            )
+            console_print()
+            console_print(
+                "See https://github.com/apache/airflow/blob/main/contributing-docs/"
+                "13_airflow_dependencies_and_extras.rst for more comprehensive documentation "
+                "about airflow dependency management."
+            )
+            console_print()
+            sys.exit(1)
+        return False
+
+    @staticmethod
+    def _check_provider_deps_in_list(
+        new_deps: list, old_deps: list, file_path: str, section: str
+    ) -> list[str]:
+        """Check a list of dependencies for apache-airflow-providers version changes."""
+        violations = []
+
+        # Parse dependencies into a dict for easier comparison
+        def parse_dep(dep_str: str) -> tuple[str, str | None]:
+            """Parse a dependency string and return (package_name, version_constraint)."""
+            if not isinstance(dep_str, str):
+                return "", None
+            # Remove inline comments
+            dep_str = dep_str.split("#")[0].strip()
+            # Match patterns like: apache-airflow-providers-xxx>=1.0.0 or apache-airflow-providers-xxx>=1.0.0,<2.0
+            match = re.match(r"^(apache-airflow-providers-[a-z0-9-]+)\s*(.*)", dep_str, re.IGNORECASE)
+            if match:
+                return match.group(1).lower(), match.group(2).strip()
+            return "", None
+
+        old_deps_dict = {}
+        for dep in old_deps:
+            pkg_name, version = parse_dep(dep)
+            if pkg_name:
+                old_deps_dict[pkg_name] = (dep, version)
+
+        for new_dep in new_deps:
+            pkg_name, new_version = parse_dep(new_dep)
+            if not pkg_name:
+                continue
+
+            # Check if this dependency existed before
+            if pkg_name in old_deps_dict:
+                old_dep_str, old_version = old_deps_dict[pkg_name]
+                # Check if the >= condition changed
+                if new_version and old_version and new_version != old_version:
+                    # Check if >= version number changed
+                    new_ge_match = re.search(r">=\s*([0-9.]+)", new_version)
+                    old_ge_match = re.search(r">=\s*([0-9.]+)", old_version)
+
+                    if new_ge_match and old_ge_match:
+                        new_ge_version = new_ge_match.group(1)
+                        old_ge_version = old_ge_match.group(1)
+                        if new_ge_version != old_ge_version:
+                            violations.append(
+                                f"{file_path} [{section}]: {pkg_name} >= version changed from "
+                                f"{old_ge_version} to {new_ge_version}"
+                            )
+
+        return violations
+
+    def _has_common_compat_changed(self) -> bool:
+        """Check if any common.compat provider file was changed."""
+        return any(
+            f.startswith("providers/common/compat/") and f not in self._test_helper_importers
+            for f in self._files
+        )
+
+    def _get_changed_providers_excluding_common_compat(self) -> set[str]:
+        """Get set of changed providers excluding common.compat itself."""
+        changed_providers: set[str] = set()
+        for changed_file in self._files:
+            if changed_file in self._test_helper_importers:
+                continue
+            provider = find_provider_affected(changed_file, include_docs=False)
+            if provider and provider not in ["common.compat", "Providers"]:
+                changed_providers.add(provider)
+        return changed_providers
+
+    def _uses_next_version_comment(self, provider: str) -> bool:
+        """Check if provider's pyproject.toml has '# use next version' for common-compat dependency."""
+        pyproject_file = f"providers/{provider.replace('.', '/')}/pyproject.toml"
+        result = run_command(
+            ["git", "show", f"{self._commit_ref}:{pyproject_file}"],
+            capture_output=True,
+            text=True,
+            cwd=AIRFLOW_ROOT_PATH,
+            check=False,
+        )
+        if result.returncode != 0:
+            return True  # If file doesn't exist, don't flag as violation
+
+        # Check if dependency line contains both the package and the comment
+        for line in result.stdout.splitlines():
+            if "apache-airflow-providers-common-compat" in line.lower():
+                return bool(re.search(r"#\s*use next version", line, re.IGNORECASE))
+        return True  # If dependency not found, don't flag as violation
+
+    def _print_violations_and_exit_or_bypass(self, violations: list[str]) -> bool:
+        """Print violations and either exit with error or bypass with warning."""
+        console = get_console()
+
+        if SKIP_COMMON_COMPAT_CHECK_LABEL in self._pr_labels:
+            console.print("[warning]The 'skip common compat check' label is set. Bypassing check for:[/]")
+            for provider in violations:
+                console.print(
+                    f"[warning]  - {provider} (providers/{provider.replace('.', '/')}/pyproject.toml)[/]"
+                )
+            console.print()
+            return True
+
+        console.print(
+            "[error]common.compat provider changed but the following providers don't have "
+            "'# use next version' comment for their common-compat dependency![/]"
+        )
+        console.print()
+        for provider in violations:
+            console.print(f"[error]  - {provider} (providers/{provider.replace('.', '/')}/pyproject.toml)[/]")
+        console.print()
+        console.print(
+            "[warning]When common.compat changes with other providers in the same PR, "
+            "add '# use next version' comment where they depend on common-compat.[/]\n"
+            "[warning]Example:[/] "
+            '[info]"apache-airflow-providers-common-compat>=1.8.0",  # use next version[/]\n'
+        )
+        console.print(
+            f"[warning]To bypass this check, add the label: '[info]{SKIP_COMMON_COMPAT_CHECK_LABEL}[/]'\n"
+        )
+        sys.exit(1)
+
+    @cached_property
+    def common_compat_changed_without_next_version(self) -> bool:
+        """
+        Check if common.compat provider changed and other providers changed don't have '# use next version'
+        comment for their common-compat dependency.
+        """
+        if not self._is_pull_request_like():
+            return False
+        # Only enforce on PRs targeting main. On release branches (e.g. v3-X-test)
+        # cherry-picked common.compat changes don't follow the '# use next version'
+        # convention, and the override label is meant for that flow on main.
+        if self._default_branch != "main":
+            return False
+
+        if not self._has_common_compat_changed():
+            return False
+
+        changed_providers = self._get_changed_providers_excluding_common_compat()
+        if not changed_providers:
+            return False  # Only common.compat changed
+
+        console_print(f"[warning]common.compat changed with providers: {sorted(changed_providers)}[/]")
+
+        # Find providers missing '# use next version' comment
+        violations = [p for p in sorted(changed_providers) if not self._uses_next_version_comment(p)]
+
+        if violations:
+            return self._print_violations_and_exit_or_bypass(violations)
+
+        return False

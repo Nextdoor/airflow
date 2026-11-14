@@ -1,0 +1,757 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import time
+import uuid
+from collections import defaultdict
+from collections.abc import Callable, Collection
+from contextvars import ContextVar
+from typing import TYPE_CHECKING, Any, NamedTuple
+from urllib.parse import urlparse
+
+from dateutil.parser import parse
+from jinja2 import Environment, TemplateError
+from packaging.version import Version
+
+from airflow import __version__ as airflow_version
+from airflow.providers.common.compat.sdk import BaseOperator, Variable
+
+try:
+    from airflow.sdk.exceptions import AirflowRuntimeError as NoVariableError  # AF3
+except (ImportError, ModuleNotFoundError, AttributeError):
+    NoVariableError = KeyError  # type: ignore[misc, assignment]  # AF2
+
+# Not imported from the system tests' expected_events: operator.py imports nothing else of the system tests, so it can
+# be copied as is next to Dags whose `system.` imports are rewritten
+AIRFLOW_VERSION = Version(airflow_version)
+
+if TYPE_CHECKING:
+    from airflow.providers.common.compat.sdk import Context
+
+log = logging.getLogger(__name__)
+
+# Marks every log line describing why event validation failed, so whatever reads the logs of a failed check can
+# report just these lines. Every problem of a failed check is logged with it, keep the tag stable.
+VALIDATION_ERROR_TAG = "[OL_VALIDATION_ERROR]"
+
+# The key of the events being checked, which prefixes the validation errors logged meanwhile
+_validated_key: ContextVar[str | None] = ContextVar("_validated_key", default=None)
+
+
+def log_validation_error(msg: str, *args: Any) -> None:
+    text = msg % args if args else msg
+    if (key := _validated_key.get()) is not None:
+        text = f"[{key}] {text}"
+    log.error("%s %s", VALIDATION_ERROR_TAG, text)
+
+
+def check_values(checks: dict[str, tuple[Any, Any]]) -> None:
+    """
+    Check values a task computes itself, given as ``{name: (actual, expected)}``, e.g. what a macro returns.
+
+    Every mismatch is logged as a validation error before failing the task.
+    """
+    mismatches = [name for name, (actual, expected) in checks.items() if actual != expected]
+    for name in mismatches:
+        actual, expected = checks[name]
+        log_validation_error("`%s`: expected `%r` but got `%r`", name, expected, actual)
+    if mismatches:
+        raise ValueError(f"Unexpected values of {mismatches}")
+
+
+def any(result: Any) -> Any:
+    return result
+
+
+def is_numeric(result: Any) -> str:
+    try:
+        float(result)
+        return "true"
+    except Exception:
+        pass
+    return "false"
+
+
+def is_datetime(result: Any) -> str:
+    try:
+        parse(result)
+        return "true"
+    except Exception:
+        pass
+    return "false"
+
+
+def is_uuid(result: Any) -> str:
+    try:
+        uuid.UUID(result)
+        return "true"
+    except Exception:
+        pass
+    return "false"
+
+
+def regex_match(result: Any, pattern: str) -> str:
+    try:
+        if re.match(pattern=pattern, string=result):
+            return "true"
+    except Exception:
+        pass
+    return "false"
+
+
+def env_var(var: str, default: str | None = None) -> str:
+    """
+    Use this jinja method to access the environment variable named 'var'.
+
+    If there is no such environment variable set, return the default.
+    If the default is None, raise an exception for an undefined variable.
+    """
+    if var in os.environ:
+        return os.environ[var]
+    if default is not None:
+        return default
+    raise ValueError(f"Env var required but not provided: '{var}'")
+
+
+def not_match(result: str, pattern: str) -> str:
+    if pattern in result:
+        raise ValueError(f"Found {pattern} in {result}")
+    return "true"
+
+
+def url_scheme_authority(url: str) -> str:
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def url_path(url: str) -> str:
+    return urlparse(url).path
+
+
+def setup_jinja() -> Environment:
+    env = Environment()
+    env.globals["any"] = any
+    env.globals["is_datetime"] = is_datetime
+    env.globals["is_numeric"] = is_numeric
+    env.globals["is_uuid"] = is_uuid
+    env.globals["regex_match"] = regex_match
+    env.globals["env_var"] = env_var
+    env.globals["not_match"] = not_match
+    env.filters["url_scheme_authority"] = url_scheme_authority
+    env.filters["url_path"] = url_path
+    return env
+
+
+def match(expected, result, env: Environment, path: list | None = None) -> bool:
+    """
+    Check if result is "equal" to expected value.
+
+    Omits keys not specified in expected value and resolves any jinja templates found.
+
+    Special sentinel values in expected dicts:
+
+    ``None`` (JSON ``null``) means the key must not be present in the result.
+
+    ``{"$optional": "<reason>", ...}`` means the key is optional. When the key is
+    present, the remaining template keys are validated. When the key is absent,
+    validation passes silently and the reason is logged.
+
+    ``{"$optional": "<reason>", "$value": <list_template>}`` is the list-template
+    form of the optional sentinel. It behaves the same way, but also skips validation
+    when the actual value is an empty list. Use this form when the template value is a
+    list rather than a dict. Dict templates embed their keys directly alongside
+    ``"$optional"``.
+
+    """
+    if path is None:
+        path = []
+    path_str = " > ".join(str(p) for p in path) if path else "<root>"
+
+    if isinstance(expected, dict):
+        # Only keys present in expected are checked — extra keys in the actual event are ignored.
+        if not isinstance(result, dict):
+            log_validation_error(
+                "Path `%s`: expected a dict but got `%s` (%s)", path_str, result, type(result).__name__
+            )
+            return False
+        for k, v in expected.items():
+            # null sentinel: assert the key must NOT appear in the actual event.
+            if v is None:
+                if k in result:
+                    log_validation_error(
+                        "Path `%s`: key `%s` must be absent but got `%s` (%s)",
+                        path_str,
+                        k,
+                        result[k],
+                        type(result[k]).__name__,
+                    )
+                    return False
+                continue
+
+            # $optional sentinel: skip validation if the key is absent or its value is an
+            # empty list; otherwise unwrap and validate normally.
+            # Two forms:
+            #   dict template — {"$optional": "reason", "field": "value", ...}
+            #     Strip "$optional" and treat the remaining keys as the template.
+            #   list template — {"$optional": "reason", "$value": [...]}
+            #     Use the "$value" list as the template.
+            # Both forms also skip when the actual value is an empty list [], which covers
+            # the case where a field is always present but may carry no items.
+            if isinstance(v, dict) and isinstance(v.get("$optional"), str):
+                reason = v["$optional"]
+                actual_val = result.get(k)
+                if k not in result or actual_val == []:
+                    log.info("Optional key `%s` not present or empty (%s), skipping", k, reason)
+                    continue
+                v = v["$value"] if "$value" in v else {ik: iv for ik, iv in v.items() if ik != "$optional"}  # noqa: PLW2901
+
+            # At this point v is a plain template (dict, list, or scalar) with no sentinels.
+            if k not in result:
+                log_validation_error("Path `%s`: key `%s` not found in received event", path_str, k)
+                return False
+            if not match(v, result[k], env, path + [k]):
+                return False
+    elif isinstance(expected, list):
+        # Lists must match exactly in length and order. Each element is compared recursively,
+        # so nested sentinels (null, $optional) work inside list items too.
+        if not isinstance(result, list):
+            log_validation_error(
+                "Path `%s`: expected a list but got `%s` (%s)", path_str, result, type(result).__name__
+            )
+            return False
+        if len(expected) != len(result):
+            log_validation_error(
+                "Path `%s`: expected %d item(s) but got %d", path_str, len(expected), len(result)
+            )
+            return False
+        for i, x in enumerate(expected):
+            if not match(x, result[i], env, path + [i]):
+                return False
+    elif isinstance(expected, str):
+        if "{{" in expected:
+            # Jinja template: render with result as the template variable, then check whether
+            # the rendered output is the string "true" (type/format validators like is_uuid,
+            # is_datetime, regex_match return "true" on success) or equals result directly
+            # (for expressions that transform the value, e.g. filters).
+            try:
+                rendered = env.from_string(expected).render(result=result)
+            except (ValueError, TemplateError) as e:
+                log_validation_error("Path `%s`: failed to render template `%s`: %s", path_str, expected, e)
+                return False
+            if str(rendered).lower() == "true" or rendered == result:
+                return True
+            log_validation_error(
+                "Path `%s`: template `%s` rendered to `%s` but expected `true` or actual value `%s` (%s)",
+                path_str,
+                expected,
+                rendered,
+                result,
+                type(result).__name__,
+            )
+            return False
+        # Plain string: exact equality check.
+        if expected != result:
+            log_validation_error(
+                "Path `%s`: expected `%s` (str) but got `%s` (%s)",
+                path_str,
+                expected,
+                result,
+                type(result).__name__,
+            )
+            return False
+    elif expected != result:
+        # Scalar (int, bool, float, …): exact equality check.
+        log_validation_error(
+            "Path `%s`: expected `%s` (%s) but got `%s` (%s)",
+            path_str,
+            expected,
+            type(expected).__name__,
+            result,
+            type(result).__name__,
+        )
+        return False
+    return True
+
+
+class Attempt(NamedTuple):
+    """
+    Which execution of a job an event belongs to.
+
+    ``try_number``, ``map_index``, ``loop_index`` and ``region_id`` are None for a Dag event and when the task has
+    none. ``clear_number`` plays for a Dag run the role ``try_number`` plays for a task instance, and ``region_id``
+    tells apart two executions of one loop iteration after the loop was cleared, which can share every other field.
+    """
+
+    dag_run_id: Any
+    clear_number: Any
+    try_number: Any
+    map_index: Any
+    loop_index: Any
+    region_id: Any
+
+
+def _get_attempt(event: dict) -> Attempt | None:
+    """Return the attempt of an event, or None for an event without the airflow facet."""
+    facets = (event.get("run") or {}).get("facets") or {}
+    # Task events carry the airflow facet, Dag run events carry the same content in airflowDagRun.
+    airflow_facet = facets.get("airflow") or facets.get("airflowDagRun")
+    if not isinstance(airflow_facet, dict):
+        return None
+    dag_run = airflow_facet.get("dagRun") or {}
+    task_instance = airflow_facet.get("taskInstance") or {}
+    return Attempt(
+        dag_run_id=dag_run.get("run_id"),
+        clear_number=dag_run.get("clear_number"),
+        try_number=task_instance.get("try_number"),
+        map_index=task_instance.get("map_index"),
+        loop_index=(task_instance.get("loop") or {}).get("index"),
+        region_id=task_instance.get("region_id"),
+    )
+
+
+def _get_job_type(event: dict) -> str | None:
+    return (((event.get("job") or {}).get("facets") or {}).get("jobType") or {}).get("jobType")
+
+
+def check_run_id_integrity(
+    events_by_key: dict[str, list[dict]],
+    repeated_start_keys: Collection[str] = (),
+    corrected_terminal_keys: Collection[str] = (),
+    unstarted_terminal_keys: Collection[str] = (),
+) -> list[str]:
+    """
+    Check that ``run.runId`` identifies exactly one attempt of exactly one job, and return the problems found.
+
+    Events are grouped by ``runId``. The attempt of an event is its Dag run id and clear number, plus for a task
+    event ``(try_number, map_index, loop.index, region_id)``, all from ``run.facets.airflow`` (``airflowDagRun`` for Dag
+    events). Query events, which are child runs of a task, have no attempt. For every group:
+
+    1. all events share one ``job.name``;
+    2. all events share one attempt, so another Dag run, clear, retry, map index or loop iteration can't reuse
+       a ``runId``;
+    3. the lifecycle is complete, so START and COMPLETE/FAIL of an attempt can't carry different ``runId`` values:
+
+       * task and query: exactly one START, or several when the key of the START events is in
+         ``repeated_start_keys`` (deferral re-emits START on every resume), and exactly one COMPLETE or FAIL;
+       * Dag run: one START and at most one COMPLETE or FAIL. The Dag run that contains the checking task is
+         still running when the check happens, so its COMPLETE/FAIL is missing, while Dag runs triggered by it
+         can already have finished;
+       * one more COMPLETE or FAIL is allowed when one of them has its key in ``corrected_terminal_keys``: a user
+         marking a finished task or Dag run with another state emits a second one for the same run;
+       * no START is needed when the key of its COMPLETE or FAIL is in ``unstarted_terminal_keys``: a task that
+         fails before it runs, e.g. on rendering its templates, or that a user marks before it started.
+
+    Across groups:
+
+    4. one attempt of a job has one ``runId``.
+
+    For a task in a loop, i.e. with ``task.loop``, also:
+
+    5. ``runId`` is ``taskInstance.id``, as its iterations share every other coordinate;
+    6. ``taskInstance.loop.region_id`` is ``taskInstance.region_id`` for a task that isn't mapped, and another region
+       for a mapped one, whose own region is its expansion inside the loop's;
+    7. one run of a loop, i.e. its Dag run, clear and ``loop.trajectory``, has one ``loop.region_id``.
+
+    Only the events passed in are checked, i.e. those of the keys listed in the expected events.
+    """
+    problems: list[str] = []
+    groups: dict[str, list[tuple[str, dict]]] = defaultdict(list)
+    for key, events in events_by_key.items():
+        for event in events:
+            run_id = (event.get("run") or {}).get("runId")
+            if run_id:
+                groups[run_id].append((key, event))
+            else:
+                problems.append(f"[{key}] {event.get('eventType')} event has no run.runId")
+
+    run_ids_by_attempt: dict[tuple, set[str]] = defaultdict(set)
+    for run_id, members in sorted(groups.items()):
+        job_names = {event["job"]["name"] for _, event in members}
+        if len(job_names) > 1:
+            problems.append(f"runId {run_id} is shared by different jobs: {sorted(job_names)}")
+            continue
+        job_name = next(iter(job_names))
+
+        attempts = {attempt for _, event in members if (attempt := _get_attempt(event)) is not None}
+        if len(attempts) > 1:
+            problems.append(
+                f"runId {run_id} of `{job_name}` is shared by different attempts: {sorted(attempts, key=str)}"
+            )
+        for attempt in attempts:
+            run_ids_by_attempt[(job_name, attempt)].add(run_id)
+
+        job_type = _get_job_type(members[0][1])
+        if job_type not in ("TASK", "QUERY", "DAG"):
+            continue
+        event_types = [event.get("eventType") for _, event in members]
+        start_keys = {key for key, event in members if event.get("eventType") == "START"}
+        terminal_keys = {key for key, event in members if event.get("eventType") in ("COMPLETE", "FAIL")}
+        terminals = [event_type for event_type in event_types if event_type in ("COMPLETE", "FAIL")]
+        starts = event_types.count("START")
+        repeated_starts_allowed = job_type != "DAG" and bool(start_keys & set(repeated_start_keys))
+        too_many_starts = starts > 1 and not repeated_starts_allowed
+        max_terminals = 2 if terminal_keys & set(corrected_terminal_keys) else 1
+        too_many_terminals = len(terminals) > max_terminals or (job_type != "DAG" and not terminals)
+        missing_start = starts < 1 and not terminal_keys & set(unstarted_terminal_keys)
+        if missing_start or too_many_starts or too_many_terminals:
+            expected = (
+                "one START (several only if the Dag expects repeated STARTs, see event_count_assertions) "
+                "and one COMPLETE/FAIL"
+                if job_type != "DAG"
+                else "one START and at most one COMPLETE/FAIL"
+            )
+            problems.append(
+                f"runId {run_id} of {job_type} `{job_name}` should have {expected}, "
+                f"got: {sorted(str(event_type) for event_type in event_types)}"
+            )
+
+    for (job_name, attempt_fields), run_ids in sorted(run_ids_by_attempt.items(), key=str):
+        if len(run_ids) > 1:
+            problems.append(f"`{job_name}` {attempt_fields} has several runIds: {sorted(run_ids)}")
+    return problems + _check_loop_runs(groups)
+
+
+def _check_loop_runs(groups: dict[str, list[tuple[str, dict]]]) -> list[str]:
+    """Check the events of tasks in a loop, see ``check_run_id_integrity``."""
+    problems: list[str] = []
+    loop_region_ids: dict[tuple, set[str]] = defaultdict(set)
+    for run_id, members in sorted(groups.items()):
+        for key, event in members:
+            airflow_facet = ((event.get("run") or {}).get("facets") or {}).get("airflow") or {}
+            if (loop_group := ((airflow_facet.get("task") or {}).get("loop") or {}).get("group_id")) is None:
+                continue
+            task_instance = airflow_facet.get("taskInstance") or {}
+            if task_instance.get("id") not in (None, run_id):
+                problems.append(f"[{key}] runId {run_id} in loop `{loop_group}` isn't taskInstance.id")
+            loop = task_instance.get("loop") or {}
+            if (loop_region_id := loop.get("region_id")) is None:
+                continue
+            mapped = task_instance.get("map_index") is not None
+            if (loop_region_id == task_instance.get("region_id")) is mapped:
+                problem = "of a mapped task is its own region_id" if mapped else "differs from its region_id"
+                problems.append(f"[{key}] runId {run_id}: loop.region_id {problem}")
+            dag_run = airflow_facet.get("dagRun") or {}
+            run = (dag_run.get("run_id"), dag_run.get("clear_number"), loop_group, loop.get("trajectory"))
+            loop_region_ids[run].add(loop_region_id)
+    for run, region_ids in sorted(loop_region_ids.items(), key=str):
+        if len(region_ids) > 1:
+            problems.append(f"loop run {run} has several loop.region_id: {sorted(region_ids)}")
+    return problems
+
+
+def sort_by_execution(event: dict) -> tuple[int, int, int, int, int]:
+    """Order the events of executions by Dag run clear, loop run and iteration, map index and try, as ``event_sort_fn``."""
+    facets = event["run"]["facets"]
+    # Dag run events carry their Dag run in airflowDagRun and have no task instance
+    dag_run = (facets.get("airflow") or facets.get("airflowDagRun") or {}).get("dagRun", {})
+    task_instance = facets.get("airflow", {}).get("taskInstance", {})
+    loop = task_instance.get("loop") or {}
+    map_index = task_instance.get("map_index")
+    return (
+        dag_run.get("clear_number", 0),
+        loop.get("trajectory", 0),
+        loop.get("index", -1),
+        map_index if map_index is not None else -1,
+        task_instance.get("try_number", -1),
+    )
+
+
+class OpenLineageTestOperator(BaseOperator):
+    """
+    This operator is added for system testing purposes.
+
+    It compares expected event templates set on initialization with ones emitted by OpenLineage integration
+    and stored in Variables by VariableTransport.
+
+    Note:
+        If `clear_variables` is True, only the Airflow Variables listed in `event_templates`
+        (or derived from `file_path`) will be deleted - those that are supposed to be checked by the Operator.
+        We won't remove all Airflow Variables to avoid interfering with other instances of this Operator
+        running in parallel on different DAGs. Running continuous system tests without clearing Variables
+        may lead to leftover or growing Variables size. We recommend implementing a process to remove all
+        Airflow Variables after all system tests have run to ensure a clean environment for each test run.
+
+    :param event_templates: Dictionary where each key is the key used by VariableTransport,
+        in the format ``<DAG_ID>.<TASK_ID>.event.<EVENT_TYPE>``. Each value may be one of
+        the following: a single event template dict, matched against the last received event;
+        a list of event template dicts, matched pairwise against all received events after
+        sorting with ``event_sort_fn`` when provided; or ``{"$absent": "<reason>"}``, which
+        asserts that no events exist for that key. The ``"$absent"`` reason is logged and
+        included in the error if events are unexpectedly found.
+    :param file_path: alternatively, a path to a JSON file containing an array of event templates.
+        Multiple events sharing the same ``job.name`` + ``eventType`` key are accumulated into a list.
+        An event with ``"$absent": "<reason>"`` asserts the variable must not exist. An event with
+        ``"$since": "<version>"`` is checked only from that Airflow version on, e.g. when older versions don't
+        emit it.
+    :param env: jinja environment used to render event templates.
+    :param event_count_assertions: dict mapping a regex pattern (matched against variable keys) to a
+        count expression. Supported expressions: ``"N"``, ``"==N"``, ``">=N"``, ``"<=N"``.
+        Applied to single-template keys only; list-template keys derive their count from the list length.
+        Example: ``{".*\\.event\\.start": ">=2"}``.
+    :param clear_variables: if True, deletes only the checked variables after all checks run (or on
+        failure). Default True.
+    :param fail_fast: if True, raise on the first failure. If False (default), collect all failures
+        and raise a combined error at the end.
+    :param event_sort_fn: optional callable ``(event: dict) -> Any`` used to sort actual events
+        ascending before comparison. Useful for mapped tasks whose events arrive in non-deterministic
+        order. When the template for a key is a list, sorting is required for pairwise comparison to
+        be meaningful.
+    :param corrected_terminal_keys: keys of COMPLETE/FAIL events emitted when a user marks a finished task or
+        Dag run with another state. The run they belong to may then have one COMPLETE/FAIL more in the
+        ``check_run_id_integrity`` check: the one of its original outcome, and the one of the correction.
+    :param unstarted_terminal_keys: keys of COMPLETE/FAIL events of runs that have no START, as the task never ran:
+        it failed before it started or a user marked it before it started. The ``check_run_id_integrity`` check
+        then doesn't require a START for their runs.
+    :param check_run_ids: if True (default), additionally check the collected events with
+        ``check_run_id_integrity``: START and COMPLETE/FAIL of one attempt share a ``runId``, while another
+        try, map index or loop iteration gets its own. Set to False only for a Dag whose expected events
+        intentionally list a task's lifecycle partially. It runs only once every key matches its template.
+
+    Special sentinel values in expected dicts:
+
+    ``None`` (JSON ``null``) means the key must not be present in the result.
+
+    ``{"$optional": "<reason>", ...}`` means the key is optional. When the key is
+    present, the remaining template keys are validated. When the key is absent,
+    validation passes silently and the reason is logged.
+
+    ``{"$optional": "<reason>", "$value": <list_template>}`` is the list-template
+    form of the optional sentinel. It behaves the same way, but also skips validation
+    when the actual value is an empty list. Use this form when the template value is a
+    list rather than a dict. Dict templates embed their keys directly alongside
+    ``"$optional"``.
+
+    :raises: ValueError if the received events do not match with expected ones.
+    """
+
+    def __init__(
+        self,
+        event_templates: dict[str, dict | list] | None = None,
+        file_path: str | None = None,
+        env: Environment | None = None,
+        event_count_assertions: dict[str, str | int] | None = None,
+        clear_variables: bool = True,
+        fail_fast: bool = False,
+        event_sort_fn: Callable[[dict], Any] | None = None,
+        check_run_ids: bool = True,
+        corrected_terminal_keys: Collection[str] = (),
+        unstarted_terminal_keys: Collection[str] = (),
+        **kwargs,
+    ):
+        # Never from the Dag's default_args: a retry would hide the mismatch the first try failed on, as that try
+        # deletes the Variables it checked
+        kwargs.setdefault("retries", 0)
+        super().__init__(**kwargs)
+        self.event_templates = event_templates
+        self.file_path = file_path
+        self.env = env or setup_jinja()
+        self.event_count_assertions = event_count_assertions
+        self.clear_variables = clear_variables
+        self.fail_fast = fail_fast
+        self.check_run_ids = check_run_ids
+        self.corrected_terminal_keys = corrected_terminal_keys
+        self.unstarted_terminal_keys = unstarted_terminal_keys
+        self.event_sort_fn = event_sort_fn
+        if event_templates is None and file_path is None:
+            raise ValueError("Either event_templates or file_path must be provided")
+        if self.event_templates and self.file_path:
+            raise ValueError("Can't pass both event_templates and file_path")
+
+    def execute(self, context: Context) -> None:
+        # Events emitted around the end of the upstream tasks may still be on their way to the Variables
+        time.sleep(int(os.getenv("SYSTEM_TESTS_OL_CHECK_EVENTS_DELAY_SECONDS", "10")))
+        if self.file_path is not None:
+            self.event_templates = {}
+            self.log.info("Reading OpenLineage event templates from file `%s`", self.file_path)
+            try:
+                with open(self.file_path) as f:
+                    events = json.load(f)
+                for event in events:
+                    # "$since" only drops events older versions do not emit, keeping one file. Events that differ
+                    # between versions need a version-suffixed file (see get_expected_event_file_path).
+                    if (since := event.pop("$since", None)) and Version(since) > AIRFLOW_VERSION:
+                        continue
+                    key = event["job"]["name"] + ".event." + event["eventType"].lower()
+                    if isinstance(event.get("$absent"), str):
+                        self.event_templates[key] = {"$absent": event["$absent"]}
+                    else:
+                        existing = self.event_templates.get(key)
+                        if existing is None:
+                            self.event_templates[key] = event
+                        elif isinstance(existing, list):
+                            existing.append(event)
+                        else:
+                            self.event_templates[key] = [existing, event]
+            except Exception as e:
+                log_validation_error(
+                    "Can't read the expected events from `%s`: %s: %s", self.file_path, type(e).__name__, e
+                )
+                raise
+        errors: dict[str, str] = {}
+        events_by_key: dict[str, list[dict]] = {}
+        try:
+            for key, template in self.event_templates.items():  # type: ignore[union-attr]
+                log.info("Checking key: `%s`", key)
+                token = _validated_key.set(key)
+                try:
+                    events_by_key[key] = self._check_key(key, template)
+                except Exception as e:
+                    # Not only a mismatch (ValueError): a malformed event or template must not hide the other keys
+                    log_validation_error("%s", e if type(e) is ValueError else f"{type(e).__name__}: {e}")
+                    if self.fail_fast:
+                        raise
+                    errors[key] = str(e) if type(e) is ValueError else f"{type(e).__name__}: {e}"
+                finally:
+                    _validated_key.reset(token)
+            if self.check_run_ids and errors:
+                # A key that failed its template is missing from events_by_key, so its runIds would look incomplete
+                log.info("Skipping the runId integrity check until the event templates match")
+            elif self.check_run_ids:
+                if problems := check_run_id_integrity(
+                    events_by_key,
+                    repeated_start_keys={key for key in events_by_key if self._expects_repeated_events(key)},
+                    corrected_terminal_keys=self.corrected_terminal_keys,
+                    unstarted_terminal_keys=self.unstarted_terminal_keys,
+                ):
+                    for problem in problems:
+                        log_validation_error("%s", problem)
+                    message = "\n".join(f"    {problem}" for problem in problems)
+                    if self.fail_fast:
+                        raise ValueError(f"runId integrity check failed:\n{message}")
+                    errors["<runId integrity>"] = f"\n{message}"
+        finally:
+            if self.clear_variables:
+                for key in self.event_templates:  # type: ignore[union-attr]
+                    log.info("Removing variable `%s`", key)
+                    Variable.delete(key=key)
+        if errors:
+            failures = "\n".join(f"  [{key}] {error}" for key, error in errors.items())
+            log.error("Event check failures:\n%s", failures)
+            raise ValueError(f"Event check failures:\n{failures}")
+
+    def _check_key(self, key: str, template: Any) -> list[dict]:
+        if isinstance(template, dict) and "$absent" in template:
+            reason = template["$absent"]
+            try:
+                actual = Variable.get(key=key, deserialize_json=True)
+                raise ValueError(f"Expected no events for key {key} ({reason}), got {len(actual)}")
+            except NoVariableError:
+                log.info("Key `%s` absent as expected (%s).", key, reason)
+                return []
+
+        try:
+            actual_events = Variable.get(key=key, deserialize_json=True)
+        except NoVariableError:
+            raise ValueError(
+                f"Expected events for key `{key}` but variable does not exist (no events emitted)"
+            )
+        if not isinstance(actual_events, list):
+            raise ValueError(
+                f"Variable {key} does not contain a list of events, got {type(actual_events).__name__}"
+            )
+        self.log.info(
+            "Events: len=`%s`, value=%s",
+            len(actual_events),
+            actual_events,
+        )
+        if self.event_sort_fn:
+            actual_events = sorted(
+                actual_events,
+                key=lambda e: self.event_sort_fn(json.loads(e)),  # type: ignore[misc]
+            )
+
+        default_count = str(len(template)) if isinstance(template, list) else "1"
+        self._assert_event_count(key, len(actual_events), default=default_count)
+
+        parsed_events = [json.loads(evt_str) for evt_str in actual_events]
+        if isinstance(template, list):
+            # Multiple expected events: compare each one after sorting.
+            for i, (tmpl, event) in enumerate(zip(template, parsed_events)):
+                if not match(tmpl, event, self.env, [i]):
+                    raise ValueError(f"Event at index {i} does not match template for key `{key}`")
+        else:
+            # Last event is checked against the template
+            if not match(template, parsed_events[-1], self.env):
+                raise ValueError(f"Event received does not match one specified in test for key `{key}`")
+        return parsed_events
+
+    def _assert_event_count(self, key: str, actual: int, default: str = "1") -> None:
+        """
+        Resolve the expected count expression for key and assert actual satisfies it.
+
+        Iterates event_count_assertions in definition order; the first regex that fully
+        matches key wins. If no pattern matches, falls back to default ("1" for single
+        templates, str(len(template)) for list templates — supplied by the caller).
+        Delegates the numeric check to _check_count_expr.
+        """
+        self._check_count_expr(key, actual, self._get_count_expr(key, default))
+
+    def _get_count_expr(self, key: str, default: str) -> str:
+        if self.event_count_assertions:
+            for pattern, count_expr in self.event_count_assertions.items():
+                if re.fullmatch(pattern, key):
+                    return str(count_expr)
+        return default
+
+    def _expects_repeated_events(self, key: str) -> bool:
+        """
+        Tell whether the Dag declares that a START key holds several START events of one run.
+
+        An open-ended ``">=N"`` (N >= 2) assertion on a START key does that, e.g. for a deferrable task that
+        emits START again after every resume. Exact counts don't: they also cover mapped tasks, where each
+        instance emits its own START under its own ``runId``.
+        """
+        expr = self._get_count_expr(key, default="1").strip()
+        return key.endswith(".event.start") and expr.startswith(">=") and int(expr[2:]) >= 2
+
+    @staticmethod
+    def _check_count_expr(key: str, actual: int, expr: str) -> None:
+        """
+        Assert that actual satisfies the count expression expr.
+
+        Supported expressions (leading/trailing whitespace is stripped):
+          "N"   or "==N"  — exactly N events
+          ">=N"           — at least N events
+          "<=N"           — at most N events
+
+        Raises ValueError if the assertion fails or the expression is not recognized.
+        """
+        expr = expr.strip()
+        if expr.startswith(">="):
+            n = int(expr[2:])
+            if actual < n:
+                raise ValueError(f"Expected >={n} events for key {key}, got {actual}")
+        elif expr.startswith("<="):
+            n = int(expr[2:])
+            if actual > n:
+                raise ValueError(f"Expected <={n} events for key {key}, got {actual}")
+        elif expr.startswith("=="):
+            n = int(expr[2:])
+            if actual != n:
+                raise ValueError(f"Expected =={n} events for key {key}, got {actual}")
+        elif expr.isdigit():
+            n = int(expr)
+            if actual != n:
+                raise ValueError(f"Expected {n} events for key {key}, got {actual}")
+        else:
+            raise ValueError(f"Invalid count expression '{expr}' for key {key}")

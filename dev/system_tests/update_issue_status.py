@@ -42,7 +42,7 @@ option_github_token = click.option(
     type=str,
     help=textwrap.dedent(
         """
-        Github token used to authenticate.
+        GitHub token used to authenticate.
         You can omit it if you have the ``GITHUB_TOKEN`` env variable set
         Can be generated with:
         https://github.com/settings/tokens/new?description=Write%20issues&scopes=repo"""
@@ -154,7 +154,9 @@ def update_issue_status(
     not_completed_opened_issues: list[Issue.Issue] = []
     per_issue_num_done: dict[int, int] = {}
     per_issue_num_all: dict[int, int] = {}
-    for issue in issues[start_from : start_from + max_issues]:
+
+    issue_list: list[Issue.Issue] = list(issues[start_from : start_from + max_issues])
+    for issue in issue_list:
         console.print(f"[blue] {issue.id}: {issue.title}")
         new_body, count_re_added, count_completed, count_done, count_all = process_paths_from_body(
             issue.body, dry_run=dry_run, verbose=verbose
@@ -171,7 +173,7 @@ def update_issue_status(
         console.print(f"[blue]Summary of performed actions: for {issue.title}[/]")
         console.print(f"   Re-added file number (still there): {count_re_added}")
         console.print(f"   Completed file number: {count_completed}")
-        console.print(f"   Done {count_done}/{count_all} = {(count_done * 100/ count_all):.2f}%")
+        console.print(f"   Done {count_done}/{count_all} = {count_done / count_all:.2%}")
         console.print()
         total_re_added += count_re_added
         total_completed += count_completed
@@ -199,11 +201,10 @@ def update_issue_status(
     console.print(f"[green]Summary of ALL issues: for {num_issues} issues[/]")
     console.print(
         f"   Completed and closed issues: {len(completed_closed_issues)}/{num_issues}: "
-        f"{len(completed_closed_issues) * 100/num_issues:.2f}%"
+        f"{len(completed_closed_issues) / num_issues:.2%}"
     )
     console.print(
-        f"   Completed files {total_count_done}/{total_count_all} = "
-        f"{(total_count_done * 100/ total_count_all):.2f}%"
+        f"   Completed files {total_count_done}/{total_count_all} = {total_count_done / total_count_all:.2%}"
     )
     console.print()
     if not_completed_closed_issues:
@@ -211,10 +212,7 @@ def update_issue_status(
         for issue in not_completed_closed_issues:
             all = per_issue_num_all[issue.id]
             done = per_issue_num_done[issue.id]
-            console.print(
-                rf" * [[yellow]{issue.title}[/]]({issue.html_url}): "
-                f"{done}/{all} : {done * 100 / all:.2f}%"
-            )
+            console.print(f" * [[yellow]{issue.title}[/]]({issue.html_url}): {done}/{all} : {done / all:.2%}")
         console.print()
     if completed_open_issues:
         console.print("[yellow] Issues that are completed and should be closed:[/]\n")
@@ -226,10 +224,7 @@ def update_issue_status(
         for issue in not_completed_opened_issues:
             all = per_issue_num_all[issue.id]
             done = per_issue_num_done[issue.id]
-            console.print(
-                rf" * [[yellow]{issue.title}[/]]({issue.html_url}): "
-                f"{done}/{all} : {done * 100 / all:.2f}%"
-            )
+            console.print(f" * [[yellow]{issue.title}[/]]({issue.html_url}): {done}/{all} : {done / all:.2%}")
         console.print()
     if completed_closed_issues:
         console.print("[green] Issues that are completed and are already closed:[/]\n")

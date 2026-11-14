@@ -1,0 +1,127 @@
+/*!
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import type { ReactNode, Dispatch, SetStateAction } from "react";
+
+import { Field, Stack, Text } from "@chakra-ui/react";
+import { type Control, type FieldValues, type Path, Controller } from "react-hook-form";
+import { useTranslation } from "react-i18next";
+
+import { Accordion } from "src/system-components";
+
+import type { ParamsSpec } from "src/queries/useDagParams";
+import { useParamStore } from "src/queries/useParamStore";
+
+import { FlexibleForm, flexibleFormDefaultSection } from "./FlexibleForm";
+import { JsonEditor } from "./JsonEditor";
+
+type ConfigFormProps<T extends FieldValues = FieldValues> = {
+  readonly children?: ReactNode;
+  readonly control: Control<T>;
+  readonly errors: {
+    conf?: string;
+    date?: unknown;
+  };
+  readonly initialParamsDict: { paramsDict: ParamsSpec };
+  readonly setErrors: Dispatch<
+    SetStateAction<{
+      conf?: string;
+      date?: unknown;
+    }>
+  >;
+  readonly setFormError: (error: boolean) => void;
+};
+
+const ConfigForm = <T extends FieldValues = FieldValues>({
+  children,
+  control,
+  errors,
+  initialParamsDict,
+  setErrors,
+  setFormError,
+}: ConfigFormProps<T>) => {
+  const { t: translate } = useTranslation(["components", "common"]);
+  const { conf, setConf } = useParamStore();
+
+  const validateAndPrettifyJson = (value: string) => {
+    try {
+      const parsedJson = JSON.parse(value) as JSON;
+
+      setErrors((prev) => ({ ...prev, conf: undefined }));
+
+      const formattedJson = JSON.stringify(parsedJson, undefined, 2);
+
+      if (formattedJson !== conf) {
+        setConf(formattedJson); // Update only if the value is different
+      }
+
+      return formattedJson;
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : translate("common:error.defaultMessage");
+
+      setErrors((prev) => ({
+        ...prev,
+        conf: translate("configForm.invalidJson", { errorMessage }),
+      }));
+
+      return value;
+    }
+  };
+
+  return (
+    <Stack data-testid="config-form" gap={4} mb={4}>
+      <FlexibleForm
+        flexibleFormDefaultSection={flexibleFormDefaultSection}
+        initialParamsDict={initialParamsDict}
+        setError={setFormError}
+      />
+      <Stack gap={4}>
+        {children}
+        <Accordion.Root collapsible overflow="visible" size="lg" variant="enclosed">
+          <Accordion.Item value="configJson">
+            <Accordion.ItemTrigger cursor="button">
+              <Text color={Boolean(errors.conf) ? "fg.error" : undefined}>
+                {translate("configForm.configJson")}
+              </Text>
+            </Accordion.ItemTrigger>
+            <Accordion.ItemContent>
+              <Controller
+                control={control}
+                name={"conf" as Path<T>}
+                render={({ field }) => (
+                  <Field.Root invalid={Boolean(errors.conf)}>
+                    <JsonEditor
+                      onBlur={() => {
+                        field.onChange(validateAndPrettifyJson(field.value));
+                      }}
+                      onChange={field.onChange}
+                      value={field.value}
+                    />
+                    {Boolean(errors.conf) ? <Field.ErrorText>{errors.conf}</Field.ErrorText> : undefined}
+                  </Field.Root>
+                )}
+              />
+            </Accordion.ItemContent>
+          </Accordion.Item>
+        </Accordion.Root>
+      </Stack>
+    </Stack>
+  );
+};
+
+export default ConfigForm;

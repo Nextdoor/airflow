@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# This is an example docker build script. It is not intended for PRODUCTION use
+set -euo pipefail
+AIRFLOW_SOURCES="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../../" && pwd)"
+TEMP_DOCKER_DIR=$(mktemp -d)
+pushd "${TEMP_DOCKER_DIR}"
+
+cp "${AIRFLOW_SOURCES}/Dockerfile" "${TEMP_DOCKER_DIR}"
+
+# [START download]
+mkdir -p docker-context-files
+export AIRFLOW_VERSION="3.5.0"
+export BASE_IMAGE="${BASE_IMAGE:-ghcr.io/apache/airflow/base/python:3.14.10-debian13-dev}"
+# The packages must be downloaded with the Python version of the base image
+[[ "${BASE_IMAGE}" =~ python:([0-9]+\.[0-9]+) ]]
+export PYTHON_VERSION="${BASH_REMATCH[1]}"
+if [[ "$(python -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')" != "${PYTHON_VERSION}" ]]; then
+    echo "Run this with Python ${PYTHON_VERSION}, the Python version of ${BASE_IMAGE}"
+    exit 1
+fi
+rm docker-context-files/*.whl docker-context-files/*.tar.gz docker-context-files/*.txt || true
+
+curl -Lo "docker-context-files/constraints-${PYTHON_VERSION}.txt" \
+    "https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PYTHON_VERSION}.txt"
+
+pip download --dest docker-context-files \
+    --constraint "docker-context-files/constraints-${PYTHON_VERSION}.txt" \
+    "apache-airflow[async,celery,cncf.kubernetes,elasticsearch,postgres,redis,ssh,statsd]==${AIRFLOW_VERSION}"
+# [END download]
+
+# [START build]
+export DOCKER_BUILDKIT=1
+
+docker build . \
+    --pull \
+    --build-arg BASE_IMAGE="${BASE_IMAGE}" \
+    --build-arg AIRFLOW_INSTALLATION_METHOD="apache-airflow" \
+    --build-arg AIRFLOW_VERSION="${AIRFLOW_VERSION}" \
+    --build-arg INSTALL_MYSQL_CLIENT="false" \
+    --build-arg INSTALL_MSSQL_CLIENT="false" \
+    --build-arg INSTALL_POSTGRES_CLIENT="true" \
+    --build-arg DOCKER_CONTEXT_FILES="docker-context-files" \
+    --build-arg INSTALL_DISTRIBUTIONS_FROM_CONTEXT="true" \
+    --build-arg AIRFLOW_CONSTRAINTS_LOCATION="/docker-context-files/constraints-${PYTHON_VERSION}.txt" \
+    --tag airflow-my-restricted-environment:0.0.1
+# [END build]
+
+docker rmi --force "airflow-my-restricted-environment"
+popd
+rm -rf "${TEMP_DOCKER_DIR}"

@@ -1,0 +1,192 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+from unittest import mock
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from airflow.exceptions import AirflowException
+from airflow.providers.amazon.aws.hooks.base_aws import AwsGenericHook
+from airflow.providers.amazon.aws.triggers.base import AwsBaseWaiterTrigger
+
+if TYPE_CHECKING:
+    from airflow.triggers.base import TriggerEvent
+
+
+class TestImplem(AwsBaseWaiterTrigger):
+    """An empty implementation that allows instantiation for tests."""
+
+    __test__ = False
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def hook(self) -> AwsGenericHook:
+        return AsyncMock()
+
+
+class TestAwsBaseWaiterTrigger:
+    def setup_method(self):
+        self.trigger = TestImplem(
+            serialized_fields={},
+            waiter_name="",
+            waiter_args={},
+            failure_message="",
+            status_message="",
+            status_queries=[],
+            return_value=None,
+            waiter_delay=0,
+            waiter_max_attempts=0,
+            aws_conn_id="",
+        )
+
+    def test_region_serialized(self):
+        self.trigger.region_name = "my_region"
+        _, args = self.trigger.serialize()
+
+        assert "region_name" in args
+        assert args["region_name"] == "my_region"
+
+    @pytest.mark.parametrize("verify", [True, False, pytest.param("/foo/bar.pem", id="path")])
+    def test_verify_serialized(self, verify):
+        self.trigger.verify = verify
+        _, args = self.trigger.serialize()
+
+        assert "verify" in args
+        assert args["verify"] == verify
+
+    @pytest.mark.parametrize(
+        "botocore_config",
+        [
+            pytest.param({"read_timeout": 10, "connect_timeout": 42, "keepalive": True}, id="non-empty-dict"),
+            pytest.param({}, id="empty-dict"),
+        ],
+    )
+    def test_botocore_config_serialized(self, botocore_config):
+        self.trigger.botocore_config = botocore_config
+        _, args = self.trigger.serialize()
+
+        assert "botocore_config" in args
+        assert args["botocore_config"] == botocore_config
+
+    @pytest.mark.parametrize("param_name", ["region_name", "verify", "botocore_config"])
+    def test_hooks_args_not_serialized_if_omitted(self, param_name):
+        _, args = self.trigger.serialize()
+
+        assert param_name not in args
+
+    def test_region_name_not_serialized_if_empty_string(self):
+        """
+        Compatibility with previous behaviour when empty string region name not serialised.
+
+        It would evaluate as None, however empty string it is not valid region name in boto3.
+        """
+        self.trigger.region_name = ""
+        _, args = self.trigger.serialize()
+
+        assert "region_name" not in args
+
+    def test_serialize_extra_fields(self):
+        self.trigger.serialized_fields = {"foo": "bar", "foz": "baz"}
+
+        _, args = self.trigger.serialize()
+
+        assert "foo" in args
+        assert args["foo"] == "bar"
+        assert "foz" in args
+        assert args["foz"] == "baz"
+
+    @pytest.mark.asyncio
+    @mock.patch("airflow.providers.amazon.aws.triggers.base.async_wait")
+    async def test_run(self, wait_mock: MagicMock):
+        self.trigger.return_key = "hello"
+        self.trigger.return_value = "world"
+
+        generator = self.trigger.run()
+        res: TriggerEvent = await generator.asend(None)
+
+        wait_mock.assert_called_once()
+        assert isinstance(res.payload, dict)
+        assert res.payload["status"] == "success"
+        assert res.payload["hello"] == "world"
+
+    @pytest.mark.asyncio
+    @mock.patch(
+        "airflow.providers.amazon.aws.triggers.base.async_wait",
+        side_effect=AirflowException("AWS Glue job failed.\nTerminal failure"),
+    )
+    async def test_run_error_yields_event(self, wait_mock: MagicMock):
+        self.trigger.return_key = "hello"
+        self.trigger.return_value = "world"
+
+        generator = self.trigger.run()
+        res: TriggerEvent = await generator.asend(None)
+
+        wait_mock.assert_called_once()
+        assert isinstance(res.payload, dict)
+        assert res.payload["status"] == "error"
+        assert "AWS Glue job failed." in res.payload["message"]
+        assert res.payload["hello"] == "world"
+
+    def test_event_from_exception(self):
+        self.trigger.return_key = "hello"
+        self.trigger.return_value = "world"
+
+        event = self.trigger._event_from_exception(AirflowException("AWS Glue job failed."))
+
+        assert event.payload == {
+            "status": "error",
+            "message": "AWS Glue job failed.",
+            "hello": "world",
+        }
+
+
+class TestAwsBaseWaiterTriggerSubclassValidation:
+    """``hook()`` runs in the triggerer, so a subclass that cannot build one must fail on import."""
+
+    def test_subclass_with_neither_hook_class_nor_hook_is_rejected(self):
+        with pytest.raises(AttributeError, match="aws_hook_class' should be set"):
+
+            class MissingBoth(AwsBaseWaiterTrigger):
+                pass
+
+    def test_subclass_whose_hook_class_is_not_a_hook_is_rejected(self):
+        with pytest.raises(AttributeError, match="not a subclass of AwsGenericHook"):
+
+            class NotAHook(AwsBaseWaiterTrigger):
+                aws_hook_class = str
+
+    def test_subclass_declaring_a_hook_class_is_accepted(self):
+        class Declared(AwsBaseWaiterTrigger):
+            aws_hook_class = AwsGenericHook
+
+        assert Declared.aws_hook_class is AwsGenericHook
+
+    def test_subclass_inheriting_a_hook_override_is_accepted(self):
+        """An override reached through an intermediate base still counts."""
+
+        class Intermediate(AwsBaseWaiterTrigger):
+            def hook(self) -> AwsGenericHook:
+                return AsyncMock()
+
+        class Leaf(Intermediate):
+            pass
+
+        assert Leaf.hook is Intermediate.hook

@@ -1,0 +1,433 @@
+ .. Licensed to the Apache Software Foundation (ASF) under one
+    or more contributor license agreements.  See the NOTICE file
+    distributed with this work for additional information
+    regarding copyright ownership.  The ASF licenses this file
+    to you under the Apache License, Version 2.0 (the
+    "License"); you may not use this file except in compliance
+    with the License.  You may obtain a copy of the License at
+
+ ..   http://www.apache.org/licenses/LICENSE-2.0
+
+ .. Unless required by applicable law or agreed to in writing,
+    software distributed under the License is distributed on an
+    "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+    KIND, either express or implied.  See the License for the
+    specific language governing permissions and limitations
+    under the License.
+
+Contribution Workflow
+=====================
+
+.. contents:: Table of Contents
+   :depth: 2
+   :local:
+
+Typically, you start your first contribution by reviewing open tickets
+at `GitHub issues <https://github.com/apache/airflow/issues>`__.
+
+If you create pull-request, you don't have to create an issue first, but if you want, you can do it.
+Creating an issue will allow you to collect feedback or share plans with other people.
+
+For example, you want to have the following sample ticket assigned to you:
+`#7782: Add extra CC: to the emails sent by Airflow <https://github.com/apache/airflow/issues/7782>`_.
+
+In general, your contribution includes the following stages:
+
+.. image:: images/workflow.png
+    :align: center
+    :alt: Contribution Workflow
+
+1. Make your own `fork <https://help.github.com/en/github/getting-started-with-github/fork-a-repo>`__ of
+   the Apache Airflow `main repository <https://github.com/apache/airflow>`__.
+
+2. Create a `local virtualenv <07_local_virtualenv.rst>`_,
+   initialize the `Breeze environment <../dev/breeze/doc/README.rst>`__, and
+   install `prek tool <08_static_code_checks.rst#prek-hooks>`__.
+   Set up the ``upstream`` and ``origin`` remotes and check them with ``breeze ci audit``; if
+   fork CI applies to you (see `CI in your fork`_), enable CI in your fork as described there.
+
+3. Join `devlist <https://lists.apache.org/list.html?dev@airflow.apache.org>`__
+   and set up a `Slack account <https://s.apache.org/airflow-slack>`__.
+
+4. Make the change and create a `Pull Request (PR) from your fork <https://help.github.com/en/github/collaborating-with-issues-and-pull-requests/creating-a-pull-request-from-a-fork>`__.
+
+5. Ping @ #contributors slack, comment @people. Be annoying. Be considerate.
+
+Step 1: Fork the Apache Airflow Repo
+------------------------------------
+From the `apache/airflow <https://github.com/apache/airflow>`_ repo,
+`create a fork <https://help.github.com/en/github/getting-started-with-github/fork-a-repo>`_:
+
+.. image:: images/fork.png
+    :align: center
+    :alt: Creating a fork
+
+
+Step 2: Configure Your Environment
+----------------------------------
+
+You can use several development environments for Airflow. If you prefer to have development environments
+on your local machine, you might choose Local Virtualenv, or dockerized Breeze environment, however we
+also have support for popular remote development environments: GitHub Codespaces and GitPodify.
+You can see the differences between the various environments in `Development environments <06_development_environments.rst>`__.
+
+The local environment instructions can be found in full in the `Local virtualenv <07_local_virtualenv.rst>`_ file.
+
+The Breeze Docker Compose environment is to maintain a consistent and common development environment so that you
+can replicate CI failures locally and work on solving them locally rather by pushing to CI.
+
+The Breeze instructions can be found in full in the `Breeze documentation <../dev/breeze/doc/README.rst>`_ file.
+
+You can configure the Docker-based Breeze development environment as follows:
+
+1. Install the latest versions of the `Docker Community Edition <https://docs.docker.com/get-docker/>`_ and
+`Docker Compose <https://docs.docker.com/compose/install/#install-compose>`_ and add them to the PATH.
+
+2. Install `jq`_ on your machine. The exact command depends on the operating system (or Linux distribution) you use.
+
+.. _jq: https://stedolan.github.io/jq/
+
+For example, on Ubuntu:
+
+.. code-block:: bash
+
+   sudo apt install jq
+
+or on macOS with `Homebrew <https://formulae.brew.sh/formula/jq>`_
+
+.. code-block:: bash
+
+   brew install jq
+
+3. Enter Breeze, and run the following in the Airflow source code directory:
+
+.. code-block:: bash
+
+   breeze
+
+Breeze starts with downloading the Airflow CI image from
+the Docker Hub and installing all required dependencies.
+
+This will enter the Docker environment and mount your local sources
+to make them immediately visible in the environment.
+
+4. Create a local virtualenv, for example:
+
+.. code-block:: bash
+
+   python3 -m venv venv && source venv/bin/activate
+
+5. Initialize the created environment:
+
+.. code-block:: bash
+
+   ./scripts/tools/initialize_virtualenv.py
+
+
+6. Open your IDE (for example, PyCharm) and select the virtual environment you created
+   as the project's default virtual environment in your IDE.
+
+CI in your fork
+~~~~~~~~~~~~~~~
+
+Pull requests from contributors who are not committers or collaborators are moving to running
+their CI in the contributor's own fork, on GitHub's free runners, instead of on the shared CI
+capacity of the Apache Software Foundation (`AIP-120
+<https://cwiki.apache.org/confluence/spaces/AIRFLOW/pages/451974711/AIP-120+Run+CI+for+external+contributions+in+contributor+forks>`__).
+CI on a public fork costs you nothing and has no minute limit; it runs on every push to your
+fork, so you get feedback before a maintainer looks at your pull request. The change is being
+piloted: until it is switched on for everyone, it applies to pilot participants (see below) and
+to pull requests a maintainer labels ``use fork ci``.
+
+Set up your checkout and fork once:
+
+1. Name your remotes as described in `Git remote naming conventions <10_working_with_git.rst>`__:
+   ``upstream`` for ``apache/airflow`` and ``origin`` for your fork.
+
+2. If fork CI applies to you, enable the ``Tests (AMD)`` workflow in your fork: today that means
+   you joined the pilot or a maintainer labelled your pull request ``use fork ci``; once fork CI is
+   switched on for everyone, it means you are not a committer, a collaborator or a member of an
+   exempted organisation. GitHub disables workflows in new forks. Sync your fork's ``main`` with
+   ``apache/airflow`` first, so it has the current version of the workflow:
+
+   .. code-block:: bash
+
+      gh repo sync <you>/airflow --branch main
+      gh workflow enable ci-amd.yml -R <you>/airflow
+
+   GitHub Actions must also be enabled in your fork and allow all actions: ``Tests (AMD)`` uses
+   actions from other repositories. When your fork's Actions settings block the workflow, its run
+   ends in "Startup failure" before any job runs, and the fork CI monitor reports
+   ``Fork CI / Tests (AMD)`` as failed with "could not start". Open the run in your fork for GitHub's
+   error, which can also be an invalid workflow file, fix the settings under
+   **Settings > Actions > General** in your fork, and push again.
+
+   Keep the workflow enabled for as long as you have open pull requests. If it gets disabled, from
+   your fork's Actions tab or by GitHub after 60 days without activity in your fork, the fork CI
+   monitor comments on your pull requests with the commands to turn it back on.
+
+   GitHub can also pause GitHub Actions in your fork to reduce wasted compute, and it sends no
+   email when it does. Your pushes then start no run, and the fork CI monitor cannot tell this from
+   a commit you have not pushed yet. ``breeze ci audit`` reports it. The banner on your fork's
+   Actions page turns GitHub Actions back on, and a push made while it was paused must be pushed
+   again. To make the pause less likely,
+   ``breeze ci audit --fix`` disables the workflows in your fork that only run on a schedule or
+   after another workflow. Fork CI does not need them.
+
+3. Check everything at once. ``breeze ci audit`` prints one row per check and the command that fixes
+   anything missing; ``--fix`` runs those commands after asking:
+
+   .. code-block:: bash
+
+      breeze ci audit
+
+When fork CI applies to your pull request, it is labelled ``fork ci required`` and kept in draft
+until the ``Tests (AMD)`` workflow runs in your fork for its latest commit. A failed run does not
+draft it. A
+``Fork CI / Tests (AMD)`` status on the pull request links to that run, and one comment on the pull
+request explains the current state. Once the run is green, a pull request the monitor drafted is
+marked ready for review and labelled ``ready for maintainer review``; a pull request you drafted
+yourself stays a draft, and gets the label, once you mark it ready. A pull request whose fork CI
+does not run for 30 days is closed with an explanation; you can reopen it after setting up fork CI. If your pull request changes
+files that decide which CI jobs run and where, such as ``.github/``, the breeze sources or
+``scripts/ci/prek/``, a green fork run is not enough: a maintainer reviews the change and runs project CI for it.
+
+**Joining the pilot.** Open a pull request that adds your GitHub login to the ``[pilot]`` table in
+``.github/fork-ci-gate.toml``, with a join instant after the expected merge, for example the next day
+at 00:00 UTC:
+
+.. code-block:: toml
+
+   [pilot]
+   "your-login" = YYYY-MM-DDT00:00:00Z
+
+Every pull request you open after that instant uses fork CI. Your earlier pull requests keep project
+CI until you push to them, rebase them or close and reopen them after that instant, and use fork CI
+from then on. To leave the pilot, open a pull request that removes the line. Your own ``[pilot]`` line is
+the only part of the fork CI gate a pull request using fork CI may change: one that changes the
+gate's code, the rest of its configuration or the ``gate`` job of ``ci-amd.yml`` is closed with an
+explanation. A pilot entry gates your pull
+requests whatever your role, so a committer in the pilot also enables the workflow;
+``breeze ci audit`` tells you which applies to you. The design is described in
+`Fork CI for external contributors <../dev/breeze/doc/ci/08_fork_ci_for_external_contributors.md>`__.
+
+Step 3: Connect with People
+---------------------------
+
+For effective collaboration, make sure to join the following Airflow groups:
+
+- Mailing lists:
+
+  - Developer's mailing list `<dev-subscribe@airflow.apache.org>`_
+    (quite substantial traffic on this list)
+
+  - All commits mailing list: `<commits-subscribe@airflow.apache.org>`_
+    (very high traffic on this list)
+
+  - Airflow users mailing list: `<users-subscribe@airflow.apache.org>`_
+    (reasonably small traffic on this list)
+
+- `Issues on GitHub <https://github.com/apache/airflow/issues>`__
+
+- `Slack (chat) <https://s.apache.org/airflow-slack>`__
+
+Step 4: Prepare PR
+------------------
+
+1. Update the local sources to address the issue.
+
+   For example, to address this example issue, do the following:
+
+   * Read about `email configuration in Airflow </airflow-core/docs/howto/email-config.rst>`__.
+
+   * Find the class you should modify. For the example GitHub issue,
+     this is `email.py <https://github.com/apache/airflow/blob/main/airflow-core/src/airflow/utils/email.py>`__.
+
+   * Find the test class where you should add tests. For the example ticket,
+     this is `test_email.py <https://github.com/apache/airflow/blob/main/airflow-core/tests/unit/utils/test_email.py>`__.
+
+   * Make sure your fork's main is synced with Apache Airflow's main before you create a branch. See
+     `How to sync your fork <10_working_with_git.rst#how-to-sync-your-fork>`_ for details.
+
+   * Create a local branch for your development. Make sure to use latest
+     ``upstream/main`` as base for the branch. See `How to Rebase PR </contributing-docs/10_working_with_git.rst#how-to-rebase-pr>`_ for details
+     on setting up the ``upstream`` remote (Airflow standardises on ``upstream`` →
+     ``apache/airflow`` and ``origin`` → your fork — see
+     `Git remote naming conventions </contributing-docs/10_working_with_git.rst#git-remote-naming-conventions>`_).
+     Note, some people develop their changes directly in their own
+     ``main`` branches - this is OK and you can make PR from your main to ``upstream/main`` but we
+     recommend to always create a local branch for your development. This allows you to easily compare
+     changes, have several changes that you work on at the same time and many more.
+     With ``upstream`` configured you can make sure that you have the latest changes in your main
+     by ``git pull upstream main`` when you are in the local ``main`` branch. If you have conflicts and
+     want to override your locally changed main you can override your local changes with
+     ``git fetch upstream; git reset --hard upstream/main``.
+
+   * Modify the class and add necessary code and unit tests.
+
+   * Run and fix all the `static checks <08_static_code_checks.rst>`__. If you have
+     `prek installed <08_static_code_checks.rst#prek-hooks>`__,
+     this step is automatically run while you are committing your code. If not, you can do it manually
+     via ``git add`` and then ``prek``.
+
+   * Run the appropriate tests as described in `Testing documentation <09_testing.rst>`__.
+
+   * Check whether your PR needs a newsfragment. Most PRs do not: the release notes for ordinary bug fixes,
+     features and doc changes are built from the commit title. Add one only for a change users must read
+     before upgrading, such as a behaviour change, a removal, a new default or migration steps. A maintainer
+     will ask if your PR needs one. See `Newsfragments`_ below for the details.
+
+2. Rebase your fork, squash commits, and resolve all conflicts. See `How to rebase PR <10_working_with_git.rst#how-to-rebase-pr>`_
+   if you need help with rebasing your change. Remember to rebase often if your PR takes a lot of time to
+   review/fix. This will make rebase process much easier and less painful and the more often you do it,
+   the more comfortable you will feel doing it.
+
+3. Re-run static code checks again.
+
+4. Make sure your commit has a good title and description of the context of your change, enough
+   for maintainers reviewing it to understand why you are proposing a change. Make sure to follow other
+   PR guidelines described in `Pull Request guidelines <05_pull_requests.rst#pull-request-guidelines>`_.
+   Create Pull Request! Make yourself ready for the discussion!
+
+5. The ``static checks`` and ``tests`` in your PR serve as a first-line-of-check, whether the PR
+   passes the quality bar for Airflow. It basically means that until you get your PR green, it is not
+   likely to get reviewed by maintainers unless you specifically ask for it and explain that you would like
+   to get first pass of reviews and explain why achieving ``green`` status for it is not easy/feasible/desired.
+   Similarly if your PR contains ``[WIP]`` in the title or it is marked as ``Draft`` it is not likely to get
+   reviewed by maintainers unless you specifically ask for it and explain why and what specifically you want
+   to get reviewed before it reaches ``Ready for review`` status. This might happen if you want to get initial
+   feedback on the direction of your PR or if you want to get feedback on the design of your PR.
+
+6. Avoid @-mentioning individual maintainers in your PR, unless you have good reason to believe that they are
+   available, have time and/or interest in your PR. Generally speaking there are no "exclusive" reviewers for
+   different parts of the code. Reviewers review PRs and respond when they have some free time to spare and
+   when they feel they can provide some valuable feedback. If you want to get attention of maintainers, you can just
+   follow-up on your PR and ask for review in general, however be considerate and do not expect "immediate"
+   reviews. People review when they have time, most of the maintainers do such reviews in their
+   free time, which is taken away from their families and other interests, so allow sufficient time before you
+   follow-up - but if you see no reaction in several days, do follow-up, as with the number of PRs we have
+   daily, some of them might simply fall through the cracks, and following up shows your interest in completing
+   the PR as well as puts it at the top of "Recently commented" PRs. However, be considerate and mindful of
+   the time zones, holidays, busy periods, and expect that some discussions and conversation might take time
+   and get stalled occasionally. Generally speaking it's the author's responsibility to follow-up on the PR when
+   they want to get it reviewed and merged.
+
+
+Newsfragments
+~~~~~~~~~~~~~
+
+Newsfragments are only consumed by ``airflow-core/``, ``chart/`` and ``dev/mypy/``. Do not add one by default.
+
+For ``airflow-core/``, use only ``significant`` newsfragments, and only for a change users must read before
+upgrading:
+
+* a behaviour change, a removal or a new default,
+* a change that needs migration steps.
+
+``task-sdk/`` has no release notes of its own. Its changes are listed in the Airflow release notes, so put
+newsfragments for ``task-sdk/`` changes in ``airflow-core/newsfragments/``.
+
+A ``significant`` newsfragment does not have to be a breaking change. Do not add a newsfragment for an
+ordinary bug fix, feature, improvement or documentation change, or for internal refactors, CI, tooling and
+tests. For ``chart/``, add a newsfragment only for major or breaking changes.
+
+If you are unsure, leave it out. A maintainer will ask for one during review if it is needed.
+
+Never add newsfragments for ``providers/`` or ``airflow-ctl/``: their release managers regenerate the
+changelog from the commit history. For a user-visible note, edit the changelog directly: the provider's
+``docs/changelog.rst`` (see `providers/AGENTS.md </providers/AGENTS.md#changelog--never-use-newsfragments>`__)
+or ``airflow-ctl/RELEASE_NOTES.rst``.
+
+To add a newsfragment, create an ``rst`` file named ``{pr_number}.significant.rst`` (e.g. ``1234.significant.rst``)
+and place it in `airflow-core/newsfragments </airflow-core/newsfragments>`__ for core newsfragments, or
+`chart/newsfragments </chart/newsfragments>`__ for helm chart newsfragments. It can be a single line, or a
+summary and a body separated by a blank line, similar to ``git`` commit messages.
+
+Static checks in CI validate that newsfragment filenames use the correct PR number. Run locally, before the
+PR exists, they accept any number. If you need to skip this check (e.g. when cherry-picking a newsfragment
+from another PR), ask a maintainer to add the ``skip newsfragment check`` label to your PR, then re-run the
+failed static checks. When your PR's CI runs in your fork, re-run them there, or push again; maintainers
+cannot re-run jobs in your fork.
+
+
+Step 5: Pass PR Review
+----------------------
+
+.. image:: images/review.png
+    :align: center
+    :alt: PR Review
+
+Note that maintainers will use **Squash and Merge** instead of **Rebase and Merge**
+when merging PRs and your commit will be squashed to single commit.
+
+When a reviewer starts a conversation it is expected that you respond to questions, suggestions, doubts,
+and generally it's great if all such conversations seem to converge to a common understanding. You do not
+necessarily have to apply all the suggestions (often they are just opinions and suggestions even if they are
+coming from seasoned maintainers) - it's perfectly ok that you respond to it with your own opinions and
+understanding of the problem and your approach and if you have good arguments, presenting them is a good idea.
+
+The reviewers might leave several types of responses:
+
+* ``General PR comment`` - which usually means that there is a question/opinion/suggestion on how the PR can be
+  improved, or it's an ask to explain how you understand the PR. You can usually quote some parts of such
+  general comment and respond to it in your comments. Often comments that are raising questions in general
+  might lead to different discussions, even a request to move the discussion to the devlist or even lead to
+  completely new PRs created as a spin-off of the discussion.
+
+* ``Comment/Conversation around specific lines of code`` - such conversation usually flags a potential
+  improvement, or a potential problem with the code. It's a good idea to respond to such comments and explain
+  your approach and understanding of the problem. The whole idea of a conversation is try to reach a consensus
+  on a good way to address the problem. As an author you can resolve the conversation if you think the
+  problem raised in the comment is resolved or ask the reviewer to re-review, confirm If you do not understand
+  the comment, you can ask for clarifications. Generally assume good intention of the person who is reviewing
+  your code and resolve conversations also having good intentions. Understand that it's not a person that
+  is criticised or argued with, but rather the code and the approach. The important thing is to take care
+  about quality of the code and the project and want to make sure that the code is good.
+
+  It's ok to mark the conversation resolved by anyone who can do it - it could be the author, who thinks
+  the arguments are changes implemented make the conversation resolved, or the maintainer/person who
+  started the conversation or it can be even marked as resolved by the maintainer who attempts to merge the
+  PR and thinks that all conversations are resolved. However if you want to make sure attention and decision
+  on merging the PR is given by maintainer, make sure you monitor, follow-up and close the conversations when
+  you think they are resolved (ideally explaining why you think the conversation is resolved).
+
+* ``Request changes`` - this is where maintainer is pretty sure that you should make a change to your PR
+  because it contains serious flaw, design misconception, or a bug or it is just not in-line with the common
+  approach Airflow community took on the issue. Usually you should respond to such request and either fix
+  the problem or convince the maintainer that they were wrong (it happens more often than you think).
+  Sometimes even if you do not agree with the request, it's a good idea to make the change anyway, because
+  it might be a good idea to follow the common approach in the project. Sometimes it might even happen that
+  two maintainers will have completely different opinions on the same issue and you will have to lead the
+  discussion to try to achieve consensus. If you cannot achieve consensus and you think it's an important
+  issue, you can ask for a vote on the issue by raising a devlist discussion - where you explain your case
+  and follow up the discussion with a vote when you cannot achieve consensus there. The ``Request changes``
+  status can be withdrawn by the maintainer, but if they don't - such PR cannot be merged - maintainers have
+  the right to veto any code modification according to the `Apache Software Foundation rules <https://www.apache.org/foundation/voting.html#votes-on-code-modification>`_.
+
+* ``Approval`` - this is given by a maintainer after the code has been reviewed and the maintainer agrees that
+  it is a good idea to merge it. There might still be some unresolved conversations, requests and questions on
+  such PR and you are expected to resolve them before the PR is merged. But the ``Approval`` status is a sign
+  of trust from the maintainer who gave the approval that they think the PR is good enough as long as their
+  comments will be resolved and they put the trust in the hands of the author and - possibly - other
+  maintainers who will merge the request that they can do that without follow-up re-review and verification.
+
+
+You need to have ``Approval`` of at least one maintainer (if you are maintainer yourself, it has to be
+another maintainer). Ideally you should have 2 or more maintainers reviewing the code that touches
+the core of Airflow - we do not have enforcement about ``2+`` reviewers required for Core of Airflow,
+but maintainers will generally ask in the PR if they think second review is needed.
+
+Your PR can be merged by a maintainer who will see that the PR is approved, all conversations are resolved
+and the code looks good. The criteria for PR being merge-able are:
+
+* ``green status for static checks and tests``
+* ``conversations resolved``
+* ``approval from 1 (or more for core changes) maintainers``
+* no unresolved ``Request changes``
+
+Once you reach the status, you do not need to do anything to get the PR merged. One of the maintainers
+will merge such PRs. However if you see that for a few days such a PR is not merged, do not hesitate to comment
+on your PR and mention that you think it is ready to be merged. Also, it's a good practice to rebase your PR
+to latest ``main``, because there could be other changes merged in the meantime that might cause conflicts or
+fail tests or static checks, so by rebasing a PR that has been build few days ago you make sure that it
+still passes the tests and static checks today.

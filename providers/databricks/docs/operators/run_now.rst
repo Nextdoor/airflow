@@ -1,0 +1,219 @@
+ .. Licensed to the Apache Software Foundation (ASF) under one
+    or more contributor license agreements.  See the NOTICE file
+    distributed with this work for additional information
+    regarding copyright ownership.  The ASF licenses this file
+    to you under the Apache License, Version 2.0 (the
+    "License"); you may not use this file except in compliance
+    with the License.  You may obtain a copy of the License at
+
+ ..   http://www.apache.org/licenses/LICENSE-2.0
+
+ .. Unless required by applicable law or agreed to in writing,
+    software distributed under the License is distributed on an
+    "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+    KIND, either express or implied.  See the License for the
+    specific language governing permissions and limitations
+    under the License.
+
+
+
+DatabricksRunNowOperator
+========================
+
+Use the :class:`~airflow.providers.databricks.operators.databricks.DatabricksRunNowOperator` to trigger a run of an existing Databricks job
+via `api/2.2/jobs/run-now <https://docs.databricks.com/dev-tools/api/latest/jobs.html#operation/JobsRunNow>`_ API endpoint.
+
+
+Using the Operator
+^^^^^^^^^^^^^^^^^^
+
+There are two ways to instantiate this operator. In the first way, you can take the JSON payload that you typically use
+to call the ``api/2.2/jobs/run-now`` endpoint and pass it directly to our ``DatabricksRunNowOperator`` through the ``json`` parameter.
+
+Another way to accomplish the same thing is to use the named parameters of the ``DatabricksRunNowOperator`` directly.
+Note that there is exactly one named parameter for each top level parameter in the ``jobs/run-now`` endpoint.
+
+The only required parameters are either:
+
+* ``job_id`` - to specify ID of the existing Databricks job
+* ``job_name`` - Name of the existing Databricks job. It will throw exception if job isn't found, of if there are multiple jobs with the same name.
+
+All other parameters are optional and described in documentation for ``DatabricksRunNowOperator``.  For example, you can pass additional parameters to a job using one of the following parameters, depending on the type of tasks in the job:
+
+* ``notebook_params``
+* ``python_params``
+* ``python_named_params``
+* ``jar_params``
+* ``spark_submit_params``
+* ``idempotency_token``
+* ``performance_target``
+* ``repair_run``
+* ``cancel_previous_runs``
+
+Forwarding Airflow Dag params as Databricks job parameters
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The Databricks ``api/2.2/jobs/run-now`` endpoint accepts a top-level `job_parameters
+<https://docs.databricks.com/api/workspace/jobs/runnow#job_parameters>`_ field — a plain
+``Dict[str, str]`` mapping parameter name to value — that overrides the job's defaults
+for this run.
+
+If ``job_parameters`` is not set in ``json`` and the operator's ``params`` dict is
+non-empty, ``params`` is forwarded as ``job_parameters`` as-is, so Airflow Dag params can
+be passed dynamically to a run without hardcoding them in ``json``. If ``json`` already
+contains ``job_parameters``, it is left untouched. Params whose value resolves to ``None`` are
+skipped, since Databricks has no value to receive for them. You can set
+``forward_dag_params=False`` to disable this parameter forwarding behavior.
+
+.. note::
+  The Databricks API does not permit ``job_parameters`` to be used in combination with
+  ``notebook_params``, ``python_params``, ``jar_params``, ``spark_submit_params``,
+  ``python_named_params``, or ``dbt_commands``. Auto-forwarding is automatically skipped
+  when any of those parameter slots are used.
+
+.. code-block:: python
+
+  run_now = DatabricksRunNowOperator(
+      task_id="run_now",
+      job_id=123,
+      params={"env": "staging", "batch_size": "42"},
+  )
+  # The triggered run receives:
+  #   job_parameters={"env": "staging", "batch_size": "42"}
+  # i.e. the same dict, passed straight through to the run-now request body.
+
+OpenLineage parent job information
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Set ``openlineage_inject_parent_job_info=True`` to add the standardized OpenLineage context to the
+run's ``job_parameters`` under the ``OPENLINEAGE_CONTEXT`` key. The JSON value contains the Airflow
+task as the parent job, with ``jobType`` set to ``BATCH/AIRFLOW/TASK``. When the current Airflow Dag
+is the root job, its ``jobType`` is set to ``BATCH/AIRFLOW/DAG``. For a root inherited through
+``DagRun.conf``, the job type is copied from ``conf["openlineage"]["rootParentJobType"]`` when that
+mapping is present; otherwise, the root job has no ``jobType`` facet. This follows the context format
+introduced in `OpenLineage #4682 <https://github.com/OpenLineage/OpenLineage/pull/4682>`_.
+
+``OPENLINEAGE_CONTEXT`` is a Databricks job parameter, not an operating-system environment variable.
+The Databricks task must expose the parameter to the downstream OpenLineage integration through its
+own configuration channel (for example, ``spark.openlineage.context`` for OpenLineage Spark or the
+``OPENLINEAGE_CONTEXT`` environment variable for dbt).
+
+The option defaults to the ``openlineage.spark_inject_parent_job_info`` configuration value. Existing
+OpenLineage context job parameters are preserved. Injection is skipped when a legacy parameter slot
+such as ``notebook_params`` or ``spark_submit_params`` is used because Databricks does not allow those
+slots to be combined with ``job_parameters``.
+
+.. code-block:: python
+
+  run_now = DatabricksRunNowOperator(
+      task_id="run_now",
+      job_id=123,
+      openlineage_inject_parent_job_info=True,
+  )
+
+
+Durable execution
+^^^^^^^^^^^^^^^^^
+
+``DatabricksRunNowOperator`` triggers a run of an existing job and then polls it to completion on
+the worker. By default the operator runs in a *durable* mode that makes this crash-safe: the
+Databricks run id is persisted to :doc:`task state store
+<apache-airflow:core-concepts/task-state-store>` before polling begins, so if the worker crashes
+or is preempted and the task is retried, the operator reconnects to the run that is already
+executing on Databricks instead of triggering a duplicate run of the same job.
+
+On retry the operator checks the prior run's state:
+
+* if it is still running, the operator reconnects and continues polling
+* if it already succeeded, the operator returns immediately without triggering a new run
+* if it failed terminally, or the run no longer exists because its history expired, the operator
+  triggers a fresh run
+
+This avoids triggering the same Databricks job twice when a worker is lost mid-run, which is common
+for long-running jobs.
+
+Durable execution requires Airflow 3.3 or newer, since it relies on the task state store. On earlier
+Airflow versions the flag is a no-op and the operator always triggers a fresh run on retry,
+exactly as before. If the task state store is unavailable at runtime, the operator logs that crash
+recovery is disabled and behaves the same way.
+
+Like the persisted state itself, the stored run id isn't deleted automatically, that only happens
+when someone runs ``airflow state-store clean``. If a task's ``retry_delay`` is longer than
+``[state_store] default_retention_days`` (30 days by default) and cleanup runs in between, the
+run id won't be there for the next retry, and the operator will trigger a fresh run instead of
+reconnecting. Avoid running cleanup on a schedule shorter than your longest ``retry_delay``.
+
+Clearing a task is treated the same as a retry, which matters specifically for a task whose run
+already succeeded: clearing does not delete the stored run id, so the next attempt reads it back
+and returns immediately without triggering a new run. See
+:doc:`apache-airflow:core-concepts/resumable-tasks` for why, and for the
+``[state_store] clear_on_success`` setting that restores "clearing always resubmits."
+
+This is most reliable for deferred tasks (``deferrable=True``); clearing a task that's actively
+polling synchronously can cancel the run via ``on_kill`` before the next attempt gets a chance to
+reconnect -- see :doc:`apache-airflow:core-concepts/resumable-tasks` for why.
+
+To opt out and always trigger a fresh run on retry, set ``durable=False``:
+
+.. code-block:: python
+
+  run_now = DatabricksRunNowOperator(
+      task_id="run_now",
+      job_id=123,
+      durable=False,
+  )
+
+Durable execution applies to the synchronous path. When ``deferrable=True`` is set, the Triggerer
+already tracks the run across the wait, so deferrable mode takes precedence and ``durable`` has no
+effect.
+
+Durable execution requires Airflow 3.3 or newer, since it relies on the task state store. Below
+3.3, ``durable`` has no effect either way: setting it explicitly only emits a warning, and the
+operator always triggers a fresh run on retry, exactly as before this feature existed.
+
+
+DatabricksRunNowDeferrableOperator
+==================================
+
+Deferrable version of the :class:`~airflow.providers.databricks.operators.databricks.DatabricksRunNowOperator` operator.
+
+It allows to utilize Airflow workers more effectively using `new functionality introduced in Airflow 2.2.0 <https://airflow.apache.org/docs/apache-airflow/2.2.0/concepts/deferring.html#triggering-deferral>`_
+
+.. _howto/operator:DatabricksRunNowOperator:retry-args:
+
+Retry args in deferrable mode
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+When ``deferrable=True``, the ``databricks_retry_args`` dictionary is serialized across the
+trigger boundary and must contain only values that Airflow serde can serialize. Primitive
+values such as ``int``, ``float``, ``str``, ``bool``, ``None``, ``dict``, and ``list`` are
+the common safe choices.
+
+For controlling attempt count and delay in deferrable mode, leave
+``databricks_retry_args`` unset and use the dedicated operator parameters
+``databricks_retry_limit`` and ``databricks_retry_delay``. When ``databricks_retry_args`` is
+set, these dedicated parameters are ignored for the hook retry policy.
+
+Serialization validation only verifies that values can cross the trigger boundary; it does
+not verify that the supplied keys and values are valid or meaningful ``tenacity.Retrying``
+keyword arguments. Custom tenacity strategy objects (``stop``, ``wait``, ``before``, etc.)
+require callable objects, which are not serialization-safe in deferrable mode. The hook always
+replaces supplied ``retry`` and ``after`` values, so setting them has no effect in either mode.
+
+**Not supported** in deferrable mode (will raise ``ValueError`` when the task defers; the
+Databricks run has already been submitted at that point):
+
+.. code-block:: python
+
+    from tenacity import stop_after_attempt, wait_incrementing
+
+    # Tenacity strategy objects — NOT serializable
+    databricks_retry_args = {"stop": stop_after_attempt(3)}
+    databricks_retry_args = {"wait": wait_incrementing(start=30, increment=30)}
+
+If you need custom ``stop`` or ``wait`` strategies, use the non-deferrable
+:class:`~airflow.providers.databricks.operators.databricks.DatabricksRunNowOperator` (``deferrable=False``).
+Setting non-empty ``databricks_retry_args`` replaces the hook's default retry policy rather
+than merging with it, so supply both ``stop`` and ``wait``. Otherwise, Tenacity defaults to
+``stop_never`` and ``wait_none()``, which retries persistently retryable API errors forever
+without backoff.

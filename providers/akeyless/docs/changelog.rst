@@ -1,0 +1,111 @@
+.. Licensed to the Apache Software Foundation (ASF) under one
+    or more contributor license agreements.  See the NOTICE file
+    distributed with this work for additional information
+    regarding copyright ownership.  The ASF licenses this file
+    to you under the Apache License, Version 2.0 (the
+    "License"); you may not use this file except in compliance
+    with the License.  You may obtain a copy of the License at
+
+ ..   http://www.apache.org/licenses/LICENSE-2.0
+
+ .. Unless required by applicable law or agreed to in writing,
+    software distributed under the License is distributed on an
+    "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+    KIND, either express or implied.  See the License for the
+    specific language governing permissions and limitations
+    under the License.
+
+Changelog
+=========
+
+.. warning::
+  In multi-team mode with ``use_team_secrets_path`` enabled (the default) and no ``global_secrets_path``
+  set, a connection or variable looked up with no team is no longer resolved when its id contains the
+  path separator. Such an id resolves under the same base path that team-scoped secrets are stored
+  under, so it could name a team's secret. Set ``global_secrets_path`` to give secrets used outside any
+  team a namespace of their own, in which nested ids keep working.
+
+0.3.2
+.....
+
+Bug Fixes
+~~~~~~~~~
+
+* ``Refuse nested secret ids looked up with no team in multi-team mode (#73789)``
+
+Misc
+~~~~
+
+* ``Drop support for Python 3.10 (#74157)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``Update provider READMEs for the Python 3.11 baseline (#74158)``
+   * ``[main] Upgrade important CI environment (#73629)``
+   * ``Revert "[main] Upgrade important CI environment (#73308)" (#73621)``
+   * ``[main] Upgrade important CI environment (#73308)``
+
+0.3.1
+.....
+
+Bug Fixes
+~~~~~~~~~
+
+* ``Refuse Akeyless secret ids that address another team's namespace (#72646)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``Bump common-compat lower bound for akeyless, hashicorp and smtp (#72503)``
+   * ``Prepare providers release 2026-08-18 (#71794)``
+   * ``Adopt flit 4 as the provider distribution build backend (#71186)``
+   * ``Pin providers in constraints to the versions published in PyPI (#71324)``
+
+0.3.0
+.....
+
+Features
+~~~~~~~~
+
+* ``Add cloud-based auth (aws_iam, gcp, azure_ad) to Akeyless secrets backend (#69772)``
+
+Doc-only
+~~~~~~~~
+
+* ``Document each provider's optional extras in its docs index (#69478)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``Fix inconsistency between generated provider docs and pyproject.toml (#68991)``
+
+
+0.2.0
+.....
+
+.. note::
+    The Akeyless connection field ``jwt`` has been renamed to ``jwt_token`` so the credential
+    is correctly masked in logs. Update existing Akeyless connections to use the new field
+    name. As this provider is still pre-1.0, the breaking change ships in a minor release.
+
+Breaking changes
+~~~~~~~~~~~~~~~~~~
+
+* ``Fix Akeyless JWT connection credential is not redacted (#67443)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``Prepare providers release 2026-05-05 (#66424)``
+
+0.1.0
+.....
+
+Initial release.
+
+Features
+~~~~~~~~
+
+* ``AkeylessHook``: Hook for interacting with Akeyless Vault Platform (static,
+  dynamic, and rotated secrets; item CRUD; multiple auth methods).
+* ``AkeylessBackend``: Secrets backend for sourcing Airflow Connections,
+  Variables, and Configuration from Akeyless.
+* Custom ``akeyless`` connection type with dedicated UI fields for all
+  authentication methods.

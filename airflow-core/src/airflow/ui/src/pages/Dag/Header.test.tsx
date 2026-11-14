@@ -1,0 +1,144 @@
+/*!
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import "@testing-library/jest-dom/vitest";
+import { render, screen } from "@testing-library/react";
+import type { DAGDetailsResponse } from "openapi-gen/requests/types.gen";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import i18n from "src/i18n/config";
+import { MOCK_DAG } from "src/mocks/handlers/dag";
+import { Wrapper } from "src/utils/Wrapper";
+
+import { Header } from "./Header";
+
+const mockConfig: Record<string, unknown> = { multi_team: false };
+
+vi.mock("src/queries/useConfig", () => ({
+  useConfig: (key: string) => mockConfig[key],
+}));
+
+const mockDag = {
+  ...MOCK_DAG,
+  active_runs_count: 0,
+  allowed_run_types: [],
+  bundle_name: "dags-folder",
+  bundle_version: "1",
+  default_args: {},
+  fileloc: "/files/dags/stale_dag.py",
+  is_favorite: false,
+  is_stale: true,
+  last_parse_duration: 0.23,
+  // `null` matches the API response shape for DAGs without version metadata.
+  latest_dag_version: null,
+  next_dagrun_logical_date: "2024-08-22T00:00:00+00:00",
+  next_dagrun_run_after: "2024-08-22T19:00:00+00:00",
+  owner_links: {},
+  relative_fileloc: "stale_dag.py",
+  tags: [],
+  timetable_partitioned: false,
+  timetable_summary: "* * * * *",
+} as unknown as DAGDetailsResponse;
+
+describe("Header", () => {
+  afterEach(() => {
+    mockConfig.multi_team = false;
+  });
+
+  it("shows a deactivated badge and hides stale-only next actions for stale dags", () => {
+    render(
+      <Wrapper>
+        <Header dag={mockDag} />
+      </Wrapper>,
+    );
+
+    expect(screen.queryByText(i18n.t("dag:dagDetails.nextRun"))).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Reparse Dag" })).not.toBeInTheDocument();
+  });
+
+  it("does not render next run timestamp for a paused Dag", () => {
+    render(
+      <Wrapper>
+        <Header dag={{ ...mockDag, is_paused: true, is_stale: false }} />
+      </Wrapper>,
+    );
+
+    expect(screen.getByText(i18n.t("dag:dagDetails.nextRun"))).toBeInTheDocument();
+    expect(screen.queryByText("2024-08-22 19:00:00")).not.toBeInTheDocument();
+  });
+
+  it("shows active runs against the maximum number of active runs", () => {
+    render(
+      <Wrapper>
+        <Header dag={{ ...mockDag, active_runs_count: 2, max_active_runs: 2 }} />
+      </Wrapper>,
+    );
+
+    expect(screen.getByText(i18n.t("common:dagDetails.activeRuns"))).toBeInTheDocument();
+    expect(screen.getByText("2 of 2")).toBeInTheDocument();
+  });
+
+  it("shows only the active runs when the Dag has no maximum", () => {
+    render(
+      <Wrapper>
+        <Header dag={{ ...mockDag, active_runs_count: 2, max_active_runs: null }} />
+      </Wrapper>,
+    );
+
+    expect(screen.getByText(i18n.t("common:dagDetails.activeRuns"))).toBeInTheDocument();
+    expect(screen.getByText("2")).toBeInTheDocument();
+    expect(screen.queryByText(/null/u)).not.toBeInTheDocument();
+  });
+
+  it("renders the draining badge instead of the next run timestamp for a draining Dag", () => {
+    render(
+      <Wrapper>
+        <Header dag={{ ...mockDag, is_stale: false, scheduling_state: "draining" }} />
+      </Wrapper>,
+    );
+
+    expect(screen.getByText(i18n.t("dag:dagDetails.nextRun"))).toBeInTheDocument();
+    expect(screen.queryByText("2024-08-22 19:00:00")).not.toBeInTheDocument();
+    expect(screen.getByTestId("draining-badge")).toBeInTheDocument();
+  });
+
+  it("shows the team alongside the owner when multi-team is enabled", () => {
+    mockConfig.multi_team = true;
+    render(
+      <Wrapper>
+        <Header dag={{ ...mockDag, team_name: "team-a" }} />
+      </Wrapper>,
+    );
+
+    expect(screen.getByText(i18n.t("common:dagDetails.team"))).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "team-a" })).toHaveAttribute("href", "/dags?teams=team-a");
+    expect(screen.getByText(i18n.t("common:dagDetails.owner"))).toBeInTheDocument();
+  });
+
+  it("shows the owner stat when multi-team is enabled but no team is resolved", () => {
+    mockConfig.multi_team = true;
+    render(
+      <Wrapper>
+        <Header dag={{ ...mockDag, team_name: null }} />
+      </Wrapper>,
+    );
+
+    expect(screen.getByText(i18n.t("common:dagDetails.owner"))).toBeInTheDocument();
+    expect(screen.queryByText(i18n.t("common:dagDetails.team"))).not.toBeInTheDocument();
+  });
+});

@@ -1,0 +1,314 @@
+/*!
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import { Flex, useDisclosure } from "@chakra-ui/react";
+import type { ColumnDef } from "@tanstack/react-table";
+import { useTranslation } from "react-i18next";
+import { useParams, useSearchParams } from "react-router-dom";
+
+import { useXcomServiceGetXcomEntries } from "openapi/queries";
+import type { XComResponse } from "openapi/requests/types.gen";
+
+import { RouterLink } from "src/system-components";
+
+import { DataTable } from "src/components/DataTable";
+import type { DataTableFeatures } from "src/components/DataTable/features";
+import { useTableURLState } from "src/components/DataTable/useTableUrlState";
+import { ErrorAlert } from "src/components/ErrorAlert";
+import { ExpandCollapseButtons } from "src/components/ExpandCollapseButtons";
+import { TeamName } from "src/components/TeamName";
+import Time from "src/components/Time";
+import { TruncatedText } from "src/components/TruncatedText";
+
+import { SearchParamsKeys, type SearchParamsKeysType } from "src/constants/searchParams";
+import { useAdvancedSearchArg } from "src/hooks/useAdvancedSearch";
+import { useTaskInstanceCoordinates } from "src/hooks/useTaskInstanceCoordinates";
+import { useConfig } from "src/queries/useConfig";
+import { useDocumentTitle } from "src/utils";
+import { getTaskInstanceLink } from "src/utils/links";
+
+import AddXComButton from "./AddXComButton";
+import DeleteXComButton from "./DeleteXComButton";
+import EditXComButton from "./EditXComButton";
+import { XComEntry } from "./XComEntry";
+import { XComFilters } from "./XComFilters";
+
+const {
+  DAG_DISPLAY_NAME_PATTERN: DAG_DISPLAY_NAME_PATTERN_PARAM,
+  KEY_PATTERN: KEY_PATTERN_PARAM,
+  MAP_INDEX: MAP_INDEX_PARAM,
+  RUN_ID_PATTERN: RUN_ID_PATTERN_PARAM,
+  TASK_ID_PATTERN: TASK_ID_PATTERN_PARAM,
+  TEAMS: TEAMS_PARAM,
+}: SearchParamsKeysType = SearchParamsKeys;
+
+type ColumnsProps = {
+  readonly isTaskInstancePage: boolean;
+  readonly multiTeam: boolean;
+  readonly open: boolean;
+  readonly translate: (key: string) => string;
+};
+
+const getColumns = ({
+  isTaskInstancePage,
+  multiTeam,
+  open,
+  translate,
+}: ColumnsProps): Array<ColumnDef<DataTableFeatures, XComResponse>> => [
+  {
+    accessorKey: "key",
+    header: translate("xcom.columns.key"),
+  },
+  ...(isTaskInstancePage
+    ? []
+    : [
+        {
+          accessorKey: "dag_id",
+          cell: ({ row: { original } }: { row: { original: XComResponse } }) => (
+            <RouterLink fontWeight="bold" to={`/dags/${original.dag_id}`}>
+              {original.dag_display_name}
+            </RouterLink>
+          ),
+          header: translate("xcom.columns.dag"),
+        },
+        ...(multiTeam
+          ? [
+              {
+                accessorKey: "team_name",
+                cell: ({ row: { original } }: { row: { original: XComResponse } }) => (
+                  <TeamName teamName={original.team_name} />
+                ),
+                enableSorting: false,
+                header: translate("common:dagDetails.team"),
+              },
+            ]
+          : []),
+        {
+          accessorKey: "run_id",
+          cell: ({ row: { original } }: { row: { original: XComResponse } }) => (
+            <RouterLink fontWeight="bold" to={`/dags/${original.dag_id}/runs/${original.run_id}`}>
+              <TruncatedText text={original.run_id} />
+            </RouterLink>
+          ),
+          header: translate("common:dagRunId"),
+        },
+        {
+          accessorKey: "run_after",
+          cell: ({ row: { original } }: { row: { original: XComResponse } }) => (
+            <RouterLink fontWeight="bold" to={`/dags/${original.dag_id}/runs/${original.run_id}`}>
+              <Time datetime={original.run_after} />
+            </RouterLink>
+          ),
+          header: translate("common:dagRun.runAfter"),
+        },
+        {
+          accessorKey: "task_display_name",
+          cell: ({ row: { original } }: { row: { original: XComResponse } }) => (
+            <RouterLink
+              fontWeight="bold"
+              to={{
+                pathname: getTaskInstanceLink({
+                  dagId: original.dag_id,
+                  dagRunId: original.run_id,
+                  mapIndex: original.map_index,
+                  taskId: original.task_id,
+                }),
+                search: new URLSearchParams(
+                  original.region_id === undefined
+                    ? {}
+                    : { region_id: original.region_id, region_index: String(original.region_index) },
+                ).toString(),
+              }}
+            >
+              <TruncatedText text={original.task_display_name} />
+            </RouterLink>
+          ),
+          header: translate("common:task_one"),
+        },
+        {
+          accessorKey: "map_index",
+          header: translate("common:mapIndex"),
+        },
+      ]),
+  {
+    accessorKey: "timestamp",
+    cell: ({ row: { original } }) => <Time datetime={original.timestamp} />,
+    header: translate("xcom.columns.timestamp"),
+  },
+  {
+    cell: ({ row: { original } }) => (
+      <XComEntry
+        dagId={original.dag_id}
+        mapIndex={original.map_index}
+        open={open}
+        regionId={original.region_id}
+        regionIndex={original.region_index}
+        runId={original.run_id}
+        taskId={original.task_id}
+        xcomKey={original.key}
+      />
+    ),
+    enableSorting: false,
+    header: translate("xcom.columns.value"),
+  },
+  {
+    accessorKey: "actions",
+    cell: ({ row: { original } }) => (
+      <Flex justifyContent="end">
+        <EditXComButton xcom={original} />
+        <DeleteXComButton xcom={original} />
+      </Flex>
+    ),
+    enableHiding: false,
+    enableSorting: false,
+    header: "",
+  },
+];
+
+export const XCom = () => {
+  const { dagId = "~", mapIndex = "-1", runId = "~", taskId = "~" } = useParams();
+  const coordinates = useTaskInstanceCoordinates();
+  const { t: translate } = useTranslation(["browse", "common"]);
+  const multiTeamEnabled = Boolean(useConfig("multi_team"));
+
+  // Only the standalone list page owns the tab title; the task-instance tab inherits that page's title.
+  useDocumentTitle(dagId === "~" ? translate("common:browse.xcoms") : undefined);
+  const { setTableURLState, tableURLState } = useTableURLState();
+  const { pagination, sorting } = tableURLState;
+  const [sort] = sorting;
+  const orderBy = sort
+    ? [`${sort.desc ? "-" : ""}${sort.id === "task_display_name" ? "task_id" : sort.id}`]
+    : undefined;
+  const [searchParams] = useSearchParams();
+  const { onClose, onOpen, open } = useDisclosure();
+
+  const filteredKey = searchParams.get(KEY_PATTERN_PARAM);
+  const filteredDagDisplayName = searchParams.get(DAG_DISPLAY_NAME_PATTERN_PARAM);
+  const filteredMapIndex = searchParams.get(MAP_INDEX_PARAM);
+  const filteredRunId = searchParams.get(RUN_ID_PATTERN_PARAM);
+  const filteredTaskId = searchParams.get(TASK_ID_PATTERN_PARAM);
+  const teams = searchParams.getAll(TEAMS_PARAM);
+
+  const { LOGICAL_DATE_GTE, LOGICAL_DATE_LTE, RUN_AFTER_GTE, RUN_AFTER_LTE } = SearchParamsKeys;
+  const logicalDateGte = searchParams.get(LOGICAL_DATE_GTE);
+  const logicalDateLte = searchParams.get(LOGICAL_DATE_LTE);
+  const runAfterGte = searchParams.get(RUN_AFTER_GTE);
+  const runAfterLte = searchParams.get(RUN_AFTER_LTE);
+
+  const dagDisplayNameArg = useAdvancedSearchArg({
+    patternApiKey: "dagDisplayNamePattern",
+    prefixApiKey: "dagDisplayNamePrefixPattern",
+    storageKey: DAG_DISPLAY_NAME_PATTERN_PARAM,
+    value: filteredDagDisplayName,
+  });
+  const runIdArg = useAdvancedSearchArg({
+    patternApiKey: "runIdPattern",
+    prefixApiKey: "runIdPrefixPattern",
+    storageKey: RUN_ID_PATTERN_PARAM,
+    value: filteredRunId,
+  });
+  const taskIdArg = useAdvancedSearchArg({
+    patternApiKey: "taskIdPattern",
+    prefixApiKey: "taskIdPrefixPattern",
+    storageKey: TASK_ID_PATTERN_PARAM,
+    value: filteredTaskId,
+  });
+  const xcomKeyArg = useAdvancedSearchArg({
+    patternApiKey: "xcomKeyPattern",
+    prefixApiKey: "xcomKeyPrefixPattern",
+    storageKey: KEY_PATTERN_PARAM,
+    value: filteredKey,
+  });
+
+  const apiParams = {
+    ...coordinates,
+    ...dagDisplayNameArg,
+    dagId,
+    dagRunId: runId,
+    excludeInternalKeys: true,
+    limit: pagination.pageSize,
+    logicalDateGte: logicalDateGte ?? undefined,
+    logicalDateLte: logicalDateLte ?? undefined,
+    mapIndex:
+      filteredMapIndex !== null && filteredMapIndex !== ""
+        ? parseInt(filteredMapIndex, 10)
+        : mapIndex === "-1"
+          ? undefined
+          : parseInt(mapIndex, 10),
+    offset: pagination.pageIndex * pagination.pageSize,
+    orderBy,
+    runAfterGte: runAfterGte ?? undefined,
+    runAfterLte: runAfterLte ?? undefined,
+    ...runIdArg,
+    taskId,
+    ...taskIdArg,
+    teams: teams.length > 0 ? teams : undefined,
+    ...xcomKeyArg,
+  };
+
+  const { data, error, isLoading } = useXcomServiceGetXcomEntries(apiParams, undefined);
+
+  const xcomEntries = data?.xcom_entries ?? [];
+  const isTaskInstancePage = dagId !== "~" && runId !== "~" && taskId !== "~";
+
+  const columns = getColumns({
+    isTaskInstancePage,
+    multiTeam: multiTeamEnabled,
+    open,
+    translate,
+  });
+
+  return (
+    <>
+      <ErrorAlert error={error} />
+      <DataTable
+        columns={columns}
+        data={xcomEntries}
+        displayMode="table"
+        filterActions={<XComFilters />}
+        initialState={tableURLState}
+        isLoading={isLoading}
+        modelName="browse:xcom.entry"
+        onStateChange={setTableURLState}
+        presentationActions={
+          xcomEntries.length > 0 ? (
+            <ExpandCollapseButtons
+              collapseLabel={translate("common:collapseAllExtra")}
+              expandLabel={translate("common:expandAllExtra")}
+              isExpanded={open}
+              onCollapse={onClose}
+              onExpand={onOpen}
+            />
+          ) : undefined
+        }
+        primaryActions={
+          isTaskInstancePage ? (
+            <AddXComButton
+              dagId={dagId}
+              mapIndex={mapIndex === "~" || mapIndex === "-1" ? -1 : parseInt(mapIndex, 10)}
+              runId={runId}
+              taskId={taskId}
+            />
+          ) : undefined
+        }
+        skeletonCount={undefined}
+        total={data?.total_entries ?? 0}
+      />
+    </>
+  );
+};

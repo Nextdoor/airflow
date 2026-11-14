@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -15,13 +16,12 @@
 # specific language governing permissions and limitations
 # under the License.
 # shellcheck shell=bash
+# shellcheck source=scripts/docker/common.sh
+. "$( dirname "${BASH_SOURCE[0]}" )/common.sh"
 set -euo pipefail
-declare -a packages
 
-COLOR_BLUE=$'\e[34m'
-readonly COLOR_BLUE
-COLOR_RESET=$'\e[0m'
-readonly COLOR_RESET
+common::get_colors
+declare -a packages
 
 : "${INSTALL_POSTGRES_CLIENT:?Should be true or false}"
 
@@ -41,8 +41,16 @@ install_postgres_client() {
         exit 1
     fi
 
-    curl https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add -
-    echo "deb https://apt.postgresql.org/pub/repos/apt/ $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list
+    common::import_trusted_gpg "7FCC7D46ACCC4CF8" "postgres"
+
+    echo "deb [arch=amd64,arm64] https://apt.postgresql.org/pub/repos/apt/ $(common::debian_codename)-pgdg main" > \
+        /etc/apt/sources.list.d/pgdg.list
+    # The hardened image's airflow-prefer-dhi pin outranks Debian's default, so apt would otherwise keep
+    # dhi.io's libpq (e.g. 17.11) and postgresql-client (which needs a matching, newer libpq5) could not
+    # install. PostgreSQL's own repository is the authority for its packages - rank it above the dhi.io
+    # preference so apt takes libpq from PGDG.
+    mkdir -p /etc/apt/preferences.d
+    printf 'Package: *\nPin: origin "apt.postgresql.org"\nPin-Priority: 1001\n' > /etc/apt/preferences.d/airflow-prefer-pgdg
     apt-get update
     apt-get install --no-install-recommends -y "${packages[@]}"
     apt-get autoremove -yqq --purge

@@ -1,0 +1,180 @@
+/*!
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import { Badge, Box, Link } from "@chakra-ui/react";
+import type { ColumnDef } from "@tanstack/react-table";
+import type { TFunction } from "i18next";
+import { useTranslation } from "react-i18next";
+import { Link as RouterLink, useSearchParams } from "react-router-dom";
+
+import { useDeadlinesServiceGetDeadlines } from "openapi/queries";
+import type { DeadlineResponse } from "openapi/requests/types.gen";
+
+import { DataTable } from "src/components/DataTable";
+import type { DataTableFeatures } from "src/components/DataTable/features";
+import { useTableURLState } from "src/components/DataTable/useTableUrlState";
+import { ErrorAlert } from "src/components/ErrorAlert";
+import { FilterBar } from "src/components/FilterBar";
+import { TeamName } from "src/components/TeamName";
+import Time from "src/components/Time";
+import { TruncatedText } from "src/components/TruncatedText";
+
+import { SearchParamsKeys } from "src/constants/searchParams";
+import { useConfig } from "src/queries/useConfig";
+import { useDocumentTitle, useFiltersHandler, type FilterableSearchParamsKeys } from "src/utils";
+
+type DeadlineRow = { row: { original: DeadlineResponse } };
+
+const createColumns = (
+  translate: TFunction,
+  multiTeam: boolean,
+): Array<ColumnDef<DataTableFeatures, DeadlineResponse>> => [
+  {
+    accessorKey: "dag_id",
+    cell: ({ row: { original } }: DeadlineRow) => (
+      <Link asChild color="fg.info">
+        <RouterLink to={`/dags/${original.dag_id}`}>
+          <TruncatedText text={original.dag_id} />
+        </RouterLink>
+      </Link>
+    ),
+    header: translate("common:dagId"),
+  },
+  ...(multiTeam
+    ? [
+        {
+          accessorKey: "team_name",
+          cell: ({ row: { original } }: DeadlineRow) => <TeamName teamName={original.team_name} />,
+          enableSorting: false,
+          header: translate("common:dagDetails.team"),
+        },
+      ]
+    : []),
+  {
+    accessorKey: "dag_run_id",
+    cell: ({ row: { original } }: DeadlineRow) => (
+      <Link asChild color="fg.info">
+        <RouterLink to={`/dags/${original.dag_id}/runs/${original.dag_run_id}`}>
+          <TruncatedText text={original.dag_run_id} />
+        </RouterLink>
+      </Link>
+    ),
+    enableSorting: false,
+    header: translate("common:dagRunId"),
+  },
+  {
+    accessorKey: "deadline_time",
+    cell: ({ row: { original } }: DeadlineRow) => <Time datetime={original.deadline_time} />,
+    header: translate("browse:deadlines.columns.deadlineTime"),
+  },
+  {
+    accessorKey: "missed",
+    cell: ({
+      row: {
+        original: { missed },
+      },
+    }) => (
+      <Badge colorPalette={missed ? "red" : "blue"} size="sm" variant="solid">
+        {missed
+          ? translate("browse:deadlines.filters.statusOptions.missed")
+          : translate("browse:deadlines.filters.statusOptions.pending")}
+      </Badge>
+    ),
+    header: translate("browse:deadlines.columns.status"),
+  },
+  {
+    accessorKey: "alert_name",
+    cell: ({ row: { original } }) => original.alert_name ?? "",
+    enableSorting: false,
+    header: translate("browse:deadlines.columns.alertName"),
+  },
+  {
+    accessorKey: "created_at",
+    cell: ({ row: { original } }: DeadlineRow) => <Time datetime={original.created_at} />,
+    header: translate("common:table.createdAt"),
+  },
+];
+
+const deadlinesFilterKeys: Array<FilterableSearchParamsKeys> = [
+  SearchParamsKeys.DAG_ID,
+  SearchParamsKeys.DEADLINE_TIME_RANGE,
+  SearchParamsKeys.MISSED,
+];
+
+export const Deadlines = () => {
+  const { t: translate } = useTranslation(["browse", "common"]);
+  const multiTeamEnabled = Boolean(useConfig("multi_team"));
+
+  useDocumentTitle(translate("common:browse.deadlines"));
+
+  const { setTableURLState, tableURLState } = useTableURLState();
+  const [searchParams] = useSearchParams();
+
+  const { filterConfigs, handleFiltersChange, initialValues } = useFiltersHandler(
+    multiTeamEnabled ? [...deadlinesFilterKeys, SearchParamsKeys.TEAMS] : deadlinesFilterKeys,
+  );
+
+  const columns = createColumns(translate, multiTeamEnabled);
+
+  const { pagination, sorting } = tableURLState;
+  const [sort] = sorting;
+  const orderBy = sort ? [`${sort.desc ? "-" : ""}${sort.id}`] : ["-deadline_time"];
+
+  const filteredDagId = searchParams.get(SearchParamsKeys.DAG_ID);
+  const filteredMissed = searchParams.get(SearchParamsKeys.MISSED);
+  const deadlineTimeGte = searchParams.get(SearchParamsKeys.DEADLINE_TIME_GTE);
+  const deadlineTimeLte = searchParams.get(SearchParamsKeys.DEADLINE_TIME_LTE);
+  const teams = searchParams.getAll(SearchParamsKeys.TEAMS);
+
+  const missedFilter =
+    filteredMissed === "true" || filteredMissed === "false" ? filteredMissed === "true" : undefined;
+
+  const { data, error, isLoading } = useDeadlinesServiceGetDeadlines({
+    dagId: filteredDagId !== null && filteredDagId !== "" ? filteredDagId : "~",
+    dagRunId: "~",
+    deadlineTimeGte: deadlineTimeGte ?? undefined,
+    deadlineTimeLte: deadlineTimeLte ?? undefined,
+    limit: pagination.pageSize,
+    missed: missedFilter,
+    offset: pagination.pageIndex * pagination.pageSize,
+    orderBy,
+    teams: teams.length > 0 ? teams : undefined,
+  });
+
+  return (
+    <Box px={2}>
+      <DataTable
+        columns={columns}
+        data={data?.deadlines ?? []}
+        errorMessage={<ErrorAlert error={error} />}
+        filterActions={
+          <FilterBar
+            configs={filterConfigs}
+            initialValues={initialValues}
+            onFiltersChange={handleFiltersChange}
+          />
+        }
+        initialState={tableURLState}
+        isLoading={isLoading}
+        modelName="browse:deadlines.deadline"
+        onStateChange={setTableURLState}
+        total={data?.total_entries}
+      />
+    </Box>
+  );
+};

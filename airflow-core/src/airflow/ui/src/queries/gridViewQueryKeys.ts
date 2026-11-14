@@ -1,0 +1,61 @@
+/*!
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import {
+  UseDagRunServiceGetDagRunsKeyFn,
+  UseDagServiceGetDagDetailsKeyFn,
+  useDagServiceGetDagRunStateCountsUiKey,
+  useDagServiceGetDagsUiKey,
+  UseDagServiceGetLatestRunInfoKeyFn,
+  useDagServiceGetRecentTaskInstanceStateCountsUiKey,
+  UseGridServiceGetDagStructureKeyFn,
+  UseGridServiceGetGridRunsKeyFn,
+  UseGridServiceGetLoopHistoryKeyFn,
+  UseGridServiceGetLoopSummaryKeyFn,
+  useTaskInstanceServiceGetExtraLinksKey,
+  useTaskInstanceServiceGetLogKey,
+  UseTaskInstanceServiceGetTaskInstancesKeyFn,
+  useTaskInstanceServiceGetTaskInstanceTryDetailsKey,
+} from "openapi/queries";
+
+export const gridQueryKeys = (dagId: string) =>
+  [
+    UseGridServiceGetGridRunsKeyFn({ dagId }, [{ dagId }]),
+    UseGridServiceGetLoopSummaryKeyFn({ dagId, groupId: "", runId: "" }, [{ dagId }]),
+    UseGridServiceGetLoopHistoryKeyFn({ dagId, groupId: "" }, [{ dagId }]),
+    // Structure is topology only, so it's invalidated on run changes here rather than polled.
+    UseGridServiceGetDagStructureKeyFn({ dagId }, [{ dagId }]),
+    UseDagServiceGetDagDetailsKeyFn({ dagId }, [{ dagId }]),
+    UseDagServiceGetLatestRunInfoKeyFn({ dagId }, [{ dagId }]),
+    UseDagRunServiceGetDagRunsKeyFn({ dagId }, [{ dagId }]),
+    UseTaskInstanceServiceGetTaskInstancesKeyFn({ dagId, dagRunId: "~" }, [{ dagId, dagRunId: "~" }]),
+  ] as const;
+
+/** Prefix keys for the Dag cards on the Dags list, which a change to a Dag run leaves stale. */
+export const dagListQueryKeys = [
+  [useDagServiceGetDagsUiKey],
+  [useDagServiceGetDagRunStateCountsUiKey],
+  [useDagServiceGetRecentTaskInstanceStateCountsUiKey],
+] as const;
+
+/** Prefix keys for per-attempt TI caches that become stale after any mutation. */
+export const tiPerAttemptQueryKeys = [
+  [useTaskInstanceServiceGetLogKey],
+  [useTaskInstanceServiceGetExtraLinksKey],
+  [useTaskInstanceServiceGetTaskInstanceTryDetailsKey],
+] as const;

@@ -1,0 +1,445 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License
+---
+# NOTE: a group applies to version updates unless it declares `applies-to: security-updates`.
+# Every entry below that targets the default branch therefore carries a matching
+# `*-security-updates` group, so alert-driven bumps arrive batched instead of one PR per
+# dependency. Entries using `target-branch` deliberately have no such group - Dependabot raises
+# security updates against the default branch only, so it would never match anything there.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    cooldown:
+      default-days: 4
+    schedule:
+      # Check for updates to GitHub Actions every week
+      interval: "weekly"
+    groups:
+      github-actions-updates:
+        patterns:
+          - "*"
+      github-actions-security-updates:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    cooldown:
+      default-days: 4
+    schedule:
+      # Check for updates to GitHub Actions every week
+      interval: "weekly"
+    target-branch: v3-4-test
+    groups:
+      github-actions-updates:
+        patterns:
+          - "*"
+
+  - package-ecosystem: pip
+    cooldown:
+      default-days: 4
+    directories:
+      - /airflow-core
+      - /airflow-ctl
+      - /clients/python
+      - /dev/breeze
+      - /docker-tests
+      - /kubernetes-tests
+      - /chart
+      - /task-sdk
+      - /
+    schedule:
+      interval: daily
+    groups:
+      pip-dependency-updates:
+        patterns:
+          - "*"
+      pip-security-updates:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  - package-ecosystem: gradle
+    directories:
+      - /java-sdk
+      - /java-sdk/example
+      - /java-sdk/scala_spark_example
+    cooldown:
+      default-days: 14
+    schedule:
+      interval: weekly
+    groups:
+      java-sdk-dependency-updates:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+      java-sdk-security-updates:
+        applies-to: security-updates
+        patterns:
+          - "*"
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-major
+      # Pinned to the last release that supports Java 11. Ignore minor/patch
+      # bumps too, not just majors, until the SDK's Java 11 support requirement
+      # is dropped. See also: java-sdk/sdk/build.gradle.kts
+      - dependency-name: "com.gradleup.shadow:shadow-gradle-plugin"
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-patch
+      - dependency-name: "org.jsonschema2pojo"
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-patch
+
+  - package-ecosystem: npm
+    cooldown:
+      default-days: 4
+    directories:
+      - /airflow-core/src/airflow/ui
+    schedule:
+      interval: "weekly"
+    groups:
+      react:
+        patterns:
+          - "react"
+          - "react-dom"
+          - "@types/react"
+          - "@types/react-dom"
+      chakra-ui:
+        patterns:
+          - "@chakra-ui/*"
+          - "@emotion/*"
+          - "framer-motion"
+      eslint:
+        patterns:
+          - "eslint*"
+          - "@eslint/*"
+      oxc:
+        patterns:
+          - "oxfmt"
+          - "oxlint*"
+      typescript:
+        patterns:
+          - "typescript*"
+          - "@typescript-eslint/*"
+          - "@types/typescript"
+      core-ui-package-updates:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+      core-ui-security-updates:
+        patterns:
+          - "*"
+        applies-to: security-updates
+
+  - package-ecosystem: npm
+    cooldown:
+      default-days: 4
+    directories:
+      - /airflow-core/src/airflow/api_fastapi/auth/managers/simple/ui
+    schedule:
+      interval: "weekly"
+    groups:
+      auth-ui-package-updates:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+      auth-ui-security-updates:
+        patterns:
+          - "*"
+        applies-to: security-updates
+
+  - package-ecosystem: npm
+    cooldown:
+      default-days: 4
+    directories:
+      - /dev/react-plugin-tools/react_plugin_template
+    schedule:
+      interval: "weekly"
+    groups:
+      ui-plugin-template-package-updates:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+      ui-plugin-template-security-updates:
+        patterns:
+          - "*"
+        applies-to: security-updates
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: npm
+    cooldown:
+      default-days: 4
+    directories:
+      - /providers/edge3/src/airflow/providers/edge3/plugins/www
+    schedule:
+      interval: "weekly"
+    groups:
+      edge-ui-package-updates:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+      edge-ui-security-updates:
+        patterns:
+          - "*"
+        applies-to: security-updates
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: npm
+    cooldown:
+      default-days: 4
+    directories:
+      - /providers/fab/src/airflow/providers/fab/www
+    schedule:
+      interval: daily
+    groups:
+      fab-ui-package-updates:
+        patterns:
+          - "*"
+      fab-ui-security-updates:
+        patterns:
+          - "*"
+        applies-to: security-updates
+
+  - package-ecosystem: npm
+    cooldown:
+      default-days: 4
+    directories:
+      - /registry
+    schedule:
+      interval: "weekly"
+    groups:
+      registry-package-updates:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+      registry-security-updates:
+        patterns:
+          - "*"
+        applies-to: security-updates
+
+  # Repeat dependency updates on v3-4-test branch as well
+  - package-ecosystem: pip
+    cooldown:
+      default-days: 4
+    directories:
+      - /airflow-core
+      - /airflow-ctl
+      - /clients/python
+      - /dev/breeze
+      - /docker-tests
+      - /kubernetes-tests
+      - /chart
+      - /task-sdk
+      - /
+    schedule:
+      interval: daily
+    target-branch: v3-4-test
+    groups:
+      pip-dependency-updates:
+        patterns:
+          - "*"
+
+  - package-ecosystem: npm
+    cooldown:
+      default-days: 4
+    directories:
+      - /airflow-core/src/airflow/ui
+    schedule:
+      interval: "weekly"
+    target-branch: v3-4-test
+    groups:
+      3-4-core-ui-package-updates:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: npm
+    cooldown:
+      default-days: 4
+    directories:
+      - /airflow-core/src/airflow/api_fastapi/auth/managers/simple/ui
+    schedule:
+      interval: "weekly"
+    target-branch: v3-4-test
+    groups:
+      3-4-auth-ui-package-updates:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  # The remaining non-provider directories are mirrored onto v3-4-test as well. Dependabot raises
+  # security updates against the default branch only, so a fixed version reaches the maintenance
+  # branch through its own version updates - Dependabot resolves and regenerates the lock file on
+  # that branch, which a cherry-picked lock file diff from main cannot do. Majors stay ignored, so
+  # a fix that needs a major bump still has to be backported by hand.
+  #
+  # Provider directories (providers/*) are deliberately NOT mirrored onto v3-4-test: providers are
+  # released from main, so their dependencies on a maintenance branch never ship to users and the
+  # PRs are pure review noise.
+  - package-ecosystem: npm
+    cooldown:
+      default-days: 4
+    directories:
+      - /registry
+    schedule:
+      interval: "weekly"
+    target-branch: v3-4-test
+    groups:
+      3-4-registry-package-updates:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: npm
+    cooldown:
+      default-days: 4
+    directories:
+      - /dev/react-plugin-tools/react_plugin_template
+    schedule:
+      interval: "weekly"
+    target-branch: v3-4-test
+    groups:
+      3-4-ui-plugin-template-package-updates:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: "uv"
+    cooldown:
+      default-days: 4
+    directory: "/dev/breeze"
+    schedule:
+      interval: "weekly"
+    target-branch: v3-4-test
+    groups:
+      3-4-uv-dependency-updates:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: npm
+    cooldown:
+      default-days: 7
+    directory: /ts-sdk
+    schedule:
+      interval: "weekly"
+    groups:
+      ts-sdk-package-updates:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+      ts-sdk-security-updates:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  - package-ecosystem: "uv"
+    cooldown:
+      default-days: 4
+    directory: "/dev/breeze"
+    schedule:
+      interval: "weekly"
+    groups:
+      uv-dependency-updates:
+        patterns:
+          - "*"
+      uv-security-updates:
+        patterns:
+          - "*"
+        applies-to: security-updates
+
+  # Go modules resolve straight to upstream repositories: there is no central registry
+  # (unlike PyPI/npm) that pre-scans a release, and whoever controls a module's namespace
+  # can publish a version at any time. To keep an unreviewed upstream Go release from being
+  # auto-merged into our dev/CI chain, we do NOT raise automatic version-update PRs here
+  # (`open-pull-requests-limit: 0`); routine Go bumps are done manually. We still accept
+  # advisory-driven security updates, which require a published GHSA advisory and so cannot
+  # be triggered by an upstream release self-declaring itself a "security" fix.
+  - package-ecosystem: "gomod"
+    cooldown:
+      default-days: 14
+    directory: "/go-sdk"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 0
+    groups:
+      go-sdk-security-updates:
+        patterns:
+          - "*"
+        applies-to: security-updates
+
+  - package-ecosystem: "gomod"
+    cooldown:
+      default-days: 14
+    directory: "/go-sdk"
+    schedule:
+      interval: "weekly"
+    target-branch: v3-4-test
+    open-pull-requests-limit: 0
+    groups:
+      3-4-go-sdk-security-updates:
+        patterns:
+          - "*"
+        applies-to: security-updates

@@ -1,0 +1,1505 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+import json
+import re
+from typing import TYPE_CHECKING
+from unittest import mock
+from uuid import uuid4
+
+import pytest
+from sqlalchemy import select, update
+from sqlalchemy.orm import Session
+
+from airflow._shared.timezones import timezone
+from airflow.api_fastapi.core_api.datamodels.xcom import XComCreateBody
+from airflow.models.dag import DagModel
+from airflow.models.dag_version import DagVersion
+from airflow.models.dagbundle import DagBundleModel
+from airflow.models.dagrun import DagRun
+from airflow.models.dynamic_region import DynamicRegion
+from airflow.models.taskinstance import TaskInstance
+from airflow.models.team import Team
+from airflow.models.xcom import EXTERNAL_CLEAR_TARGET_XCOM_KEY, XCOM_RETURN_KEY, XComModel, xcom_entity
+from airflow.providers.standard.operators.empty import EmptyOperator
+from airflow.sdk import DAG, Asset, AssetAlias, task_group
+from airflow.sdk.bases.xcom import BaseXCom
+from airflow.sdk.definitions._internal.loop import create_loop
+from airflow.sdk.execution_time.xcom import resolve_xcom_backend
+from airflow.utils.session import NEW_SESSION, provide_session
+from airflow.utils.types import DagRunType
+
+from tests_common.test_utils.asserts import (
+    assert_no_cartesian_products,
+    assert_queries_count,
+    capture_orm_selects,
+)
+from tests_common.test_utils.config import conf_vars
+from tests_common.test_utils.dag import sync_dag_to_db
+from tests_common.test_utils.db import (
+    clear_db_dag_bundles,
+    clear_db_dags,
+    clear_db_runs,
+    clear_db_teams,
+    clear_db_xcom,
+)
+from tests_common.test_utils.logs import check_last_log
+from tests_common.test_utils.mock_operators import MockOperator
+from tests_common.test_utils.taskinstance import create_task_instance
+
+if TYPE_CHECKING:
+    from airflow.sdk.types import MappedOperator
+
+pytestmark = pytest.mark.db_test
+
+TEST_XCOM_KEY = "test_xcom_key"
+TEST_XCOM_VALUE = {"key": "value"}
+TEST_XCOM_VALUE_AS_JSON = json.dumps(TEST_XCOM_VALUE)
+TEST_XCOM_KEY_2 = "test_xcom_key_non_existing"
+
+TEST_DAG_ID = "test-dag-id"
+TEST_DAG_DISPLAY_NAME = "test-dag-id"
+TEST_TASK_ID = "test-task-id"
+TEST_TASK_DISPLAY_NAME = "test-task-id"
+TEST_EXECUTION_DATE = "2005-04-02T00:00:00+00:00"
+
+TEST_DAG_ID_2 = "test-dag-id-2"
+TEST_DAG_DISPLAY_NAME_2 = "test-dag-id-2"
+TEST_TASK_ID_2 = "test-task-id-2"
+TEST_TASK_DISPLAY_NAME_2 = "test-task-id-2"
+
+logical_date_parsed = timezone.parse(TEST_EXECUTION_DATE)
+logical_date_formatted = logical_date_parsed.strftime("%Y-%m-%dT%H:%M:%SZ")
+run_after_parsed = timezone.parse(TEST_EXECUTION_DATE)
+run_after_formatted = run_after_parsed.strftime("%Y-%m-%dT%H:%M:%SZ")
+run_id = DagRun.generate_run_id(
+    run_type=DagRunType.MANUAL, logical_date=logical_date_parsed, run_after=run_after_parsed
+)
+
+
+def _last_audit_extra(session: Session, event: str) -> dict:
+    from airflow.models import Log
+
+    extra = session.scalar(
+        select(Log.extra)
+        .where(Log.dag_id == TEST_DAG_ID, Log.event == event)
+        .order_by(Log.dttm.desc())
+        .limit(1)
+    )
+    assert extra is not None
+    return json.loads(extra)
+
+
+@provide_session
+def _create_xcom(key, value, backend, *, session: Session = NEW_SESSION) -> None:
+    XComModel.set(
+        key=key,
+        value=value,
+        dag_id=TEST_DAG_ID,
+        task_id=TEST_TASK_ID,
+        run_id=run_id,
+        session=session,
+    )
+
+
+def _create_regional_ti(dag_maker, session, *, region_id, region_index) -> TaskInstance:
+    dag_run = session.scalar(select(DagRun).where(DagRun.dag_id == TEST_DAG_ID, DagRun.run_id == run_id))
+    ti = TaskInstance(
+        task=dag_maker.dag.get_task(TEST_TASK_ID),
+        run_id=run_id,
+        dag_version_id=dag_run.created_dag_version_id,
+        region_id=region_id,
+        region_index=region_index,
+    )
+    session.add(ti)
+    session.flush()
+    return ti
+
+
+@provide_session
+def _create_dag_run(dag_maker, *, session: Session = NEW_SESSION):
+    with dag_maker(TEST_DAG_ID, schedule=None, start_date=logical_date_parsed):
+        EmptyOperator(task_id=TEST_TASK_ID)
+    dag_maker.create_dagrun(
+        run_id=run_id,
+        run_type=DagRunType.MANUAL,
+        logical_date=logical_date_parsed,
+    )
+
+    dag_maker.sync_dagbag_to_db()
+    session.merge(dag_maker.dag_model)
+    session.commit()
+
+
+@provide_session
+def _attach_dag_to_team(dag_id: str, team_name: str, *, session: Session = NEW_SESSION) -> None:
+    """Move a Dag into a team-scoped bundle, which is how a Dag gains a team."""
+    bundle = DagBundleModel(name=f"team-bundle-{team_name}")
+    bundle.teams.append(Team(name=team_name))
+    session.add(bundle)
+    session.flush()
+    session.execute(update(DagModel).where(DagModel.dag_id == dag_id).values(bundle_name=bundle.name))
+    session.commit()
+
+
+class CustomXCom(BaseXCom):
+    @classmethod
+    def deserialize_value(cls, xcom):
+        return f"real deserialized {super().deserialize_value(xcom)}"
+
+
+class TestXComEndpoint:
+    @staticmethod
+    def clear_db():
+        clear_db_dags()
+        clear_db_runs()
+        clear_db_dag_bundles()
+        clear_db_teams()
+        clear_db_xcom()
+
+    @pytest.fixture(autouse=True)
+    def setup(self, dag_maker) -> None:
+        self.clear_db()
+        _create_dag_run(dag_maker)
+
+    def teardown_method(self) -> None:
+        self.clear_db()
+
+    def _create_xcom(self, key, value, backend=None) -> None:
+        _create_xcom(key, value, backend)
+
+
+class TestGetXComEntry(TestXComEndpoint):
+    @pytest.mark.parametrize("mapped", [False, True])
+    def test_regional_xcom_projects_public_map_index(self, test_client, dag_maker, session, mapped):
+        region = DynamicRegion.get_or_create(
+            dag_id=TEST_DAG_ID, run_id=run_id, node_id=TEST_TASK_ID if mapped else "loop", session=session
+        )
+        session.add(region)
+        session.flush()
+        _create_regional_ti(dag_maker, session, region_id=region.id, region_index=3)
+        XComModel.set(
+            dag_id=TEST_DAG_ID,
+            run_id=run_id,
+            task_id=TEST_TASK_ID,
+            region_id=region.id,
+            map_index=3,
+            key=TEST_XCOM_KEY,
+            value="live",
+            serialize=False,
+            session=session,
+        )
+        session.commit()
+        url = f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries"
+        expected_index = 3 if mapped else -1
+        response = test_client.get(
+            f"{url}/{TEST_XCOM_KEY}", params={"region_id": str(region.id), "region_index": 3}
+        )
+        assert response.status_code == 200
+        assert response.json()["map_index"] == expected_index
+        assert response.json()["region_index"] == 3
+        response = test_client.get(url, params={"map_index_filter": expected_index})
+        assert response.status_code == 200
+        assert response.json()["total_entries"] == 1
+        assert response.json()["xcom_entries"][0]["map_index"] == expected_index
+
+    @pytest.mark.parametrize(
+        ("params", "expected_indexes", "expected_region_indexes", "total"),
+        [
+            ({"map_index": -1}, [-1], [5], 1),
+            ({"map_index_filter": 0}, [0], [0], 1),
+            ({"order_by": "map_index", "limit": 1, "offset": 1}, [0], [0], 3),
+        ],
+    )
+    def test_collection_projects_loop_and_mapped_group_before_pagination(
+        self, test_client, dag_maker, session, params, expected_indexes, expected_region_indexes, total
+    ):
+        @task_group
+        def body():
+            EmptyOperator(task_id="member")
+
+        @task_group
+        def mapped_group(value):
+            EmptyOperator(task_id="member")
+
+        with dag_maker("regional-xcom", serialized=True):
+            loop = create_loop(body, max_iterations=7)
+            mapped_group.expand(value=[1, 2])
+        dr = dag_maker.create_dagrun()
+        regions = {}
+        for ti in dr.task_instances:
+            if ti.task_id == loop.gate_task_id:
+                continue
+            node_id = loop.group_id if ti.task_id == "body.member" else ti.task_id
+            if node_id not in regions:
+                region = DynamicRegion.get_or_create(
+                    dag_id=dr.dag_id, run_id=dr.run_id, node_id=node_id, session=session
+                )
+                session.add(region)
+                session.flush()
+                regions[node_id] = region.id
+            ti.region_id = regions[node_id]
+            if ti.task_id == "body.member":
+                ti.region_index = 5
+            session.flush()
+            XComModel.set(
+                dag_id=dr.dag_id,
+                run_id=dr.run_id,
+                task_id=ti.task_id,
+                region_id=ti.region_id,
+                map_index=ti.region_index,
+                key=TEST_XCOM_KEY,
+                value="value",
+                session=session,
+            )
+        session.commit()
+        response = test_client.get(
+            f"/dags/{dr.dag_id}/dagRuns/{dr.run_id}/taskInstances/~/xcomEntries", params=params
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total_entries"] == total
+        assert [row["map_index"] for row in data["xcom_entries"]] == expected_indexes
+        assert [row["region_index"] for row in data["xcom_entries"]] == expected_region_indexes
+
+    def test_exact_region_read_update_and_delete_preserve_sibling(self, test_client, dag_maker, session):
+        selected, sibling = uuid4(), uuid4()
+        for region_id, source in ((selected, None), (sibling, selected)):
+            session.add(
+                DynamicRegion(
+                    id=region_id,
+                    dag_id=TEST_DAG_ID,
+                    run_id=run_id,
+                    node_id="loop",
+                    forked_from_region_id=source,
+                )
+            )
+            session.flush()
+            _create_regional_ti(dag_maker, session, region_id=region_id, region_index=2)
+            XComModel.set(
+                dag_id=TEST_DAG_ID,
+                run_id=run_id,
+                task_id=TEST_TASK_ID,
+                key=TEST_XCOM_KEY,
+                map_index=2,
+                region_id=region_id,
+                value=str(region_id),
+                serialize=False,
+                session=session,
+            )
+        session.commit()
+        url = f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries/{TEST_XCOM_KEY}"
+        params = {"region_id": str(selected), "region_index": 2}
+        response = test_client.get(url, params=params)
+        assert response.status_code == 200
+        assert response.json()["value"] == str(selected)
+        assert response.json()["map_index"] == -1
+        assert response.json()["region_id"] == str(selected)
+        assert response.json()["region_index"] == 2
+
+        response = test_client.patch(url, json={**params, "value": "replacement"})
+        assert response.status_code == 200
+        assert response.json()["value"] == "replacement"
+        response = test_client.delete(url, params=params)
+        assert response.status_code == 204
+        remaining = session.scalars(select(XComModel).where(XComModel.key == TEST_XCOM_KEY)).all()
+        assert [(row.region_id, row.map_index) for row in remaining] == [(sibling, 2)]
+
+    def test_should_respond_200_native(self, test_client):
+        self._create_xcom(TEST_XCOM_KEY, TEST_XCOM_VALUE)
+        response = test_client.get(
+            f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries/{TEST_XCOM_KEY}"
+        )
+        assert response.status_code == 200
+
+        current_data = response.json()
+        assert current_data == {
+            "dag_id": TEST_DAG_ID,
+            "dag_display_name": TEST_DAG_DISPLAY_NAME,
+            "logical_date": logical_date_parsed.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "run_id": run_id,
+            "run_after": run_after_formatted,
+            "key": TEST_XCOM_KEY,
+            "task_id": TEST_TASK_ID,
+            "task_display_name": TEST_TASK_DISPLAY_NAME,
+            "team_name": None,
+            "map_index": -1,
+            "timestamp": current_data["timestamp"],
+            "value": json.dumps(TEST_XCOM_VALUE),
+        }
+
+    @conf_vars({("core", "multi_team"): "True"})
+    def test_should_respond_200_with_team_name(self, test_client):
+        self._create_xcom(TEST_XCOM_KEY, TEST_XCOM_VALUE)
+        _attach_dag_to_team(TEST_DAG_ID, "team-xcom-entry")
+
+        response = test_client.get(
+            f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries/{TEST_XCOM_KEY}"
+        )
+        assert response.status_code == 200
+        assert response.json()["team_name"] == "team-xcom-entry"
+
+    def test_should_respond_401(self, unauthenticated_test_client):
+        response = unauthenticated_test_client.get(
+            f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries/{TEST_XCOM_KEY}"
+        )
+        assert response.status_code == 401
+
+    def test_should_respond_403(self, unauthorized_test_client):
+        response = unauthorized_test_client.get(
+            f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries/{TEST_XCOM_KEY}"
+        )
+        assert response.status_code == 403
+
+    def test_should_raise_404_for_non_existent_xcom(self, test_client):
+        response = test_client.get(
+            f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries/{TEST_XCOM_KEY_2}"
+        )
+        assert response.status_code == 404
+        assert response.json()["detail"] == f"XCom entry with key: `{TEST_XCOM_KEY_2}` not found"
+
+    def test_map_index_below_minus_one_returns_422(self, test_client):
+        response = test_client.get(
+            f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries/{TEST_XCOM_KEY}",
+            params={"map_index": -5},
+        )
+        assert response.status_code == 422
+
+    def test_should_respond_200_native_with_slash_key(self, test_client):
+        slash_key = "folder/sub/value"
+        self._create_xcom(slash_key, TEST_XCOM_VALUE)
+        # Use raw slash_key directly - FastAPI with :path converter handles it
+        response = test_client.get(
+            f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries/{slash_key}"
+        )
+        assert response.status_code == 200
+        current_data = response.json()
+        assert current_data["key"] == slash_key
+        assert current_data["value"] == json.dumps(TEST_XCOM_VALUE)
+
+    @pytest.mark.parametrize(
+        ("params", "expected_value"),
+        [
+            pytest.param(
+                {"deserialize": True},
+                TEST_XCOM_VALUE,
+                id="deserialize=true",
+            ),
+            pytest.param(
+                {"deserialize": False},
+                f"{TEST_XCOM_VALUE_AS_JSON}",
+                id="deserialize=false",
+            ),
+            pytest.param(
+                {},
+                f"{TEST_XCOM_VALUE_AS_JSON}",
+                id="default",
+            ),
+        ],
+    )
+    @conf_vars({("core", "xcom_backend"): "unit.api_fastapi.core_api.routes.public.test_xcom.CustomXCom"})
+    def test_custom_xcom_deserialize(self, params: str, expected_value: int | str, test_client):
+        # Even with a CustomXCom defined, we should not be using it during deserialization because API / UI doesn't integrate their
+        # deserialization with custom backends
+        XCom = resolve_xcom_backend()
+        self._create_xcom(TEST_XCOM_KEY, TEST_XCOM_VALUE, backend=XCom)
+
+        url = f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries/{TEST_XCOM_KEY}"
+        with mock.patch("airflow.sdk.execution_time.xcom.XCom", XCom):
+            response = test_client.get(url, params=params)
+
+        assert response.status_code == 200
+        assert response.json()["value"] == expected_value
+
+    @pytest.mark.parametrize(
+        ("xcom_value", "expected_return"),
+        [
+            pytest.param(42, 42, id="jsonable"),
+            pytest.param("text", "text", id="str"),
+            pytest.param({"a": [1, 2], "b": None}, {"a": [1, 2], "b": None}, id="dict"),
+            pytest.param([1, "two", 3.0], [1, "two", 3.0], id="list"),
+            pytest.param(AssetAlias("x"), "AssetAlias(name='x', group='asset')", id="nonjsonable"),
+            pytest.param([42, AssetAlias("x")], [42, "AssetAlias(name='x', group='asset')"], id="nested"),
+            pytest.param(
+                Asset("s3://bucket/key", extra={"a": 1}),
+                repr(Asset("s3://bucket/key", extra={"a": 1})),
+                id="asset",
+            ),
+        ],
+    )
+    def test_stringify_false(self, test_client, xcom_value, expected_return):
+        XComModel.set(TEST_XCOM_KEY, xcom_value, dag_id=TEST_DAG_ID, task_id=TEST_TASK_ID, run_id=run_id)
+
+        url = f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries/{TEST_XCOM_KEY}"
+        response = test_client.get(url, params={"deserialize": True, "stringify": False})
+        assert response.status_code == 200
+        assert response.json()["value"] == expected_return
+
+    @pytest.mark.parametrize(
+        ("xcom_value", "expected_return"),
+        [
+            pytest.param(42, "42", id="int"),
+            pytest.param({"a": [1, 2]}, "{'a': [1, 2]}", id="dict"),
+            pytest.param(AssetAlias("x"), "AssetAlias(name='x', group='asset')", id="airflow-class"),
+        ],
+    )
+    def test_stringify_true(self, test_client, xcom_value, expected_return):
+        XComModel.set(TEST_XCOM_KEY, xcom_value, dag_id=TEST_DAG_ID, task_id=TEST_TASK_ID, run_id=run_id)
+
+        url = f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries/{TEST_XCOM_KEY}"
+        response = test_client.get(url, params={"deserialize": True, "stringify": True})
+        assert response.status_code == 200
+        assert response.json()["value"] == expected_return
+
+    @mock.patch("airflow.sdk.serde.serializers.deltalake.deserialize", autospec=True)
+    @mock.patch("airflow.sdk.serde.deserialize", autospec=True)
+    def test_deserialize_renders_stored_payload_without_building_objects(
+        self, serde_deserialize, deltalake_deserialize, test_client
+    ):
+        """A ``deserialize=true`` read renders the stored payload; it never imports or builds the classes it names."""
+        payload = {
+            "__classname__": "airflow.sdk.definitions.asset.AssetAlias",
+            "__version__": 0,
+            "__data__": {
+                "name": "x",
+                "group": {
+                    "__classname__": "deltalake.table.DeltaTable",
+                    "__version__": 1,
+                    "__data__": {"table_uri": "s3://bucket/table", "version": 0},
+                },
+            },
+        }
+        # Stored as-is, the way the Execution API stores values a task pushes.
+        XComModel.set(
+            TEST_XCOM_KEY,
+            json.dumps(payload),
+            dag_id=TEST_DAG_ID,
+            task_id=TEST_TASK_ID,
+            run_id=run_id,
+            serialize=False,
+        )
+
+        url = f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries/{TEST_XCOM_KEY}"
+        response = test_client.get(url, params={"deserialize": True})
+
+        assert response.status_code == 200
+        assert response.json()["value"] == (
+            "AssetAlias(name='x', group=deltalake.table.DeltaTable@version=1"
+            "(table_uri='s3://bucket/table', version=0))"
+        )
+        serde_deserialize.assert_not_called()
+        deltalake_deserialize.assert_not_called()
+
+
+class TestGetXComEntries(TestXComEndpoint):
+    @pytest.fixture(autouse=True)
+    def setup(self, dag_maker) -> None:
+        self.clear_db()
+
+    def test_should_respond_200(self, test_client):
+        self._create_xcom_entries(TEST_DAG_ID, run_id, logical_date_parsed, TEST_TASK_ID)
+        with assert_queries_count(4):
+            response = test_client.get(
+                f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries"
+            )
+        assert response.status_code == 200
+        response_data = response.json()
+        for xcom_entry in response_data["xcom_entries"]:
+            xcom_entry["timestamp"] = "TIMESTAMP"
+
+        expected_response = {
+            "xcom_entries": [
+                {
+                    "dag_id": TEST_DAG_ID,
+                    "dag_display_name": TEST_DAG_DISPLAY_NAME,
+                    "logical_date": logical_date_formatted,
+                    "run_id": run_id,
+                    "run_after": run_after_formatted,
+                    "key": f"{TEST_XCOM_KEY}-0",
+                    "task_id": TEST_TASK_ID,
+                    "task_display_name": TEST_TASK_DISPLAY_NAME,
+                    "team_name": None,
+                    "timestamp": "TIMESTAMP",
+                    "map_index": -1,
+                },
+                {
+                    "dag_id": TEST_DAG_ID,
+                    "dag_display_name": TEST_DAG_DISPLAY_NAME,
+                    "logical_date": logical_date_formatted,
+                    "run_id": run_id,
+                    "run_after": run_after_formatted,
+                    "key": f"{TEST_XCOM_KEY}-1",
+                    "task_id": TEST_TASK_ID,
+                    "task_display_name": TEST_TASK_DISPLAY_NAME,
+                    "team_name": None,
+                    "timestamp": "TIMESTAMP",
+                    "map_index": -1,
+                },
+            ],
+            "total_entries": 2,
+        }
+        assert response_data == expected_response
+
+    @pytest.mark.parametrize(
+        ("method", "path", "body", "expected_status", "expected"),
+        [
+            pytest.param(
+                "GET",
+                "/dags/~/dagRuns/~/taskInstances/~/xcomEntries",
+                None,
+                200,
+                [
+                    (TEST_DAG_ID, TEST_TASK_ID, f"{TEST_XCOM_KEY}-0"),
+                    (TEST_DAG_ID, TEST_TASK_ID, f"{TEST_XCOM_KEY}-1"),
+                    (TEST_DAG_ID_2, TEST_TASK_ID_2, f"{TEST_XCOM_KEY}-0"),
+                    (TEST_DAG_ID_2, TEST_TASK_ID_2, f"{TEST_XCOM_KEY}-1"),
+                ],
+                id="list",
+            ),
+            pytest.param(
+                "GET",
+                f"/dags/{TEST_DAG_ID_2}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID_2}/xcomEntries/{TEST_XCOM_KEY}-1",
+                None,
+                200,
+                [(TEST_DAG_ID_2, TEST_TASK_ID_2, f"{TEST_XCOM_KEY}-1")],
+                id="get",
+            ),
+            pytest.param(
+                "PATCH",
+                f"/dags/{TEST_DAG_ID_2}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID_2}/xcomEntries/{TEST_XCOM_KEY}-1",
+                {"value": "patched"},
+                200,
+                [(TEST_DAG_ID_2, TEST_TASK_ID_2, f"{TEST_XCOM_KEY}-1")],
+                id="patch",
+            ),
+            pytest.param(
+                "POST",
+                f"/dags/{TEST_DAG_ID_2}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID_2}/xcomEntries",
+                {"key": "created", "value": "created"},
+                201,
+                [(TEST_DAG_ID_2, TEST_TASK_ID_2, "created")],
+                id="create",
+            ),
+        ],
+    )
+    def test_each_entry_is_joined_to_its_own_task_and_run(
+        self, test_client, method, path, body, expected_status, expected
+    ):
+        self._create_xcom_entries(TEST_DAG_ID, run_id, logical_date_parsed, TEST_TASK_ID)
+        self._create_xcom_entries(TEST_DAG_ID_2, run_id, logical_date_parsed, TEST_TASK_ID_2)
+
+        with assert_no_cartesian_products():
+            response = test_client.request(method, path, json=body)
+
+        assert response.status_code == expected_status
+        entries = response.json().get("xcom_entries", [response.json()])
+        assert response.json().get("total_entries", len(expected)) == len(expected)
+        assert [
+            (e["dag_id"], e["dag_display_name"], e["task_id"], e["task_display_name"], e["run_id"], e["key"])
+            for e in entries
+        ] == [(dag_id, dag_id, task_id, task_id, run_id, key) for dag_id, task_id, key in expected]
+
+    @pytest.mark.parametrize(
+        ("exclude_internal_keys", "expected_keys"),
+        [
+            (
+                False,
+                [
+                    f"{TEST_XCOM_KEY}-0",
+                    f"{TEST_XCOM_KEY}-1",
+                    "_airflow_loop_decision_reason",
+                    EXTERNAL_CLEAR_TARGET_XCOM_KEY,
+                    "xairflowxloopx",
+                ],
+            ),
+            (True, [f"{TEST_XCOM_KEY}-0", f"{TEST_XCOM_KEY}-1", "xairflowxloopx"]),
+        ],
+        ids=["included-by-default", "excluded"],
+    )
+    def test_exclude_internal_keys(self, test_client, exclude_internal_keys, expected_keys):
+        self._create_xcom_entries(TEST_DAG_ID, run_id, logical_date_parsed, TEST_TASK_ID)
+        for key in ("_airflow_loop_decision_reason", EXTERNAL_CLEAR_TARGET_XCOM_KEY, "xairflowxloopx"):
+            XComModel.set(
+                key=key, value="v", run_id=run_id, task_id=TEST_TASK_ID, dag_id=TEST_DAG_ID, map_index=-1
+            )
+
+        response = test_client.get(
+            f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries",
+            params={"exclude_internal_keys": exclude_internal_keys, "order_by": "key"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["total_entries"] == len(expected_keys)
+        assert sorted(entry["key"] for entry in response.json()["xcom_entries"]) == sorted(expected_keys)
+
+    def test_should_respond_200_with_tilde(self, test_client):
+        self._create_xcom_entries(TEST_DAG_ID, run_id, logical_date_parsed, TEST_TASK_ID)
+        self._create_xcom_entries(TEST_DAG_ID_2, run_id, logical_date_parsed, TEST_TASK_ID_2)
+
+        with assert_queries_count(4):
+            response = test_client.get("/dags/~/dagRuns/~/taskInstances/~/xcomEntries")
+        assert response.status_code == 200
+        response_data = response.json()
+        for xcom_entry in response_data["xcom_entries"]:
+            xcom_entry["timestamp"] = "TIMESTAMP"
+
+        expected_response = {
+            "xcom_entries": [
+                {
+                    "dag_id": TEST_DAG_ID,
+                    "dag_display_name": TEST_DAG_DISPLAY_NAME,
+                    "logical_date": logical_date_formatted,
+                    "run_id": run_id,
+                    "run_after": run_after_formatted,
+                    "key": f"{TEST_XCOM_KEY}-0",
+                    "task_id": TEST_TASK_ID,
+                    "task_display_name": TEST_TASK_DISPLAY_NAME,
+                    "team_name": None,
+                    "timestamp": "TIMESTAMP",
+                    "map_index": -1,
+                },
+                {
+                    "dag_id": TEST_DAG_ID,
+                    "dag_display_name": TEST_DAG_DISPLAY_NAME,
+                    "logical_date": logical_date_formatted,
+                    "run_id": run_id,
+                    "run_after": run_after_formatted,
+                    "key": f"{TEST_XCOM_KEY}-1",
+                    "task_id": TEST_TASK_ID,
+                    "task_display_name": TEST_TASK_DISPLAY_NAME,
+                    "team_name": None,
+                    "timestamp": "TIMESTAMP",
+                    "map_index": -1,
+                },
+                {
+                    "dag_id": TEST_DAG_ID_2,
+                    "dag_display_name": TEST_DAG_DISPLAY_NAME_2,
+                    "logical_date": logical_date_formatted,
+                    "run_id": run_id,
+                    "run_after": run_after_formatted,
+                    "key": f"{TEST_XCOM_KEY}-0",
+                    "task_id": TEST_TASK_ID_2,
+                    "task_display_name": TEST_TASK_DISPLAY_NAME_2,
+                    "team_name": None,
+                    "timestamp": "TIMESTAMP",
+                    "map_index": -1,
+                },
+                {
+                    "dag_id": TEST_DAG_ID_2,
+                    "dag_display_name": TEST_DAG_DISPLAY_NAME_2,
+                    "logical_date": logical_date_formatted,
+                    "run_id": run_id,
+                    "run_after": run_after_formatted,
+                    "key": f"{TEST_XCOM_KEY}-1",
+                    "task_id": TEST_TASK_ID_2,
+                    "task_display_name": TEST_TASK_DISPLAY_NAME_2,
+                    "team_name": None,
+                    "timestamp": "TIMESTAMP",
+                    "map_index": -1,
+                },
+            ],
+            "total_entries": 4,
+        }
+        assert response_data == expected_response
+
+    @pytest.mark.parametrize("map_index", (0, 1, None))
+    def test_should_respond_200_with_map_index(self, map_index, test_client):
+        self._create_xcom_entries(TEST_DAG_ID, run_id, logical_date_parsed, TEST_TASK_ID, mapped_ti=True)
+
+        with assert_queries_count(4):
+            response = test_client.get(
+                "/dags/~/dagRuns/~/taskInstances/~/xcomEntries",
+                params={"map_index": map_index} if map_index is not None else None,
+            )
+        assert response.status_code == 200
+        response_data = response.json()
+
+        if map_index is None:
+            expected_entries = [
+                {
+                    "dag_id": TEST_DAG_ID,
+                    "dag_display_name": TEST_DAG_DISPLAY_NAME,
+                    "logical_date": logical_date_formatted,
+                    "run_id": run_id,
+                    "run_after": run_after_formatted,
+                    "key": TEST_XCOM_KEY,
+                    "task_id": TEST_TASK_ID,
+                    "task_display_name": TEST_TASK_DISPLAY_NAME,
+                    "team_name": None,
+                    "timestamp": "TIMESTAMP",
+                    "map_index": idx,
+                }
+                for idx in range(2)
+            ]
+        else:
+            expected_entries = [
+                {
+                    "dag_id": TEST_DAG_ID,
+                    "dag_display_name": TEST_DAG_DISPLAY_NAME,
+                    "logical_date": logical_date_formatted,
+                    "run_id": run_id,
+                    "run_after": run_after_formatted,
+                    "key": TEST_XCOM_KEY,
+                    "task_id": TEST_TASK_ID,
+                    "task_display_name": TEST_TASK_DISPLAY_NAME,
+                    "team_name": None,
+                    "timestamp": "TIMESTAMP",
+                    "map_index": map_index,
+                }
+            ]
+        for xcom_entry in response_data["xcom_entries"]:
+            xcom_entry["timestamp"] = "TIMESTAMP"
+        assert response_data == {
+            "xcom_entries": expected_entries,
+            "total_entries": len(expected_entries),
+        }
+
+    @pytest.mark.parametrize(
+        ("key", "expected_entries"),
+        [
+            (
+                TEST_XCOM_KEY,
+                [
+                    {
+                        "dag_id": TEST_DAG_ID,
+                        "dag_display_name": TEST_DAG_DISPLAY_NAME,
+                        "logical_date": logical_date_formatted,
+                        "run_id": run_id,
+                        "run_after": run_after_formatted,
+                        "key": TEST_XCOM_KEY,
+                        "task_id": TEST_TASK_ID,
+                        "task_display_name": TEST_TASK_DISPLAY_NAME,
+                        "team_name": None,
+                        "timestamp": "TIMESTAMP",
+                        "map_index": 0,
+                    },
+                    {
+                        "dag_id": TEST_DAG_ID,
+                        "dag_display_name": TEST_DAG_DISPLAY_NAME,
+                        "logical_date": logical_date_formatted,
+                        "run_id": run_id,
+                        "run_after": run_after_formatted,
+                        "key": TEST_XCOM_KEY,
+                        "task_id": TEST_TASK_ID,
+                        "task_display_name": TEST_TASK_DISPLAY_NAME,
+                        "team_name": None,
+                        "timestamp": "TIMESTAMP",
+                        "map_index": 1,
+                    },
+                ],
+            ),
+            (f"{TEST_XCOM_KEY}-0", []),
+        ],
+    )
+    def test_should_respond_200_with_xcom_key(self, key, expected_entries, test_client):
+        self._create_xcom_entries(TEST_DAG_ID, run_id, logical_date_parsed, TEST_TASK_ID, mapped_ti=True)
+        with assert_queries_count(4):
+            response = test_client.get(
+                "/dags/~/dagRuns/~/taskInstances/~/xcomEntries",
+                params={"xcom_key_pattern": key} if key is not None else None,
+            )
+
+        assert response.status_code == 200
+        response_data = response.json()
+        for xcom_entry in response_data["xcom_entries"]:
+            xcom_entry["timestamp"] = "TIMESTAMP"
+        assert response_data == {
+            "xcom_entries": expected_entries,
+            "total_entries": len(expected_entries),
+        }
+
+    @conf_vars({("core", "multi_team"): "True"})
+    def test_should_respond_200_with_team_name(self, test_client):
+        self._create_xcom_entries(TEST_DAG_ID, run_id, logical_date_parsed, TEST_TASK_ID)
+        self._create_xcom_entries(TEST_DAG_ID_2, run_id, logical_date_parsed, TEST_TASK_ID_2)
+        _attach_dag_to_team(TEST_DAG_ID, "team-xcom")
+
+        response = test_client.get("/dags/~/dagRuns/~/taskInstances/~/xcomEntries")
+
+        assert response.status_code == 200
+        assert {(entry["dag_id"], entry["team_name"]) for entry in response.json()["xcom_entries"]} == {
+            (TEST_DAG_ID, "team-xcom"),
+            (TEST_DAG_ID_2, None),
+        }
+
+    @conf_vars({("core", "multi_team"): "True"})
+    def test_should_respond_200_filtered_by_team(self, test_client):
+        self._create_xcom_entries(TEST_DAG_ID, run_id, logical_date_parsed, TEST_TASK_ID)
+        self._create_xcom_entries(TEST_DAG_ID_2, run_id, logical_date_parsed, TEST_TASK_ID_2)
+        _attach_dag_to_team(TEST_DAG_ID, "team-xcom")
+
+        response = test_client.get(
+            "/dags/~/dagRuns/~/taskInstances/~/xcomEntries", params={"teams": ["team-xcom"]}
+        )
+        assert response.status_code == 200
+        response_data = response.json()
+        assert response_data["total_entries"] == 2
+        assert {entry["dag_id"] for entry in response_data["xcom_entries"]} == {TEST_DAG_ID}
+
+        response = test_client.get(
+            "/dags/~/dagRuns/~/taskInstances/~/xcomEntries", params={"teams": ["team-without-dags"]}
+        )
+        assert response.status_code == 200
+        assert response.json()["total_entries"] == 0
+
+    @provide_session
+    def _create_xcom_entries(
+        self, dag_id, run_id, logical_date, task_id, mapped_ti=False, *, session: Session = NEW_SESSION
+    ):
+        bundle_name = "testing"
+        orm_dag_bundle = DagBundleModel(name=bundle_name)
+        session.merge(orm_dag_bundle)
+        session.flush()
+
+        with DAG(dag_id=dag_id) as dag:
+            task: EmptyOperator | MappedOperator
+            if mapped_ti:
+                task = MockOperator.partial(task_id=task_id).expand(arg1=[0, 1])
+            else:
+                task = EmptyOperator(task_id=task_id)
+        sync_dag_to_db(dag)
+        dagrun = DagRun(
+            dag_id=dag_id,
+            run_id=run_id,
+            logical_date=logical_date,
+            start_date=logical_date,
+            run_type=DagRunType.MANUAL,
+        )
+        session.add(dagrun)
+        dag_version = DagVersion.get_latest_version(dag.dag_id)
+        assert dag_version
+        if mapped_ti:
+            for i in [0, 1]:
+                ti = create_task_instance(task, run_id=run_id, map_index=i, dag_version_id=dag_version.id)
+                session.add(ti)
+        else:
+            ti = create_task_instance(task, run_id=run_id, dag_version_id=dag_version.id)
+            session.add(ti)
+        session.commit()
+
+        for i in [0, 1]:
+            if mapped_ti:
+                key = TEST_XCOM_KEY
+                map_index = i
+            else:
+                key = f"{TEST_XCOM_KEY}-{i}"
+                map_index = -1
+
+            XComModel.set(
+                key=key,
+                value=TEST_XCOM_VALUE,
+                run_id=run_id,
+                task_id=task_id,
+                dag_id=dag_id,
+                map_index=map_index,
+            )
+
+    def test_should_respond_401(self, unauthenticated_test_client):
+        response = unauthenticated_test_client.get(
+            "/dags/~/dagRuns/~/taskInstances/~/xcomEntries",
+            params={},
+        )
+        assert response.status_code == 401
+
+    def test_should_respond_403(self, unauthorized_test_client):
+        response = unauthorized_test_client.get(
+            "/dags/~/dagRuns/~/taskInstances/~/xcomEntries",
+            params={},
+        )
+        assert response.status_code == 403
+
+
+class TestPaginationGetXComEntries(TestXComEndpoint):
+    @pytest.mark.parametrize(
+        ("query_params", "expected_xcom_ids"),
+        [
+            (
+                {"limit": "1"},
+                ["TEST_XCOM_KEY0"],
+            ),
+            (
+                {"limit": "2"},
+                ["TEST_XCOM_KEY0", "TEST_XCOM_KEY1"],
+            ),
+            (
+                {"offset": "5"},
+                [
+                    "TEST_XCOM_KEY5",
+                    "TEST_XCOM_KEY6",
+                    "TEST_XCOM_KEY7",
+                    "TEST_XCOM_KEY8",
+                    "TEST_XCOM_KEY9",
+                ],
+            ),
+            (
+                {"offset": "0"},
+                [
+                    "TEST_XCOM_KEY0",
+                    "TEST_XCOM_KEY1",
+                    "TEST_XCOM_KEY2",
+                    "TEST_XCOM_KEY3",
+                    "TEST_XCOM_KEY4",
+                    "TEST_XCOM_KEY5",
+                    "TEST_XCOM_KEY6",
+                    "TEST_XCOM_KEY7",
+                    "TEST_XCOM_KEY8",
+                    "TEST_XCOM_KEY9",
+                ],
+            ),
+            (
+                {"limit": "1", "offset": "5"},
+                ["TEST_XCOM_KEY5"],
+            ),
+            (
+                {"limit": "1", "offset": "1"},
+                ["TEST_XCOM_KEY1"],
+            ),
+            (
+                {"limit": "2", "offset": "2"},
+                ["TEST_XCOM_KEY2", "TEST_XCOM_KEY3"],
+            ),
+        ],
+    )
+    def test_handle_limit_offset(self, query_params, expected_xcom_ids, test_client):
+        for i in range(10):
+            self._create_xcom(f"TEST_XCOM_KEY{i}", TEST_XCOM_VALUE)
+        response = test_client.get("/dags/~/dagRuns/~/taskInstances/~/xcomEntries", params=query_params)
+        assert response.status_code == 200
+        response_data = response.json()
+        assert response_data["total_entries"] == 10
+        conn_ids = [conn["key"] for conn in response_data["xcom_entries"] if conn]
+        assert conn_ids == expected_xcom_ids
+
+
+class TestCreateXComEntry(TestXComEndpoint):
+    @pytest.mark.parametrize(
+        ("dag_id", "task_id", "dag_run_id", "request_body", "expected_status", "expected_detail"),
+        [
+            # Test case: Valid input, should succeed with 201 CREATED
+            pytest.param(
+                TEST_DAG_ID,
+                TEST_TASK_ID,
+                run_id,
+                XComCreateBody(key=TEST_XCOM_KEY, value=TEST_XCOM_VALUE),
+                201,
+                None,
+                id="valid-xcom-entry",
+            ),
+            # Test case: Valid input with string value
+            pytest.param(
+                TEST_DAG_ID,
+                TEST_TASK_ID,
+                run_id,
+                XComCreateBody(key="string_key", value="simple string"),
+                201,
+                None,
+                id="valid-xcom-with-string-value",
+            ),
+            # Test case: Valid input with integer value
+            pytest.param(
+                TEST_DAG_ID,
+                TEST_TASK_ID,
+                run_id,
+                XComCreateBody(key="int_key", value=42),
+                201,
+                None,
+                id="valid-xcom-with-integer-value",
+            ),
+            # Test case: Valid input with list value
+            pytest.param(
+                TEST_DAG_ID,
+                TEST_TASK_ID,
+                run_id,
+                XComCreateBody(key="list_key", value=[1, 2, 3]),
+                201,
+                None,
+                id="valid-xcom-with-list-value",
+            ),
+            # Test case: DAG not found
+            pytest.param(
+                "invalid-dag-id",
+                TEST_TASK_ID,
+                run_id,
+                XComCreateBody(key=TEST_XCOM_KEY, value=TEST_XCOM_VALUE),
+                404,
+                "The Dag with ID: `invalid-dag-id` was not found",
+                id="dag-not-found",
+            ),
+            # Test case: Task not found in DAG
+            pytest.param(
+                TEST_DAG_ID,
+                "invalid-task-id",
+                run_id,
+                XComCreateBody(key=TEST_XCOM_KEY, value=TEST_XCOM_VALUE),
+                404,
+                f"Task with ID: `invalid-task-id` not found in dag: `{TEST_DAG_ID}`",
+                id="task-not-found",
+            ),
+            # Test case: DAG Run not found
+            pytest.param(
+                TEST_DAG_ID,
+                TEST_TASK_ID,
+                "invalid-dag-run-id",
+                XComCreateBody(key=TEST_XCOM_KEY, value=TEST_XCOM_VALUE),
+                404,
+                f"Dag Run with ID: `invalid-dag-run-id` not found for dag: `{TEST_DAG_ID}`",
+                id="dag-run-not-found",
+            ),
+            # Test case: XCom entry already exists
+            pytest.param(
+                TEST_DAG_ID,
+                TEST_TASK_ID,
+                run_id,
+                XComCreateBody(key=TEST_XCOM_KEY, value=TEST_XCOM_VALUE),
+                409,
+                f"The XCom with key: `{TEST_XCOM_KEY}` with mentioned task instance already exists.",
+                id="xcom-already-exists",
+            ),
+            pytest.param(
+                TEST_DAG_ID,
+                TEST_TASK_ID,
+                run_id,
+                XComCreateBody(key="_airflow_loop_decision_reason", value="converged"),
+                400,
+                "Reserved loop XCom key",
+                id="reserved-loop-key",
+            ),
+            pytest.param(
+                TEST_DAG_ID,
+                TEST_TASK_ID,
+                run_id,
+                XComCreateBody(key=EXTERNAL_CLEAR_TARGET_XCOM_KEY, value={"dag_id": "other"}),
+                400,
+                "Reserved XCom key",
+                id="reserved-external-clear-target-key",
+            ),
+        ],
+    )
+    def test_create_xcom_entry(
+        self,
+        dag_id,
+        task_id,
+        dag_run_id,
+        request_body,
+        expected_status,
+        expected_detail,
+        test_client,
+        session,
+    ):
+        # Pre-create an XCom entry to test conflict case
+        if expected_status == 409:
+            self._create_xcom(TEST_XCOM_KEY, TEST_XCOM_VALUE)
+
+        response = test_client.post(
+            f"/dags/{dag_id}/dagRuns/{dag_run_id}/taskInstances/{task_id}/xcomEntries",
+            json=request_body.dict(),
+        )
+
+        assert response.status_code == expected_status
+        if expected_detail:
+            assert response.json()["detail"] == expected_detail
+        elif expected_status == 201:
+            # Validate the created XCom response
+            current_data = response.json()
+            assert current_data["key"] == request_body.key
+            assert current_data["value"] == request_body.value
+            assert current_data["dag_id"] == dag_id
+            assert current_data["task_id"] == task_id
+            assert current_data["run_id"] == dag_run_id
+            assert current_data["map_index"] == request_body.map_index
+        check_last_log(session, dag_id=TEST_DAG_ID, event="create_xcom_entry", logical_date=None)
+
+    def test_create_xcom_entry_audit_log_masks_value(self, test_client, session):
+        """The audit log records that an XCom was written, not its value, whatever the key name."""
+        response = test_client.post(
+            f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries",
+            json=XComCreateBody(key="report_rows", value="xcom-payload-canary").model_dump(),
+        )
+
+        assert response.status_code == 201
+        extra = _last_audit_extra(session, "create_xcom_entry")
+        assert extra["value"] == "***"
+        assert extra["key"] == "report_rows"
+        assert "xcom-payload-canary" not in json.dumps(extra)
+
+    def test_create_xcom_entry_duplicate_check_is_bounded(self, test_client):
+        """Checking for an existing XCom before inserting must ask the database for one row."""
+        with capture_orm_selects("xcom_v2") as statements:
+            response = test_client.post(
+                f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries",
+                json=XComCreateBody(key=TEST_XCOM_KEY, value=TEST_XCOM_VALUE).model_dump(),
+            )
+
+        assert response.status_code == 201
+        assert statements, "expected the endpoint to query the xcom table"
+        for sql in statements:
+            assert re.search(r"\bLIMIT 1\b", sql), f"XCom lookup is not bounded to one row: {sql}"
+
+    @conf_vars({("core", "multi_team"): "True"})
+    def test_create_xcom_entry_with_team_name(self, test_client):
+        _attach_dag_to_team(TEST_DAG_ID, "team-xcom-create")
+
+        response = test_client.post(
+            f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries",
+            json=XComCreateBody(key=TEST_XCOM_KEY, value=TEST_XCOM_VALUE).dict(),
+        )
+
+        assert response.status_code == 201
+        assert response.json()["team_name"] == "team-xcom-create"
+
+    def test_should_respond_401(self, unauthenticated_test_client):
+        response = unauthenticated_test_client.post(
+            "/dags/dag_id/dagRuns/dag_run_id/taskInstances/task_id/xcomEntries",
+            json={},
+        )
+        assert response.status_code == 401
+
+    def test_should_respond_403(self, unauthorized_test_client):
+        response = unauthorized_test_client.post(
+            "/dags/dag_id/dagRuns/dag_run_id/taskInstances/task_id/xcomEntries",
+            json={},
+        )
+        assert response.status_code == 403
+
+    def test_create_xcom_entry_with_slash_key(self, test_client):
+        slash_key = "a/b/c"
+        body = XComCreateBody(key=slash_key, value=TEST_XCOM_VALUE)
+        response = test_client.post(
+            f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries",
+            json=body.dict(),
+        )
+        assert response.status_code == 201
+        assert response.json()["key"] == slash_key
+        # Verify retrieval via encoded path
+        get_resp = test_client.get(
+            f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries/{slash_key}"
+        )
+        assert get_resp.status_code == 200
+        assert get_resp.json()["key"] == slash_key
+        assert get_resp.json()["value"] == TEST_XCOM_VALUE
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("__classname__", {"__classname__": "airflow.sdk.definitions.connection.Connection"}),
+            ("__type", {"__type": "airflow.sdk.definitions.connection.Connection", "__var": {}}),
+            ("__data__", {"nested": {"__data__": "malicious"}}),
+        ],
+    )
+    def test_create_xcom_entry_blocks_forbidden_keys(self, test_client, key, value):
+        """Test that XCom creation blocks deserialization metadata keys."""
+        response = test_client.post(
+            f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries",
+            json={"key": "test_key", "value": value, "map_index": -1},
+        )
+        assert response.status_code == 422
+        detail = str(response.json()["detail"])
+        assert "reserved serialization keys" in detail
+        assert key in detail
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param(
+                json.dumps({"__classname__": "airflow.sdk.definitions.connection.Connection"}),
+                id="classname-in-json-string",
+            ),
+            pytest.param(
+                json.dumps(
+                    {"nested": {"__type": "airflow.sdk.definitions.connection.Connection", "__var": {}}}
+                ),
+                id="nested-forbidden-in-json-string",
+            ),
+        ],
+    )
+    def test_create_xcom_entry_blocks_forbidden_keys_in_json_string(self, test_client, value):
+        """A forbidden payload submitted as a JSON string literal is blocked too.
+
+        The reserved-key walk previously descended dict/list/tuple but not
+        ``str``, so a value like ``json.dumps({"__classname__": ...})`` slipped past the
+        filter and was reconstructed into a dict on a ``deserialize=true`` read.
+        """
+        response = test_client.post(
+            f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries",
+            json={"key": "test_key", "value": value, "map_index": -1},
+        )
+        assert response.status_code == 422
+        assert "reserved serialization keys" in str(response.json()["detail"])
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param("just a plain string", id="plain-string"),
+            pytest.param(json.dumps({"safe": "data", "count": 3}), id="benign-json-object-string"),
+            pytest.param(json.dumps(["a", "b"]), id="benign-json-array-string"),
+            pytest.param('{"not valid json', id="not-json"),
+        ],
+    )
+    def test_create_xcom_entry_allows_benign_string_values(self, test_client, value):
+        """String values that do not decode to a reserved-key structure stay accepted."""
+        response = test_client.post(
+            f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries",
+            json={"key": "test_key", "value": value, "map_index": -1},
+        )
+        assert response.status_code != 422
+
+
+class TestDeleteXComEntry(TestXComEndpoint):
+    def test_delete_xcom_entry(self, test_client, session):
+        self._create_xcom(TEST_XCOM_KEY, TEST_XCOM_VALUE)
+
+        response = test_client.delete(
+            f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries/{TEST_XCOM_KEY}"
+        )
+
+        assert response.status_code == 204
+        check_last_log(session, dag_id=TEST_DAG_ID, event="delete_xcom_entry", logical_date=None)
+
+        # Verify it's gone
+        response = test_client.get(
+            f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries/{TEST_XCOM_KEY}"
+        )
+        assert response.status_code == 404
+
+    def test_delete_xcom_entry_not_found(self, test_client):
+        response = test_client.delete(
+            f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries/{TEST_XCOM_KEY}"
+        )
+        assert response.status_code == 404
+
+    def test_should_respond_401(self, unauthenticated_test_client):
+        response = unauthenticated_test_client.delete(
+            f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries/{TEST_XCOM_KEY}"
+        )
+        assert response.status_code == 401
+
+    def test_should_respond_403(self, unauthorized_test_client):
+        response = unauthorized_test_client.delete(
+            f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries/{TEST_XCOM_KEY}"
+        )
+        assert response.status_code == 403
+
+
+class TestPatchXComEntry(TestXComEndpoint):
+    @pytest.mark.parametrize(
+        ("key", "patch_body", "expected_status", "expected_detail"),
+        [
+            # Test case: Valid update, should return 200 OK
+            pytest.param(
+                TEST_XCOM_KEY,
+                {"value": "new_value"},
+                200,
+                None,
+                id="valid-xcom-update",
+            ),
+            # Test case: Update with complex object
+            pytest.param(
+                TEST_XCOM_KEY,
+                {"value": {"nested": {"key": "value"}, "list": [1, 2, 3]}},
+                200,
+                None,
+                id="valid-xcom-update-complex-object",
+            ),
+            # Test case: Update with integer
+            pytest.param(
+                TEST_XCOM_KEY,
+                {"value": 999},
+                200,
+                None,
+                id="valid-xcom-update-integer",
+            ),
+            # Test case: Update with list
+            pytest.param(
+                TEST_XCOM_KEY,
+                {"value": ["updated", "list", "values"]},
+                200,
+                None,
+                id="valid-xcom-update-list",
+            ),
+            # Test case: XCom entry does not exist, should return 404
+            pytest.param(
+                TEST_XCOM_KEY,
+                {"value": "new_value", "map_index": -1},
+                404,
+                f"The XCom with key: `{TEST_XCOM_KEY}` with mentioned task instance doesn't exist.",
+                id="xcom-not-found",
+            ),
+            pytest.param(
+                "_airflow_loop_decision_reason",
+                {"value": "converged"},
+                400,
+                "Reserved loop XCom key",
+                id="reserved-loop-key",
+            ),
+            pytest.param(
+                EXTERNAL_CLEAR_TARGET_XCOM_KEY,
+                {"value": {"dag_id": "other"}},
+                400,
+                "Reserved XCom key",
+                id="reserved-external-clear-target-key",
+            ),
+        ],
+    )
+    def test_patch_xcom_entry(self, key, patch_body, expected_status, expected_detail, test_client, session):
+        # Ensure the XCom entry exists before updating
+        if expected_status != 404:
+            self._create_xcom(TEST_XCOM_KEY, TEST_XCOM_VALUE)
+
+        response = test_client.patch(
+            f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries/{key}",
+            json=patch_body,
+        )
+
+        assert response.status_code == expected_status
+
+        if expected_status == 200:
+            assert response.json()["value"] == patch_body["value"]
+        else:
+            assert response.json()["detail"] == expected_detail
+        check_last_log(session, dag_id=TEST_DAG_ID, event="update_xcom_entry", logical_date=None)
+
+    def test_patch_xcom_entry_audit_log_masks_value(self, test_client, session):
+        """An XCom update is audited without its new value."""
+        self._create_xcom(TEST_XCOM_KEY, TEST_XCOM_VALUE)
+
+        response = test_client.patch(
+            f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries/{TEST_XCOM_KEY}",
+            json={"value": {"nested": "xcom-payload-canary"}},
+        )
+
+        assert response.status_code == 200
+        extra = _last_audit_extra(session, "update_xcom_entry")
+        assert extra["value"] == "***"
+        assert extra["xcom_key"] == TEST_XCOM_KEY
+        assert "xcom-payload-canary" not in json.dumps(extra)
+
+    @conf_vars({("core", "multi_team"): "True"})
+    def test_patch_xcom_entry_with_team_name(self, test_client):
+        self._create_xcom(TEST_XCOM_KEY, TEST_XCOM_VALUE)
+        _attach_dag_to_team(TEST_DAG_ID, "team-xcom-patch")
+
+        response = test_client.patch(
+            f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries/{TEST_XCOM_KEY}",
+            json={"value": "new_value"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["team_name"] == "team-xcom-patch"
+
+    def test_should_respond_401(self, unauthenticated_test_client):
+        response = unauthenticated_test_client.patch(
+            f"/dags/{TEST_DAG_ID}/dagRuns/run_id/taskInstances/TEST_TASK_ID/xcomEntries/key",
+            json={},
+        )
+        assert response.status_code == 401
+
+    def test_should_respond_403(self, unauthorized_test_client):
+        response = unauthorized_test_client.patch(
+            f"/dags/{TEST_DAG_ID}/dagRuns/run_id/taskInstances/TEST_TASK_ID/xcomEntries/key",
+            json={},
+        )
+        assert response.status_code == 403
+
+    def test_patch_xcom_entry_with_slash_key(self, test_client, session):
+        slash_key = "x/y"
+        self._create_xcom(slash_key, TEST_XCOM_VALUE)
+        new_value = {"updated": True}
+        response = test_client.patch(
+            f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries/{slash_key}",
+            json={"value": new_value},
+        )
+        assert response.status_code == 200
+        assert response.json()["key"] == slash_key
+        assert response.json()["value"] == new_value
+        check_last_log(session, dag_id=TEST_DAG_ID, event="update_xcom_entry", logical_date=None)
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("__classname__", {"__classname__": "airflow.sdk.definitions.connection.Connection"}),
+            ("__type", {"__type": "airflow.sdk.definitions.connection.Connection", "__var": {}}),
+            ("__data__", {"nested": {"__data__": "malicious"}}),
+        ],
+    )
+    def test_patch_xcom_entry_blocks_forbidden_keys(self, test_client, key, value):
+        """Test that XCom update blocks deserialization metadata keys."""
+        self._create_xcom(TEST_XCOM_KEY, TEST_XCOM_VALUE)
+        response = test_client.patch(
+            f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries/{TEST_XCOM_KEY}",
+            json={"value": value, "map_index": -1},
+        )
+        assert response.status_code == 422
+        detail = str(response.json()["detail"])
+        assert "reserved serialization keys" in detail
+        assert key in detail
+
+    def test_patch_xcom_entry_blocks_forbidden_keys_in_json_string(self, test_client):
+        """A forbidden payload submitted as a JSON string literal is blocked on PATCH too."""
+        self._create_xcom(TEST_XCOM_KEY, TEST_XCOM_VALUE)
+        response = test_client.patch(
+            f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries/{TEST_XCOM_KEY}",
+            json={
+                "value": json.dumps({"__classname__": "airflow.sdk.definitions.connection.Connection"}),
+                "map_index": -1,
+            },
+        )
+        assert response.status_code == 422
+        assert "reserved serialization keys" in str(response.json()["detail"])
+
+    def test_patch_xcom_preserves_int_type(self, test_client, session):
+        """Test scenario described in #59032: if existing XCom value type is int,
+        after patching with different value, it should still be int in the API response.
+        """
+        key = "int_type_xcom"
+        # Create with int value
+        self._create_xcom(key, 42)
+        patch_value = 100
+        response = test_client.patch(
+            f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries/{key}",
+            json={"value": patch_value},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["value"] == patch_value
+        assert isinstance(data["value"], int), f"Expected int type but got {type(data['value'])}"
+        check_last_log(session, dag_id=TEST_DAG_ID, event="update_xcom_entry", logical_date=None)
+
+    def test_patch_xcom_preserves_mapped_length(self, test_client, session):
+        """set() replaces the row, so an edit must not drop the recorded expansion length."""
+        key = XCOM_RETURN_KEY
+        XComModel.set(
+            key=key,
+            value=[1, 2, 3],
+            dag_id=TEST_DAG_ID,
+            task_id=TEST_TASK_ID,
+            run_id=run_id,
+            mapped_length=3,
+            session=session,
+        )
+        session.commit()
+
+        response = test_client.patch(
+            f"/dags/{TEST_DAG_ID}/dagRuns/{run_id}/taskInstances/{TEST_TASK_ID}/xcomEntries/{key}",
+            json={"value": [9, 9, 9]},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["value"] == [9, 9, 9]
+        read = XComModel.get_many(run_id=run_id, dag_ids=TEST_DAG_ID, task_ids=TEST_TASK_ID, key=key)
+        entity = xcom_entity(read)
+        assert session.scalar(read.with_only_columns(entity.mapped_length)) == 3

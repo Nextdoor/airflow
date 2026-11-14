@@ -1,0 +1,503 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+import functools
+import gc
+import warnings
+from datetime import timedelta
+
+import pendulum
+import pytest
+
+from airflow.providers.standard.operators.empty import EmptyOperator
+from airflow.sdk import DAG, dag, task, task_group
+from airflow.sdk.definitions._internal.expandinput import (
+    DictOfListsExpandInput,
+    ListOfDictsExpandInput,
+    MappedArgument,
+)
+from airflow.sdk.definitions.taskgroup import MappedTaskGroup
+
+
+class _CallableUntil:
+    """Class docstring that must not become the gate documentation."""
+
+    def __call__(self, *, loop):
+        return loop.index == 1
+
+
+def _threshold_until(*, loop, threshold):
+    """Function docstring that a partial must not expose."""
+    return loop.index >= threshold
+
+
+@pytest.mark.parametrize(
+    "until",
+    [
+        pytest.param(functools.partial(_threshold_until, threshold=1), id="partial"),
+        pytest.param(_CallableUntil(), id="callable-object"),
+    ],
+)
+def test_loop_gate_has_no_doc_md_for_non_function_until(until):
+    @task_group
+    def body():
+        EmptyOperator(task_id="terminal")
+
+    with DAG("callable_until_loop", schedule=None) as pipeline:
+        group = body.loop(max_iterations=3, until=until)
+
+    assert pipeline.get_task(group.gate_task_id).doc_md is None
+
+
+@pytest.mark.parametrize("mapped", [False, True])
+@pytest.mark.parametrize("conditional", [False, True])
+def test_loop_preserves_group_configuration_and_body_arguments(mapped, conditional):
+    @task
+    def terminal(value, *, loop):
+        return value + loop.index
+
+    @task_group
+    def body(value):
+        """Refine the input."""
+        if mapped:
+            return terminal.expand(value=[value, value + 1])
+        return terminal(value)
+
+    def converged(*, loop):
+        """Stop after the second iteration."""
+        return loop.index == 1
+
+    with DAG("public_loop", schedule=None) as pipeline:
+        start = EmptyOperator(task_id="start")
+        finish = EmptyOperator(task_id="finish")
+        group = (
+            body.override(group_id="refine")
+            .partial(value=2)
+            .loop(max_iterations=3, until=converged if conditional else None)
+        )
+        start >> group >> finish
+
+    gate = pipeline.get_task("refine.converged" if conditional else "refine.__loop_gate")
+    assert group.doc_md == "Refine the input."
+    assert gate.until is (converged if conditional else None)
+    assert gate.doc_md == ("Stop after the second iteration." if conditional else None)
+    assert gate.upstream_task_ids == {"refine.terminal"}
+    assert gate.downstream_task_ids == {"finish"}
+    result = pipeline.get_task("refine.terminal")
+    assert result.upstream_task_ids == {"start"}
+    if mapped:
+        assert result.op_kwargs_expand_input.value == {"value": [2, 3]}
+    else:
+        assert result.op_args == (2,)
+
+
+@pytest.mark.parametrize("max_iterations", [0, True])
+def test_loop_rejects_invalid_iteration_limit(max_iterations):
+    @task_group
+    def body():
+        EmptyOperator(task_id="terminal")
+
+    with DAG("invalid_public_loop", schedule=None):
+        with pytest.raises(ValueError, match="positive integer"):
+            body.loop(max_iterations=max_iterations)
+
+
+def test_loop_rejects_multiple_terminal_definitions():
+    @task_group
+    def body():
+        EmptyOperator(task_id="first")
+        EmptyOperator(task_id="second")
+
+    with DAG("ambiguous_public_loop", schedule=None):
+        with pytest.raises(ValueError, match="exactly one terminal"):
+            body.loop(max_iterations=2)
+
+
+@pytest.mark.parametrize("partial_first", [False, True])
+def test_loop_after_partial_and_override_in_either_order_does_not_warn(partial_first):
+    @task_group
+    def body(value):
+        EmptyOperator(task_id="terminal")
+
+    with DAG("ordered_public_loop", schedule=None) as pipeline:
+        with warnings.catch_warnings(record=True) as recorded:
+            warnings.simplefilter("always")
+            if partial_first:
+                factory = body.partial(value=2).override(group_id="refine")
+            else:
+                factory = body.override(group_id="refine").partial(value=2)
+            factory.loop(max_iterations=2)
+            del factory
+            gc.collect()
+
+    assert pipeline.get_task("refine.terminal")
+    assert [str(warning.message) for warning in recorded if "never mapped" in str(warning.message)] == []
+
+
+def test_task_group_with_overridden_kwargs():
+    @task_group(
+        default_args={
+            "params": {
+                "x": 5,
+                "y": 5,
+            },
+        },
+        add_suffix_on_collision=True,
+    )
+    def simple_tg(): ...
+
+    tg_with_overridden_kwargs = simple_tg.override(
+        group_id="custom_group_id",
+        default_args={
+            "params": {
+                "x": 10,
+            },
+        },
+    )
+
+    assert tg_with_overridden_kwargs.tg_kwargs == {
+        "group_id": "custom_group_id",
+        "default_args": {
+            "params": {
+                "x": 10,
+            },
+        },
+        "add_suffix_on_collision": True,
+    }
+
+
+def test_tooltip_derived_from_function_docstring():
+    """Test that the tooltip for TaskGroup is the decorated-function's docstring."""
+
+    @dag(schedule=None, start_date=pendulum.datetime(2022, 1, 1))
+    def pipeline():
+        @task_group()
+        def tg():
+            """Function docstring."""
+
+        tg()
+
+    _ = pipeline()
+
+    assert _.task_group_dict["tg"].tooltip == "Function docstring."
+    assert _.task_group_dict["tg"].doc_md == "Function docstring."
+
+
+def test_doc_md_derived_from_function_docstring_does_not_resolve_markdown_file(tmp_path, monkeypatch):
+    """Test that docstrings ending with .md are not treated as markdown file paths."""
+    (tmp_path / "README.md").write_text("External file content.")
+    monkeypatch.chdir(tmp_path)
+
+    @dag(schedule=None, start_date=pendulum.datetime(2022, 1, 1))
+    def pipeline():
+        @task_group()
+        def tg():
+            """README.md"""
+
+        tg()
+
+    _ = pipeline()
+
+    assert _.task_group_dict["tg"].doc_md == "README.md"
+
+
+def test_tooltip_not_overridden_by_function_docstring():
+    """
+    Test that the tooltip for TaskGroup is the explicitly set value even if the decorated function has a
+    docstring.
+    """
+
+    @dag(schedule=None, start_date=pendulum.datetime(2022, 1, 1))
+    def pipeline():
+        @task_group(tooltip="tooltip for the TaskGroup")
+        def tg():
+            """Function docstring."""
+
+        tg()
+
+    _ = pipeline()
+
+    assert _.task_group_dict["tg"].tooltip == "tooltip for the TaskGroup"
+
+
+def test_doc_md_not_overridden_by_function_docstring():
+    """Test that explicitly set TaskGroup markdown docs are not overwritten by the function docstring."""
+
+    @dag(schedule=None, start_date=pendulum.datetime(2022, 1, 1))
+    def pipeline():
+        @task_group(doc_md="TaskGroup docs.")
+        def tg():
+            """Function docstring."""
+
+        tg()
+
+    _ = pipeline()
+
+    assert _.task_group_dict["tg"].doc_md == "TaskGroup docs."
+
+
+def test_doc_md_file_resolved(tmp_path):
+    """Test that task_group reads markdown files supplied as doc_md."""
+    raw_content = """
+    ### External Markdown TaskGroup documentation
+    """
+
+    path = tmp_path / "testfile.md"
+    path.write_text(raw_content)
+
+    @dag(schedule=None, start_date=pendulum.datetime(2022, 1, 1))
+    def pipeline():
+        @task_group(doc_md=str(path))
+        def tg(): ...
+
+        tg()
+
+    _ = pipeline()
+
+    assert _.task_group_dict["tg"].doc_md == raw_content
+
+
+def test_partial_evolves_factory():
+    tgp = None
+
+    @task_group()
+    def tg(a, b):
+        pass
+
+    @dag(schedule=None, start_date=pendulum.datetime(2022, 1, 1))
+    def pipeline():
+        nonlocal tgp
+        tgp = tg.partial(a=1)
+
+    d = pipeline()
+
+    assert d.task_group_dict == {}  # Calling partial() without expanding does not create a task group.
+
+    assert type(tgp) is type(tg)
+    assert tgp.partial_kwargs == {"a": 1}  # Partial kwargs are saved.
+
+    # Warn if the partial object goes out of scope without being mapped.
+    with pytest.warns(UserWarning, match=r"Partial task group 'tg' was never mapped!"):
+        del tgp
+
+
+def test_expand_fail_empty():
+    @dag(schedule=None, start_date=pendulum.datetime(2022, 1, 1))
+    def pipeline():
+        @task_group()
+        def tg():
+            pass
+
+        tg.expand()
+
+    with pytest.raises(TypeError) as ctx:
+        pipeline()
+    assert str(ctx.value) == "no arguments to expand against"
+
+
+def test_expand_create_mapped():
+    saved = {}
+
+    @dag(schedule=None, start_date=pendulum.datetime(2022, 1, 1))
+    def pipeline():
+        @task_group()
+        def tg(a, b):
+            saved["a"] = a
+            saved["b"] = b
+
+        tg.partial(a=1).expand(b=["x", "y"])
+
+    d = pipeline()
+
+    tg = d.task_group_dict["tg"]
+    assert isinstance(tg, MappedTaskGroup)
+    assert tg._expand_input == DictOfListsExpandInput({"b": ["x", "y"]})
+
+    assert saved == {"a": 1, "b": MappedArgument(input=tg._expand_input, key="b")}
+
+
+def test_expand_invalid_xcomarg_return_value():
+    saved = {}
+
+    @dag(schedule=None, start_date=pendulum.datetime(2022, 1, 1))
+    def pipeline():
+        @task
+        def t():
+            return {"values": ["value_1", "value_2"]}
+
+        @task_group()
+        def tg(a, b):
+            saved["a"] = a
+            saved["b"] = b
+
+        tg.partial(a=1).expand(b=t()["values"])
+
+    with pytest.raises(
+        ValueError,
+        match=r"cannot map over XCom with custom key 'values' from <Task\(_PythonDecoratedOperator\): t>",
+    ):
+        pipeline()
+
+
+def test_expand_kwargs_no_wildcard():
+    @dag(schedule=None, start_date=pendulum.datetime(2022, 1, 1))
+    def pipeline():
+        @task_group()
+        def tg(**kwargs):
+            pass
+
+        tg.expand_kwargs([])
+
+    with pytest.raises(TypeError) as ctx:
+        pipeline()
+
+    assert str(ctx.value) == "calling expand_kwargs() on task group function with * or ** is not supported"
+
+
+def test_expand_kwargs_create_mapped():
+    saved = {}
+
+    @dag(schedule=None, start_date=pendulum.datetime(2022, 1, 1))
+    def pipeline():
+        @task_group()
+        def tg(a, b):
+            saved["a"] = a
+            saved["b"] = b
+
+        tg.partial(a=1).expand_kwargs([{"b": "x"}, {"b": None}])
+
+    d = pipeline()
+
+    tg = d.task_group_dict["tg"]
+    assert isinstance(tg, MappedTaskGroup)
+    assert tg._expand_input == ListOfDictsExpandInput([{"b": "x"}, {"b": None}])
+
+    assert saved == {"a": 1, "b": MappedArgument(input=tg._expand_input, key="b")}
+
+
+def test_expand_kwargs_invalid_xcomarg_return_value():
+    saved = {}
+
+    @dag(schedule=None, start_date=pendulum.datetime(2022, 1, 1))
+    def pipeline():
+        @task
+        def t():
+            return {"values": [{"b": 2}, {"b": 3}]}
+
+        @task_group()
+        def tg(a, b):
+            saved["a"] = a
+            saved["b"] = b
+
+        tg.partial(a=1).expand_kwargs(t()["values"])
+
+    with pytest.raises(
+        ValueError,
+        match=r"cannot map over XCom with custom key 'values' from <Task\(_PythonDecoratedOperator\): t>",
+    ):
+        pipeline()
+
+
+def test_override_dag_default_args():
+    @dag(
+        dag_id="test_dag",
+        schedule=None,
+        start_date=pendulum.parse("20200101"),
+        default_args={
+            "retries": 1,
+            "owner": "x",
+        },
+    )
+    def pipeline():
+        @task_group(
+            group_id="task_group",
+            default_args={
+                "owner": "y",
+                "execution_timeout": timedelta(seconds=10),
+            },
+        )
+        def tg():
+            EmptyOperator(task_id="task")
+
+        tg()
+
+    test_dag = pipeline()
+    test_task = test_dag.task_group_dict["task_group"].children["task_group.task"]
+    assert test_task.retries == 1
+    assert test_task.owner == "y"
+    assert test_task.execution_timeout == timedelta(seconds=10)
+
+
+def test_override_dag_default_args_nested_tg():
+    @dag(
+        dag_id="test_dag",
+        schedule=None,
+        start_date=pendulum.parse("20200101"),
+        default_args={
+            "retries": 1,
+            "owner": "x",
+        },
+    )
+    def pipeline():
+        @task_group(
+            group_id="task_group",
+            default_args={
+                "owner": "y",
+                "execution_timeout": timedelta(seconds=10),
+            },
+        )
+        def tg():
+            @task_group(group_id="nested_task_group")
+            def nested_tg():
+                @task_group(group_id="another_task_group")
+                def another_tg():
+                    EmptyOperator(task_id="task")
+
+                another_tg()
+
+            nested_tg()
+
+        tg()
+
+    test_dag = pipeline()
+    test_task = (
+        test_dag.task_group_dict["task_group"]
+        .children["task_group.nested_task_group"]
+        .children["task_group.nested_task_group.another_task_group"]
+        .children["task_group.nested_task_group.another_task_group.task"]
+    )
+    assert test_task.retries == 1
+    assert test_task.owner == "y"
+    assert test_task.execution_timeout == timedelta(seconds=10)
+
+
+def test_task_group_display_name_used_as_label():
+    """Test that the group_display_name for TaskGroup is used as the label for display on the UI."""
+
+    @dag(schedule=None, start_date=pendulum.datetime(2022, 1, 1))
+    def pipeline():
+        @task_group(group_display_name="my_custom_name")
+        def tg():
+            pass
+
+        tg()
+
+    p = pipeline()
+
+    assert p.task_group_dict["tg"].label == "my_custom_name"

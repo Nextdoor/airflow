@@ -1,0 +1,648 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+import base64
+import json
+import logging
+import pickle
+import warnings
+from types import SimpleNamespace
+from unittest import mock
+from unittest.mock import call, patch
+
+import pytest
+import tenacity
+from aiohttp import BasicAuth
+from requests import Response
+from requests.models import RequestEncodingMixin
+
+from airflow.hooks import base
+from airflow.models import Connection
+from airflow.providers.common.compat.sdk import AirflowException, TaskDeferred
+from airflow.providers.http.hooks.http import HttpHook
+from airflow.providers.http.operators.http import (
+    HTTP_DEFERRABLE_DOCS,
+    IDEMPOTENT_METHODS,
+    HttpOperator,
+)
+from airflow.providers.http.triggers.http import HttpResponseSerializer, HttpTrigger, serialize_auth_type
+
+_DEFER_WARN_FRAGMENT = "may send duplicate requests if the Triggerer restarts"
+
+
+@mock.patch.dict("os.environ", AIRFLOW_CONN_HTTP_EXAMPLE="http://www.example.com")
+class TestHttpOperator:
+    @pytest.fixture(autouse=True)
+    def setup_connections(self, create_connection_without_db):
+        create_connection_without_db(
+            Connection(
+                conn_id="http_default", conn_type="http", host="test:8080/", extra='{"bearer": "test"}'
+            )
+        )
+
+    def test_response_in_logs(self, requests_mock):
+        """
+        Test that when using HttpOperator with 'GET',
+        the log contains 'Example Domain' in it
+        """
+
+        requests_mock.get("http://www.example.com", text="Example.com fake response")
+        operator = HttpOperator(
+            task_id="test_HTTP_op",
+            method="GET",
+            endpoint="/",
+            http_conn_id="HTTP_EXAMPLE",
+            log_response=True,
+        )
+
+        result = operator.execute("Example.com fake response")
+        assert result == "Example.com fake response"
+
+    def test_response_in_logs_after_failed_check(self, requests_mock):
+        """
+        Test that when using HttpOperator with log_response=True,
+        the response is logged even if request_check fails
+        """
+
+        def response_check(response):
+            return response.text != "invalid response"
+
+        requests_mock.get("http://www.example.com", text="invalid response")
+        operator = HttpOperator(
+            task_id="test_HTTP_op",
+            method="GET",
+            endpoint="/",
+            http_conn_id="HTTP_EXAMPLE",
+            log_response=True,
+            response_check=response_check,
+        )
+
+        with mock.patch.object(operator.log, "info") as mock_info:
+            with pytest.raises(AirflowException):
+                operator.execute({})
+            calls = [mock.call("Calling HTTP method"), mock.call("invalid response")]
+            mock_info.assert_has_calls(calls, any_order=True)
+
+    def test_filters_response(self, requests_mock):
+        requests_mock.get("http://www.example.com", json={"value": 5})
+        operator = HttpOperator(
+            task_id="test_HTTP_op",
+            method="GET",
+            endpoint="/",
+            http_conn_id="HTTP_EXAMPLE",
+            response_filter=lambda response: response.json(),
+        )
+        result = operator.execute({})
+        assert result == {"value": 5}
+
+    def test_async_defer_successfully(self, requests_mock):
+        operator = HttpOperator(
+            task_id="test_HTTP_op",
+            deferrable=True,
+        )
+        with pytest.raises(TaskDeferred) as exc:
+            operator.execute({})
+        assert isinstance(exc.value.trigger, HttpTrigger), "Trigger is not a HttpTrigger"
+
+    def _defer_warning_records(self, caplog):
+        return [
+            r
+            for r in caplog.records
+            if r.levelno >= logging.WARNING and _DEFER_WARN_FRAGMENT in r.getMessage()
+        ]
+
+    @pytest.mark.parametrize(
+        ("method", "deferrable", "expect_warning"),
+        [
+            # E1: lowercase non-idempotent
+            ("post", True, True),
+            # E6: PATCH is not idempotent (RFC 9110)
+            ("PATCH", True, True),
+            # E7: PUT / DELETE are idempotent — do not warn
+            ("PUT", True, False),
+            ("DELETE", True, False),
+            # E8: deferrable=False + POST — no warning
+            ("POST", False, False),
+            # E9: custom method outside the idempotent set
+            ("REPORT", True, True),
+            # Standard defaults / safe methods
+            ("POST", True, True),
+            ("GET", True, False),
+            ("HEAD", True, False),
+            ("OPTIONS", True, False),
+            ("TRACE", True, False),
+            ("get", True, False),
+        ],
+    )
+    def test_deferrable_non_idempotent_warning_on_execute(
+        self, monkeypatch, caplog, method, deferrable, expect_warning
+    ):
+        """Exactly one log.warning per task attempt when deferrable + non-idempotent; else zero."""
+        captured = self._capture_defer(monkeypatch) if deferrable else None
+        operator = HttpOperator(task_id="test_HTTP_op", method=method, deferrable=deferrable)
+
+        with caplog.at_level(logging.WARNING):
+            if deferrable:
+                operator.execute(context={})
+            else:
+                # Non-deferrable path needs a network mock; only assert no advisory was logged.
+                with mock.patch.object(operator, "execute_sync", return_value="ok") as sync:
+                    result = operator.execute(context={})
+                assert result == "ok"
+                sync.assert_called_once()
+
+        records = self._defer_warning_records(caplog)
+        if expect_warning:
+            assert len(records) == 1
+            message = records[0].getMessage()
+            assert f"method={method}" in message
+            assert HTTP_DEFERRABLE_DOCS in message
+            assert "issues/67945" not in message
+            assert "warn_on_non_idempotent=False" in message
+        else:
+            assert len(records) == 0
+
+        if deferrable:
+            assert isinstance(captured["trigger"], HttpTrigger)
+
+    def test_silences_warning_when_warn_on_non_idempotent_false(self, monkeypatch, caplog):
+        captured = self._capture_defer(monkeypatch)
+        operator = HttpOperator(
+            task_id="test_HTTP_op",
+            method="POST",
+            deferrable=True,
+            warn_on_non_idempotent=False,
+        )
+
+        with caplog.at_level(logging.WARNING):
+            operator.execute(context={})
+
+        assert self._defer_warning_records(caplog) == []
+        assert isinstance(captured["trigger"], HttpTrigger)
+
+    def test_does_not_warn_on_construction_for_deferrable_post(self, caplog):
+        """E10: construction / parse-time must not warn (would flood the Dag processor)."""
+        with caplog.at_level(logging.WARNING), warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            HttpOperator(task_id="test_HTTP_op", method="POST", deferrable=True)
+
+        assert self._defer_warning_records(caplog) == []
+        assert not [w for w in caught if _DEFER_WARN_FRAGMENT in str(w.message)]
+
+    def test_deferrable_method_none_does_not_raise_and_warns(self, monkeypatch, caplog):
+        """E2: method is None — guard so .upper() is not called on None; treat as non-idempotent."""
+        captured = self._capture_defer(monkeypatch)
+        operator = HttpOperator(task_id="test_HTTP_op", method="POST", deferrable=True)
+        operator.method = None
+
+        with caplog.at_level(logging.WARNING):
+            operator.execute(context={})
+
+        assert len(self._defer_warning_records(caplog)) == 1
+        assert isinstance(captured["trigger"], HttpTrigger)
+
+    def test_paginated_deferrable_non_idempotent_warns_once(self, monkeypatch, caplog):
+        """E3: paginated non-idempotent — exactly ONE warning for the task attempt, not per page."""
+        captured_defers: list[dict] = []
+
+        def _fake_defer(self, *, trigger, method_name, **kwargs):
+            captured_defers.append({"trigger": trigger, "kwargs": kwargs})
+
+        monkeypatch.setattr(HttpOperator, "defer", _fake_defer)
+
+        def pagination_function(response: Response) -> dict | None:
+            if response.url.endswith("/page1"):
+                return {"endpoint": "/page2"}
+            return None
+
+        operator = HttpOperator(
+            task_id="test_HTTP_op",
+            method="POST",
+            deferrable=True,
+            pagination_function=pagination_function,
+        )
+
+        with caplog.at_level(logging.WARNING):
+            operator.execute(context={})
+            # Simulate first page completing and requesting another page (second defer).
+            page1 = Response()
+            page1._content = b'{"page": 1}'
+            page1.url = "http://test:8080/page1"
+            page1.status_code = 200
+            page1.headers["Content-Type"] = "application/json"
+            operator.execute_complete(
+                context={},
+                event={
+                    "status": "success",
+                    "response": HttpResponseSerializer.serialize(page1),
+                },
+            )
+
+        assert len(self._defer_warning_records(caplog)) == 1
+        # Initial execute defers once; execute_complete with pagination defers again — still one warn.
+        assert len(captured_defers) == 2
+
+    def test_http_trigger_deserialize_emits_no_warning(self, caplog):
+        """E4/E5: Trigger reconstruct from serialized kwargs (Triggerer restart) must not warn."""
+        trigger = HttpTrigger(method="POST", endpoint="/", http_conn_id="http_default")
+        classpath, kwargs = trigger.serialize()
+        assert classpath.endswith("HttpTrigger")
+
+        with caplog.at_level(logging.WARNING), warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            # Triggerer path: trigger_class(**deserialised_kwargs)
+            reconstructed = HttpTrigger(**kwargs)
+
+        assert reconstructed.method == "POST"
+        assert self._defer_warning_records(caplog) == []
+        assert not [w for w in caught if _DEFER_WARN_FRAGMENT in str(w.message)]
+        assert not any(issubclass(w.category, UserWarning) for w in caught)
+
+    def test_idempotent_methods_match_rfc9110(self):
+        # PUT and DELETE are idempotent per RFC 9110 §9.2.2 even though not safe.
+        assert "PUT" in IDEMPOTENT_METHODS
+        assert "DELETE" in IDEMPOTENT_METHODS
+        assert "PATCH" not in IDEMPOTENT_METHODS
+        assert "POST" not in IDEMPOTENT_METHODS
+
+    def test_deferrable_warning_links_to_stable_docs(self, monkeypatch, caplog):
+        self._capture_defer(monkeypatch)
+        operator = HttpOperator(task_id="test_HTTP_op", method="POST", deferrable=True)
+
+        with caplog.at_level(logging.WARNING):
+            operator.execute(context={})
+
+        records = self._defer_warning_records(caplog)
+        assert len(records) == 1
+        message = records[0].getMessage()
+        assert HTTP_DEFERRABLE_DOCS in message
+        assert "issues/67945" not in message
+
+    def test_async_execute_successfully(self, requests_mock):
+        operator = HttpOperator(
+            task_id="test_HTTP_op",
+            deferrable=True,
+        )
+        response = Response()
+        response._content = b"content"
+        result = operator.execute_complete(
+            context={},
+            event={
+                "status": "success",
+                "response": HttpResponseSerializer.serialize(response),
+            },
+        )
+        assert result == "content"
+
+    def test_async_execute_legacy_pickle_format_raise_error(self):
+        """Test error raised with legacy pickle format."""
+        operator = HttpOperator(
+            task_id="test_HTTP_op",
+            deferrable=True,
+        )
+        response = Response()
+        response._content = b"content"
+
+        with pytest.raises(TypeError, match="Response data must be a dict, got str"):
+            _ = operator.execute_complete(
+                context={},
+                event={
+                    "status": "success",
+                    "response": base64.standard_b64encode(pickle.dumps(response)).decode("ascii"),
+                },
+            )
+
+    @pytest.mark.parametrize(
+        (
+            "data",
+            "headers",
+            "extra_options",
+            "pagination_data",
+            "pagination_headers",
+            "pagination_extra_options",
+        ),
+        [
+            ({"data": 1}, {"x-head": "1"}, {"verify": False}, {"data": 2}, {"x-head": "0"}, {"verify": True}),
+            ("data foo", {"x-head": "1"}, {"verify": False}, {"data": 2}, {"x-head": "0"}, {"verify": True}),
+            ("data foo", {"x-head": "1"}, {"verify": False}, "data bar", {"x-head": "0"}, {"verify": True}),
+            ({"data": 1}, {"x-head": "1"}, {"verify": False}, "data foo", {"x-head": "0"}, {"verify": True}),
+        ],
+    )
+    def test_pagination(
+        self,
+        requests_mock,
+        data,
+        headers,
+        extra_options,
+        pagination_data,
+        pagination_headers,
+        pagination_extra_options,
+    ):
+        """
+        Test that the HttpOperator calls repetitively the API when a
+        pagination_function is provided, and as long as this function returns
+        a dictionary that override previous' call parameters.
+        """
+        is_second_call: bool = False
+        extra_options_verify = extra_options["verify"]
+
+        def pagination_function(response: Response) -> dict | None:
+            """Paginated function which returns None at the second call."""
+            nonlocal is_second_call
+            if not is_second_call:
+                is_second_call = True
+                return dict(
+                    endpoint=response.json()["endpoint"],
+                    data=pagination_data,
+                    headers=pagination_headers,
+                    extra_options=pagination_extra_options,
+                )
+            return None
+
+        first_endpoint = requests_mock.post("http://www.example.com/1", json={"value": 5, "endpoint": "2"})
+        second_endpoint = requests_mock.post("http://www.example.com/2", json={"value": 10, "endpoint": "3"})
+        operator = HttpOperator(
+            task_id="test_HTTP_op",
+            method="POST",
+            endpoint="/1",
+            data=data,
+            headers=headers,
+            extra_options=extra_options,
+            http_conn_id="HTTP_EXAMPLE",
+            pagination_function=pagination_function,
+            response_filter=lambda resp: [entry.json()["value"] for entry in resp],
+        )
+        result = operator.execute({})
+
+        # Ensure the initial call is made with parameters passed to the Operator
+        first_call = first_endpoint.request_history[0]
+        assert first_call.headers.items() >= headers.items()
+        assert first_call.body == RequestEncodingMixin._encode_params(data)
+        assert first_call.verify == extra_options_verify
+
+        # Ensure the second - paginated - call is made with parameters merged from the pagination function
+        second_call = second_endpoint.request_history[0]
+        assert second_call.headers.items() >= pagination_headers.items()
+        assert second_call.body == RequestEncodingMixin._encode_params(pagination_data)
+        assert second_call.verify is pagination_extra_options["verify"]
+
+        assert result == [5, 10]
+
+    def test_async_pagination(self, requests_mock):
+        """
+        Test that the HttpOperator calls asynchronously and repetitively
+        the API when a pagination_function is provided, and as long as this function
+        returns a dictionary that override previous' call parameters.
+        """
+
+        values = iter([5, 10])
+
+        def make_response_object() -> Response:
+            response = Response()
+            response._content = json.dumps({"value": next(values)}).encode()
+            return response
+
+        def create_resume_response_parameters() -> dict:
+            response = make_response_object()
+            return dict(
+                context={},
+                event={
+                    "status": "success",
+                    "response": HttpResponseSerializer.serialize(response),
+                },
+            )
+
+        has_returned: bool = False
+
+        def pagination_function(response: Response) -> dict | None:
+            """Paginated function which returns None at the second call."""
+            nonlocal has_returned
+            if not has_returned:
+                has_returned = True
+                return dict(endpoint="/")
+            return None
+
+        operator = HttpOperator(
+            task_id="test_HTTP_op",
+            pagination_function=pagination_function,
+            deferrable=True,
+        )
+
+        with pytest.raises(TaskDeferred) as exc_info:
+            operator.execute_complete(**create_resume_response_parameters())
+
+        paginated_responses = exc_info.value.kwargs["paginated_responses"]
+        assert [r.text for r in paginated_responses] == ['{"value": 5}']
+
+        result = operator.execute_complete(
+            **create_resume_response_parameters(), paginated_responses=paginated_responses
+        )
+        assert result == ['{"value": 5}', '{"value": 10}']
+
+    def test_async_pagination_with_response_filter(self, requests_mock):
+        """The response_filter must receive every accumulated page on the final resume."""
+        values = iter([1, 2, 3])
+
+        def make_response_object() -> Response:
+            response = Response()
+            response._content = json.dumps({"value": next(values)}).encode()
+            return response
+
+        def create_resume_response_parameters() -> dict:
+            return dict(
+                context={},
+                event={
+                    "status": "success",
+                    "response": HttpResponseSerializer.serialize(make_response_object()),
+                },
+            )
+
+        remaining_pages = {"count": 2}
+
+        def pagination_function(response: Response) -> dict | None:
+            if remaining_pages["count"] > 0:
+                remaining_pages["count"] -= 1
+                return dict(endpoint="/")
+            return None
+
+        operator = HttpOperator(
+            task_id="test_HTTP_op",
+            pagination_function=pagination_function,
+            deferrable=True,
+            response_filter=lambda resp: [entry.json()["value"] for entry in resp],
+        )
+
+        with pytest.raises(TaskDeferred) as exc_info:
+            operator.execute_complete(**create_resume_response_parameters())
+        paginated_responses = exc_info.value.kwargs["paginated_responses"]
+
+        with pytest.raises(TaskDeferred) as exc_info:
+            operator.execute_complete(
+                **create_resume_response_parameters(), paginated_responses=paginated_responses
+            )
+        paginated_responses = exc_info.value.kwargs["paginated_responses"]
+
+        result = operator.execute_complete(
+            **create_resume_response_parameters(), paginated_responses=paginated_responses
+        )
+        assert result == [1, 2, 3]
+
+    def test_async_execute_complete_without_pagination_returns_single_response(self, requests_mock):
+        """Without a pagination_function, the resume call must return the lone response as before."""
+        operator = HttpOperator(
+            task_id="test_HTTP_op",
+            deferrable=True,
+        )
+        response = Response()
+        response._content = b'{"value": 1}'
+        result = operator.execute_complete(
+            context={},
+            event={
+                "status": "success",
+                "response": HttpResponseSerializer.serialize(response),
+            },
+        )
+        assert result == '{"value": 1}'
+
+    @patch.object(HttpHook, "run_with_advanced_retry")
+    def test_retry_args(self, mock_run_with_advanced_retry, requests_mock):
+        requests_mock.get("http://www.example.com", exc=Exception("Example Exception"))
+        retry_args = dict(
+            wait=tenacity.wait_none(),
+            stop=tenacity.stop_after_attempt(5),
+            retry=tenacity.retry_if_exception_type(Exception),
+        )
+        operator = HttpOperator(
+            task_id="test_HTTP_op",
+            method="GET",
+            endpoint="/",
+            http_conn_id="HTTP_EXAMPLE",
+            retry_args=retry_args,
+        )
+        operator.execute({})
+        mock_run_with_advanced_retry.assert_called_with(retry_args, "/", {}, {}, {})
+        assert mock_run_with_advanced_retry.call_count == 1
+
+    @patch.object(HttpHook, "run_with_advanced_retry")
+    def test_pagination_retry_args(
+        self,
+        mock_run_with_advanced_retry,
+        requests_mock,
+    ):
+        is_second_call: bool = False
+
+        def pagination_function(response: Response) -> dict | None:
+            """Paginated function which returns None at the second call."""
+            nonlocal is_second_call
+            if not is_second_call:
+                is_second_call = True
+                return dict(
+                    endpoint=response.json()["endpoint"],
+                )
+            return None
+
+        retry_args = dict(
+            wait=tenacity.wait_none(),
+            stop=tenacity.stop_after_attempt(5),
+            retry=tenacity.retry_if_exception_type(Exception),
+        )
+        operator = HttpOperator(
+            task_id="test_HTTP_op",
+            method="GET",
+            endpoint="/",
+            http_conn_id="HTTP_EXAMPLE",
+            pagination_function=pagination_function,
+            retry_args=retry_args,
+        )
+
+        response = Response()
+        response.status_code = 200
+        response._content = json.dumps({"value": 5, "endpoint": "/"}).encode("utf-8")
+        response.headers["Content-Type"] = "application/json"
+
+        mock_run_with_advanced_retry.return_value = response
+        operator.execute({})
+        mock_run_with_advanced_retry.assert_has_calls(
+            [
+                call(retry_args, "/", {}, {}, {}),
+                call(retry_args, endpoint="/", data={}, headers={}, extra_options={}),
+            ]
+        )
+
+        assert mock_run_with_advanced_retry.call_count == 2
+
+    def _capture_defer(self, monkeypatch):
+        captured = {}
+
+        def _fake_defer(self, *, trigger, method_name, **kwargs):
+            captured["trigger"] = trigger
+            captured["kwargs"] = kwargs
+
+        monkeypatch.setattr(HttpOperator, "defer", _fake_defer)
+        return captured
+
+    @pytest.mark.parametrize(
+        ("login", "password", "auth_type", "expect_cls"),
+        [
+            ("user", "password", None, BasicAuth),
+            (None, None, None, type(None)),
+            ("user", "password", BasicAuth, BasicAuth),
+        ],
+    )
+    def test_auth_type_is_serialised_as_string(self, monkeypatch, login, password, auth_type, expect_cls):
+        monkeypatch.setattr(
+            base.BaseHook, "get_connection", lambda _cid: SimpleNamespace(login=login, password=password)
+        )
+        captured = self._capture_defer(monkeypatch)
+
+        HttpOperator(task_id="test_HTTP_op", deferrable=True, auth_type=auth_type).execute(context={})
+
+        trigger = captured["trigger"]
+        kwargs = captured["trigger"].serialize()[1]
+
+        expected_str = serialize_auth_type(expect_cls) if expect_cls is not type(None) else None
+        assert kwargs["auth_type"] == expected_str
+
+        assert trigger.auth_type == expect_cls or (trigger.auth_type is None and expect_cls is type(None))
+
+    def test_resolve_auth_type_variants(self, monkeypatch):
+        monkeypatch.setattr(
+            base.BaseHook, "get_connection", lambda _cid: SimpleNamespace(login="user", password="password")
+        )
+        assert HttpOperator(task_id="test_HTTP_op_1")._resolve_auth_type() is BasicAuth
+
+        class DummyAuth:
+            def __init__(self, *_, **__): ...
+
+        assert HttpOperator(task_id="test_HTTP_op_2", auth_type=DummyAuth)._resolve_auth_type() is DummyAuth
+
+        monkeypatch.setattr(
+            base.BaseHook, "get_connection", lambda _cid: SimpleNamespace(login=None, password=None)
+        )
+        assert HttpOperator(task_id="test_HTTP_op_3")._resolve_auth_type() is None
+
+    def test_http_conn_id_is_templated(self):
+        operator = HttpOperator(
+            task_id="test_HTTP_op",
+            endpoint="/",
+            http_conn_id="{{ conn_id }}",
+        )
+        assert "http_conn_id" in operator.template_fields
+        operator.render_template_fields({"conn_id": "http_staging"})
+        assert operator.http_conn_id == "http_staging"

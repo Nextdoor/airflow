@@ -1,0 +1,294 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+import json
+
+import pytest
+from packaging.version import Version
+
+
+def date_param():
+    import random
+    from datetime import datetime, timedelta
+
+    from dateutil.relativedelta import relativedelta
+
+    # original datetime string
+    dt_str = "2025-10-25T00:02:00+00:00"
+
+    # parse to datetime object
+    dt = datetime.fromisoformat(dt_str)
+
+    # boundaries
+    start = dt - relativedelta(months=1)
+    end = dt + relativedelta(months=1)
+
+    # pick random time between start and end
+    delta = end - start
+    random_seconds = random.randint(0, int(delta.total_seconds()))
+    random_dt = start + timedelta(seconds=random_seconds)
+    return random_dt.isoformat()
+
+
+# Passing password via command line is insecure but acceptable for testing purposes
+# Please do not do this in production, it enables possibility of exposing your credentials
+CREDENTIAL_SUFFIX = "--username airflow --password airflow"
+LOGIN_COMMAND = f"auth login {CREDENTIAL_SUFFIX}"
+LOGIN_COMMAND_SKIP_KEYRING = "auth login --skip-keyring"
+LOGIN_OUTPUT = "Login successful! Welcome to airflowctl!"
+TEST_COMMANDS = [
+    # Auth commands
+    f"auth token {CREDENTIAL_SUFFIX}",
+    "auth list-envs",
+    # Assets commands
+    "assets list",
+    "assets get 1",
+    "assets create-event --asset-id=1",
+    "assets set-state-store 1 test_key test_value",
+    "assets get-state-store 1 test_key",
+    "assets list-state-store 1",
+    "assets delete-state-store 1 test_key",
+    "assets set-state-store 1 clear_key value",
+    "assets clear-state-store 1",
+    # Backfill commands
+    "backfill list example_bash_operator",
+    # Config commands
+    "config get core executor",
+    "config list",
+    "config lint",
+    # Connections commands
+    "connections create --connection-id=test_con --conn-type=mysql --password=TEST_PASS -o json",
+    "connections list",
+    "connections list -o yaml",
+    "connections list -o table",
+    "connections get test_con",
+    "connections get test_con -o json",
+    "connections update --connection-id=test_con --conn-type=postgres",
+    "connections import tests/airflowctl_tests/fixtures/test_connections.json",
+    "connections delete test_con",
+    "connections delete test_import_conn",
+    # Dags commands
+    "dags list",
+    "dags get example_bash_operator",
+    "dags get-details example_bash_operator",
+    "dags get-stats example_bash_operator",
+    "dags get-tags",
+    "dags get-version example_bash_operator 1",
+    "dags list-import-errors",
+    "dags list-version example_bash_operator",
+    "dags list-warning",
+    # Order of trigger, state, and pause/unpause is important for test stability
+    "dags trigger example_bash_operator --logical-date={date_param} --run-after={date_param}",
+    'dags state example_bash_operator "manual__{date_param}"',
+    'dags state example_bash_operator --logical-date "{date_param}"',
+    # Test trigger without logical-date (should default to now)
+    "dags trigger example_bash_operator",
+    "dags next-execution example_bash_operator",
+    "dags pause example_bash_operator",
+    "dags unpause example_bash_operator",
+    # Dag Run commands
+    'dagrun get example_bash_operator "manual__{date_param}"',
+    "dags update example_bash_operator --no-is-paused",
+    # Dag Run commands
+    "dagrun list --dag-id example_bash_operator --state success --limit=1",
+    # Tasks commands
+    "tasks get example_bash_operator runme_0",
+    "tasks list example_bash_operator",
+    'tasks failed-deps example_bash_operator runme_0 "manual__{date_param}"',
+    'tasks failed-deps example_bash_operator runme_0 --logical-date "{date_param}"',
+    'tasks states-for-dag-run example_bash_operator "manual__{date_param}"',
+    'tasks states-for-dag-run example_bash_operator --logical-date "{date_param}"',
+    'tasks state example_bash_operator runme_0 "manual__{date_param}"',
+    'tasks state example_bash_operator runme_0 --logical-date "{date_param}"',
+    'tasks logs example_bash_operator "manual__{date_param}" runme_0 --try-number 1',
+    'tasks clear example_bash_operator --dag-run-id "manual__{date_param}" --task-ids runme_0 -o json',
+    # Task Instances commands
+    'taskinstances get example_bash_operator "manual__{date_param}" runme_0',
+    'taskinstances get-dependencies example_bash_operator "manual__{date_param}" runme_0',
+    'taskinstances logs example_bash_operator "manual__{date_param}" runme_0 1',
+    'taskinstances list example_bash_operator "manual__{date_param}"',
+    'taskinstances state-store set example_bash_operator "manual__{date_param}" runme_0 test_key test_value',
+    'taskinstances state-store get example_bash_operator "manual__{date_param}" runme_0 test_key',
+    'taskinstances state-store list example_bash_operator "manual__{date_param}" runme_0',
+    'taskinstances state-store update example_bash_operator "manual__{date_param}" runme_0 test_key new_value',
+    'taskinstances state-store delete example_bash_operator "manual__{date_param}" runme_0 test_key',
+    'taskinstances state-store set example_bash_operator "manual__{date_param}" runme_0 clear_key value',
+    'taskinstances state-store clear example_bash_operator "manual__{date_param}" runme_0',
+    # XCom commands - need a Dag run with completed tasks
+    'xcom add example_bash_operator "manual__{date_param}" runme_0 {xcom_key} \'{{"test": "value"}}\'',
+    'xcom get example_bash_operator "manual__{date_param}" runme_0 {xcom_key}',
+    'xcom list example_bash_operator "manual__{date_param}" runme_0',
+    'xcom edit example_bash_operator "manual__{date_param}" runme_0 {xcom_key} \'{{"updated": "value"}}\'',
+    'xcom delete example_bash_operator "manual__{date_param}" runme_0 {xcom_key}',
+    # Delete Dag run command - needs to run after xcom ops
+    'dagrun delete example_bash_operator "manual__{date_param}"',
+    # Jobs commands
+    "jobs list",
+    # Pools commands
+    "pools create --name=test_pool --slots=5",
+    "pools list",
+    "pools get test_pool",
+    "pools get test_pool -o yaml",
+    "pools update --pool=test_pool --slots=10 --no-include-deferred",
+    "pools import tests/airflowctl_tests/fixtures/test_pools.json",
+    "pools export tests/airflowctl_tests/fixtures/pools_export.json --output=json",
+    "pools delete test_pool",
+    "pools delete test_import_pool",
+    # Providers commands
+    "providers list",
+    "providers get apache-airflow-providers-standard",
+    # Variables commands
+    "variables create --key=test_key --value=test_value",
+    "variables list",
+    "variables get test_key",
+    "variables get test_key -o table",
+    "variables update --key=test_key --value=updated_value",
+    "variables import tests/airflowctl_tests/fixtures/test_variables.json",
+    "variables delete test_key",
+    "variables delete test_import_var",
+    "variables delete test_import_var_with_desc",
+    # Plugins command
+    "plugins list",
+    "plugins list-import-errors",
+]
+
+# The first Airflow version whose API serves each command, keyed by `_get_command_id`.
+MIN_AIRFLOW_VERSIONS = {
+    "assets set-state-store": Version("3.3.0"),
+    "assets get-state-store": Version("3.3.0"),
+    "assets list-state-store": Version("3.3.0"),
+    "assets delete-state-store": Version("3.3.0"),
+    "assets clear-state-store": Version("3.3.0"),
+    "taskinstances state-store": Version("3.3.0"),
+}
+
+NO_AUTH_TEST_COMMANDS = [
+    "version --remote",
+]
+
+DATE_PARAM_1 = date_param()
+DATE_PARAM_2 = date_param()
+
+# Unique xcom key per test run to avoid "already exists" errors from leftover state
+_XCOM_KEY_1 = f"test_xcom_key_{DATE_PARAM_1.replace(':', '').replace('+', '').replace('-', '')[:16]}"
+_XCOM_KEY_2 = f"test_xcom_key_{DATE_PARAM_2.replace(':', '').replace('+', '').replace('-', '')[:16]}"
+TEST_COMMANDS_DEBUG_MODE = [LOGIN_COMMAND] + [
+    test.format(date_param=DATE_PARAM_1, xcom_key=_XCOM_KEY_1) for test in TEST_COMMANDS
+]
+TEST_COMMANDS_SKIP_KEYRING = [LOGIN_COMMAND_SKIP_KEYRING] + [
+    test.format(date_param=DATE_PARAM_2, xcom_key=_XCOM_KEY_2) for test in TEST_COMMANDS
+]
+
+
+def _get_command_id(command: str) -> str:
+    return " ".join(command.split(" ", 2)[:2])
+
+
+def _skip_if_unsupported(command: str, airflow_version: Version) -> None:
+    min_version = MIN_AIRFLOW_VERSIONS.get(_get_command_id(command))
+    if min_version and airflow_version < min_version:
+        pytest.skip(f"needs Airflow >= {min_version}, the server runs {airflow_version}")
+
+
+def test_min_airflow_versions_match_test_commands():
+    """A renamed command must be renamed here too, or its version gate silently stops applying."""
+    stale_command_ids = set(MIN_AIRFLOW_VERSIONS) - {_get_command_id(command) for command in TEST_COMMANDS}
+    assert not stale_command_ids
+
+
+def test_hardcoded_xcom_key_would_collide():
+    """Regression: a hardcoded xcom key produces identical 'xcom add' commands
+    across parametrize sets, causing 'already exists' errors when both run
+    against the same Airflow instance (the bug that was fixed)."""
+    xcom_add_template = [t for t in TEST_COMMANDS if "xcom add" in t]
+    assert xcom_add_template, "xcom add must be in TEST_COMMANDS"
+
+    hardcoded = xcom_add_template[0].format(date_param=DATE_PARAM_1, xcom_key="test_xcom_key")
+    also_hardcoded = xcom_add_template[0].format(date_param=DATE_PARAM_2, xcom_key="test_xcom_key")
+    # With a hardcoded key, only the dag-run-id differs — but if the same date
+    # is reused (e.g. across retries), the commands are fully identical → collision.
+    assert "test_xcom_key" in hardcoded
+    assert "test_xcom_key" in also_hardcoded
+
+    # The fix: derived keys are unique per set, so commands always differ.
+    debug_cmd = xcom_add_template[0].format(date_param=DATE_PARAM_1, xcom_key=_XCOM_KEY_1)
+    keyring_cmd = xcom_add_template[0].format(date_param=DATE_PARAM_2, xcom_key=_XCOM_KEY_2)
+    assert _XCOM_KEY_1 != _XCOM_KEY_2, "derived xcom keys must differ between sets"
+    assert debug_cmd != keyring_cmd, "xcom add commands must differ to avoid collisions"
+
+
+@pytest.mark.parametrize(
+    "command",
+    TEST_COMMANDS_DEBUG_MODE,
+    ids=[_get_command_id(command) for command in TEST_COMMANDS_DEBUG_MODE],
+)
+def test_airflowctl_commands(command: str, airflow_version: Version, run_command):
+    """Test airflowctl commands using docker-compose environment."""
+    _skip_if_unsupported(command, airflow_version)
+    run_command(command=command, env_vars={"AIRFLOW_CLI_DEBUG_MODE": "true"}, skip_login=True)
+
+
+@pytest.mark.parametrize(
+    "command",
+    TEST_COMMANDS_SKIP_KEYRING,
+    ids=[_get_command_id(command) for command in TEST_COMMANDS_SKIP_KEYRING],
+)
+def test_airflowctl_commands_skip_keyring(
+    command: str, api_token: str, airflow_version: Version, run_command
+):
+    """Test airflowctl commands using docker-compose environment without using keyring."""
+    _skip_if_unsupported(command, airflow_version)
+    run_command(
+        command=command,
+        env_vars={
+            "AIRFLOW_CLI_TOKEN": api_token,
+            "AIRFLOW_CLI_DEBUG_MODE": "false",
+            "AIRFLOW_CLI_ENVIRONMENT": "nokeyring",
+        },
+        skip_login=True,
+    )
+
+
+def test_backfill_create_dry_run_lists_the_runs_it_would_create(api_token, run_command, tmp_path):
+    # 2024 stays clear of the runs triggered above, which a dry run would leave out.
+    output = run_command(
+        command="backfill create-dry-run --dag-id example_bash_operator "
+        "--from-date 2024-01-01T00:00:00+00:00 --to-date 2024-01-03T00:00:00+00:00 -o json",
+        env_vars={"AIRFLOW_HOME": str(tmp_path), "AIRFLOW_CLI_TOKEN": api_token},
+        skip_login=True,
+    )
+    # A server older than 3.2 omits the partition fields, and that warning precedes the JSON.
+    assert [row["logical_date"] for row in json.loads(output.splitlines()[-1])] == [
+        "2024-01-01T00:00:00Z",
+        "2024-01-02T00:00:00Z",
+        "2024-01-03T00:00:00Z",
+    ]
+
+
+@pytest.mark.parametrize("command", NO_AUTH_TEST_COMMANDS)
+def test_airflowctl_no_auth_commands(command: str, run_command, tmp_path):
+    """Test airflowctl no-auth commands without login or persisted credentials."""
+    run_command(
+        command=command,
+        env_vars={
+            "AIRFLOW_HOME": str(tmp_path),
+            "AIRFLOW_CLI_ENVIRONMENT": "no-auth",
+            "AIRFLOW_CLI_DEBUG_MODE": "false",
+        },
+        skip_login=True,
+    )

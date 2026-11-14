@@ -17,34 +17,55 @@
 """
 Useful tools for various Paths used inside Airflow Sources.
 """
+
 from __future__ import annotations
 
+import contextlib
+import errno
 import hashlib
 import os
 import platform
+import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
-from functools import lru_cache
+import uuid
 from pathlib import Path
 
 from airflow_breeze import NAME
-from airflow_breeze.utils.console import get_console
-from airflow_breeze.utils.reinstall import reinstall_breeze, warn_dependencies_changed, warn_non_editable
+from airflow_breeze.utils.console import console_print
+from airflow_breeze.utils.functools_cache import clearable_cache
+from airflow_breeze.utils.reinstall import inform_about_self_upgrade, reinstall_breeze, warn_non_editable
 from airflow_breeze.utils.shared_options import get_verbose, set_forced_answer
 
-AIRFLOW_CFG_FILE = "setup.cfg"
+PYPROJECT_TOML_FILE = "pyproject.toml"
+
+# Location and markers of the breeze shim installed by scripts/tools/setup_breeze
+# (ADR 0017). Used to detect a stale installed shim and tell the user to re-run
+# the setup script.
+BREEZE_SHIM_PATH = Path.home() / ".local" / "bin" / "breeze"
+BREEZE_SHIM_MARKER = "Apache Airflow breeze shim — managed by scripts/tools/setup_breeze"
+BREEZE_SHIM_VERSION_PREFIX = "# breeze-shim-version:"
+SETUP_BREEZE_SHIM_VERSION_PREFIX = "SHIM_VERSION="
 
 
-def search_upwards_for_airflow_sources_root(start_from: Path) -> Path | None:
+def search_upwards_for_airflow_root_path(start_from: Path) -> Path | None:
     root = Path(start_from.root)
-    d = start_from
-    while d != root:
-        attempt = d / AIRFLOW_CFG_FILE
-        if attempt.exists() and "name = apache-airflow\n" in attempt.read_text():
-            return attempt.parent
-        d = d.parent
+    directory = start_from
+    while directory != root:
+        airflow_candidate_init_py = directory / "airflow-core" / "src" / "airflow" / "__init__.py"
+        if airflow_candidate_init_py.exists() and "airflow" in airflow_candidate_init_py.read_text().lower():
+            return directory
+        airflow_2_candidate_init_py = directory / "airflow" / "__init__.py"
+        if (
+            airflow_2_candidate_init_py.exists()
+            and "airflow" in airflow_2_candidate_init_py.read_text().lower()
+            and directory.parent.name != "src"
+        ):
+            return directory
+        directory = directory.parent
     return None
 
 
@@ -60,13 +81,13 @@ def in_help() -> bool:
     return "--help" in sys.argv or "-h" in sys.argv
 
 
-def skip_upgrade_check():
+def skip_breeze_self_upgrade_check():
     return (
         in_self_upgrade()
         or in_autocomplete()
         or in_help()
         or hasattr(sys, "_called_from_test")
-        or os.environ.get("SKIP_UPGRADE_CHECK")
+        or os.environ.get("SKIP_BREEZE_SELF_UPGRADE_CHECK")
     )
 
 
@@ -74,35 +95,10 @@ def skip_group_output():
     return in_autocomplete() or in_help() or os.environ.get("SKIP_GROUP_OUTPUT") is not None
 
 
-def get_package_setup_metadata_hash() -> str:
-    """
-    Retrieves hash of setup files from the source of installation of Breeze.
-
-    This is used in order to determine if we need to upgrade Breeze, because some
-    setup files changed. Blake2b algorithm will not be flagged by security checkers
-    as insecure algorithm (in Python 3.9 and above we can use `usedforsecurity=False`
-    to disable it, but for now it's better to use more secure algorithms.
-    """
-    # local imported to make sure that autocomplete works
-    try:
-        from importlib.metadata import distribution  # type: ignore[attr-defined]
-    except ImportError:
-        from importlib_metadata import distribution  # type: ignore[no-redef]
-
-    prefix = "Package config hash: "
-
-    for line in distribution("apache-airflow-breeze").metadata.as_string().splitlines(keepends=False):
-        if line.startswith(prefix):
-            return line[len(prefix) :]
-    return "NOT FOUND"
-
-
-def get_sources_setup_metadata_hash(sources: Path) -> str:
+def get_pyproject_toml_hash(sources: Path) -> str:
     try:
         the_hash = hashlib.new("blake2b")
-        the_hash.update((sources / "dev" / "breeze" / "setup.py").read_bytes())
-        the_hash.update((sources / "dev" / "breeze" / "setup.cfg").read_bytes())
-        the_hash.update((sources / "dev" / "breeze" / "pyproject.toml").read_bytes())
+        the_hash.update((sources / "dev" / "breeze" / PYPROJECT_TOML_FILE).read_bytes())
         return the_hash.hexdigest()
     except FileNotFoundError as e:
         return f"Missing file {e.filename}"
@@ -110,7 +106,7 @@ def get_sources_setup_metadata_hash(sources: Path) -> str:
 
 def get_installation_sources_config_metadata_hash() -> str:
     """
-    Retrieves hash of setup.py and setup.cfg files from the source of installation of Breeze.
+    Retrieves hash of pyproject.toml from the source of installation of Breeze.
 
     This is used in order to determine if we need to upgrade Breeze, because some
     setup files changed. Blake2b algorithm will not be flagged by security checkers
@@ -120,14 +116,14 @@ def get_installation_sources_config_metadata_hash() -> str:
     installation_sources = get_installation_airflow_sources()
     if installation_sources is None:
         return "NOT FOUND"
-    return get_sources_setup_metadata_hash(installation_sources)
+    return get_pyproject_toml_hash(installation_sources)
 
 
 def get_used_sources_setup_metadata_hash() -> str:
     """
     Retrieves hash of setup files from the currently used sources.
     """
-    return get_sources_setup_metadata_hash(get_used_airflow_sources())
+    return get_pyproject_toml_hash(get_used_airflow_sources())
 
 
 def set_forced_answer_for_upgrade_check():
@@ -140,15 +136,7 @@ def set_forced_answer_for_upgrade_check():
         set_forced_answer("quit")
 
 
-def process_breeze_readme(breeze_sources: Path, sources_hash: str):
-    breeze_readme = breeze_sources / "README.md"
-    lines = breeze_readme.read_text().splitlines(keepends=True)
-    result_lines = []
-    for line in lines:
-        if line.startswith("Package config hash:"):
-            line = f"Package config hash: {sources_hash}\n"
-        result_lines.append(line)
-    breeze_readme.write_text("".join(result_lines))
+MY_BREEZE_ROOT_PATH = Path(__file__).resolve().parents[1]
 
 
 def reinstall_if_setup_changed() -> bool:
@@ -157,27 +145,18 @@ def reinstall_if_setup_changed() -> bool:
     :return: True if warning was printed.
     """
     try:
-        package_hash = get_package_setup_metadata_hash()
-    except ModuleNotFoundError as e:
-        if "importlib_metadata" in e.msg:
-            return False
-        if "apache-airflow-breeze" in e.msg:
-            print(
-                """Missing Package `apache-airflow-breeze`.
-                   Use `pipx install -e ./dev/breeze` to install the package."""
-            )
-            return False
-    sources_hash = get_installation_sources_config_metadata_hash()
-    if sources_hash != package_hash:
-        installation_sources = get_installation_airflow_sources()
-        if installation_sources is not None:
-            breeze_sources = installation_sources / "dev" / "breeze"
-            warn_dependencies_changed()
-            process_breeze_readme(breeze_sources, sources_hash)
-            set_forced_answer_for_upgrade_check()
-            reinstall_breeze(breeze_sources)
-            set_forced_answer(None)
-        return True
+        res = subprocess.run(
+            ["uv", "tool", "upgrade", "apache-airflow-breeze"],
+            cwd=MY_BREEZE_ROOT_PATH,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        if res.returncode == 0 and "Modified" in res.stderr:
+            inform_about_self_upgrade()
+            return True
+    except FileNotFoundError:
+        pass
     return False
 
 
@@ -199,7 +178,7 @@ def get_installation_airflow_sources() -> Path | None:
     Retrieves the Root of the Airflow Sources where Breeze was installed from.
     :return: the Path for Airflow sources.
     """
-    return search_upwards_for_airflow_sources_root(Path(__file__).resolve().parent)
+    return search_upwards_for_airflow_root_path(Path(__file__).resolve().parent)
 
 
 def get_used_airflow_sources() -> Path:
@@ -208,7 +187,7 @@ def get_used_airflow_sources() -> Path:
     upwards in directory tree or sources where Breeze was installed from.
     :return: the Path for Airflow sources we use.
     """
-    current_sources = search_upwards_for_airflow_sources_root(Path.cwd())
+    current_sources = search_upwards_for_airflow_root_path(Path.cwd())
     if current_sources is None:
         current_sources = get_installation_airflow_sources()
         if current_sources is None:
@@ -217,13 +196,162 @@ def get_used_airflow_sources() -> Path:
     return current_sources
 
 
-@lru_cache(maxsize=None)
-def find_airflow_sources_root_to_operate_on() -> Path:
+def _parse_shim_version(shim_text: str) -> int | None:
+    """Read the ``# breeze-shim-version: N`` marker from an installed shim, if present."""
+    for line in shim_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(BREEZE_SHIM_VERSION_PREFIX):
+            value = stripped[len(BREEZE_SHIM_VERSION_PREFIX) :].strip()
+            try:
+                return int(value)
+            except ValueError:
+                return None
+    return None
+
+
+def get_expected_shim_version(airflow_sources: Path) -> int | None:
+    """Read ``SHIM_VERSION`` that the current sources' ``setup_breeze`` would install."""
+    setup_script = airflow_sources / "scripts" / "tools" / "setup_breeze"
+    try:
+        for line in setup_script.read_text().splitlines():
+            stripped = line.strip()
+            if stripped.startswith(SETUP_BREEZE_SHIM_VERSION_PREFIX):
+                value = stripped[len(SETUP_BREEZE_SHIM_VERSION_PREFIX) :].strip().strip("\"'")
+                try:
+                    return int(value)
+                except ValueError:
+                    return None
+    except OSError:
+        return None
+    return None
+
+
+def warn_if_shim_outdated(airflow_sources: Path, shim_text: str | None = None) -> bool:
     """
-    Find the root of airflow sources we operate on. Handle the case when Breeze is installed via `pipx` from
-    a different source tree, so it searches upwards of the current directory to find the right root of
-    airflow directory we are actually in. This **might** be different than the sources of Airflow Breeze
-    was installed from.
+    Warn if the installed breeze shim is older than the one the current sources would install.
+
+    The shim at ``~/.local/bin/breeze`` (see ADR 0017) carries a ``# breeze-shim-version: N``
+    marker. When the shim body changes, ``scripts/tools/setup_breeze`` bumps that version, so an
+    installed shim with a lower (or missing) version means the user is running a stale shim and
+    should re-run the setup script. Only our own managed shim is inspected — a ``uv tool`` / ``pipx``
+    install or a user's own script at that path is left alone.
+
+    :param airflow_sources: Airflow sources breeze is operating on.
+    :param shim_text: contents of the installed shim, if already read by the caller.
+    :return: True if a warning was printed.
+    """
+    if shim_text is None:
+        try:
+            shim_text = BREEZE_SHIM_PATH.read_text() if BREEZE_SHIM_PATH.is_file() else ""
+        except OSError:
+            return False
+    if BREEZE_SHIM_MARKER not in shim_text:
+        # Not our managed shim (uv tool / pipx install, or the user's own script).
+        return False
+    expected_version = get_expected_shim_version(airflow_sources)
+    if expected_version is None:
+        return False
+    installed_version = _parse_shim_version(shim_text)
+    if installed_version is not None and installed_version >= expected_version:
+        return False
+    setup_script = airflow_sources / "scripts" / "tools" / "setup_breeze"
+    installed_text = installed_version if installed_version is not None else "unknown (pre-versioning)"
+    console_print(
+        f"\n[warning]Your breeze shim at {BREEZE_SHIM_PATH} needs to be upgraded "
+        f"(installed: {installed_text}, current: {expected_version}).[/]\n"
+        "[warning]Re-run the setup script to upgrade it:[/]\n\n"
+        f"     {setup_script}\n"
+    )
+    return True
+
+
+def has_uv_breeze_tool_dir() -> bool:
+    """Tell whether uv owns a tool directory for breeze."""
+    try:
+        result = subprocess.run(["uv", "tool", "dir"], text=True, capture_output=True, check=False)
+    except FileNotFoundError:
+        return False
+    if result.returncode != 0:
+        return False
+    tool_dir = result.stdout.strip()
+    return bool(tool_dir) and (Path(tool_dir) / "apache-airflow-breeze").is_dir()
+
+
+def detect_legacy_global_breeze_install() -> str | None:
+    """
+    Detect a legacy global breeze install superseded by the shim (ADR 0017).
+
+    :return: ``"uv"`` or ``"pipx"`` if breeze is installed as a global ``uv tool`` / ``pipx``
+        install, otherwise ``None``.
+    """
+    try:
+        result = subprocess.run(["uv", "tool", "list"], text=True, capture_output=True, check=False)
+        if result.returncode == 0 and "apache-airflow-breeze" in result.stdout:
+            return "uv"
+    except FileNotFoundError:
+        pass
+    # `uv tool list` drops a tool whose environment is corrupted, so an install the listing above
+    # cannot see may still be there, owning ~/.local/bin/breeze.
+    if has_uv_breeze_tool_dir():
+        return "uv"
+    try:
+        result = subprocess.run(["pipx", "list", "--short"], text=True, capture_output=True, check=False)
+        if result.returncode == 0 and "apache-airflow-breeze" in result.stdout:
+            return "pipx"
+    except FileNotFoundError:
+        pass
+    return None
+
+
+def warn_if_breeze_launcher_outdated(airflow_sources: Path) -> bool:
+    """
+    Warn when the breeze launcher in use is not the current recommended shim (ADR 0017).
+
+    Covers both ways an installation can be out of date:
+
+    * the managed shim at ``~/.local/bin/breeze`` exists but is older than the one the current
+      sources would install (e.g. ``$AIRFLOW_REPO_ROOT`` support was added) — re-run the setup
+      script to refresh it;
+    * breeze is still installed as a legacy global ``uv tool`` / ``pipx`` install (no shim) — that
+      install keeps working but is no longer recommended; point the user at migrating to the shim.
+
+    :param airflow_sources: Airflow sources breeze is operating on.
+    :return: True if a warning was printed.
+    """
+    try:
+        shim_text = BREEZE_SHIM_PATH.read_text() if BREEZE_SHIM_PATH.is_file() else ""
+    except OSError:
+        shim_text = ""
+    if BREEZE_SHIM_MARKER in shim_text:
+        # Our managed shim is installed — only check that it is current.
+        return warn_if_shim_outdated(airflow_sources, shim_text=shim_text)
+    legacy = detect_legacy_global_breeze_install()
+    if legacy is None:
+        return False
+    uninstall_cmd = (
+        "uv tool uninstall apache-airflow-breeze"
+        if legacy == "uv"
+        else "pipx uninstall apache-airflow-breeze"
+    )
+    setup_script = airflow_sources / "scripts" / "tools" / "setup_breeze"
+    console_print(
+        f"\n[warning]Breeze is installed as a legacy global '{legacy}' install, which resolves its "
+        "dependencies against the package index rather than dev/breeze/uv.lock (see ADR 0017).[/]\n"
+        "[warning]Migrate to the per-worktree shim by uninstalling the global install and "
+        "running the setup script:[/]\n\n"
+        f"     {uninstall_cmd}\n"
+        f"     {setup_script}\n"
+    )
+    return True
+
+
+@clearable_cache
+def find_airflow_root_path_to_operate_on() -> Path:
+    """
+    Find the root of airflow sources we operate on. Handle the case when Breeze is installed via
+    `pipx` or `uv tool` from a different source tree, so it searches upwards of the current directory
+    to find the right root of airflow directory we are actually in. This **might** be different
+    than the sources of Airflow Breeze was installed from.
 
     If not found, we operate on Airflow sources that we were installed it. This handles the case when
     we run Breeze from a "random" directory.
@@ -241,45 +369,190 @@ def find_airflow_sources_root_to_operate_on() -> Path:
     :return: Path for the found sources.
 
     """
-    sources_root_from_env = os.getenv("AIRFLOW_SOURCES_ROOT", None)
+    sources_root_from_env = os.getenv("AIRFLOW_ROOT_PATH", None)
     if sources_root_from_env:
-        return Path(sources_root_from_env)
+        # Set by the shim (ADR 0017) — the global self-upgrade checks below are skipped in this
+        # path (the shim also exports SKIP_BREEZE_SELF_UPGRADE_CHECK), so check here that the
+        # installed shim itself is not stale. Ignore SKIP here on purpose: the shim always sets it.
+        airflow_sources_from_env = Path(sources_root_from_env)
+        if not in_autocomplete() and not in_help() and not hasattr(sys, "_called_from_test"):
+            warn_if_breeze_launcher_outdated(airflow_sources_from_env)
+        return airflow_sources_from_env
     installation_airflow_sources = get_installation_airflow_sources()
-    if installation_airflow_sources is None and not skip_upgrade_check():
-        get_console().print(
-            "\n[error]Breeze should only be installed with -e flag[/]\n\n"
+    if installation_airflow_sources is None and not skip_breeze_self_upgrade_check():
+        console_print(
+            "\n[error]Breeze should only be installed with --editable flag[/]\n\n"
             "[warning]Please go to Airflow sources and run[/]\n\n"
-            f"     {NAME} self-upgrade --force\n"
+            f"     {NAME} setup self-upgrade --use-current-airflow-sources\n"
+            '[warning]If during installation you see warning starting "Ignoring --editable install",[/]\n'
+            '[warning]make sure you first downgrade "packaging" package to <23.2, for example by:[/]\n\n'
+            f'     pip install "packaging<23.2"\n\n'
         )
         sys.exit(1)
     airflow_sources = get_used_airflow_sources()
-    if not skip_upgrade_check():
+    if not skip_breeze_self_upgrade_check():
         # only print warning and sleep if not producing complete results
         reinstall_if_different_sources(airflow_sources)
         reinstall_if_setup_changed()
-    os.chdir(str(airflow_sources))
+        # Not invoked via the shim (no AIRFLOW_ROOT_PATH). If breeze is still on a legacy global
+        # uv tool / pipx install, nudge the user to migrate to the recommended shim (ADR 0017).
+        warn_if_breeze_launcher_outdated(airflow_sources)
+    os.chdir(airflow_sources.as_posix())
+    airflow_home_dir = Path(os.environ.get("AIRFLOW_HOME", (Path.home() / "airflow").resolve().as_posix()))
+    if airflow_sources.resolve() == airflow_home_dir.resolve():
+        console_print(
+            f"\n[error]Your Airflow sources are checked out in {airflow_home_dir} which "
+            f"is your also your AIRFLOW_HOME where airflow writes logs and database. \n"
+            f"This is a bad idea because Airflow might override and cleanup your checked out "
+            f"sources and .git repository.[/]\n"
+        )
+        console_print("\nPlease check out your Airflow code elsewhere.\n")
+        sys.exit(1)
     return airflow_sources
 
 
-AIRFLOW_SOURCES_ROOT = find_airflow_sources_root_to_operate_on().resolve()
-BUILD_CACHE_DIR = AIRFLOW_SOURCES_ROOT / ".build"
-WWW_CACHE_DIR = BUILD_CACHE_DIR / "www"
-WWW_ASSET_COMPILE_LOCK = WWW_CACHE_DIR / ".asset_compile.lock"
-WWW_ASSET_OUT_FILE = WWW_CACHE_DIR / "asset_compile.out"
-DAGS_DIR = AIRFLOW_SOURCES_ROOT / "dags"
-FILES_DIR = AIRFLOW_SOURCES_ROOT / "files"
-HOOKS_DIR = AIRFLOW_SOURCES_ROOT / "hooks"
-KUBE_DIR = AIRFLOW_SOURCES_ROOT / ".kube"
-LOGS_DIR = AIRFLOW_SOURCES_ROOT / "logs"
-DIST_DIR = AIRFLOW_SOURCES_ROOT / "dist"
-DOCS_DIR = AIRFLOW_SOURCES_ROOT / "docs"
-SCRIPTS_CI_DIR = AIRFLOW_SOURCES_ROOT / "scripts" / "ci"
-DOCKER_CONTEXT_DIR = AIRFLOW_SOURCES_ROOT / "docker-context-files"
-CACHE_TMP_FILE_DIR = tempfile.TemporaryDirectory()
-OUTPUT_LOG = Path(CACHE_TMP_FILE_DIR.name, "out.log")
-BREEZE_SOURCES_ROOT = AIRFLOW_SOURCES_ROOT / "dev" / "breeze"
+AIRFLOW_ROOT_PATH = find_airflow_root_path_to_operate_on().resolve()
+AIRFLOW_PYPROJECT_TOML_FILE_PATH = AIRFLOW_ROOT_PATH / "pyproject.toml"
+AIRFLOW_CORE_ROOT_PATH = AIRFLOW_ROOT_PATH / "airflow-core"
+AIRFLOW_CORE_SOURCES_PATH = AIRFLOW_CORE_ROOT_PATH / "src"
+AIRFLOW_TASK_SDK_ROOT_PATH = AIRFLOW_ROOT_PATH / "task-sdk"
+AIRFLOW_TASK_SDK_SOURCES_PATH = AIRFLOW_TASK_SDK_ROOT_PATH / "src"
+AIRFLOW_WWW_DIR = AIRFLOW_CORE_SOURCES_PATH / "airflow" / "www"
+AIRFLOW_UI_DIR = AIRFLOW_CORE_SOURCES_PATH / "airflow" / "ui"
+# Do not delete it - it is used for old commit retrieval from providers
+AIRFLOW_ORIGINAL_PROVIDERS_DIR = AIRFLOW_ROOT_PATH / "airflow" / "providers"
+AIRFLOW_PROVIDERS_ROOT_PATH = AIRFLOW_ROOT_PATH / "providers"
+AIRFLOW_PROVIDERS_LAST_RELEASE_DATE_PATH = AIRFLOW_PROVIDERS_ROOT_PATH / ".last_release_date.txt"
+AIRFLOW_DIST_PATH = AIRFLOW_ROOT_PATH / "dist"
 
-MSSQL_TMP_DIR_NAME = ".tmp-mssql"
+TASK_SDK_ROOT_PATH = AIRFLOW_ROOT_PATH / "task-sdk"
+TASK_SDK_DIST_PATH = TASK_SDK_ROOT_PATH / "dist"
+TASK_SDK_SOURCES_PATH = TASK_SDK_ROOT_PATH / "src"
+
+AIRFLOW_CTL_ROOT_PATH = AIRFLOW_ROOT_PATH / "airflow-ctl"
+AIRFLOW_CTL_SOURCES_PATH = AIRFLOW_CTL_ROOT_PATH / "src"
+AIRFLOW_CTL_DIST_PATH = AIRFLOW_CTL_ROOT_PATH / "dist"
+
+MYPY_ROOT_PATH = AIRFLOW_ROOT_PATH / "dev" / "mypy"
+MYPY_SOURCES_PATH = MYPY_ROOT_PATH / "src"
+MYPY_DIST_PATH = MYPY_ROOT_PATH / "dist"
+
+# Same here - do not remove those this is used for past commit retrieval
+PREVIOUS_AIRFLOW_PROVIDERS_SOURCES_PATH = AIRFLOW_PROVIDERS_ROOT_PATH / "src"
+PREVIOUS_AIRFLOW_PROVIDERS_NS_PACKAGE_PATH = PREVIOUS_AIRFLOW_PROVIDERS_SOURCES_PATH / "airflow" / "providers"
+PREVIOUS_TESTS_PROVIDERS_ROOT = AIRFLOW_PROVIDERS_ROOT_PATH / "tests"
+PREVIOUS_SYSTEM_TESTS_PROVIDERS_PATH = AIRFLOW_PROVIDERS_ROOT_PATH / "tests" / "system"
+
+AIRFLOW_DEVEL_COMMON_PATH = AIRFLOW_ROOT_PATH / "devel-common"
+DOCS_ROOT = AIRFLOW_ROOT_PATH / "docs"
+BUILD_CACHE_PATH = AIRFLOW_ROOT_PATH / ".build"
+GENERATED_PATH = AIRFLOW_ROOT_PATH / "generated"
+CONSTRAINTS_CACHE_PATH = BUILD_CACHE_PATH / "constraints"
+PROVIDER_DEPENDENCIES_JSON_PATH = GENERATED_PATH / "provider_dependencies.json"
+PROVIDER_DEPENDENCIES_JSON_HASH_PATH = GENERATED_PATH / "provider_dependencies.json.sha256sum"
+PROVIDER_METADATA_JSON_PATH = GENERATED_PATH / "provider_metadata.json"
+UI_CACHE_PATH = BUILD_CACHE_PATH / "ui"
+AIRFLOW_TMP_PATH = AIRFLOW_ROOT_PATH / "tmp"
+UI_ASSET_COMPILE_LOCK = UI_CACHE_PATH / ".asset_compile.lock"
+UI_ASSET_OUT_FILE = UI_CACHE_PATH / "asset_compile.out"
+UI_ASSET_OUT_DEV_MODE_FILE = UI_CACHE_PATH / "asset_compile_dev_mode.out"
+UI_ASSET_HASH_PATH = AIRFLOW_ROOT_PATH / ".build" / "ui" / "hash.txt"
+
+UI_NODE_MODULES_PATH = AIRFLOW_CORE_SOURCES_PATH / "airflow" / "ui" / "node_modules"
+UI_DIST_PATH = AIRFLOW_CORE_SOURCES_PATH / "airflow" / "ui" / "dist"
+UI_VITE_MANIFEST_PATH = UI_DIST_PATH / ".vite" / "manifest.json"
+FAST_API_SIMPLE_AUTH_MANAGER_PATH = (
+    AIRFLOW_CORE_SOURCES_PATH / "airflow" / "api_fastapi" / "auth" / "managers" / "simple"
+)
+FAST_API_SIMPLE_AUTH_MANAGER_NODE_MODULES_PATH = FAST_API_SIMPLE_AUTH_MANAGER_PATH / "ui" / "node_modules"
+FAST_API_SIMPLE_AUTH_MANAGER_DIST_PATH = FAST_API_SIMPLE_AUTH_MANAGER_PATH / "ui" / "dist"
+FAST_API_SIMPLE_AUTH_MANAGER_VITE_MANIFEST_PATH = (
+    FAST_API_SIMPLE_AUTH_MANAGER_DIST_PATH / ".vite" / "manifest.json"
+)
+EDGE_PLUGIN_PATH = (
+    AIRFLOW_PROVIDERS_ROOT_PATH / "edge3" / "src" / "airflow" / "providers" / "edge3" / "plugins" / "www"
+)
+EDGE_PLUGIN_UI_NODE_MODULES_PATH = EDGE_PLUGIN_PATH / "node_modules"
+EDGE_PLUGIN_UI_DIST_PATH = EDGE_PLUGIN_PATH / "dist"
+EDGE_PLUGIN_PREK_HOOK = "compile-edge-assets"
+FAB_AUTH_MANAGER_WWW_PATH = (
+    AIRFLOW_PROVIDERS_ROOT_PATH / "fab" / "src" / "airflow" / "providers" / "fab" / "www"
+)
+FAB_AUTH_MANAGER_WWW_NODE_MODULES_PATH = FAB_AUTH_MANAGER_WWW_PATH / "node_modules"
+FAB_AUTH_MANAGER_WWW_DIST_PATH = FAB_AUTH_MANAGER_WWW_PATH / "static" / "dist"
+FAB_AUTH_MANAGER_WWW_PREK_HOOK = "compile-fab-assets"
+
+COMMON_AI_PLUGIN_PATH = (
+    AIRFLOW_PROVIDERS_ROOT_PATH
+    / "common"
+    / "ai"
+    / "src"
+    / "airflow"
+    / "providers"
+    / "common"
+    / "ai"
+    / "plugins"
+    / "www"
+)
+COMMON_AI_UI_PLUGIN_NODE_MODULES_PATH = COMMON_AI_PLUGIN_PATH / "node_modules"
+COMMON_AI_UI_PLUGIN_DIST_PATH = COMMON_AI_PLUGIN_PATH / "dist"
+COMMON_AI_PLUGIN_PREK_HOOK = "compile-common-ai-provider-assets"
+
+
+DAGS_PATH = AIRFLOW_ROOT_PATH / "dags"
+FILES_PATH = AIRFLOW_ROOT_PATH / "files"
+FILES_SBOM_PATH = FILES_PATH / "sbom"
+KUBE_PATH = AIRFLOW_ROOT_PATH / ".kube"
+LOGS_PATH = AIRFLOW_ROOT_PATH / "logs"
+OUT_PATH = AIRFLOW_ROOT_PATH / "out"
+
+REPRODUCIBLE_PATH = OUT_PATH / "reproducible"
+DOCS_DIR = AIRFLOW_ROOT_PATH / "docs"
+SCRIPTS_CI_PATH = AIRFLOW_ROOT_PATH / "scripts" / "ci"
+SCRIPTS_DOCKER_PATH = AIRFLOW_ROOT_PATH / "scripts" / "docker"
+SCRIPTS_CI_DOCKER_COMPOSE_PATH = SCRIPTS_CI_PATH / "docker-compose"
+SCRIPTS_CI_DOCKER_COMPOSE_BASE_PATH = SCRIPTS_CI_DOCKER_COMPOSE_PATH / "base.yml"
+SCRIPTS_CI_DOCKER_COMPOSE_BASE_PORTS_PATH = SCRIPTS_CI_DOCKER_COMPOSE_PATH / "base-ports.yml"
+SCRIPTS_CI_DOCKER_COMPOSE_CI_TESTS_PATH = SCRIPTS_CI_DOCKER_COMPOSE_PATH / "ci-tests.yml"
+SCRIPTS_CI_DOCKER_COMPOSE_DEBUG_PORTS_PATH = SCRIPTS_CI_DOCKER_COMPOSE_PATH / "debug-ports.yml"
+SCRIPTS_CI_DOCKER_COMPOSE_DOCKER_SOCKET_PATH = SCRIPTS_CI_DOCKER_COMPOSE_PATH / "docker-socket.yml"
+SCRIPTS_CI_DOCKER_COMPOSE_ENABLE_TTY_PATH = SCRIPTS_CI_DOCKER_COMPOSE_PATH / "enable-tty.yml"
+SCRIPTS_CI_DOCKER_COMPOSE_FILES_PATH = SCRIPTS_CI_DOCKER_COMPOSE_PATH / "files.yml"
+SCRIPTS_CI_DOCKER_COMPOSE_FORWARD_CREDENTIALS_PATH = (
+    SCRIPTS_CI_DOCKER_COMPOSE_PATH / "forward-credentials.yml"
+)
+SCRIPTS_CI_DOCKER_COMPOSE_INTEGRATION_CELERY_PATH = SCRIPTS_CI_DOCKER_COMPOSE_PATH / "integration-celery.yml"
+SCRIPTS_CI_DOCKER_COMPOSE_INTEGRATION_KERBEROS_PATH = (
+    SCRIPTS_CI_DOCKER_COMPOSE_PATH / "integration-kerberos.yml"
+)
+SCRIPTS_CI_DOCKER_COMPOSE_LOCAL_ALL_SOURCES_PATH = SCRIPTS_CI_DOCKER_COMPOSE_PATH / "local-all-sources.yml"
+SCRIPTS_CI_DOCKER_COMPOSE_LOCAL_YAML_PATH = SCRIPTS_CI_DOCKER_COMPOSE_PATH / "local.yml"
+SCRIPTS_CI_DOCKER_COMPOSE_MOUNT_SPHINX_AIRFLOW_THEME_PATH = (
+    SCRIPTS_CI_DOCKER_COMPOSE_PATH / "mount-sphinx-airflow-theme.yml"
+)
+SCRIPTS_CI_DOCKER_COMPOSE_MOUNT_UI_DIST_PATH = SCRIPTS_CI_DOCKER_COMPOSE_PATH / "mount-ui-dist.yml"
+SCRIPTS_CI_DOCKER_COMPOSE_MOUNT_UV_LOCK_PATH = SCRIPTS_CI_DOCKER_COMPOSE_PATH / "mount-uv-lock.yml"
+SCRIPTS_CI_DOCKER_COMPOSE_MYPY_PATH = SCRIPTS_CI_DOCKER_COMPOSE_PATH / "mypy.yml"
+SCRIPTS_CI_DOCKER_COMPOSE_PYCACHE_PATH = SCRIPTS_CI_DOCKER_COMPOSE_PATH / "pycache.yml"
+SCRIPTS_CI_DOCKER_COMPOSE_PROVIDERS_AND_TESTS_SOURCES_PATH = (
+    SCRIPTS_CI_DOCKER_COMPOSE_PATH / "providers-and-tests-sources.yml"
+)
+SCRIPTS_CI_DOCKER_COMPOSE_REMOVE_SOURCES_PATH = SCRIPTS_CI_DOCKER_COMPOSE_PATH / "remove-sources.yml"
+SCRIPTS_CI_DOCKER_COMPOSE_TESTS_SOURCES_PATH = SCRIPTS_CI_DOCKER_COMPOSE_PATH / "tests-sources.yml"
+GENERATED_DOCKER_COMPOSE_ENV_PATH = SCRIPTS_CI_DOCKER_COMPOSE_PATH / "_generated_docker_compose.env"
+GENERATED_DOCKER_ENV_PATH = SCRIPTS_CI_DOCKER_COMPOSE_PATH / "_generated_docker.env"
+GENERATED_DOCKER_LOCK_PATH = SCRIPTS_CI_DOCKER_COMPOSE_PATH / "_generated.lock"
+DOCKER_CONTEXT_PATH = AIRFLOW_ROOT_PATH / "docker-context-files"
+CACHE_TEMP_PATH = tempfile.TemporaryDirectory()
+OUTPUT_LOG_PATH = Path(CACHE_TEMP_PATH.name, "out.log")
+BREEZE_ROOT_PATH = AIRFLOW_ROOT_PATH / "dev" / "breeze"
+BREEZE_SOURCES_PATH = BREEZE_ROOT_PATH / "src"
+BREEZE_DOC_PATH = BREEZE_ROOT_PATH / "doc"
+BREEZE_IMAGES_PATH = BREEZE_DOC_PATH / "images"
+AIRFLOW_HOME_PATH = Path(os.environ.get("AIRFLOW_HOME", Path.home() / "airflow"))
+
+
+PYCACHE_VOLUME_NAME = "airflow-pycache-volume"
 
 
 def create_volume_if_missing(volume_name: str):
@@ -293,12 +566,12 @@ def create_volume_if_missing(volume_name: str):
     )
     if res_inspect.returncode != 0:
         result = run_command(
-            cmd=["docker", "volume", "create", volume_name],
+            cmd=["docker", "volume", "create", "--label", "org.apache.airflow.breeze=true", volume_name],
             check=False,
             capture_output=True,
         )
         if result.returncode != 0:
-            get_console().print(
+            console_print(
                 "[warning]\nMypy Cache volume could not be created. Continuing, but you "
                 "should make sure your docker works.\n\n"
                 f"Error: {result.stdout}\n"
@@ -309,43 +582,61 @@ def create_mypy_volume_if_needed():
     create_volume_if_missing("mypy-cache-volume")
 
 
+def create_pycache_volume_if_needed():
+    create_volume_if_missing(PYCACHE_VOLUME_NAME)
+
+
 def create_directories_and_files() -> None:
     """
     Creates all directories and files that are needed for Breeze to work via docker-compose.
     Checks if setup has been updates since last time and proposes to upgrade if so.
     """
-    BUILD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    DAGS_DIR.mkdir(parents=True, exist_ok=True)
-    FILES_DIR.mkdir(parents=True, exist_ok=True)
-    HOOKS_DIR.mkdir(parents=True, exist_ok=True)
-    KUBE_DIR.mkdir(parents=True, exist_ok=True)
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    DIST_DIR.mkdir(parents=True, exist_ok=True)
-    OUTPUT_LOG.mkdir(parents=True, exist_ok=True)
-    (AIRFLOW_SOURCES_ROOT / ".bash_aliases").touch()
-    (AIRFLOW_SOURCES_ROOT / ".bash_history").touch()
-    (AIRFLOW_SOURCES_ROOT / ".inputrc").touch()
+    BUILD_CACHE_PATH.mkdir(parents=True, exist_ok=True)
+    DAGS_PATH.mkdir(parents=True, exist_ok=True)
+    FILES_PATH.mkdir(parents=True, exist_ok=True)
+    KUBE_PATH.mkdir(parents=True, exist_ok=True)
+    LOGS_PATH.mkdir(parents=True, exist_ok=True)
+    AIRFLOW_DIST_PATH.mkdir(parents=True, exist_ok=True)
+    OUTPUT_LOG_PATH.mkdir(parents=True, exist_ok=True)
+    (AIRFLOW_ROOT_PATH / ".bash_aliases").touch()
+    (AIRFLOW_ROOT_PATH / ".bash_history").touch()
+    (AIRFLOW_ROOT_PATH / ".inputrc").touch()
 
 
 def cleanup_python_generated_files():
     if get_verbose():
-        get_console().print("[info]Cleaning .pyc and __pycache__")
+        console_print("[info]Cleaning .pyc and __pycache__")
     permission_errors = []
-    for path in AIRFLOW_SOURCES_ROOT.rglob("*.pyc"):
-        try:
-            path.unlink()
-        except PermissionError:
-            permission_errors.append(path)
-    for path in AIRFLOW_SOURCES_ROOT.rglob("__pycache__"):
-        try:
-            shutil.rmtree(path)
-        except PermissionError:
-            permission_errors.append(path)
+    for dirpath, dirnames, filenames in os.walk(AIRFLOW_ROOT_PATH):
+        # Skip node_modules and hidden directories (.*) — modify in place to prune os.walk
+        dirnames[:] = [d for d in dirnames if d != "node_modules" and not d.startswith(".")]
+        for filename in filenames:
+            if filename.endswith(".pyc"):
+                path = Path(dirpath) / filename
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                except PermissionError:
+                    permission_errors.append(path)
+        if Path(dirpath).name == "__pycache__":
+            try:
+                shutil.rmtree(dirpath)
+            except FileNotFoundError:
+                pass
+            except PermissionError:
+                permission_errors.append(Path(dirpath))
+            except OSError as e:
+                # A concurrent breeze process (e.g. parallel prek hooks) can write a fresh .pyc
+                # between rmtree emptying the directory and removing it.
+                if e.errno != errno.ENOTEMPTY:
+                    raise
+            dirnames.clear()
     if permission_errors:
         if platform.uname().system.lower() == "linux":
-            get_console().print("[warning]There were files that you could not clean-up:\n")
-            get_console().print(permission_errors)
-            get_console().print(
+            console_print("[warning]There were files that you could not clean-up:\n")
+            console_print(permission_errors)
+            console_print(
                 "Please run at earliest convenience:\n"
                 "[warning]breeze ci fix-ownership[/]\n\n"
                 "If you have sudo you can use:\n"
@@ -354,8 +645,105 @@ def cleanup_python_generated_files():
                 "You can also remove those files manually using sudo."
             )
         else:
-            get_console().print("[warnings]There were files that you could not clean-up:\n")
-            get_console().print(permission_errors)
-            get_console().print("You can also remove those files manually using sudo.")
+            console_print("[warnings]There were files that you could not clean-up:\n")
+            console_print(permission_errors)
+            console_print("You can also remove those files manually using sudo.")
     if get_verbose():
-        get_console().print("[info]Cleaned")
+        console_print("[info]Cleaned")
+
+
+WORKTREE_ISOLATION_ENV = "BREEZE_WORKTREE_ISOLATION"
+SUPPRESS_WORKTREE_ISOLATION_FILE = "suppress_worktree_isolation"
+
+
+def get_shared_build_cache_path() -> Path:
+    """Return the ``.build`` directory of the main checkout, shared by all of its worktrees."""
+    main_git_dir = get_main_git_dir_for_worktree()
+    return main_git_dir.parent / ".build" if main_git_dir else BUILD_CACHE_PATH
+
+
+def is_worktree_isolation_enabled() -> bool:
+    value = os.environ.get(WORKTREE_ISOLATION_ENV, "").strip().lower()
+    if value in ("true", "1", "yes", "on"):
+        return True
+    if value in ("false", "0", "no", "off"):
+        return False
+    return not (get_shared_build_cache_path() / SUPPRESS_WORKTREE_ISOLATION_FILE).exists()
+
+
+def get_isolated_worktree_path() -> Path | None:
+    """
+    Return the path of the linked worktree that owns this checkout's Docker resources.
+
+    ``None`` means the resources are shared: the main checkout, or a worktree with isolation disabled.
+    """
+    if get_main_git_dir_for_worktree() is None or not is_worktree_isolation_enabled():
+        return None
+    return AIRFLOW_ROOT_PATH.resolve()
+
+
+def get_default_project_name() -> str:
+    worktree = get_isolated_worktree_path()
+    if worktree is None:
+        return "breeze"
+    name = re.sub(r"[^a-z0-9_-]", "-", worktree.name.lower())
+    # Worktrees with the same directory name in different locations or clones must not share a project.
+    path_hash = hashlib.sha256(str(worktree).encode()).hexdigest()[:6]
+    return f"breeze-{name}-{path_hash}"
+
+
+HOST_ID_PATH = Path.home() / ".config" / "breeze" / "host-id"
+
+
+@clearable_cache
+def get_host_id() -> str:
+    """
+    Identify the machine whose filesystem decides whether a labelled worktree still exists.
+
+    A random id is stored on first use instead of using the host name, because macOS renames the host
+    when another device on the network has the same name, and resources labelled with the old name
+    would never be swept. The host name is the fallback when the home directory is not writable.
+    """
+    try:
+        return HOST_ID_PATH.read_text().strip()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return socket.gethostname()
+    try:
+        HOST_ID_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", dir=HOST_ID_PATH.parent, prefix=".host-id-") as new_id:
+            new_id.write(uuid.uuid4().hex)
+            new_id.flush()
+            # Linking fails when the file exists, so concurrent first runs all keep the first id.
+            with contextlib.suppress(FileExistsError):
+                os.link(new_id.name, HOST_ID_PATH)
+        return HOST_ID_PATH.read_text().strip()
+    except OSError:
+        return socket.gethostname()
+
+
+def get_main_git_dir_for_worktree() -> Path | None:
+    """
+    Detect if we are in a git worktree and return the main repository's .git directory.
+
+    Git worktrees store a ``.git`` *file* (not a directory) containing a ``gitdir:`` reference
+    pointing to ``<main-repo>/.git/worktrees/<name>``.  This helper resolves that reference
+    (handling both absolute and relative paths) and returns the main ``.git`` directory
+    (i.e. the grandparent of the ``gitdir`` path).
+
+    :return: Absolute path to the main repository's ``.git`` directory, or ``None``
+             if the current checkout is not a worktree.
+    """
+    git_path = AIRFLOW_ROOT_PATH / ".git"
+    if git_path.is_file():
+        git_content = git_path.read_text().strip()
+        if git_content.startswith("gitdir:"):
+            gitdir = Path(git_content.removeprefix("gitdir:").strip())
+            if not gitdir.is_absolute():
+                gitdir = (AIRFLOW_ROOT_PATH / gitdir).resolve()
+            # gitdir points to <main-repo>/.git/worktrees/<name>
+            # .parent.parent gives us <main-repo>/.git
+            main_git_dir = gitdir.parent.parent
+            return main_git_dir if main_git_dir.is_dir() else None
+    return None

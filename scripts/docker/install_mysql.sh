@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -15,65 +16,115 @@
 # specific language governing permissions and limitations
 # under the License.
 # shellcheck shell=bash
+# shellcheck source=scripts/docker/common.sh
+. "$( dirname "${BASH_SOURCE[0]}" )/common.sh"
+
 set -euo pipefail
+
+common::get_colors
 declare -a packages
 
-MYSQL_VERSION="8.0"
-readonly MYSQL_VERSION
-
-COLOR_BLUE=$'\e[34m'
-readonly COLOR_BLUE
-COLOR_RESET=$'\e[0m'
-readonly COLOR_RESET
 
 : "${INSTALL_MYSQL_CLIENT:?Should be true or false}"
+: "${INSTALL_MYSQL_CLIENT_TYPE:-mariadb}"
 
-install_mysql_client() {
+if [[ "${INSTALL_MYSQL_CLIENT}" != "true" && "${INSTALL_MYSQL_CLIENT}" != "false" ]]; then
+    echo
+    echo "${COLOR_RED}INSTALL_MYSQL_CLIENT must be either true or false${COLOR_RESET}"
+    echo
+    exit 1
+fi
+
+if [[ "${INSTALL_MYSQL_CLIENT_TYPE}" != "mysql" && "${INSTALL_MYSQL_CLIENT_TYPE}" != "mariadb" ]]; then
+    echo
+    echo "${COLOR_RED}INSTALL_MYSQL_CLIENT_TYPE must be either mysql or mariadb${COLOR_RESET}"
+    echo
+    exit 1
+fi
+
+if [[ "${INSTALL_MYSQL_CLIENT_TYPE}" == "mysql" ]]; then
+    echo
+    echo "${COLOR_RED}The 'mysql' client type is not supported any more. Use 'mariadb' instead.${COLOR_RESET}"
+    echo
+    echo "The MySQL drivers are wrongly packaged and released by Oracle with an expiration date on their GPG keys,"
+    echo "which causes builds to fail after the expiration date. MariaDB client is protocol-compatible with MySQL client."
+    echo ""
+    echo "Every two years the MySQL packages fail and Oracle team is always surprised and struggling"
+    echo "with fixes and re-signing the packages which lasts few days"
+    echo "See https://bugs.mysql.com/bug.php?id=113432 for more details."
+    echo "As a community we are not able to support this broken packaging practice from Oracle"
+    echo "Feel free however to install MySQL drivers on your own as extension of the image."
+    echo
+    exit 1
+fi
+
+retry() {
+    local retries=3
+    local count=0
+    # adding delay of 10 seconds
+    local delay=10
+    until "$@"; do
+        exit_code=$?
+        count=$((count + 1))
+        if [[ $count -lt $retries ]]; then
+            echo "Command failed. Attempt $count/$retries. Retrying in ${delay}s..."
+            sleep $delay
+        else
+            echo "Command failed after $retries attempts."
+            return $exit_code
+        fi
+    done
+}
+
+install_mariadb_client() {
+    # https://mariadb.org/about/#maintenance-policy
+    # MariaDB publishes each LTS series only for the Debian releases current when it came out - 10.11
+    # has no trixie repository and 11.8 is the first LTS that does.
+    local mariadb_lts_version="10.11"
+    if [[ "$(common::debian_codename)" != "bookworm" ]]; then
+        mariadb_lts_version="11.8"
+    fi
+    # List of compatible package Oracle MySQL -> MariaDB:
+    # `mysql-client` -> `mariadb-client` or `mariadb-client-compat` (11+)
+    # `libmysqlclientXX` (where XX is a number) -> `libmariadb3-compat`
+    # `libmysqlclient-dev` -> `libmariadb-dev-compat`
+    #
+    # Different naming against Debian repo which we used before
+    # that some of packages might contains `-compat` suffix, Debian repo -> MariaDB repo:
+    # `libmariadb-dev` -> `libmariadb-dev-compat`
+    # `mariadb-client-core` -> `mariadb-client` or `mariadb-client-compat` (11+)
     if [[ "${1}" == "dev" ]]; then
-        packages=("libmysqlclient-dev" "mysql-client")
+        packages=("libmariadb-dev-compat" "mariadb-client")
     elif [[ "${1}" == "prod" ]]; then
-        packages=("libmysqlclient21" "mysql-client")
+        packages=("libmariadb3-compat" "mariadb-client")
     else
         echo
-        echo "Specify either prod or dev"
+        echo "${COLOR_RED}Specify either prod or dev${COLOR_RESET}"
         echo
         exit 1
     fi
+    if [[ "${mariadb_lts_version%%.*}" -ge 11 ]]; then
+        # From 11.0 mariadb-client no longer ships the "mysql" named commands
+        packages+=("mariadb-client-compat")
+    fi
+
+    common::import_trusted_gpg "0xF1656F24C74CD1D8" "mariadb"
 
     echo
-    echo "${COLOR_BLUE}Installing mysql client version ${MYSQL_VERSION}: ${1}${COLOR_RESET}"
+    echo "${COLOR_BLUE}Installing MariaDB client version ${mariadb_lts_version}: ${1}${COLOR_RESET}"
+    echo "${COLOR_YELLOW}MariaDB client protocol-compatible with MySQL client.${COLOR_RESET}"
     echo
 
-    local key="467B942D3A79BD29"
-    readonly key
-
-    GNUPGHOME="$(mktemp -d)"
-    export GNUPGHOME
-    set +e
-    for keyserver in $(shuf -e ha.pool.sks-keyservers.net hkp://p80.pool.sks-keyservers.net:80 \
-                               keyserver.ubuntu.com hkp://keyserver.ubuntu.com:80)
-    do
-        gpg --keyserver "${keyserver}" --recv-keys "${key}" 2>&1 && break
-    done
-    set -e
-    gpg --export "${key}" > /etc/apt/trusted.gpg.d/mysql.gpg
-    gpgconf --kill all
-    rm -rf "${GNUPGHOME}"
-    unset GNUPGHOME
-    echo "deb http://repo.mysql.com/apt/debian/ $(lsb_release -cs) mysql-${MYSQL_VERSION}" > /etc/apt/sources.list.d/mysql.list
-    apt-get update
-    apt-get install --no-install-recommends -y "${packages[@]}"
+    echo "deb [arch=amd64,arm64] https://archive.mariadb.org/mariadb-${mariadb_lts_version}/repo/debian/ $(common::debian_codename) main" > \
+        /etc/apt/sources.list.d/mariadb.list
+    # Make sure that dependencies from MariaDB repo are preferred over Debian dependencies
+    printf "Package: *\nPin: release o=MariaDB\nPin-Priority: 999\n" > /etc/apt/preferences.d/mariadb
+    retry apt-get update
+    retry apt-get install --no-install-recommends -y "${packages[@]}"
     apt-get autoremove -yqq --purge
     apt-get clean && rm -rf /var/lib/apt/lists/*
 }
 
-if [[ $(uname -m) == "arm64" || $(uname -m) == "aarch64" ]]; then
-    # disable MYSQL for ARM64
-    INSTALL_MYSQL_CLIENT="false"
-fi
-
-# Install MySQL client from Oracle repositories (Debian installs mariadb)
-# But only if it is not disabled
 if [[ ${INSTALL_MYSQL_CLIENT:="true"} == "true" ]]; then
-    install_mysql_client "${@}"
+    install_mariadb_client "${@}"
 fi

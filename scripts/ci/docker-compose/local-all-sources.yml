@@ -15,11 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 ---
-version: "3.7"
 services:
   airflow:
     stdin_open: true  # docker run -i
     tty: true  # docker run -t
+    environment:
+      - AIRFLOW__CORE__PLUGINS_FOLDER=/files/plugins
     # We need to mount files and directories individually because some files
     # such apache_airflow.egg-info should not be mounted from host
     # we only mount those files, so that it makes sense to edit while developing
@@ -31,3 +32,16 @@ services:
       - ../../../.inputrc:/root/.inputrc:cached
       - ../../../tmp:/tmp:cached
       - ../../../:/opt/airflow:cached
+      - root-airflow-volume:/root/airflow/
+      - airflow-cache-volume:/root/.cache
+volumes:
+  root-airflow-volume:
+    labels:
+      org.apache.airflow.breeze: "true"
+      org.apache.airflow.breeze.worktree: "${BREEZE_WORKTREE_PATH:-}"
+      org.apache.airflow.breeze.host: "${BREEZE_HOST_ID:-}"
+  airflow-cache-volume:
+    labels:
+      org.apache.airflow.breeze: "true"
+      org.apache.airflow.breeze.worktree: "${BREEZE_WORKTREE_PATH:-}"
+      org.apache.airflow.breeze.host: "${BREEZE_HOST_ID:-}"

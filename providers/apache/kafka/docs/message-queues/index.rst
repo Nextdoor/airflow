@@ -1,0 +1,137 @@
+.. Licensed to the Apache Software Foundation (ASF) under one
+    or more contributor license agreements.  See the NOTICE file
+    distributed with this work for additional information
+    regarding copyright ownership.  The ASF licenses this file
+    to you under the Apache License, Version 2.0 (the
+    "License"); you may not use this file except in compliance
+    with the License.  You may obtain a copy of the License at
+
+ ..   http://www.apache.org/licenses/LICENSE-2.0
+
+ .. Unless required by applicable law or agreed to in writing,
+    software distributed under the License is distributed on an
+    "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+    KIND, either express or implied.  See the License for the
+    specific language governing permissions and limitations
+    under the License.
+
+.. NOTE TO CONTRIBUTORS:
+   Please, only add notes to the Changelog just below the "Changelog" header when there are some breaking changes
+   and you want to add an explanation to the users on how they are supposed to deal with them.
+   The changelog is updated and maintained semi-automatically by release manager.
+
+
+Apache Kafka Message Queue
+==========================
+
+Apache Kafka Queue Provider
+---------------------------
+
+Implemented by :class:`~airflow.providers.apache.kafka.queues.kafka.KafkaMessageQueueProvider`
+
+
+The Apache Kafka Queue Provider is a :class:`~airflow.providers.common.messaging.providers.base_provider.BaseMessageQueueProvider` that uses
+Apache Kafka as the underlying message queue system.
+It allows you to send and receive messages using Kafka topics in your Airflow workflows with :class:`~airflow.providers.common.messaging.triggers.msg_queue.MessageQueueTrigger` common message queue interface.
+
+
+* It uses ``kafka`` as scheme for identifying Kafka queues.
+* For parameter definitions take a look at :class:`~airflow.providers.apache.kafka.triggers.await_message.AwaitMessageTrigger`.
+
+.. code-block:: python
+
+    from airflow.providers.common.messaging.triggers.msg_queue import MessageQueueTrigger
+    from airflow.sdk import Asset, AssetWatcher
+
+    trigger = MessageQueueTrigger(
+        scheme="kafka",
+        # Additional Kafka AwaitMessageTrigger parameters as needed
+        topics=["my_topic"],
+        apply_function="module.apply_function",
+        bootstrap_servers="localhost:9092",
+    )
+
+    asset = Asset("kafka_queue_asset", watchers=[AssetWatcher(name="kafka_watcher", trigger=trigger)])
+
+For a complete example, see:
+:mod:`tests.system.common.messaging.kafka_message_queue_trigger`
+
+
+.. _howto/triggers:KafkaMessageQueueTrigger:
+
+Apache Kafka Message Queue Trigger
+----------------------------------
+
+Implemented by :class:`~airflow.providers.apache.kafka.triggers.msg_queue.KafkaMessageQueueTrigger`
+
+Inherited from :class:`~airflow.providers.common.messaging.triggers.msg_queue.MessageQueueTrigger`
+
+Wait for a message in a queue
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Below is an example of how you can configure an Airflow Dag to be triggered by a message in Apache Kafka.
+
+.. exampleinclude:: /../tests/system/apache/kafka/example_dag_kafka_message_queue_trigger.py
+    :language: python
+    :start-after: [START howto_trigger_message_queue]
+    :end-before: [END howto_trigger_message_queue]
+
+
+How it works
+------------
+
+1. **Kafka Message Queue Trigger**: The ``KafkaMessageQueueTrigger`` listens for messages from Apache Kafka Topic(s).
+
+2. **Asset and Watcher**: The ``Asset`` abstracts the external entity, the Kafka queue in this example.
+The ``AssetWatcher`` associate a trigger with a name. This name helps you identify which trigger is associated to which
+asset.
+
+3. **Event-Driven Dag**: Instead of running on a fixed schedule, the Dag executes when the asset receives an update
+(e.g., a new message in the queue).
+
+For how to use the trigger, refer to the documentation of the
+:ref:`Messaging Trigger <howto/trigger:MessageQueueTrigger>`
+
+.. _howto/triggers:KafkaApplyFunction:
+
+The ``apply_function``
+----------------------
+
+The ``apply_function`` is applied to every message polled from the Kafka topic(s). If it returns a truthy
+value, that value is used as the payload of the ``TriggerEvent``. Otherwise, the trigger keeps polling.
+It is required when using the Kafka queue provider, while the Kafka sensors also accept ``None``, in which
+case the raw message value (decoded as UTF-8) is used as the event payload.
+
+The function must be passed as a string in Python dot notation, for example
+``"my_package.my_module.my_function"``, not as the function object, because trigger arguments are
+serialized to the metadata database. The function is imported in the triggerer at runtime, so the module
+must be importable there, and changes to the function require a triggerer restart.
+
+Additional arguments can be passed using ``apply_function_args`` and ``apply_function_kwargs``. The message
+is always passed as the last positional argument:
+
+.. code-block:: python
+
+    # my_package/my_module.py
+    import json
+
+    from confluent_kafka import Message
+
+
+    def my_function(prefix: str, message: Message, threshold: int = 0) -> str | None:
+        val = json.loads(message.value())
+        if val["amount"] > threshold:
+            return f"{prefix}{val}"
+
+.. code-block:: python
+
+    # In your Dag file
+    from airflow.providers.common.messaging.triggers.msg_queue import MessageQueueTrigger
+
+    trigger = MessageQueueTrigger(
+        scheme="kafka",
+        topics=["my_topic"],
+        apply_function="my_package.my_module.my_function",
+        apply_function_args=["received:"],
+        apply_function_kwargs={"threshold": 100},
+    )

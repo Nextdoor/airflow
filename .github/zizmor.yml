@@ -1,0 +1,39 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+---
+rules:
+  secrets-outside-env:
+    disable: true
+  # This audit wants every in-repo `uses: ./...` rewritten to GitHub's
+  # self-repository form (`uses: $/...`). Two things outside this repository's
+  # control block that, and both were confirmed by pushing the conversion:
+  #
+  #  * `$/` makes the runner fetch apache/airflow as an action repository, and
+  #    that download cannot materialise the symlinks this repository commits --
+  #    it aborts on `.claude/skills/airflow-translations`, whose target is not
+  #    tracked, before any job runs.
+  #  * ASF infrastructure's allowlist check does not recognise the syntax and
+  #    reports every `$/...` reference as an action missing from the allowlist.
+  #
+  # The audit's own threat model -- a privileged workflow loading a local action
+  # out of a checkout untrusted code could have altered first -- does not reach
+  # us either, since no Airflow workflow runs on `pull_request_target` or
+  # `workflow_run`. Revisit if the symlinks go away and ASF Infra teaches the
+  # allowlist about `$/`.
+  self-repository:
+    disable: true

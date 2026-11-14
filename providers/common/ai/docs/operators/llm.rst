@@ -1,0 +1,347 @@
+ .. Licensed to the Apache Software Foundation (ASF) under one
+    or more contributor license agreements.  See the NOTICE file
+    distributed with this work for additional information
+    regarding copyright ownership.  The ASF licenses this file
+    to you under the Apache License, Version 2.0 (the
+    "License"); you may not use this file except in compliance
+    with the License.  You may obtain a copy of the License at
+
+ ..   http://www.apache.org/licenses/LICENSE-2.0
+
+ .. Unless required by applicable law or agreed to in writing,
+    software distributed under the License is distributed on an
+    "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+    KIND, either express or implied.  See the License for the
+    specific language governing permissions and limitations
+    under the License.
+
+.. _howto/operator:llm:
+
+Single prompts: ``LLMOperator`` and ``@task.llm``
+=================================================
+
+Use :class:`~airflow.providers.common.ai.operators.llm.LLMOperator` for
+general-purpose LLM calls: summarization, extraction, classification,
+structured output, or any prompt-based task.
+
+The operator sends a prompt to an LLM via
+:class:`~airflow.providers.common.ai.hooks.pydantic_ai.PydanticAIHook` and
+returns the output as XCom.
+
+.. seealso::
+    :ref:`Connection configuration <howto/connection:pydanticai>`
+
+Basic usage
+-----------
+
+Provide a ``prompt`` and the operator returns the LLM's response as a string:
+
+.. exampleinclude:: /../../ai/src/airflow/providers/common/ai/example_dags/example_llm.py
+    :language: python
+    :start-after: [START howto_operator_llm_basic]
+    :end-before: [END howto_operator_llm_basic]
+
+Structured output
+-----------------
+
+Set ``output_type`` to a Pydantic ``BaseModel`` subclass and the model instance is pushed to
+XCom unchanged, so downstream tasks can type-hint the class and use attribute access.
+Inside a list of types (``[MyModel, int]``) the model is pushed as a ``dict`` instead.
+:doc:`../structured_output` explains the XCom deserialization rules, the cross-Dag gap and
+``serialize_output``.
+
+.. exampleinclude:: /../../ai/src/airflow/providers/common/ai/example_dags/example_llm.py
+    :language: python
+    :start-after: [START howto_operator_llm_structured_output_class]
+    :end-before: [END howto_operator_llm_structured_output_class]
+
+.. exampleinclude:: /../../ai/src/airflow/providers/common/ai/example_dags/example_llm.py
+    :language: python
+    :start-after: [START howto_operator_llm_structured]
+    :end-before: [END howto_operator_llm_structured]
+
+Model settings and output retries
+---------------------------------
+
+Set ``model_settings`` to pass Pydantic AI
+`ModelSettings <https://ai.pydantic.dev/api/settings/>`__ to the model call, such as
+``temperature`` or ``max_tokens``. Set ``output_retries`` to choose how many times the
+model is asked again when its output fails validation against ``output_type``.
+
+.. exampleinclude:: /../../ai/src/airflow/providers/common/ai/example_dags/example_llm.py
+    :language: python
+    :start-after: [START howto_operator_llm_model_settings]
+    :end-before: [END howto_operator_llm_model_settings]
+
+No tool runs in the task: ``LLMOperator`` accepts no function tools, toolsets or
+capabilities, so ``model_settings`` cannot register one. A provider-hosted tool that a
+provider's own setting turns on, such as ``openai_native_tools`` for OpenAI's web search,
+runs on the provider's side. For a model that calls your tools, use
+:ref:`AgentOperator <howto/operator:agent>`.
+
+Moving from ``agent_params``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Common AI 1.0 removes ``agent_params`` from ``LLMOperator``, the operators built on it and
+their ``@task.llm*`` decorators. Passing it fails when the Dag is parsed. Move each key:
+
+- ``agent_params={"model_settings": {...}}`` becomes ``model_settings={...}``.
+- ``agent_params={"retries": n}`` becomes ``output_retries=n``.
+- ``tools``, ``toolsets``, ``capabilities`` or ``spec_file`` in ``agent_params``: use
+  ``AgentOperator`` or ``@task.agent``, which keep ``agent_params``.
+
+.. _howto/operator:llm_usage_limits:
+
+Usage limits
+------------
+
+Set ``usage_limits`` to a
+`pydantic-ai UsageLimits <https://ai.pydantic.dev/api/usage/#pydantic_ai.usage.UsageLimits>`__
+to fail the task when the run exceeds a configured budget: request count,
+input/output tokens, or tool calls. The check happens inside pydantic-ai's
+run loop, so the limit applies even when ``output_retries`` asks the model again
+within a single attempt.
+
+.. exampleinclude:: /../../ai/src/airflow/providers/common/ai/example_dags/example_llm.py
+    :language: python
+    :start-after: [START howto_operator_llm_usage_limits]
+    :end-before: [END howto_operator_llm_usage_limits]
+
+A plain ``dict`` can be passed instead of a ``UsageLimits`` instance, which lets
+Jinja template individual fields -- e.g. a per-run cost cap driven by an Airflow
+Variable so the budget can change per environment without editing the Dag:
+
+.. exampleinclude:: /../../ai/src/airflow/providers/common/ai/example_dags/example_llm.py
+    :language: python
+    :start-after: [START howto_operator_llm_templated_usage_limits]
+    :end-before: [END howto_operator_llm_templated_usage_limits]
+
+Each dict value is rendered by Jinja like any other ``template_fields`` entry,
+then coerced to that field's type (``Decimal``, ``int``, or ``bool``). A value
+that doesn't parse -- a Variable that exists but is empty renders to ``""``, a
+typo renders to a non-numeric string -- fails the task with a ``ValueError``
+naming the field and the rendered value, instead of silently disabling the
+limit. A ``UsageLimits`` instance passed directly is used as-is and is not
+templated or validated.
+
+Common knobs on ``UsageLimits``:
+
+- ``request_limit``: max model requests per run (caps retry/tool-loop blow-ups).
+  pydantic-ai applies a default of ``50`` when ``UsageLimits()`` is constructed
+  without an explicit value, so passing ``UsageLimits(input_tokens_limit=4_000)``
+  (or the dict form ``{"input_tokens_limit": 4_000}``) silently inherits that
+  50-request cap. Set ``request_limit=None`` explicitly when you only want a
+  token cap. On Airflow >= 3.3 with ``usage_limits`` set, the ``LLM*`` operators and
+  ``AgentOperator`` count this (including the ``50`` default) across the whole task
+  instance; otherwise each attempt (run) counts on its own -- see below.
+- ``input_tokens_limit`` / ``output_tokens_limit``: token caps. On Airflow >= 3.3
+  with ``usage_limits`` set, the ``LLM*`` operators and ``AgentOperator`` count them
+  across the whole task instance; otherwise each attempt (run) counts on its own --
+  see below.
+- ``total_tokens_limit``: combined input + output cap, scoped like the limits above.
+- ``tool_calls_limit``: max tool invocations (``AgentOperator`` only).
+- ``cost_limit``: a ``Decimal`` cap on the run's estimated USD cost. This is **not** a
+  hard guarantee against overspend: the response that crosses the limit has already been
+  produced and billed: pydantic-ai checks the accumulated cost *after* each response and
+  then fails the run with ``UsageLimitExceeded``. It protects you from further spend, not
+  from the request that broke the budget; even a single-request run fails as soon as that
+  request's cost pushes the total over the limit. Pricing is looked up by model
+  name, not by endpoint: a self-hosted deployment serving a model pydantic-ai
+  recognizes is still priced, at that model's public list rates rather than at what
+  the deployment actually costs you. That covers vLLM, whose only working prefix is
+  ``openai:<model>`` (see :doc:`../self_hosted_models`).
+  A model pydantic-ai cannot price (``ollama:llama3.2``, a private fine-tune)
+  reports no cost at all, so ``cost_limit`` is not enforced there -- a
+  ``CostNotFoundWarning`` is emitted instead of failing the run. And like the other
+  knobs above, setting ``cost_limit``
+  alone still inherits the ``request_limit=50`` default; see the ``request_limit`` note
+  above. Note that ``cost_limit`` only caps the operator's own LLM calls --
+  the meta-agent that ``LLMRetryPolicy`` runs to classify a failed task is a separate,
+  uncapped LLM call; see :doc:`../retry_policies`. It counts model spend only, so
+  compute billed by a ``SandboxToolset`` backend is outside it; see
+  :ref:`sandbox-cost`.
+
+When the limit is hit pydantic-ai raises ``UsageLimitExceeded``, which
+propagates to Airflow as a task failure, so Airflow's standard retry policy
+applies on top.
+
+On Airflow >= 3.3, setting ``usage_limits`` makes every limit bound the whole
+task instance, for the ``LLM*`` family (``LLMOperator``, ``LLMBranchOperator``,
+``LLMSQLQueryOperator``, ``LLMSchemaCompareOperator``, ``LLMFileAnalysisOperator`` and
+the matching ``@task.*`` decorators) the same way it does for ``AgentOperator``:
+the initial run and every retry add to one running total, including the implicit
+``request_limit=50``. A pause for approval, and a retry after a reviewer rejects the
+output, share the same total. The total is cleared only once the task succeeds -- a
+reviewer approval, or a rejection with ``fail_on_reject=False``, counts as success -- and a
+cleared task instance starts a fresh one. A ``cost_limit`` of ``Decimal("0.50")``
+therefore bounds what the task spends across every attempt combined (best-effort,
+like the rest of ``cost_limit`` above -- a SIGKILL loses the spend of the attempt
+it kills, and this is not a hard guarantee). To keep the old per-attempt headroom,
+scale each limit by ``retries + 1`` or set ``usage_limits=None``. See
+:ref:`the cross-attempt usage budget <agent-usage-budget>` for how that budget is
+persisted and how to reset it.
+
+Clearing and rerunning a *finished* (failed or succeeded) task instance gets a
+fresh budget automatically; clearing a *running* task instance does not bump
+``max_tries``, so the restarted attempt still sees the prior spend.
+
+On Airflow < 3.3, and whenever ``usage_limits`` is ``None``, each Airflow task
+retry re-renders ``usage_limits`` and starts a fresh count, so a limit bounds a
+single agent *run*, not the task. ``LLMBatchOperator`` has no ``usage_limits``.
+
+TaskFlow decorator
+------------------
+
+The ``@task.llm`` decorator wraps ``LLMOperator``. The function returns the
+prompt string; all other parameters are passed to the operator:
+
+.. exampleinclude:: /../../ai/src/airflow/providers/common/ai/example_dags/example_llm.py
+    :language: python
+    :start-after: [START howto_decorator_llm]
+    :end-before: [END howto_decorator_llm]
+
+With structured output:
+
+.. exampleinclude:: /../../ai/src/airflow/providers/common/ai/example_dags/example_llm.py
+    :language: python
+    :start-after: [START howto_decorator_llm_structured]
+    :end-before: [END howto_decorator_llm_structured]
+
+The returned prompt is rendered as a Jinja template, like the operator's ``prompt``
+argument, so ``{{ ds }}`` and other template variables work in it. Text you insert into
+the returned string yourself, for example with an f-string, is rendered as part of the
+template too. To include text that comes from a function argument, such as a document or
+an upstream task's output, reference the argument by name in the template instead of
+formatting it into the string, as the examples above do with ``{{ text }}``. Every argument
+the task is called with, positionally or by keyword, is available when the prompt is
+rendered, and its value is inserted as it is. A parameter left at its default value is not
+available; pass it explicitly to reference it:
+
+.. exampleinclude:: /../../ai/src/airflow/providers/common/ai/example_dags/example_llm_analysis_pipeline.py
+    :language: python
+    :start-after: [START howto_decorator_llm_prompt_argument]
+    :end-before: [END howto_decorator_llm_prompt_argument]
+
+Multimodal prompts
+^^^^^^^^^^^^^^^^^^
+
+``@task.llm`` accepts the same prompt shape as ``@task.agent`` -- the callable
+may return either a ``str`` or a non-empty ``Sequence[UserContent]`` (e.g.,
+``["Describe this:", ImageUrl(url="...")]``) for vision, audio, or document
+inputs. See :ref:`@task.agent multimodal prompts <howto/operator:agent-multimodal>` for
+the full example. With ``require_approval=True``, the review shows the
+prompt's text and a placeholder such as ``[image/png, 2048 bytes]`` for each
+non-text part.
+
+Classification with ``Literal``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Set ``output_type`` to a ``Literal`` to constrain the LLM to a fixed set of
+labels, useful for classification tasks:
+
+.. exampleinclude:: /../../ai/src/airflow/providers/common/ai/example_dags/example_llm_classification.py
+    :language: python
+    :start-after: [START howto_decorator_llm_classification]
+    :end-before: [END howto_decorator_llm_classification]
+
+Multi-task pipeline with dynamic mapping
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Combine ``@task.llm`` with upstream and downstream tasks. Use ``.expand()``
+to process a list of items in parallel:
+
+.. exampleinclude:: /../../ai/src/airflow/providers/common/ai/example_dags/example_llm_analysis_pipeline.py
+    :language: python
+    :start-after: [START howto_decorator_llm_pipeline]
+    :end-before: [END howto_decorator_llm_pipeline]
+
+.. seealso::
+    :ref:`Dynamic System Prompt <howto/operator:agent-dynamic-system-prompt>` --
+    ``system_prompt`` is templated identically on ``@task.llm``, so the same
+    upstream-XCom pattern applies here.
+
+Human-in-the-loop approval
+--------------------------
+
+Set ``require_approval=True`` to pause the task after the model answers and wait for a human
+reviewer. The full guide, including timeouts, notifiers and assigned reviewers, is
+:doc:`../approval_gates`.
+
+Reviewing uncertain output
+--------------------------
+
+.. note::
+
+    Experimental: this can change or be removed in a minor release of this provider.
+    See :ref:`howto/stability`.
+
+A ``decision_policy`` with a confidence bar sends output the model is unsure about to the
+same review flow. See :doc:`../approval_gates`.
+
+Parameters
+----------
+
+- ``prompt``: The prompt to send to the LLM (operator) or the return value of the
+  decorated function (decorator).
+- ``llm_conn_id``: Airflow connection ID for the LLM provider.
+- ``fallback_conn_ids``: Connection IDs to fail over to, in order, when the primary
+  provider is unavailable. Overrides the list in the connection's extra; an explicit
+  ``[]`` disables a chain configured there. See :doc:`../provider_fallback`.
+- ``model_id``: Model identifier (e.g. ``"openai:gpt-5"``). Overrides the connection's extra field.
+- ``system_prompt``: System-level instructions for the agent. Supports Jinja templating.
+- ``output_type``: Expected output type (default: ``str``). Set to a Pydantic ``BaseModel``
+  for structured output.
+- ``decision_policy``: A ``DecisionPolicy(min_confidence=..., on_uncertain=...)``.
+  ``min_confidence`` is the confidence the least confident reporting field needs for
+  the operator to return the output without a person, from 0 to 1; no reported
+  confidence counts as uncertain. ``on_uncertain`` is ``"review"`` (default) or
+  ``"fail"``. Default ``None``: no gate.
+- ``model_settings``: Pydantic AI ``ModelSettings`` for the model call, such as
+  ``temperature`` or ``max_tokens``. Supports Jinja templating.
+- ``output_retries``: How many times the model is asked again when its output fails
+  validation. Default ``None`` (Pydantic AI's default).
+- ``usage_limits``: Optional pydantic-ai ``UsageLimits`` enforced on the run, or a
+  ``dict`` of the same fields (templated via Jinja, then coerced per field type).
+  Fails the task when token / request / tool-call budgets are exceeded, or when a
+  templated dict value cannot be coerced.  Default ``None``.
+- ``require_approval``: If ``True``, the task pauses after generating output and waits
+  for human review (``awaiting_input`` on Airflow 3.3+, deferred on 3.1 and 3.2).
+  Default ``False``. Needs Airflow 3.1+.
+- ``approval_timeout``: Maximum time to wait for a review (``timedelta``).  ``None``
+  means wait indefinitely.  Default ``None``.
+- ``on_approval_timeout``: Outcome when ``approval_timeout`` expires without a
+  review: ``"fail"`` (default), ``"approve"``, or ``"reject"``.  Requires a
+  review path (``require_approval=True`` or a ``decision_policy`` that reviews)
+  and a positive ``approval_timeout``.
+- ``allow_modifications``: If ``True``, the reviewer can edit the output before
+  approving.  For a type pydantic can validate, an edit that does not validate
+  fails the task with ``ReviewedOutputValidationError``; a retry runs the model
+  again.  Default ``False``.
+- ``approval_notifiers``: Notifier, or list of notifiers, called once the review
+  is open.  Default ``None``.
+- ``approval_assigned_users``: Users allowed to answer the review, as
+  ``{"id": ..., "name": ...}`` dicts where ``id`` is the auth manager's user id.
+  ``None`` (default) lets any user with the permission respond.  Fixed at first
+  run on Airflow 3.1 to 3.3; replaced on clear or retry from 3.4.  Needs Airflow 3.1+.
+- ``fail_on_reject``: If ``False``, a rejected review skips the direct downstream
+  tasks except teardowns and the task succeeds, as ``ApprovalOperator`` does.
+  Default ``True``: a rejection fails the task.
+- ``ignore_downstream_trigger_rules``: If ``True``, a rejection that does not fail
+  the task skips every downstream task except teardowns rather than only the
+  direct ones.  Default ``False``.
+
+Logging
+-------
+
+After each LLM call, the operator logs a summary with model name, token usage,
+and request count at INFO level. At DEBUG level, the LLM output is also logged
+(truncated to 500 characters). See :ref:`AgentOperator logging <howto/operator:agent>`
+for details on the log format.
+
+The same request/token/cost counts are also pushed to XCom under the ``usage``
+key, the same shape ``AgentOperator`` uses. Alongside it, the operator pushes a
+``run_id`` XCom and stamps the task's identity on the run's GenAI spans, the
+same way ``AgentOperator`` does -- see :doc:`../observability` for how the join
+key and identity attributes work. Both XComs are pushed on a failed run too, so
+a downstream ``all_done`` task or failure callback can read what was spent, and
+which run, before it raised.

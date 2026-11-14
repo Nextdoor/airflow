@@ -1,0 +1,859 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+"""This module contains Google Dataproc triggers."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import re
+import time
+from collections.abc import AsyncIterator, Sequence
+from typing import TYPE_CHECKING, Any
+
+from asgiref.sync import sync_to_async
+from google.api_core.exceptions import AlreadyExists, NotFound
+from google.cloud.dataproc_v1 import Batch, Cluster, ClusterStatus, Job, JobStatus
+
+from airflow.providers.common.compat.sdk import AirflowException
+from airflow.providers.google.cloud.hooks.dataproc import DataprocAsyncHook, DataprocHook
+from airflow.providers.google.cloud.utils.dataproc import DataprocOperationType
+from airflow.providers.google.common.hooks.base_google import PROVIDE_PROJECT_ID
+from airflow.providers.google.version_compat import AIRFLOW_V_3_0_PLUS, AIRFLOW_V_3_3_PLUS
+from airflow.triggers.base import BaseTrigger, TriggerEvent
+from airflow.utils.state import TaskInstanceState
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm.session import Session
+
+if not AIRFLOW_V_3_3_PLUS:
+    from sqlalchemy import select
+
+    from airflow.models.taskinstance import TaskInstance
+    from airflow.utils.session import provide_session
+
+
+class DataprocBaseTrigger(BaseTrigger):
+    """Base class for Dataproc triggers."""
+
+    def __init__(
+        self,
+        region: str,
+        project_id: str = PROVIDE_PROJECT_ID,
+        gcp_conn_id: str = "google_cloud_default",
+        impersonation_chain: str | Sequence[str] | None = None,
+        polling_interval_seconds: int = 30,
+        cancel_on_kill: bool = True,
+        delete_on_error: bool = True,
+    ):
+        super().__init__()
+        self.region = region
+        self.project_id = project_id
+        self.gcp_conn_id = gcp_conn_id
+        self.impersonation_chain = impersonation_chain
+        self.polling_interval_seconds = polling_interval_seconds
+        self.cancel_on_kill = cancel_on_kill
+        self.delete_on_error = delete_on_error
+
+    def get_async_hook(self):
+        return DataprocAsyncHook(
+            gcp_conn_id=self.gcp_conn_id,
+            impersonation_chain=self.impersonation_chain,
+        )
+
+    def get_sync_hook(self):
+        # The synchronous hook is utilized to delete the cluster when a task is cancelled.
+        # This is because the asynchronous hook deletion is not awaited when the trigger task
+        # is cancelled. The call for deleting the cluster or job through the sync hook is not a blocking
+        # call, which means it does not wait until the cluster or job is deleted.
+        return DataprocHook(
+            gcp_conn_id=self.gcp_conn_id,
+            impersonation_chain=self.impersonation_chain,
+        )
+
+
+class DataprocSubmitTrigger(DataprocBaseTrigger):
+    """
+    DataprocSubmitTrigger run on the trigger worker to perform create Build operation.
+
+    :param job_id: The ID of a Dataproc job.
+    :param project_id: Google Cloud Project where the job is running
+    :param region: The Cloud Dataproc region in which to handle the request.
+    :param gcp_conn_id: Optional, the connection ID used to connect to Google Cloud Platform.
+    :param impersonation_chain: Optional service account to impersonate using short-term
+        credentials, or chained list of accounts required to get the access_token
+        of the last account in the list, which will be impersonated in the request.
+        If set as a string, the account must grant the originating account
+        the Service Account Token Creator IAM role.
+        If set as a sequence, the identities from the list must grant
+        Service Account Token Creator IAM role to the directly preceding identity, with first
+        account from the list granting this role to the originating account (templated).
+    :param polling_interval_seconds: polling period in seconds to check for the status
+    :param execution_deadline: Optional absolute timestamp (in seconds since the epoch) after
+        which the task is considered timed out. On expiry the trigger cancels the Dataproc job
+        (unless ``cancel_on_kill`` is False) and emits a ``TIMED_OUT`` event.
+    """
+
+    def __init__(self, job_id: str, execution_deadline: float | None = None, **kwargs):
+        self.job_id = job_id
+        self.execution_deadline = execution_deadline
+        super().__init__(**kwargs)
+
+    def serialize(self):
+        return (
+            "airflow.providers.google.cloud.triggers.dataproc.DataprocSubmitTrigger",
+            {
+                "job_id": self.job_id,
+                "project_id": self.project_id,
+                "region": self.region,
+                "gcp_conn_id": self.gcp_conn_id,
+                "impersonation_chain": self.impersonation_chain,
+                "polling_interval_seconds": self.polling_interval_seconds,
+                "cancel_on_kill": self.cancel_on_kill,
+                "execution_deadline": self.execution_deadline,
+            },
+        )
+
+    async def on_kill(self) -> None:
+        """Cancel the Dataproc job when the task is killed by a user action."""
+        if self.job_id and self.cancel_on_kill:
+            self.log.info("Cancelling Dataproc job: %s.", self.job_id)
+            await sync_to_async(self.get_sync_hook().cancel_job)(
+                job_id=self.job_id, project_id=self.project_id, region=self.region
+            )
+            self.log.info("Job: %s is cancelled.", self.job_id)
+
+    if not AIRFLOW_V_3_3_PLUS:
+
+        @provide_session
+        def get_task_instance(self, *, session: Session) -> TaskInstance:
+            """
+            Get the task instance for the current task.
+
+            :param session: Sqlalchemy session
+            """
+            ti = self.task_instance
+            if ti is None:
+                raise RuntimeError("task_instance is not set on the trigger")
+            task_instance = session.scalar(
+                select(TaskInstance).where(
+                    TaskInstance.dag_id == ti.dag_id,
+                    TaskInstance.task_id == ti.task_id,
+                    TaskInstance.run_id == ti.run_id,
+                    TaskInstance.map_index == ti.map_index,
+                )
+            )
+            if task_instance is None:
+                msg = (
+                    f"TaskInstance with dag_id: {ti.dag_id}, task_id: {ti.task_id}, "
+                    f"run_id: {ti.run_id} and map_index: {ti.map_index} is not found"
+                )
+                raise AirflowException(msg)
+            return task_instance
+
+        async def get_task_state(self):
+            from airflow.sdk.execution_time.task_runner import RuntimeTaskInstance
+
+            ti = self.task_instance
+            if ti is None:
+                raise RuntimeError("task_instance is not set on the trigger")
+            task_states_response = await sync_to_async(RuntimeTaskInstance.get_task_states)(
+                dag_id=ti.dag_id,
+                task_ids=[ti.task_id],
+                run_ids=[ti.run_id],
+                map_index=ti.map_index,
+            )
+            # The execution API keys a mapped task instance as ``<task_id>_<map_index>``.
+            task_key = ti.task_id if ti.map_index < 0 else f"{ti.task_id}_{ti.map_index}"
+            try:
+                task_state = task_states_response[ti.run_id][task_key]
+            except Exception:
+                msg = (
+                    f"TaskInstance with dag_id: {ti.dag_id}, task_id: {ti.task_id}, "
+                    f"run_id: {ti.run_id} and map_index: {ti.map_index} is not found"
+                )
+                raise AirflowException(msg)
+            return task_state
+
+        async def safe_to_cancel(self) -> bool:
+            """
+            Whether it is safe to cancel the external job which is being executed by this trigger.
+
+            This is to avoid the case that `asyncio.CancelledError` is called because the trigger itself is stopped.
+            Because in those cases, we should NOT cancel the external job.
+            """
+            if AIRFLOW_V_3_0_PLUS:
+                task_state = await self.get_task_state()
+            else:
+                # Database query is needed to get the latest state of the task instance.
+                task_instance = self.get_task_instance()  # type: ignore[call-arg]
+                task_state = task_instance.state
+            return task_state != TaskInstanceState.DEFERRED
+
+    async def run(self):
+        hook = self.get_async_hook()
+        # Trigger client cache with sync call get_credentials(), evaluated once.
+        await hook.get_job_client(region=self.region)
+
+        try:
+            while True:
+                remaining = None if self.execution_deadline is None else self.execution_deadline - time.time()
+                if remaining is not None and remaining <= 0:
+                    if self.cancel_on_kill:
+                        self.log.info("Job %s exceeded execution_timeout; cancelling it.", self.job_id)
+                        try:
+                            await sync_to_async(self.get_sync_hook().cancel_job)(
+                                job_id=self.job_id, project_id=self.project_id, region=self.region
+                            )
+                        except Exception:
+                            self.log.exception("Failed to cancel job %s after execution timeout", self.job_id)
+                    yield TriggerEvent(
+                        {
+                            "job_id": self.job_id,
+                            "job_state": "TIMED_OUT",
+                            "message": f"Job {self.job_id} exceeded the task's execution_timeout "
+                            "while deferred.",
+                        }
+                    )
+                    return
+                try:
+                    job = await asyncio.wait_for(
+                        hook.get_job(project_id=self.project_id, region=self.region, job_id=self.job_id),
+                        timeout=remaining,
+                    )
+                except TimeoutError:
+                    continue
+                state = job.status.state
+                self.log.info("Dataproc job: %s is in state: %s", self.job_id, state)
+                if state in (JobStatus.State.DONE, JobStatus.State.CANCELLED, JobStatus.State.ERROR):
+                    break
+                sleep_seconds = self.polling_interval_seconds
+                if self.execution_deadline is not None:
+                    sleep_seconds = min(sleep_seconds, max(self.execution_deadline - time.time(), 0))
+                await asyncio.sleep(sleep_seconds)
+            yield TriggerEvent(
+                {"job_id": self.job_id, "job_state": JobStatus.State(state).name, "job": Job.to_dict(job)}
+            )
+        except asyncio.CancelledError:
+            if not AIRFLOW_V_3_3_PLUS:
+                self.log.info("Task got cancelled.")
+                try:
+                    if self.job_id and self.cancel_on_kill and await self.safe_to_cancel():
+                        self.log.info("Cancelling the job: %s", self.job_id)
+                        self.get_sync_hook().cancel_job(
+                            job_id=self.job_id, project_id=self.project_id, region=self.region
+                        )
+                        self.log.info("Job: %s is cancelled", self.job_id)
+                        yield TriggerEvent(
+                            {
+                                "job_id": self.job_id,
+                                "job_state": ClusterStatus.State.DELETING.name,
+                            }
+                        )
+                except Exception as e:
+                    self.log.error("Failed to cancel the job: %s with error : %s", self.job_id, str(e))
+                    raise e
+            raise
+
+
+class DataprocSubmitJobDirectTrigger(DataprocBaseTrigger):
+    """
+    Trigger that submits a Dataproc job and polls for its completion.
+
+    Used for direct-to-triggerer functionality where job submission and polling
+    are handled entirely by the triggerer without requiring a worker.
+
+    Unless the job resource already names the job, the trigger assigns a job id of its own before
+    submitting, so the job stays identifiable when the trigger is torn down or re-created while the
+    submit call is in flight.
+
+    :param job: The job resource dict to submit.
+    :param project_id: Google Cloud Project where the job is running.
+    :param region: The Cloud Dataproc region in which to handle the request.
+    :param gcp_conn_id: The connection ID used to connect to Google Cloud Platform.
+    :param impersonation_chain: Optional service account to impersonate using short-term credentials.
+    :param polling_interval_seconds: Polling period in seconds to check for the status.
+    :param cancel_on_kill: Flag indicating whether to cancel the job when on_kill is called.
+    :param request_id: Optional unique id used to identify the request. Defaults to the job id the
+        trigger assigns, which makes a re-submission by a restarted triggerer a no-op.
+    """
+
+    def __init__(
+        self,
+        job: dict,
+        request_id: str | None = None,
+        **kwargs,
+    ):
+        self.job = job
+        self.request_id = request_id
+        self.job_id: str | None = None
+        super().__init__(**kwargs)
+
+    def serialize(self):
+        return (
+            "airflow.providers.google.cloud.triggers.dataproc.DataprocSubmitJobDirectTrigger",
+            {
+                "job": self.job,
+                "request_id": self.request_id,
+                "project_id": self.project_id,
+                "region": self.region,
+                "gcp_conn_id": self.gcp_conn_id,
+                "impersonation_chain": self.impersonation_chain,
+                "polling_interval_seconds": self.polling_interval_seconds,
+                "cancel_on_kill": self.cancel_on_kill,
+            },
+        )
+
+    def _build_assigned_job_id(self) -> str | None:
+        """Derive the job id to assign for this deferral, or None when the trigger should not name it."""
+        ti = self.task_instance
+        if ti is None or self.trigger_id is None or (self.job.get("reference") or {}).get("job_id"):
+            return None
+        # ti.id is a per-try uuid7, so the job id stays unique even where two Airflow deployments
+        # share a Dataproc project; Airflow 2 has no such column and falls back to a task identity
+        # unique only within one deployment. trigger_id separates two deferrals of one attempt.
+        attempt = getattr(ti, "id", None) or (
+            f"{ti.dag_id}:{ti.task_id}:{ti.run_id}:{ti.map_index}:{ti.try_number}"
+        )
+        identity = f"{self.trigger_id}:{attempt}"
+        return f"airflow-{hashlib.sha256(identity.encode()).hexdigest()[:24]}"
+
+    async def on_kill(self) -> None:
+        """Cancel the Dataproc job when the task is killed by a user action."""
+        if self.job_id and self.cancel_on_kill:
+            self.log.info("Cancelling Dataproc job: %s.", self.job_id)
+            try:
+                await sync_to_async(self.get_sync_hook().cancel_job)(
+                    job_id=self.job_id, project_id=self.project_id, region=self.region
+                )
+            except NotFound:
+                # The kill can arrive while the submit call is in flight, so the job the trigger
+                # named may never have reached Dataproc.
+                self.log.info("Dataproc job: %s does not exist, nothing to cancel.", self.job_id)
+                return
+            self.log.info("Job: %s is cancelled.", self.job_id)
+
+    if not AIRFLOW_V_3_3_PLUS:
+
+        @provide_session
+        def get_task_instance(self, *, session: Session) -> TaskInstance:
+            """
+            Get the task instance for the current task.
+
+            :param session: Sqlalchemy session
+            """
+            ti = self.task_instance
+            if ti is None:
+                raise RuntimeError("task_instance is not set on the trigger")
+            task_instance = session.scalar(
+                select(TaskInstance).where(
+                    TaskInstance.dag_id == ti.dag_id,
+                    TaskInstance.task_id == ti.task_id,
+                    TaskInstance.run_id == ti.run_id,
+                    TaskInstance.map_index == ti.map_index,
+                )
+            )
+            if task_instance is None:
+                msg = (
+                    f"TaskInstance with dag_id: {ti.dag_id}, task_id: {ti.task_id}, "
+                    f"run_id: {ti.run_id} and map_index: {ti.map_index} is not found"
+                )
+                raise RuntimeError(msg)
+            return task_instance
+
+        async def get_task_state(self):
+            from airflow.sdk.execution_time.task_runner import RuntimeTaskInstance
+
+            ti = self.task_instance
+            if ti is None:
+                raise RuntimeError("task_instance is not set on the trigger")
+            task_states_response = await sync_to_async(RuntimeTaskInstance.get_task_states)(
+                dag_id=ti.dag_id,
+                task_ids=[ti.task_id],
+                run_ids=[ti.run_id],
+                map_index=ti.map_index,
+            )
+            # The execution API keys a mapped task instance as ``<task_id>_<map_index>``.
+            task_key = ti.task_id if ti.map_index < 0 else f"{ti.task_id}_{ti.map_index}"
+            try:
+                task_state = task_states_response[ti.run_id][task_key]
+            except Exception:
+                msg = (
+                    f"TaskInstance with dag_id: {ti.dag_id}, task_id: {ti.task_id}, "
+                    f"run_id: {ti.run_id} and map_index: {ti.map_index} is not found"
+                )
+                raise RuntimeError(msg)
+            return task_state
+
+        async def safe_to_cancel(self) -> bool:
+            """
+            Whether it is safe to cancel the external job which is being executed by this trigger.
+
+            This is to avoid the case that `asyncio.CancelledError` is called because the trigger itself is stopped.
+            Because in those cases, we should NOT cancel the external job.
+            """
+            if AIRFLOW_V_3_0_PLUS:
+                task_state = await self.get_task_state()
+            else:
+                task_instance = self.get_task_instance()  # type: ignore[call-arg]
+                task_state = task_instance.state
+            return task_state != TaskInstanceState.DEFERRED
+
+    async def run(self) -> AsyncIterator[TriggerEvent]:
+        try:
+            hook = self.get_async_hook()
+            job_to_submit = self.job
+            assigned_job_id = self._build_assigned_job_id()
+            if assigned_job_id is not None:
+                # Naming the job up front keeps its id known when the submit call is interrupted, and
+                # sends a re-submission by a restarted triggerer back to the job already running.
+                reference = {**(self.job.get("reference") or {}), "job_id": assigned_job_id}
+                job_to_submit = {**self.job, "reference": reference}
+                self.job_id = assigned_job_id
+            self.log.info("Submitting Dataproc job.")
+            try:
+                job_object = await hook.submit_job(
+                    project_id=self.project_id,
+                    region=self.region,
+                    job=job_to_submit,
+                    request_id=self.request_id or assigned_job_id,
+                )
+            except AlreadyExists:
+                # Only a job this trigger named can be assumed to be its own earlier submission; a
+                # job id the caller chose is theirs to keep unique.
+                if assigned_job_id is None:
+                    raise
+                self.log.info("Dataproc job %s was already submitted, resuming polling.", self.job_id)
+            else:
+                self.job_id = job_object.reference.job_id
+                self.log.info("Dataproc job %s submitted successfully.", self.job_id)
+
+            while True:
+                job = await hook.get_job(project_id=self.project_id, region=self.region, job_id=self.job_id)
+                state = job.status.state
+                self.log.info("Dataproc job: %s is in state: %s", self.job_id, state)
+                if state in (JobStatus.State.DONE, JobStatus.State.CANCELLED, JobStatus.State.ERROR):
+                    break
+                await asyncio.sleep(self.polling_interval_seconds)
+
+            yield TriggerEvent(
+                {"job_id": self.job_id, "job_state": JobStatus.State(state).name, "job": Job.to_dict(job)}
+            )
+        except asyncio.CancelledError:
+            if not AIRFLOW_V_3_3_PLUS:
+                self.log.info("Task got cancelled.")
+                try:
+                    if self.job_id and self.cancel_on_kill and await self.safe_to_cancel():
+                        self.log.info("Cancelling the job: %s", self.job_id)
+                        self.get_sync_hook().cancel_job(
+                            job_id=self.job_id, project_id=self.project_id, region=self.region
+                        )
+                        self.log.info("Job: %s is cancelled", self.job_id)
+                        yield TriggerEvent(
+                            {
+                                "job_id": self.job_id,
+                                "job_state": ClusterStatus.State.DELETING.name,  # type: ignore[attr-defined]
+                            }
+                        )
+                except NotFound:
+                    self.log.info("Dataproc job: %s does not exist, nothing to cancel.", self.job_id)
+                except Exception as e:
+                    self.log.error("Failed to cancel the job: %s with error : %s", self.job_id, str(e))
+                    raise e
+            raise
+
+
+class DataprocClusterTrigger(DataprocBaseTrigger):
+    """
+    DataprocClusterTrigger run on the trigger worker to perform create Build operation.
+
+    :param cluster_name: The name of the cluster.
+    :param project_id: Google Cloud Project where the job is running
+    :param region: The Cloud Dataproc region in which to handle the request.
+    :param gcp_conn_id: Optional, the connection ID used to connect to Google Cloud Platform.
+    :param impersonation_chain: Optional service account to impersonate using short-term
+        credentials, or chained list of accounts required to get the access_token
+        of the last account in the list, which will be impersonated in the request.
+        If set as a string, the account must grant the originating account
+        the Service Account Token Creator IAM role.
+        If set as a sequence, the identities from the list must grant
+        Service Account Token Creator IAM role to the directly preceding identity, with first
+        account from the list granting this role to the originating account (templated).
+    :param polling_interval_seconds: polling period in seconds to check for the status
+    """
+
+    def __init__(self, cluster_name: str, **kwargs):
+        super().__init__(**kwargs)
+        self.cluster_name = cluster_name
+
+    def serialize(self) -> tuple[str, dict[str, Any]]:
+        return (
+            "airflow.providers.google.cloud.triggers.dataproc.DataprocClusterTrigger",
+            {
+                "cluster_name": self.cluster_name,
+                "project_id": self.project_id,
+                "region": self.region,
+                "gcp_conn_id": self.gcp_conn_id,
+                "impersonation_chain": self.impersonation_chain,
+                "polling_interval_seconds": self.polling_interval_seconds,
+                "delete_on_error": self.delete_on_error,
+            },
+        )
+
+    if not AIRFLOW_V_3_0_PLUS:
+
+        @provide_session
+        def get_task_instance(self, *, session: Session) -> TaskInstance:
+            ti = self.task_instance
+            if ti is None:
+                raise RuntimeError("task_instance is not set on the trigger")
+            task_instance = session.scalar(
+                select(TaskInstance).where(
+                    TaskInstance.dag_id == ti.dag_id,
+                    TaskInstance.task_id == ti.task_id,
+                    TaskInstance.run_id == ti.run_id,
+                    TaskInstance.map_index == ti.map_index,
+                )
+            )
+            if task_instance is None:
+                msg = (
+                    f"TaskInstance with dag_id: {ti.dag_id}, task_id: {ti.task_id}, "
+                    f"run_id: {ti.run_id} and map_index: {ti.map_index} is not found"
+                )
+                raise AirflowException(msg)
+            return task_instance
+
+    async def get_task_state(self):
+        from airflow.sdk.execution_time.task_runner import RuntimeTaskInstance
+
+        ti = self.task_instance
+        if ti is None:
+            raise RuntimeError("task_instance is not set on the trigger")
+        task_states_response = await sync_to_async(RuntimeTaskInstance.get_task_states)(
+            dag_id=ti.dag_id,
+            task_ids=[ti.task_id],
+            run_ids=[ti.run_id],
+            map_index=ti.map_index,
+        )
+        # The execution API keys a mapped task instance as ``<task_id>_<map_index>``.
+        task_key = ti.task_id if ti.map_index < 0 else f"{ti.task_id}_{ti.map_index}"
+        try:
+            task_state = task_states_response[ti.run_id][task_key]
+        except Exception:
+            msg = (
+                f"TaskInstance with dag_id: {ti.dag_id}, task_id: {ti.task_id}, "
+                f"run_id: {ti.run_id} and map_index: {ti.map_index} is not found"
+            )
+            raise AirflowException(msg)
+        return task_state
+
+    async def safe_to_cancel(self) -> bool:
+        """
+        Whether it is safe to cancel the external job which is being executed by this trigger.
+
+        This is to avoid the case that `asyncio.CancelledError` is called because the trigger itself is stopped.
+        Because in those cases, we should NOT cancel the external job.
+        """
+        if AIRFLOW_V_3_0_PLUS:
+            task_state = await self.get_task_state()
+        else:
+            # Database query is needed to get the latest state of the task instance.
+            task_instance = self.get_task_instance()  # type: ignore[call-arg]
+            task_state = task_instance.state
+        return task_state != TaskInstanceState.DEFERRED
+
+    async def run(self) -> AsyncIterator[TriggerEvent]:
+        try:
+            while True:
+                cluster = await self.fetch_cluster()
+                state = cluster.status.state
+                if state == ClusterStatus.State.ERROR:
+                    await self.delete_when_error_occurred(cluster)
+                    yield TriggerEvent(
+                        {
+                            "cluster_name": self.cluster_name,
+                            "cluster_state": ClusterStatus.State.DELETING.name,  # type: ignore
+                            "cluster": Cluster.to_dict(cluster),
+                        }
+                    )
+                    return
+                elif state == ClusterStatus.State.RUNNING:
+                    yield TriggerEvent(
+                        {
+                            "cluster_name": self.cluster_name,
+                            "cluster_state": ClusterStatus.State(state).name,
+                            "cluster": Cluster.to_dict(cluster),
+                        }
+                    )
+                    return
+                else:
+                    self.log.info("Current state is %s", state)
+                    self.log.info("Sleeping for %s seconds.", self.polling_interval_seconds)
+                    await asyncio.sleep(self.polling_interval_seconds)
+        except asyncio.CancelledError:
+            try:
+                if self.delete_on_error and await self.safe_to_cancel():
+                    self.log.info(
+                        "Deleting the cluster as it is safe to delete as the airflow TaskInstance is not in "
+                        "deferred state."
+                    )
+                    self.log.info("Deleting cluster %s.", self.cluster_name)
+                    # The synchronous hook is utilized to delete the cluster when a task is cancelled.
+                    # This is because the asynchronous hook deletion is not awaited when the trigger task
+                    # is cancelled. The call for deleting the cluster through the sync hook is not a blocking
+                    # call, which means it does not wait until the cluster is deleted.
+                    self.get_sync_hook().delete_cluster(
+                        region=self.region, cluster_name=self.cluster_name, project_id=self.project_id
+                    )
+                    self.log.info("Deleted cluster %s during cancellation.", self.cluster_name)
+            except Exception as e:
+                self.log.error("Error during cancellation handling: %s", e)
+                msg = f"Error during cancellation handling: {e}"
+                raise AirflowException(msg)
+            raise
+
+    async def fetch_cluster(self) -> Cluster:
+        """Fetch the cluster status."""
+        return await self.get_async_hook().get_cluster(
+            project_id=self.project_id, region=self.region, cluster_name=self.cluster_name
+        )
+
+    async def delete_when_error_occurred(self, cluster: Cluster) -> None:
+        """
+        Delete the cluster on error.
+
+        :param cluster: The cluster to delete.
+        """
+        if self.delete_on_error:
+            self.log.info("Deleting cluster %s.", self.cluster_name)
+            await self.get_async_hook().delete_cluster(
+                region=self.region, cluster_name=self.cluster_name, project_id=self.project_id
+            )
+            self.log.info("Cluster %s has been deleted.", self.cluster_name)
+        else:
+            self.log.info("Cluster %s is not deleted as delete_on_error is set to False.", self.cluster_name)
+
+
+class DataprocBatchTrigger(DataprocBaseTrigger):
+    """
+    DataprocCreateBatchTrigger run on the trigger worker to perform create Build operation.
+
+    :param batch_id: The ID of the build.
+    :param project_id: Google Cloud Project where the job is running
+    :param region: The Cloud Dataproc region in which to handle the request.
+    :param gcp_conn_id: Optional, the connection ID used to connect to Google Cloud Platform.
+    :param impersonation_chain: Optional service account to impersonate using short-term
+        credentials, or chained list of accounts required to get the access_token
+        of the last account in the list, which will be impersonated in the request.
+        If set as a string, the account must grant the originating account
+        the Service Account Token Creator IAM role.
+        If set as a sequence, the identities from the list must grant
+        Service Account Token Creator IAM role to the directly preceding identity, with first
+        account from the list granting this role to the originating account (templated).
+    :param polling_interval_seconds: polling period in seconds to check for the status
+    """
+
+    def __init__(self, batch_id: str, **kwargs):
+        super().__init__(**kwargs)
+        self.batch_id = batch_id
+
+    def serialize(self) -> tuple[str, dict[str, Any]]:
+        """Serialize DataprocBatchTrigger arguments and classpath."""
+        return (
+            "airflow.providers.google.cloud.triggers.dataproc.DataprocBatchTrigger",
+            {
+                "batch_id": self.batch_id,
+                "project_id": self.project_id,
+                "region": self.region,
+                "gcp_conn_id": self.gcp_conn_id,
+                "impersonation_chain": self.impersonation_chain,
+                "polling_interval_seconds": self.polling_interval_seconds,
+            },
+        )
+
+    async def run(self):
+        hook = self.get_async_hook()
+
+        while True:
+            batch = await hook.get_batch(
+                project_id=self.project_id, region=self.region, batch_id=self.batch_id
+            )
+            state = batch.state
+
+            if state in (Batch.State.FAILED, Batch.State.SUCCEEDED, Batch.State.CANCELLED):
+                break
+            self.log.info("Current state is %s", Batch.State(state).name)
+            self.log.info("Sleeping for %s seconds.", self.polling_interval_seconds)
+            await asyncio.sleep(self.polling_interval_seconds)
+
+        yield TriggerEvent(
+            {
+                "batch_id": self.batch_id,
+                "batch_state": Batch.State(state).name,
+                "batch_state_message": batch.state_message,
+            }
+        )
+
+
+class DataprocDeleteClusterTrigger(DataprocBaseTrigger):
+    """
+    DataprocDeleteClusterTrigger run on the trigger worker to perform delete cluster operation.
+
+    :param cluster_name: The name of the cluster
+    :param end_time: Time in second left to check the cluster status
+    :param project_id: The ID of the Google Cloud project the cluster belongs to
+    :param region: The Cloud Dataproc region in which to handle the request
+    :param metadata: Additional metadata that is provided to the method
+    :param gcp_conn_id: The connection ID to use when fetching connection info.
+    :param impersonation_chain: Optional service account to impersonate using short-term
+        credentials, or chained list of accounts required to get the access_token
+        of the last account in the list, which will be impersonated in the request.
+        If set as a string, the account must grant the originating account
+        the Service Account Token Creator IAM role.
+        If set as a sequence, the identities from the list must grant
+        Service Account Token Creator IAM role to the directly preceding identity, with first
+        account from the list granting this role to the originating account.
+    :param polling_interval_seconds: Time in seconds to sleep between checks of cluster status
+    """
+
+    def __init__(
+        self,
+        cluster_name: str,
+        end_time: float,
+        metadata: Sequence[tuple[str, str]] = (),
+        **kwargs: Any,
+    ):
+        super().__init__(**kwargs)
+        self.cluster_name = cluster_name
+        self.end_time = end_time
+        self.metadata = metadata
+
+    def serialize(self) -> tuple[str, dict[str, Any]]:
+        """Serialize DataprocDeleteClusterTrigger arguments and classpath."""
+        return (
+            "airflow.providers.google.cloud.triggers.dataproc.DataprocDeleteClusterTrigger",
+            {
+                "cluster_name": self.cluster_name,
+                "end_time": self.end_time,
+                "project_id": self.project_id,
+                "region": self.region,
+                "metadata": self.metadata,
+                "gcp_conn_id": self.gcp_conn_id,
+                "impersonation_chain": self.impersonation_chain,
+                "polling_interval_seconds": self.polling_interval_seconds,
+            },
+        )
+
+    async def run(self) -> AsyncIterator[TriggerEvent]:
+        """Wait until cluster is deleted completely."""
+        try:
+            while self.end_time > time.time():
+                cluster = await self.get_async_hook().get_cluster(
+                    region=self.region,
+                    cluster_name=self.cluster_name,
+                    project_id=self.project_id,
+                    metadata=self.metadata,
+                )
+                self.log.info(
+                    "Cluster status is %s. Sleeping for %s seconds.",
+                    cluster.status.state,
+                    self.polling_interval_seconds,
+                )
+                await asyncio.sleep(self.polling_interval_seconds)
+        except NotFound:
+            yield TriggerEvent({"status": "success", "message": ""})
+        except Exception as e:
+            yield TriggerEvent({"status": "error", "message": str(e)})
+        else:
+            yield TriggerEvent({"status": "error", "message": "Timeout"})
+
+
+class DataprocOperationTrigger(DataprocBaseTrigger):
+    """
+    Trigger that periodically polls information on a long running operation from Dataproc API to verify status.
+
+    Implementation leverages asynchronous transport.
+    """
+
+    def __init__(self, name: str, operation_type: str | None = None, **kwargs: Any):
+        super().__init__(**kwargs)
+        self.name = name
+        self.operation_type = operation_type
+
+    def serialize(self):
+        return (
+            "airflow.providers.google.cloud.triggers.dataproc.DataprocOperationTrigger",
+            {
+                "name": self.name,
+                "operation_type": self.operation_type,
+                "project_id": self.project_id,
+                "region": self.region,
+                "gcp_conn_id": self.gcp_conn_id,
+                "impersonation_chain": self.impersonation_chain,
+                "polling_interval_seconds": self.polling_interval_seconds,
+            },
+        )
+
+    async def run(self) -> AsyncIterator[TriggerEvent]:
+        hook = self.get_async_hook()
+        try:
+            while True:
+                operation = await hook.get_operation(region=self.region, operation_name=self.name)
+                if operation.done:
+                    if operation.error.message:
+                        status = "error"
+                        message = operation.error.message
+                    else:
+                        status = "success"
+                        message = "Operation is successfully ended."
+                    if self.operation_type == DataprocOperationType.DIAGNOSE.value:
+                        gcs_regex = rb"gs:\/\/[a-z0-9][a-z0-9_-]{1,61}[a-z0-9_\-\/]*"
+                        gcs_uri_value = operation.response.value
+                        match = re.search(gcs_regex, gcs_uri_value)
+                        if match:
+                            output_uri = match.group(0).decode("utf-8", "ignore")
+                        else:
+                            output_uri = gcs_uri_value
+                        yield TriggerEvent(
+                            {
+                                "status": status,
+                                "message": message,
+                                "output_uri": output_uri,
+                            }
+                        )
+                    else:
+                        yield TriggerEvent(
+                            {
+                                "operation_name": operation.name,
+                                "operation_done": operation.done,
+                                "status": status,
+                                "message": message,
+                            }
+                        )
+                    return
+                else:
+                    self.log.info("Sleeping for %s seconds.", self.polling_interval_seconds)
+                    await asyncio.sleep(self.polling_interval_seconds)
+        except Exception as e:
+            self.log.exception("Exception occurred while checking operation status.")
+            yield TriggerEvent(
+                {
+                    "status": "failed",
+                    "message": str(e),
+                }
+            )

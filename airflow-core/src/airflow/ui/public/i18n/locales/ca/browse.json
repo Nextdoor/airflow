@@ -1,0 +1,96 @@
+{
+  "auditLog": {
+    "columns": {
+      "event": "Esdeveniment",
+      "extra": "Extra",
+      "user": "Usuari",
+      "when": "Quan"
+    },
+    "filters": {
+      "eventType": "Tipus d'esdeveniment"
+    }
+  },
+  "dagBundles": {
+    "active": "Activa",
+    "columns": {
+      "active": "Activa",
+      "importErrors": "Errors d'importació",
+      "lastRefreshed": "Darrera actualització",
+      "name": "Nom",
+      "version": "Versió"
+    },
+    "detail": {
+      "status": "Estat"
+    },
+    "files": {
+      "columns": {
+        "file": "Fitxer",
+        "lastParsed": "Darrera anàlisi",
+        "parseDuration": "Durada de l'anàlisi"
+      },
+      "importErrorGone": "Aquest error d'importació ja no consta al registre. Probablement s'ha resolt amb una nova anàlisi.",
+      "neverParsed": "Mai",
+      "parsedFile_one": "Fitxer analitzat",
+      "parsedFile_other": "Fitxers analitzats",
+      "parsedFilesNote": "Només es mostren els fitxers que defineixen un Dag o que no s'han pogut importar.",
+      "showImportError_one": "Veure error",
+      "showImportError_other": "Veure {{count, number}} errors"
+    },
+    "inactive": "Inactiva",
+    "neverRefreshed": "Mai",
+    "notRefreshedYet": "Encara no s'ha actualitzat",
+    "notVersioned": "Sense versions"
+  },
+  "deadlines": {
+    "columns": {
+      "alertName": "Nom de l'alerta",
+      "deadlineTime": "Hora del termini",
+      "status": "Estat"
+    },
+    "deadline_one": "Termini",
+    "deadline_other": "Terminis",
+    "filters": {
+      "status": "Estat",
+      "statusOptions": {
+        "all": "Tots",
+        "missed": "Vençut",
+        "pending": "Pendent"
+      }
+    },
+    "title": "Terminis"
+  },
+  "xcom": {
+    "add": {
+      "error": "No s'ha pogut afegir l'XCom",
+      "errorTitle": "Error",
+      "success": "XCom afegit correctament",
+      "successTitle": "XCom afegit",
+      "title": "Afegir XCom"
+    },
+    "columns": {
+      "dag": "Dag",
+      "key": "Clau",
+      "value": "Valor"
+    },
+    "delete": {
+      "error": "No s'ha pogut eliminar l'XCom",
+      "errorTitle": "Error",
+      "success": "XCom eliminat correctament",
+      "successTitle": "XCom eliminat",
+      "title": "Eliminar XCom",
+      "warning": "Estàs segur que vols eliminar aquest XCom? Aquesta acció no es pot desfer."
+    },
+    "edit": {
+      "error": "No s'ha pogut actualitzar l'XCom",
+      "errorTitle": "Error",
+      "success": "XCom actualitzat correctament",
+      "successTitle": "XCom actualitzat",
+      "title": "Editar XCom"
+    },
+    "entry_one": "Entrada d'XCom",
+    "entry_other": "Entrades d'XCom",
+    "key": "Clau",
+    "title": "XCom",
+    "value": "Valor"
+  }
+}

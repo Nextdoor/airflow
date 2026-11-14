@@ -1,0 +1,52 @@
+{
+  "filters": {
+    "body": "Cos",
+    "createdAt": "Creat a",
+    "response": {
+      "all": "Totes",
+      "pending": "Pendents",
+      "received": "Revisades"
+    }
+  },
+  "requiredAction_one": "Acció requerida",
+  "requiredAction_other": "Accions requerides",
+  "requiredActionCount_one": "Accions requerides ({{count, number}})",
+  "requiredActionCount_other": "Accions requerides ({{count, number}})",
+  "requiredActionState": "Estat de l'acció requerida",
+  "response": {
+    "created": "Resposta creada a ",
+    "error": "Resposta fallida",
+    "optionsDescription": "Escull les teves opcions per a aquesta instància de tasca",
+    "optionsLabel": "Opcions",
+    "received": "Resposta rebuda a ",
+    "respond": "Respondre",
+    "responded_by_user_name": "Respost per (usuari)",
+    "success": "Resposta de {{taskId}} exitosa",
+    "title": "Instància de tasca humana - {{taskId}}"
+  },
+  "review": {
+    "detail": {
+      "selectRequiredAction": "Seleccioneu una acció requerida per a veure'n els detalls"
+    },
+    "list": {
+      "completedRequiredActions": "Accions requerides completades ({{count, number}})",
+      "loadError": "No s'han pogut carregar les accions requerides",
+      "loadingActions": "Carregant les accions requerides...",
+      "pendingRequiredActions": "Accions requerides pendents ({{count, number}})"
+    },
+    "openReviewDrawer": "Obrir el calaix de revisió",
+    "pageLimitHint": "Aquí només es mostren les primeres accions. Utilitzeu \"$t(review.viewAll)\" per veure-les totes.",
+    "viewAll": "Veure totes les accions requerides"
+  },
+  "state": {
+    "approvalReceived": "Aprovació rebuda",
+    "approvalRequired": "Aprovació requerida",
+    "choiceReceived": "Elecció rebuda",
+    "choiceRequired": "Elecció requerida",
+    "noResponseReceived": "No s'ha rebut cap resposta",
+    "rejectionReceived": "Rebuig rebut",
+    "responseReceived": "Resposta rebuda",
+    "responseRequired": "Resposta requerida"
+  },
+  "subject": "Assumpte"
+}

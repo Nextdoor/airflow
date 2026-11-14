@@ -26,20 +26,18 @@ IN_CONTAINER_DIR=$(cd "$(dirname "$0")" || exit 1; pwd)
 . "${IN_CONTAINER_DIR}/_in_container_utils.sh"
 
 in_container_set_colors
-
-in_container_basic_sanity_check
-
+in_container_basic_check
 in_container_script_start
 
 # any argument received is overriding the default nose execution arguments:
 PYTEST_ARGS=( "$@" )
 
 echo
-echo "Starting the tests with those pytest arguments: ${PYTEST_ARGS[*]}"
+echo "Starting system tests with those pytest arguments: --system ${PYTEST_ARGS[*]}"
 echo
 set +e
 
-pytest "${PYTEST_ARGS[@]}"
+pytest --system "${PYTEST_ARGS[@]}"
 
 RES=$?
 

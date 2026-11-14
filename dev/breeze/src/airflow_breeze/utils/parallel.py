@@ -23,17 +23,18 @@ import sys
 import textwrap
 import time
 from abc import ABCMeta, abstractmethod
+from collections.abc import Generator
 from contextlib import contextmanager
 from enum import Enum
 from multiprocessing.pool import ApplyResult, Pool
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from threading import Thread
-from typing import Any, Generator, NamedTuple
+from typing import Any, NamedTuple
 
 from rich.table import Table
 
-from airflow_breeze.utils.console import MessageType, Output, get_console
+from airflow_breeze.utils.console import MessageType, Output, console_print, get_console
 from airflow_breeze.utils.shared_options import (
     get_dry_run,
     get_forced_answer,
@@ -66,9 +67,9 @@ def get_temp_file_name() -> str:
 
 
 def get_output_files(titles: list[str]) -> list[Output]:
-    outputs = [Output(title=titles[i], file_name=get_temp_file_name()) for i in range(len(titles))]
+    outputs = [Output(title=title, file_name=get_temp_file_name()) for title in titles]
     for out in outputs:
-        get_console().print(f"[info]Capturing output of {out.title}:[/] {out.file_name}")
+        console_print(f"[info]Capturing output of {out.escaped_title}:[/] {out.file_name}")
     return outputs
 
 
@@ -116,6 +117,12 @@ class AbstractProgressInfoMatcher(metaclass=ABCMeta):
         Return best matching lines of the output.
         :return: array of lines to print
         """
+
+
+class ShowLastLineProgressMatcher(AbstractProgressInfoMatcher):
+    def get_best_matching_lines(self, output: Output) -> list[str] | None:
+        last_lines, _ = get_last_lines_of_file(output.file_name, num_lines=1)
+        return last_lines
 
 
 class DockerBuildxProgressMatcher(AbstractProgressInfoMatcher):
@@ -185,8 +192,7 @@ class GenericRegexpProgressMatcher(AbstractProgressInfoMatcher):
             if self.matcher_for_joined_line is not None and previous_line is not None:
                 list_to_return: list[str] = [previous_line, best_line]
                 return list_to_return
-            else:
-                self.last_good_match[output.file_name] = best_line
+            self.last_good_match[output.file_name] = best_line
         last_match = self.last_good_match.get(output.file_name)
         if last_match is None:
             return None
@@ -203,7 +209,7 @@ def bytes2human(n):
         prefix[s] = 1 << (i + 1) * 10
     for s in reversed(symbols):
         if n >= prefix[s]:
-            value = float(n) / prefix[s]
+            value = n / prefix[s]
             return f"{value:.1f}{s}"
     return f"{n}B"
 
@@ -222,7 +228,7 @@ def get_single_tuple_array(title: str, t: NamedTuple) -> Table:
     for key, value in t._asdict().items():
         table.add_column(header=key, header_style="info")
         row.append(get_printable_value(key, value))
-    table.add_row(*row, style="magenta")
+    table.add_row(*row, style="special")
     return table
 
 
@@ -239,7 +245,7 @@ def get_multi_tuple_array(title: str, tuples: list[tuple[NamedTuple, ...]]) -> T
         for named_tuple in t:
             for key, value in named_tuple._asdict().items():
                 row.append(get_printable_value(key, value))
-        table.add_row(*row, style="magenta")
+        table.add_row(*row, style="special")
     return table
 
 
@@ -267,7 +273,7 @@ class ParallelMonitor(Thread):
         self,
         outputs: list[Output],
         initial_time_in_seconds: int = 2,
-        time_in_seconds: int = 10,
+        time_in_seconds: int = int(os.environ.get("AIRFLOW_MONITOR_DELAY_TIME_IN_SECONDS", "20")),
         debug_resources: bool = False,
         progress_matcher: AbstractProgressInfoMatcher | None = None,
     ):
@@ -277,7 +283,7 @@ class ParallelMonitor(Thread):
         self.time_in_seconds = time_in_seconds
         self.debug_resources = debug_resources
         self.progress_matcher = progress_matcher
-        self.start_time = datetime.datetime.utcnow()
+        self.start_time = datetime.datetime.now(tz=datetime.UTC)
 
     def print_single_progress(self, output: Output):
         if self.progress_matcher:
@@ -301,26 +307,31 @@ class ParallelMonitor(Thread):
             else:
                 size = os.path.getsize(output.file_name) if Path(output.file_name).exists() else 0
                 default_output = f"File: {output.file_name} Size: {size:>10} bytes"
-                get_console().print(f"Progress: {output.title[:30]:<30} {default_output:>161}")
+                console_print(f"Progress: {output.escaped_title[:30]:<30} {default_output:>161}")
 
     def print_summary(self):
         import psutil
 
-        time_passed = datetime.datetime.utcnow() - self.start_time
+        time_passed = datetime.datetime.now(tz=datetime.UTC) - self.start_time
         get_console().rule()
         for output in self.outputs:
             self.print_single_progress(output)
         get_console().rule(title=f"Time passed: {nice_timedelta(time_passed)}")
         if self.debug_resources:
-            get_console().print(get_single_tuple_array("Virtual memory", psutil.virtual_memory()))
+            console_print(get_single_tuple_array("Virtual memory", psutil.virtual_memory()))
             disk_stats = []
             for partition in psutil.disk_partitions(all=True):
                 if partition.fstype not in IGNORED_FSTYPES:
                     try:
                         disk_stats.append((partition, psutil.disk_usage(partition.mountpoint)))
                     except Exception:
-                        get_console().print(f"No disk usage info for {partition.mountpoint}")
-            get_console().print(get_multi_tuple_array("Disk usage", disk_stats))
+                        console_print(f"No disk usage info for {partition.mountpoint}")
+            console_print(get_multi_tuple_array("Disk usage", disk_stats))
+            # Print CPU percent usage
+            console_print("CPU usage:")
+            usage = psutil.cpu_percent(percpu=True, interval=None)
+            for i, cpu_usage in enumerate(usage):
+                console_print(f"CPU {i}: {cpu_usage / 100:.0%}")
 
     def run(self):
         try:
@@ -332,25 +343,26 @@ class ParallelMonitor(Thread):
             get_console().print_exception(show_locals=True)
 
 
-def print_async_summary(completed_list: list[ApplyResult]) -> None:
+def print_async_result_status(completed_list: list[ApplyResult]) -> None:
     """
-    Print summary of completed async results.
+    Print status of completed async results.
     :param completed_list: list of completed async results.
     """
     completed_list.sort(key=lambda x: x.get()[1])
-    get_console().print()
+    console_print()
     for result in completed_list:
         return_code, info = result.get()
+        info = info.replace("[", "\\[")
         if return_code != 0:
-            get_console().print(f"[error]NOK[/] for {info}: Return code: {return_code}.")
+            console_print(f"[error]NOK[/] for {info}: Return code: {return_code}.")
         else:
-            get_console().print(f"[success]OK [/] for {info}.")
-    get_console().print()
+            console_print(f"[success]OK [/] for {info}.")
+    console_print()
 
 
 def get_completed_result_list(results: list[ApplyResult]) -> list[ApplyResult]:
     """Return completed results from the list."""
-    return list(filter(lambda result: result.ready(), results))
+    return [result for result in results if result.ready()]
 
 
 class SummarizeAfter(Enum):
@@ -362,30 +374,65 @@ class SummarizeAfter(Enum):
 
 def check_async_run_results(
     results: list[ApplyResult],
-    success: str,
+    success_message: str,
     outputs: list[Output],
     include_success_outputs: bool,
-    poll_time: float = 0.2,
+    poll_time_seconds: float = 0.2,
     skip_cleanup: bool = False,
     summarize_on_ci: SummarizeAfter = SummarizeAfter.NO_SUMMARY,
     summary_start_regexp: str | None = None,
+    terminated_on_timeout: bool = False,
 ):
     """
-    Check if all async results were success. Exits with error if not.
+    Check if all async results were success.
+
+    Exits with error if:
+
+    * exit code 1: some tasks failed
+    * exit code 2: some tasks were terminated on timeout
+
     :param results: results of parallel runs (expected in the form of Tuple: (return_code, info)
     :param outputs: outputs where results are written to
-    :param success: Success string printed when everything is OK
+    :param success_message: Success string printed when everything is OK
     :param include_success_outputs: include outputs of successful parallel runs
-    :param poll_time: what's the poll time between checks
+    :param poll_time_seconds: what's the poll time between checks
     :param skip_cleanup: whether to skip cleanup of temporary files.
     :param summarize_on_ci: determines when to summarize the parallel jobs  when they are completed in CI,
         outside the folded CI output
     :param summary_start_regexp: the regexp that determines line after which
         outputs should be printed as summary, so that you do not have to look at the folded details of
         the run in CI
+    :param terminated_on_timeout: whether the run was terminated on timeout
     """
-    from airflow_breeze.utils.ci_group import ci_group
+    if terminated_on_timeout:
+        print_outputs_on_timeout(outputs, results, include_success_outputs)
+        sys.exit(2)
+    completed_list = wait_for_all_tasks_completed(poll_time_seconds, results)
+    print_async_result_status(completed_list)
+    print_logs_on_completion(include_success_outputs, outputs, results)
+    summarize_results_outside_of_folded_logs(outputs, results, summarize_on_ci, summary_start_regexp)
+    if finalize_async_tasks(outputs, results, skip_cleanup, success_message):
+        sys.exit(1)
 
+
+def print_logs_on_completion(
+    include_success_outputs: bool, outputs: list[Output], results: list[ApplyResult]
+):
+    for i, result in enumerate(results):
+        if result.get()[0] != 0:
+            message_type = MessageType.ERROR
+        else:
+            message_type = MessageType.SUCCESS
+        if message_type == MessageType.ERROR or include_success_outputs:
+            from airflow_breeze.utils.ci_group import ci_group
+
+            with ci_group(f"{outputs[i].escaped_title}", message_type):
+                os.write(1, Path(outputs[i].file_name).read_bytes())
+        else:
+            console_print(f"[success]{outputs[i].escaped_title} OK[/]")
+
+
+def wait_for_all_tasks_completed(poll_time_seconds: float, results: list[ApplyResult]) -> list[ApplyResult]:
     completed_number = 0
     total_number_of_results = len(results)
     completed_list = get_completed_result_list(results)
@@ -393,59 +440,125 @@ def check_async_run_results(
         current_completed_number = len(completed_list)
         if current_completed_number != completed_number:
             completed_number = current_completed_number
-            get_console().print(
+            console_print(
                 f"\n[info]Completed {completed_number} out of {total_number_of_results} "
-                f"({int(100*completed_number/total_number_of_results)}%).[/]\n"
+                f"({completed_number / total_number_of_results:.0%}).[/]\n"
             )
-            print_async_summary(completed_list)
-        time.sleep(poll_time)
+            print_async_result_status(completed_list)
+        time.sleep(poll_time_seconds)
         completed_list = get_completed_result_list(results)
     completed_number = len(completed_list)
-    get_console().print(
+    console_print(
         f"\n[info]Completed {completed_number} out of {total_number_of_results} "
-        f"({int(100*completed_number/total_number_of_results)}%).[/]\n"
+        f"({completed_number / total_number_of_results:.0%}).[/]\n"
     )
-    print_async_summary(completed_list)
+    return completed_list
+
+
+def finalize_async_tasks(
+    outputs: list[Output], results: list[ApplyResult], skip_cleanup: bool, success_message: str
+) -> bool:
+    """
+    Finalize async tasks by checking results and cleaning up temporary files.
+
+    :param outputs: List of Output objects containing file names and titles.
+    :param results: List of ApplyResult objects containing the results of the tasks.
+    :param skip_cleanup: Whether to skip cleanup of temporary files.
+    :param success_message: Message to print if all tasks were successful.
+    :return: True if there were errors, False otherwise.
+    """
     errors = False
-    for i, result in enumerate(results):
+    for result in results:
         if result.get()[0] != 0:
             errors = True
+    if errors:
+        console_print("\n[error]There were errors when running some tasks. Quitting.[/]\n")
+    else:
+        console_print(f"\n[success]{success_message}[/]\n")
+    if not skip_cleanup:
+        for output in outputs:
+            Path(output.file_name).unlink(missing_ok=True)
+    from airflow_breeze.utils.docker_command_utils import fix_ownership_using_docker
+
+    fix_ownership_using_docker()
+    return errors
+
+
+def summarize_results_outside_of_folded_logs(
+    outputs: list[Output],
+    results: list[ApplyResult],
+    summarize_on_ci: SummarizeAfter,
+    summary_start_regexp: str | None = None,
+):
+    """
+    Print summary of the results outside the folded logs in CI.
+
+    :param outputs: List of Output objects containing file names and titles.
+    :param results: List of ApplyResult objects containing the results of the tasks.
+    :param summarize_on_ci: Determines when to summarize the parallel jobs when they are completed in
+        CI, outside the folded CI output.
+    :param summary_start_regexp: The regexp that determines line after which
+        outputs should be printed as summary, so that you do not have to look at the folded details of
+        the run in CI.
+    """
+    if summarize_on_ci == SummarizeAfter.NO_SUMMARY:
+        return
+    regex = re.compile(summary_start_regexp) if summary_start_regexp is not None else None
+    for i, result in enumerate(results):
+        failure = result.get()[0] != 0
+        if summarize_on_ci in [
+            SummarizeAfter.BOTH,
+            SummarizeAfter.FAILURE if failure else SummarizeAfter.SUCCESS,
+        ]:
+            print_lines = False
+            for line in Path(outputs[i].file_name).read_bytes().decode(errors="ignore").splitlines():
+                if not print_lines and (regex is None or regex.match(remove_ansi_colours(line))):
+                    print_lines = True
+                    console_print(f"\n[info]Summary: {outputs[i].escaped_title:<30}:\n")
+                if print_lines:
+                    print(line)
+
+
+def print_outputs_on_timeout(
+    outputs: list[Output], results: list[ApplyResult], include_success_outputs: bool
+):
+    """
+    Print outputs of the tasks that were terminated on timeout.
+    This function is called when some tasks were terminated on timeout.
+    It prints the outputs of the tasks that were terminated on timeout,
+    and the outputs of the tasks that were successful if `include_success_outputs` is True.
+    :param outputs: list of Output objects containing file names and titles
+    :param results: list of ApplyResult objects containing the results of the tasks
+    :param include_success_outputs: whether to include outputs of successful tasks
+    """
+    console_print(
+        "\n[warning]Some tasks were terminated on timeout. "
+        "Please check the logs of the tasks (below) for more details.[/]\n"
+    )
+    for i, result in enumerate(results):
+        try:
+            exit_code = result.get(timeout=0)[0]
+        except Exception:
+            exit_code = -1
+        if exit_code != 0:
             message_type = MessageType.ERROR
         else:
             message_type = MessageType.SUCCESS
+        output = outputs[i]
         if message_type == MessageType.ERROR or include_success_outputs:
-            with ci_group(title=f"{outputs[i].title}", message_type=message_type):
-                os.write(1, Path(outputs[i].file_name).read_bytes())
+            from airflow_breeze.utils.ci_group import ci_group
+
+            with ci_group(f"{output.escaped_title}", message_type):
+                os.write(1, Path(output.file_name).read_bytes())
         else:
-            get_console().print(f"[success]{outputs[i].title}")
-    if summarize_on_ci != SummarizeAfter.NO_SUMMARY:
-        regex = re.compile(summary_start_regexp) if summary_start_regexp is not None else None
-        for i, result in enumerate(results):
-            failure = result.get()[0] != 0
-            if summarize_on_ci in [
-                SummarizeAfter.BOTH,
-                SummarizeAfter.FAILURE if failure else SummarizeAfter.SUCCESS,
-            ]:
-                print_lines = False
-                for line in Path(outputs[i].file_name).read_bytes().decode(errors="ignore").splitlines():
-                    if not print_lines and (regex is None or regex.match(remove_ansi_colours(line))):
-                        print_lines = True
-                        get_console().print(f"\n[info]Summary: {outputs[i].title:<30}:\n")
-                    if print_lines:
-                        print(line)
-    try:
-        if errors:
-            get_console().print("\n[error]There were errors when running some tasks. Quitting.[/]\n")
-            sys.exit(1)
-        else:
-            get_console().print(f"\n[success]{success}[/]\n")
-    finally:
-        if not skip_cleanup:
-            for output in outputs:
-                try:
-                    os.unlink(output.file_name)
-                except FileNotFoundError:
-                    pass
+            console_print(f"[success]{outputs[i].escaped_title} OK[/]")
+    console_print(
+        "\n[warning]Some tasks were terminated on timeout. "
+        "Please check the logs of the tasks (above) for more details.[/]\n"
+    )
+    from airflow_breeze.utils.docker_command_utils import fix_ownership_using_docker
+
+    fix_ownership_using_docker()
 
 
 @contextmanager
@@ -453,11 +566,11 @@ def run_with_pool(
     parallelism: int,
     all_params: list[str],
     initial_time_in_seconds: int = 2,
-    time_in_seconds: int = 10,
+    time_in_seconds: int = int(os.environ.get("AIRFLOW_MONITOR_DELAY_TIME_IN_SECONDS", "20")),
     debug_resources: bool = False,
     progress_matcher: AbstractProgressInfoMatcher | None = None,
 ) -> Generator[tuple[Pool, list[Output]], None, None]:
-    get_console().print(f"Running with parallelism: {parallelism}")
+    console_print(f"Running with parallelism: {parallelism}")
     pool = create_pool(parallelism)
     outputs = get_output_files(all_params)
     m = ParallelMonitor(

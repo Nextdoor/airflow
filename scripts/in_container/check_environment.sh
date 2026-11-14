@@ -28,50 +28,24 @@ EXIT_CODE=0
 # Even if this message might be harmless, it might hide the real reason for the problem
 # Which is the long time needed to start some services, seeing this message might be totally misleading
 # when you try to analyse the problem, that's why it's best to avoid it,
-function run_nc() {
-    local host=${1}
-    local port=${2}
-    local ip
-    ip=$(python -c "import socket; print(socket.gethostbyname('${host}'))")
 
-    nc -zvvn "${ip}" "${port}"
-}
+. "$( dirname "${BASH_SOURCE[0]}" )/check_connectivity.sh"
+
+export COLOR_YELLOW=$'\e[33m'
+export COLOR_RESET=$'\e[0m'
 
 function check_service {
     local label=$1
     local call=$2
     local max_check=${3:=1}
+    local initial_delay="${4:-0}"
 
-    echo -n "${label}: "
-    while true
-    do
-        set +e
-        local last_check_result
-        last_check_result=$(eval "${call}" 2>&1)
-        local res=$?
-        set -e
-        if [[ ${res} == 0 ]]; then
-            echo  "${COLOR_GREEN}OK.  ${COLOR_RESET}"
-            break
-        else
-            echo -n "."
-            max_check=$((max_check-1))
-        fi
-        if [[ ${max_check} == 0 ]]; then
-            echo "${COLOR_RED}ERROR: Maximum number of retries while checking service. Exiting ${COLOR_RESET}"
-            break
-        else
-            sleep 1
-        fi
-    done
-    if [[ ${res} != 0 ]]; then
-        echo "Service could not be started!"
-        echo
-        echo "$ ${call}"
-        echo "${last_check_result}"
-        echo
-        EXIT_CODE=${res}
+    if [[ ${initial_delay} != 0 ]]; then
+        echo "${COLOR_YELLOW}Adding initial delay. Waiting ${initial_delay} seconds before checking ${label}.${COLOR_RESET}"
+        sleep "${initial_delay}"
     fi
+    check_service_connection "${label}" "${call}" "${max_check}"
+    EXIT_CODE=$?
 }
 
 function check_db_backend {
@@ -86,8 +60,24 @@ function check_db_backend {
         check_service "MSSQL Login Check" "airflow db check" "${max_check}"
     elif [[ ${BACKEND} == "sqlite" ]]; then
         return
+    elif [[ ${BACKEND} == "none" ]]; then
+        echo "${COLOR_YELLOW}WARNING: Using no database backend${COLOR_RESET}"
+
+        if [[ ${START_AIRFLOW=} == "true" ]]; then
+            echo "${COLOR_RED}ERROR: 'start-airflow' cannot be used with --backend=none${COLOR_RESET}"
+            echo "${COLOR_RED}Supported values are: [postgres,mysql,sqlite,custom]${COLOR_RESET}"
+            echo "${COLOR_RED}Please specify one using '--backend'${COLOR_RESET}"
+            exit 1
+        fi
+    elif [[ ${BACKEND} == "custom" ]]; then
+        echo "${COLOR_YELLOW}WARNING: Using custom database backend. Only officially supported backends are tested.${COLOR_RESET}"
+
+        if [[ -z ${AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=} ]]; then
+            echo "${COLOR_RED}ERROR: AIRFLOW__DATABASE__SQL_ALCHEMY_CONN must be set when using --backend=custom${COLOR_RESET}"
+            exit 1
+        fi
     else
-        echo "Unknown backend. Supported values: [postgres,mysql,mssql,sqlite]. Current value: [${BACKEND}]"
+        echo "${COLOR_RED}ERROR: Unknown backend. Supported values: [postgres,mysql,sqlite,custom]. Current value: [${BACKEND}]${COLOR_RESET}"
         exit 1
     fi
 }
@@ -110,16 +100,44 @@ function startairflow_if_requested() {
         echo
         echo "Starting Airflow"
         echo
-        export AIRFLOW__DATABASE__LOAD_DEFAULT_CONNECTIONS=${LOAD_DEFAULT_CONNECTIONS}
         export AIRFLOW__CORE__LOAD_EXAMPLES=${LOAD_EXAMPLES}
 
-        . "$( dirname "${BASH_SOURCE[0]}" )/configure_environment.sh"
+        if airflow db migrate
+        then
+            if [[ ${LOAD_DEFAULT_CONNECTIONS=} == "true" || ${LOAD_DEFAULT_CONNECTIONS=} == "True" ]]; then
+                echo
+                echo "${COLOR_BLUE}Creating default connections${COLOR_RESET}"
+                echo
+                airflow connections create-default-connections
+            fi
+        else
+            echo "${COLOR_YELLOW}Failed to run 'airflow db migrate'.${COLOR_RESET}"
+            echo "${COLOR_BLUE}This could be because you are installing old airflow version${COLOR_RESET}"
+            echo "${COLOR_BLUE}Attempting to run deprecated 'airflow db init' instead.${COLOR_RESET}"
+            # For Airflow versions that do not support db migrate, we should run airflow db init and
+            # set the removed AIRFLOW__DATABASE__LOAD_DEFAULT_CONNECTIONS
+            AIRFLOW__DATABASE__LOAD_DEFAULT_CONNECTIONS=${LOAD_DEFAULT_CONNECTIONS} airflow db init
+        fi
 
-        airflow db init
-        airflow users create -u admin -p admin -f Thor -l Adminstra -r Admin -e dummy@dummy.email
+        local auth_manager="${AIRFLOW__CORE__AUTH_MANAGER:-}"
+        if [[ -z "${auth_manager}" ]]; then
+            auth_manager=$(airflow config get-value core auth_manager || true)
+        fi
+        if [[ "${auth_manager}" == *FabAuthManager* ]]; then
+            airflow users create -u admin -p admin -f Thor -l Adminstra -r Admin -e admin@email.domain || true
 
-        . "$( dirname "${BASH_SOURCE[0]}" )/run_init_script.sh"
-
+            # Create all roles for testing if CREATE_ALL_ROLES is set
+            if [[ "${CREATE_ALL_ROLES}" == "true" ]]; then
+                echo "Creating all test roles for FabAuthManager..."
+                airflow users create -u viewer -p viewer -f Test -l Viewer -r Viewer -e viewer@email.domain || true
+                airflow users create -u user -p user -f Test -l User -r User -e user@email.domain || true
+                airflow users create -u op -p op -f Test -l Op -r Op -e op@email.domain || true
+                airflow users create -u testadmin -p testadmin -f Test -l TestAdmin -r Admin -e testadmin@email.domain || true
+                echo "All test roles created successfully for FabAuthManager."
+            fi
+        else
+            echo "SimpleAuthManager detected. All roles (admin, viewer, user, op) are always available via configuration in .dev/breeze/src/airflow_breeze/files/simple_auth_manager_passwords.json"
+        fi
     fi
     return $?
 }
@@ -138,6 +156,12 @@ if [[ ${INTEGRATION_KERBEROS} == "true" ]]; then
 fi
 if [[ ${INTEGRATION_MONGO} == "true" ]]; then
     check_service "MongoDB" "run_nc mongo 27017" 50
+fi
+if [[ ${INTEGRATION_REDIS} == "true" ]]; then
+    check_service "Redis" "run_nc redis 6379" 50
+fi
+if [[ ${INTEGRATION_OTEL} == "true" ]]; then
+    check_service "Jaeger" "run_nc jaeger 16686" 50
 fi
 if [[ ${INTEGRATION_CELERY} == "true" ]]; then
     check_service "Redis" "run_nc redis 6379" 50
@@ -159,6 +183,32 @@ if [[ ${INTEGRATION_PINOT} == "true" ]]; then
     check_service "Pinot (Controller API)" "${CMD}" 50
     CMD="curl --max-time 1 -X GET 'http://pinot:8000/health' -H 'accept: text/plain' | grep OK"
     check_service "Pinot (Broker API)" "${CMD}" 50
+fi
+
+if [[ ${INTEGRATION_QDRANT} == "true" ]]; then
+    check_service "Qdrant" "run_nc qdrant 6333" 50
+    CMD="curl -f -X GET 'http://qdrant:6333/collections'"
+    check_service "Qdrant (Collections API)" "${CMD}" 50
+fi
+
+if [[ ${INTEGRATION_KAFKA} == "true" ]]; then
+    check_service "Kafka Cluster" "run_nc broker 9092" 50
+fi
+
+if [[ ${INTEGRATION_MSSQL} == "true" ]]; then
+    check_service "mssql" "run_nc mssql 1433" 50
+fi
+
+if [[ ${INTEGRATION_DRILL} == "true" ]]; then
+    check_service "drill" "run_nc drill 8047" 50
+fi
+
+if [[ ${INTEGRATION_YDB} == "true" ]]; then
+    check_service "YDB Cluster" "run_nc ydb 2136" 50
+fi
+
+if [[ ${INTEGRATION_TINKERPOP} == "true" ]]; then
+    check_service "gremlin" "run_nc gremlin 8182" 100 30
 fi
 
 if [[ ${EXIT_CODE} != 0 ]]; then

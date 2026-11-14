@@ -1,0 +1,415 @@
+/*!
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import type { JSX } from "react";
+
+import type { UseQueryOptions } from "@tanstack/react-query";
+import Anser from "anser";
+import dayjs from "dayjs";
+import type { TFunction } from "i18next";
+import { useTranslation } from "react-i18next";
+import innerText from "react-innertext";
+
+import { useDeadlinesServiceGetCallbackLogs, useTaskInstanceServiceGetLog } from "openapi/queries";
+import type {
+  StructuredLogMessage,
+  TaskInstanceResponse,
+  TaskInstanceHistoryResponse,
+  TaskInstancesLogResponse,
+} from "openapi/requests/types.gen";
+
+import {
+  extractTIContext,
+  renderStructuredLog,
+  renderTIContextPreamble,
+} from "src/components/renderStructuredLog";
+
+import { isStatePending, useAutoRefresh } from "src/utils";
+import { getTaskInstanceLink } from "src/utils/links";
+import { parseStreamingLogContent } from "src/utils/logs";
+
+export type ParsedLogEntry = {
+  element: JSX.Element | string | undefined;
+  getPlainText?: () => string;
+  group?: { id: number; level: number; parentId?: number; type: "header" | "line" };
+  lineNumber?: number;
+  timestamp?: string;
+};
+
+type GetLogLineTextOptions = {
+  logLevelFilters?: Array<string>;
+  logMessage: string | StructuredLogMessage;
+  showLogLevel?: boolean;
+  showSource?: boolean;
+  showTimestamp?: boolean;
+  sourceFilters?: Array<string>;
+  translate: TFunction;
+};
+
+/**
+ * Plain-text rendering of a single log line — same pipeline as the log
+ * download, with ANSI escape codes stripped. Used to rebuild copied text for
+ * selected rows the virtualizer has unmounted.
+ */
+export const getLogLineText = ({
+  logLevelFilters,
+  logMessage,
+  showLogLevel,
+  showSource,
+  showTimestamp,
+  sourceFilters,
+  translate,
+}: GetLogLineTextOptions): string =>
+  Anser.ansiToText(
+    renderStructuredLog({
+      index: 0,
+      logLevelFilters,
+      logLink: "",
+      logMessage,
+      renderingMode: "text",
+      showLogLevel,
+      showSource,
+      showTimestamp,
+      sourceFilters,
+      translate,
+    }),
+  );
+
+type Props = {
+  accept?: "*/*" | "application/json" | "application/x-ndjson";
+  dagId: string;
+  historical?: boolean;
+  limit?: number;
+  logLevelFilters?: Array<string>;
+  showLogLevel?: boolean;
+  showSource?: boolean;
+  showTimestamp?: boolean;
+  sourceFilters?: Array<string>;
+  taskInstance?: TaskInstanceHistoryResponse | TaskInstanceResponse;
+  tryNumber?: number;
+};
+
+type ParseLogsProps = {
+  data: TaskInstancesLogResponse["content"];
+  logLevelFilters?: Array<string>;
+  showLogLevel?: boolean;
+  showSource?: boolean;
+  showTimestamp?: boolean;
+  sourceFilters?: Array<string>;
+  taskInstance?: TaskInstanceHistoryResponse | TaskInstanceResponse;
+  translate: TFunction;
+  tryNumber: number;
+};
+
+export const parseLogs = ({
+  data,
+  logLevelFilters,
+  showLogLevel,
+  showSource,
+  showTimestamp,
+  sourceFilters,
+  taskInstance,
+  translate,
+  tryNumber,
+}: ParseLogsProps) => {
+  let warning;
+  let parsedLines;
+  const sources: Array<string> = [];
+
+  const logSearch = new URLSearchParams({ try_number: String(tryNumber) });
+
+  if (taskInstance?.region_id !== undefined) {
+    logSearch.set("region_id", taskInstance.region_id);
+    logSearch.set("region_index", String(taskInstance.region_index));
+  }
+  const logLink = taskInstance
+    ? `${getTaskInstanceLink({ dagId: taskInstance.dag_id, dagRunId: taskInstance.dag_run_id, mapIndex: taskInstance.map_index, taskId: taskInstance.task_id }, "logs")}?${logSearch}`
+    : "";
+
+  try {
+    let lineNumber = 0;
+    const lineNumbers = data.map((datum) => {
+      const text = typeof datum === "string" ? datum : datum.event;
+
+      if (text.includes("::group::") || text.includes("::endgroup::")) {
+        return undefined;
+      }
+      const current = lineNumber;
+
+      lineNumber += 1;
+
+      return current;
+    });
+
+    parsedLines = data
+      .map((datum, index) => {
+        if (typeof datum !== "string" && "logger" in datum) {
+          const source = datum.logger as string;
+
+          if (!sources.includes(source)) {
+            sources.push(source);
+          }
+        }
+
+        return {
+          element: renderStructuredLog({
+            index: lineNumbers[index] ?? index,
+            logLevelFilters,
+            logLink,
+            logMessage: datum,
+            renderingMode: "jsx",
+            showLogLevel,
+            showSource,
+            showTimestamp,
+            sourceFilters,
+            translate,
+          }),
+          lineNumber: lineNumbers[index],
+          logMessage: datum,
+        };
+      })
+      .filter(({ element }) => element !== "");
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : "An error occurred.";
+
+    // eslint-disable-next-line no-console
+    console.warn(`Error parsing logs: ${errorMessage}`);
+    warning = "Unable to show logs. There was an error parsing logs.";
+
+    return { data, warning };
+  }
+
+  const flatEntries: Array<ParsedLogEntry> = (() => {
+    type Group = { headerIndex: number; id: number; level: number; name: string };
+    const groupStack: Array<Group> = [];
+    const result: Array<ParsedLogEntry> = [];
+    let nextGroupId = 0;
+
+    parsedLines.forEach(({ element, lineNumber, logMessage }) => {
+      const text = innerText(element);
+      const getPlainText = () =>
+        getLogLineText({
+          logLevelFilters,
+          logMessage,
+          showLogLevel,
+          showSource,
+          showTimestamp,
+          sourceFilters,
+          translate,
+        });
+
+      if (text.includes("::group::")) {
+        const groupName = text.split("::group::")[1] as string;
+        const id = nextGroupId;
+
+        nextGroupId += 1;
+        const level = groupStack.length;
+        const parentGroup = groupStack[groupStack.length - 1];
+
+        groupStack.push({ headerIndex: result.length, id, level, name: groupName });
+        result.push({
+          element: groupName,
+          group: { id, level, parentId: parentGroup?.id, type: "header" },
+        });
+
+        return;
+      }
+
+      if (text.includes("::endgroup::")) {
+        const closedGroup = groupStack.pop();
+
+        // Hide groups that closed with nothing in them.
+        if (closedGroup !== undefined && result.length === closedGroup.headerIndex + 1) {
+          result.pop();
+        }
+
+        return;
+      }
+
+      const currentGroup = groupStack[groupStack.length - 1];
+      const timestamp = typeof logMessage === "string" ? undefined : logMessage.timestamp;
+
+      if (groupStack.length > 0 && currentGroup) {
+        result.push({
+          element,
+          getPlainText,
+          group: { id: currentGroup.id, level: currentGroup.level, type: "line" },
+          lineNumber,
+          timestamp,
+        });
+      } else {
+        result.push({ element, getPlainText, lineNumber, timestamp });
+      }
+    });
+
+    // Handle unclosed groups: their lines are already in result as flat entries
+    return result;
+  })();
+
+  // Extract TI identity fields from the first structured log line and insert a single preamble
+  // entry after the "Pre Execute" group header (or at position 0 if absent), so they
+  // appear once rather than repeated on every line.
+  const tiContext = extractTIContext(data);
+
+  if (tiContext !== undefined) {
+    let insertAt = 0;
+    let insertGroup: { id: number; level: number; parentId?: number; type: "header" | "line" } | undefined =
+      undefined;
+    const preExecuteIndex = flatEntries.findIndex(
+      (entry) =>
+        entry.group?.type === "header" &&
+        typeof entry.element === "string" &&
+        entry.element.startsWith("Pre Execute"),
+    );
+
+    const preExecuteGroup = preExecuteIndex === -1 ? undefined : flatEntries[preExecuteIndex];
+
+    if (preExecuteGroup?.group !== undefined) {
+      insertAt = preExecuteIndex + 1;
+      insertGroup = {
+        id: preExecuteGroup.group.id,
+        level: preExecuteGroup.group.level,
+        parentId: preExecuteGroup.group.id,
+        type: "line",
+      };
+    }
+    flatEntries.splice(insertAt, 0, {
+      element: renderTIContextPreamble(tiContext, "jsx", "Task Identity"),
+      group: insertGroup,
+    });
+  }
+
+  return {
+    parsedLogs: flatEntries,
+    sources,
+    warning,
+  };
+};
+
+// Log truncation is performed in the frontend because the backend
+// does not support yet pagination / limits on logs reading endpoint
+const truncateData = (data: TaskInstancesLogResponse | undefined, limit?: number) => {
+  if (!data?.content || limit === undefined || limit <= 0) {
+    return data;
+  }
+
+  const streamingContent = parseStreamingLogContent(data);
+  const truncatedContent =
+    streamingContent.length > limit ? streamingContent.slice(-limit) : streamingContent;
+
+  return {
+    ...data,
+    content: truncatedContent,
+  };
+};
+
+// Build a 1:1 searchable text array from parsedLogs so search indices align
+// with the rendered output. Each entry maps to exactly one line.
+const getSearchableText = (parsedLogs: Array<ParsedLogEntry> | undefined): Array<string> =>
+  (parsedLogs ?? []).map((entry) => {
+    if (typeof entry.element === "string") {
+      return entry.element;
+    }
+
+    return entry.element ? innerText(entry.element) : "";
+  });
+
+export const useLogs = (
+  {
+    accept = "application/x-ndjson",
+    dagId,
+    historical = false,
+    limit,
+    logLevelFilters,
+    showLogLevel,
+    showSource,
+    showTimestamp,
+    sourceFilters,
+    taskInstance,
+    tryNumber = 1,
+  }: Props,
+  options?: Omit<UseQueryOptions<TaskInstancesLogResponse>, "queryFn" | "queryKey">,
+) => {
+  const { t: translate } = useTranslation();
+  const refetchInterval = useAutoRefresh({ dagId });
+
+  const { data, ...rest } = useTaskInstanceServiceGetLog(
+    {
+      accept,
+      dagId,
+      dagRunId: taskInstance?.dag_run_id ?? "",
+      mapIndex: taskInstance?.map_index ?? -1,
+      regionId: taskInstance?.region_id,
+      regionIndex: taskInstance?.region_index,
+      taskId: taskInstance?.task_id ?? "",
+      tryNumber,
+    },
+    undefined,
+    {
+      enabled: Boolean(taskInstance),
+      refetchInterval: (query) =>
+        !historical &&
+        (isStatePending(taskInstance?.state) ||
+          dayjs(query.state.dataUpdatedAt).isBefore(taskInstance?.end_date)) &&
+        refetchInterval,
+      ...options,
+    },
+  );
+
+  const parsedData = parseLogs({
+    data: parseStreamingLogContent(truncateData(data, limit)),
+    logLevelFilters,
+    showLogLevel,
+    showSource,
+    showTimestamp,
+    sourceFilters,
+    taskInstance,
+    translate,
+    tryNumber,
+  });
+
+  const searchableText = getSearchableText(parsedData.parsedLogs);
+
+  return { parsedData: { ...parsedData, searchableText }, ...rest, fetchedData: data };
+};
+
+type CallbackLogsProps = { callbackId: string; dagRunId: string } & Omit<
+  Props,
+  "accept" | "limit" | "taskInstance" | "tryNumber"
+>;
+
+export const useCallbackLogs = ({ callbackId, dagId, dagRunId, ...displayOptions }: CallbackLogsProps) => {
+  const { t: translate } = useTranslation();
+
+  const { data, ...rest } = useDeadlinesServiceGetCallbackLogs({
+    accept: "application/x-ndjson",
+    callbackId,
+    dagId,
+    dagRunId,
+  });
+
+  const parsedData = parseLogs({
+    data: parseStreamingLogContent(data),
+    ...displayOptions,
+    translate,
+    tryNumber: 1,
+  });
+  const searchableText = getSearchableText(parsedData.parsedLogs);
+
+  return { parsedData: { ...parsedData, searchableText }, ...rest, fetchedData: data };
+};

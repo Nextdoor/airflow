@@ -1,0 +1,338 @@
+/*!
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import "@testing-library/jest-dom/vitest";
+import { render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+
+import type {
+  LightGridTaskInstanceSummary,
+  TaskInstanceHistoryResponse,
+  TaskInstanceResponse,
+} from "openapi/requests/types.gen";
+
+import { Wrapper } from "src/utils/Wrapper";
+
+import TaskInstanceTooltip from "./TaskInstanceTooltip";
+
+vi.mock("react-i18next", () => ({
+  useTranslation: () => ({
+    i18n: { language: "en" },
+    // eslint-disable-next-line id-length
+    t: (key: string) => key,
+  }),
+}));
+
+const buildTry = (overrides: Partial<TaskInstanceHistoryResponse>) =>
+  ({
+    dag_id: "test",
+    dag_run_id: "test",
+    duration: null,
+    end_date: null,
+    start_date: null,
+    task_id: "my_task",
+    try_number: 2,
+    ...overrides,
+  }) as unknown as TaskInstanceHistoryResponse;
+
+describe("TaskInstanceTooltip", () => {
+  it("renders children directly when both taskInstance and tooltip are undefined", () => {
+    render(
+      <TaskInstanceTooltip>
+        <span data-testid="child">Child content</span>
+      </TaskInstanceTooltip>,
+      { wrapper: Wrapper },
+    );
+
+    expect(screen.getByTestId("child")).toBeInTheDocument();
+    // Should not render a tooltip trigger wrapper
+    expect(screen.queryByRole("tooltip")).toBeNull();
+  });
+
+  it("shows state and dates for LightGridTaskInstanceSummary with both dates", () => {
+    const taskInstance: LightGridTaskInstanceSummary = {
+      child_states: null,
+      max_end_date: "2025-01-01T01:00:00Z",
+      min_start_date: "2025-01-01T00:00:00Z",
+      state: "success",
+      task_display_name: "My Task",
+      task_id: "my_task",
+    };
+
+    render(
+      <TaskInstanceTooltip open taskInstance={taskInstance}>
+        <span>trigger</span>
+      </TaskInstanceTooltip>,
+      { wrapper: Wrapper },
+    );
+
+    expect(screen.getByText(/state/iu)).toBeInTheDocument();
+    expect(screen.getByText(/startDate/iu)).toBeInTheDocument();
+    expect(screen.getByText(/duration/iu)).toBeInTheDocument();
+  });
+
+  it("calculates live duration for a running task instead of using stale duration", () => {
+    // We pass a stale duration of 50 seconds, but start date is 2 hours ago.
+    // The calculated duration should be ~2 hours, not 50 seconds.
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    const taskInstance: TaskInstanceResponse = {
+      dag_display_name: "Test DAG",
+      dag_id: "test",
+      dag_run_id: "test",
+      dag_version: null,
+      duration: 50.0,
+      end_date: null,
+      executor: null,
+      executor_config: "{}",
+      hostname: null,
+      id: "test_my_task",
+      in_loop: false,
+      logical_date: null,
+      map_index: 0,
+      max_tries: 3,
+      note: null,
+      operator: "DummyOperator",
+      operator_name: "DummyOperator",
+      pid: null,
+      pool: "default_pool",
+      pool_slots: 1,
+      priority_weight: null,
+      queue: null,
+      queued_when: null,
+      rendered_fields: undefined,
+      rendered_map_index: null,
+      run_after: twoHoursAgo,
+      scheduled_when: null,
+      start_date: twoHoursAgo,
+      state: "running",
+      task_display_name: "My Task",
+      task_id: "my_task",
+      trigger: null,
+      triggerer_job: null,
+      try_number: 2,
+      unixname: null,
+    };
+
+    render(
+      <TaskInstanceTooltip open taskInstance={taskInstance}>
+        <span>trigger</span>
+      </TaskInstanceTooltip>,
+      { wrapper: Wrapper },
+    );
+
+    const durationText = screen.getByText(/duration/iu).parentElement?.textContent;
+
+    // The live start_date is two hours old; the stale `duration: 50` field must not win.
+    expect(durationText).not.toContain("50s");
+    expect(durationText).toContain("2h");
+  });
+
+  it("shows only start date when max_end_date is null", () => {
+    const taskInstance: LightGridTaskInstanceSummary = {
+      child_states: null,
+      max_end_date: null,
+      min_start_date: "2025-01-01T00:00:00Z",
+      state: "running",
+      task_display_name: "My Task",
+      task_id: "my_task",
+    };
+
+    render(
+      <TaskInstanceTooltip open taskInstance={taskInstance}>
+        <span>trigger</span>
+      </TaskInstanceTooltip>,
+      { wrapper: Wrapper },
+    );
+
+    expect(screen.getByText(/state/iu)).toBeInTheDocument();
+    expect(screen.getByText(/startDate/iu)).toBeInTheDocument();
+    expect(screen.queryByText(/endDate/iu)).toBeNull();
+    expect(screen.queryByText(/duration/iu)).toBeNull();
+  });
+
+  it("shows no dates when min_start_date is null", () => {
+    const taskInstance: LightGridTaskInstanceSummary = {
+      child_states: null,
+      max_end_date: null,
+      min_start_date: null,
+      state: "queued",
+      task_display_name: "My Task",
+      task_id: "my_task",
+    };
+
+    render(
+      <TaskInstanceTooltip open taskInstance={taskInstance}>
+        <span>trigger</span>
+      </TaskInstanceTooltip>,
+      { wrapper: Wrapper },
+    );
+
+    expect(screen.getByText(/state/iu)).toBeInTheDocument();
+    expect(screen.queryByText(/startDate/iu)).toBeNull();
+    expect(screen.queryByText(/endDate/iu)).toBeNull();
+  });
+
+  it("shows tooltip text when only tooltip prop is provided", () => {
+    render(
+      <TaskInstanceTooltip open tooltip="My group description">
+        <span>trigger</span>
+      </TaskInstanceTooltip>,
+      { wrapper: Wrapper },
+    );
+
+    expect(screen.getByText("My group description")).toBeInTheDocument();
+  });
+
+  it("shows both tooltip text and task instance data", () => {
+    const taskInstance: LightGridTaskInstanceSummary = {
+      child_states: { success: 3 },
+      max_end_date: "2025-01-01T02:00:00Z",
+      min_start_date: "2025-01-01T00:00:00Z",
+      state: "success",
+      task_display_name: "Group Task",
+      task_id: "group_task",
+    };
+
+    render(
+      <TaskInstanceTooltip open taskInstance={taskInstance} tooltip="Task Group Info">
+        <span>trigger</span>
+      </TaskInstanceTooltip>,
+      { wrapper: Wrapper },
+    );
+
+    expect(screen.getByText("Task Group Info")).toBeInTheDocument();
+    expect(screen.getAllByText(/state/iu).length).toBeGreaterThan(0);
+    expect(screen.getByText(/startDate/iu)).toBeInTheDocument();
+  });
+
+  it("renders API-normalized none child state in the breakdown", () => {
+    const taskInstance: LightGridTaskInstanceSummary = {
+      child_states: { none: 2, success: 1 },
+      max_end_date: null,
+      min_start_date: null,
+      state: null,
+      task_display_name: "Mapped Task",
+      task_id: "mapped_task",
+    };
+
+    render(
+      <TaskInstanceTooltip open taskInstance={taskInstance}>
+        <span>trigger</span>
+      </TaskInstanceTooltip>,
+      { wrapper: Wrapper },
+    );
+
+    expect(screen.getByText(/2\s+common:states\.none/iu)).toBeInTheDocument();
+    expect(screen.queryByText(/^common:states\.None$/iu)).toBeNull();
+    expect(screen.getByText(/1\s+common:states\.success/iu)).toBeInTheDocument();
+  });
+
+  it("groups thousands in the child state breakdown", () => {
+    const taskInstance: LightGridTaskInstanceSummary = {
+      child_states: { success: 1234 },
+      max_end_date: null,
+      min_start_date: null,
+      state: "success",
+      task_display_name: "Mapped Task",
+      task_id: "mapped_task",
+    };
+
+    render(
+      <TaskInstanceTooltip open taskInstance={taskInstance}>
+        <span>trigger</span>
+      </TaskInstanceTooltip>,
+      { wrapper: Wrapper },
+    );
+
+    expect(screen.getByText(/1,234\s+common:states\.success/iu)).toBeInTheDocument();
+  });
+
+  it("shows run ID when provided explicitly for grid summaries", () => {
+    const taskInstance: LightGridTaskInstanceSummary = {
+      child_states: null,
+      max_end_date: "2025-01-01T02:00:00Z",
+      min_start_date: "2025-01-01T00:00:00Z",
+      state: "success",
+      task_display_name: "My Task",
+      task_id: "my_task",
+    };
+
+    render(
+      <TaskInstanceTooltip open runId="manual__2025-01-01T00:00:00+00:00" taskInstance={taskInstance}>
+        <span>trigger</span>
+      </TaskInstanceTooltip>,
+      { wrapper: Wrapper },
+    );
+
+    expect(screen.getByText(/runId/iu)).toBeInTheDocument();
+    expect(screen.getByText(/manual__2025-01-01T00:00:00\+00:00/iu)).toBeInTheDocument();
+  });
+
+  it("names the try even on a first attempt", () => {
+    render(
+      <TaskInstanceTooltip
+        open
+        taskInstance={{
+          child_states: null,
+          loop_iteration: { iteration: 1, loop_id: "process_batch" },
+          max_end_date: null,
+          min_start_date: null,
+          state: "success",
+          task_display_name: "batch_ready",
+          task_id: "process_batch.batch_ready",
+          try_number: 1,
+        }}
+      >
+        <span>trigger</span>
+      </TaskInstanceTooltip>,
+      { wrapper: Wrapper },
+    );
+
+    // Clearing a pass regenerates the later ones as fresh executions that start at try 1, so
+    // two neighbouring bars can both be a first try and the number is what tells them apart.
+    expect(screen.getByText(/tryNumber/iu).textContent).toContain("1");
+  });
+
+  it("shows when a try waiting to be retried becomes due", () => {
+    render(
+      <TaskInstanceTooltip
+        open
+        taskInstance={buildTry({ retry_at: "2026-10-29T12:00:30Z", state: "up_for_retry" })}
+      >
+        <span>trigger</span>
+      </TaskInstanceTooltip>,
+      { wrapper: Wrapper },
+    );
+
+    expect(screen.getByText(/taskInstance\.retryAt/u)).toBeInTheDocument();
+  });
+
+  it.each([
+    { retry_at: null, state: "up_for_retry" },
+    { retry_at: "2026-10-29T12:00:30Z", state: "failed" },
+  ] as const)("hides retry at for a $state try with retry_at $retry_at", (overrides) => {
+    render(
+      <TaskInstanceTooltip open taskInstance={buildTry(overrides)}>
+        <span>trigger</span>
+      </TaskInstanceTooltip>,
+      { wrapper: Wrapper },
+    );
+
+    expect(screen.queryByText(/taskInstance\.retryAt/u)).not.toBeInTheDocument();
+  });
+});

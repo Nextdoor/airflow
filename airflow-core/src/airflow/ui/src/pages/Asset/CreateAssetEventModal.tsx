@@ -1,0 +1,265 @@
+/*!
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import { useState } from "react";
+
+import { Button, Field, HStack, Input, Text } from "@chakra-ui/react";
+import { useQueryClient } from "@tanstack/react-query";
+import { useTranslation } from "react-i18next";
+import { FiPlay } from "react-icons/fi";
+
+import {
+  useAssetServiceCreateAssetEvent,
+  UseAssetServiceGetAssetEventsKeyFn,
+  useAssetServiceGetAssetsUiKey,
+  useAssetServiceMaterializeAsset,
+  UseDagRunServiceGetDagRunsKeyFn,
+  useDagServiceGetDagDetails,
+  UseDagServiceGetDagDetailsKeyFn,
+  UseDagServiceGetDagKeyFn,
+  useDagServiceGetDagsUiKey,
+  useDependenciesServiceGetDependencies,
+  UseTaskInstanceServiceGetTaskInstancesKeyFn,
+} from "openapi/queries";
+import type {
+  AssetEventResponse,
+  AssetResponse,
+  DAGRunResponse,
+  EdgeResponse,
+  MaterializeAssetBody,
+} from "openapi/requests/types.gen";
+
+import { Modal, toaster, RadioCardItem, RadioCardRoot } from "src/system-components";
+
+import { ErrorAlert } from "src/components/ErrorAlert";
+import { JsonEditor } from "src/components/JsonEditor";
+import TriggerDAGForm from "src/components/TriggerDag/TriggerDAGForm";
+import type { DagRunTriggerParams } from "src/components/TriggerDag/types";
+
+import { isOneOf, toNullablePartitionKey } from "src/utils";
+
+const isAssetEventType = isOneOf(["manual", "materialize"] as const);
+
+type Props = {
+  readonly asset: AssetResponse;
+  readonly onClose: () => void;
+  readonly open: boolean;
+};
+
+export const CreateAssetEventModal = ({ asset, onClose, open }: Props) => {
+  const { t: translate } = useTranslation(["assets", "components"]);
+  const [eventType, setEventType] = useState<"manual" | "materialize">("manual");
+  const [extraError, setExtraError] = useState<string | undefined>();
+  const [extra, setExtra] = useState("{}");
+  const [partitionKey, setPartitionKey] = useState<string | undefined>(undefined);
+  const queryClient = useQueryClient();
+
+  const { data } = useDependenciesServiceGetDependencies({ nodeId: `asset:${asset.id}` }, undefined, {
+    enabled: Boolean(asset) && Boolean(asset.id),
+  });
+
+  const upstreamDags: Array<EdgeResponse> = (data?.edges ?? []).filter(
+    (edge) => edge.target_id === `asset:${asset.id}` && edge.source_id.startsWith("dag:"),
+  );
+  const hasUpstreamDag = upstreamDags.length === 1;
+  const [upstreamDag] = upstreamDags;
+  const upstreamDagId = hasUpstreamDag ? upstreamDag?.source_id.replace("dag:", "") : undefined;
+
+  const onSuccess = async (response: AssetEventResponse | DAGRunResponse) => {
+    setExtra("{}");
+    setExtraError(undefined);
+    setPartitionKey(undefined);
+    onClose();
+
+    let queryKeys = [
+      UseAssetServiceGetAssetEventsKeyFn({ assetId: asset.id }, [{ assetId: asset.id }]),
+      // The Assets list defaults to sorting by last asset event, so a new event changes both the
+      // displayed timestamp and the row's position; refresh it for manual events and materializes.
+      [useAssetServiceGetAssetsUiKey],
+    ];
+
+    if ("dag_run_id" in response) {
+      const dagId = response.dag_id;
+
+      queryKeys = [
+        ...queryKeys,
+        [useDagServiceGetDagsUiKey],
+        UseDagServiceGetDagKeyFn({ dagId }, [{ dagId }]),
+        UseDagServiceGetDagDetailsKeyFn({ dagId }, [{ dagId }]),
+        UseDagRunServiceGetDagRunsKeyFn({ dagId }, [{ dagId }]),
+        UseTaskInstanceServiceGetTaskInstancesKeyFn({ dagId, dagRunId: "~" }, [{ dagId, dagRunId: "~" }]),
+      ];
+
+      toaster.create({
+        description: translate("createEvent.success.materializeDescription", { dagId: response.dag_id }),
+        title: translate("createEvent.success.materializeTitle"),
+        type: "success",
+      });
+    } else {
+      toaster.create({
+        description: translate("createEvent.success.manualDescription"),
+        title: translate("createEvent.success.manualTitle"),
+        type: "success",
+      });
+    }
+
+    await Promise.all(queryKeys.map((key) => queryClient.invalidateQueries({ queryKey: key })));
+  };
+
+  const {
+    data: dag,
+    error: dagError,
+    isError: isDagError,
+    isFetching: isDagFetching,
+  } = useDagServiceGetDagDetails({ dagId: upstreamDagId ?? "" }, undefined, {
+    enabled: Boolean(upstreamDagId),
+    // The paused state decides whether a drain is requested, so it must not come from a stale cache.
+    staleTime: 0,
+  });
+
+  const {
+    error: manualError,
+    isPending: isManualPending,
+    mutate: createAssetEvent,
+  } = useAssetServiceCreateAssetEvent({ onSuccess });
+  const {
+    error: materializeError,
+    isPending: isMaterializePending,
+    mutate: materializeAsset,
+    reset: resetMaterializeError,
+  } = useAssetServiceMaterializeAsset({
+    onSuccess,
+  });
+
+  const handleMaterializeSubmit = (dagRunRequestBody: DagRunTriggerParams) => {
+    const parsedConfig = JSON.parse(dagRunRequestBody.conf) as Record<string, unknown>;
+    const logicalDate = dagRunRequestBody.logicalDate ? new Date(dagRunRequestBody.logicalDate) : undefined;
+    const dataIntervalStart = dagRunRequestBody.dataIntervalStart
+      ? new Date(dagRunRequestBody.dataIntervalStart)
+      : undefined;
+    const dataIntervalEnd = dagRunRequestBody.dataIntervalEnd
+      ? new Date(dagRunRequestBody.dataIntervalEnd)
+      : undefined;
+
+    const requestBody: MaterializeAssetBody = {
+      conf: parsedConfig,
+      dag_run_id: dagRunRequestBody.dagRunId === "" ? undefined : dagRunRequestBody.dagRunId,
+      data_interval_end: dataIntervalEnd?.toISOString() ?? null,
+      data_interval_start: dataIntervalStart?.toISOString() ?? null,
+      drain_dag: dagRunRequestBody.drainDag,
+      logical_date: logicalDate?.toISOString() ?? null,
+      note: dagRunRequestBody.note === "" ? undefined : dagRunRequestBody.note,
+      partition_key: toNullablePartitionKey(dagRunRequestBody.partitionKey),
+    };
+
+    materializeAsset({
+      assetId: asset.id,
+      requestBody,
+    });
+  };
+
+  const handleManualSubmit = () =>
+    createAssetEvent({
+      requestBody: {
+        asset_id: asset.id,
+        extra: JSON.parse(extra) as Record<string, unknown>,
+        partition_key: toNullablePartitionKey(partitionKey),
+      },
+    });
+
+  return (
+    <Modal
+      footerActions={
+        eventType === "manual" ? (
+          <Button disabled={Boolean(extraError)} loading={isManualPending} onClick={handleManualSubmit}>
+            <FiPlay /> {translate("createEvent.button")}
+          </Button>
+        ) : undefined
+      }
+      lazyMount
+      onOpenChange={onClose}
+      open={open}
+      title={translate("createEvent.title", { name: asset.name })}
+      unmountOnExit
+    >
+      <RadioCardRoot
+        mb={6}
+        onValueChange={(details) => {
+          if (isAssetEventType(details.value)) {
+            setEventType(details.value);
+          }
+        }}
+        value={eventType}
+      >
+        <HStack align="stretch">
+          <RadioCardItem
+            description={
+              upstreamDagId === undefined
+                ? translate("createEvent.materialize.description")
+                : translate("createEvent.materialize.descriptionWithDag", {
+                    dagName: dag?.dag_display_name ?? upstreamDagId,
+                  })
+            }
+            disabled={!hasUpstreamDag}
+            label={translate("createEvent.materialize.label")}
+            value="materialize"
+          />
+          <RadioCardItem
+            description={translate("createEvent.manual.description")}
+            label={translate("createEvent.manual.label")}
+            value="manual"
+          />
+        </HStack>
+      </RadioCardRoot>
+      {eventType === "manual" ? (
+        <Field.Root mt={6}>
+          <Field.Label fontSize="md">{translate("createEvent.manual.extra")}</Field.Label>
+          <JsonEditor onChange={setExtra} onError={setExtraError} prettify value={extra} />
+          <Text color="fg.error">{extraError}</Text>
+        </Field.Root>
+      ) : undefined}
+      {eventType === "manual" ? (
+        <>
+          <Field.Root mt={6}>
+            <Field.Label fontSize="md">{translate("common:dagRun.partitionKey")}</Field.Label>
+            <Input
+              onChange={(event) => setPartitionKey(event.target.value)}
+              size="sm"
+              value={partitionKey ?? ""}
+            />
+          </Field.Root>
+          <ErrorAlert error={manualError} />
+        </>
+      ) : undefined}
+      {eventType === "materialize" && dag !== undefined && upstreamDagId !== undefined ? (
+        <TriggerDAGForm
+          dagId={upstreamDagId}
+          disabled={isDagFetching || isDagError}
+          error={materializeError ?? dagError}
+          hasSchedule={dag.timetable_summary !== null}
+          isPartitioned={dag.timetable_partitioned}
+          isPaused={dag.is_paused}
+          isPending={isMaterializePending}
+          onPausedDagActionChange={Boolean(materializeError) ? resetMaterializeError : undefined}
+          onSubmitTrigger={handleMaterializeSubmit}
+          open={open}
+        />
+      ) : undefined}
+    </Modal>
+  );
+};

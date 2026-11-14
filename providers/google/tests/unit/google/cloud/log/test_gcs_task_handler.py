@@ -1,0 +1,813 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+import copy
+import io
+import logging
+import os
+import pathlib
+from types import GeneratorType
+from typing import TYPE_CHECKING
+from unittest import mock
+from unittest.mock import MagicMock
+
+import pytest
+
+from airflow.providers.common.compat.sdk import AirflowNotFoundException, timezone
+from airflow.providers.google.cloud.log.gcs_task_handler import GCSRemoteLogIO, GCSTaskHandler
+from airflow.utils.state import TaskInstanceState
+
+from tests_common.test_utils.config import conf_vars
+from tests_common.test_utils.db import clear_db_dags, clear_db_runs
+from tests_common.test_utils.version_compat import AIRFLOW_V_3_0_PLUS, AIRFLOW_V_3_2_2_PLUS
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+
+def patch_mock_client_for_list_blobs(mock_client: MagicMock, blob_names: list[str]):
+    mock_blobs = []
+    for name in blob_names:
+        mock_blob = MagicMock()
+        mock_blob.name = name
+        mock_blobs.append(mock_blob)
+    mock_client.return_value.list_blobs.return_value = mock_blobs
+
+
+class TestGCSRemoteLogIOFromConfig:
+    @conf_vars(
+        {
+            ("logging", "base_log_folder"): "~/airflow/logs",
+            ("logging", "remote_base_log_folder"): "gs://bucket/remote/log/location",
+            ("logging", "delete_local_logs"): "True",
+            ("logging", "google_key_path"): "/tmp/gcs-logging-key.json",
+        }
+    )
+    def test_from_config(self):
+        subject = GCSRemoteLogIO.from_config()
+
+        assert subject.remote_base == "gs://bucket/remote/log/location"
+        assert subject.base_log_folder == pathlib.Path(os.path.expanduser("~/airflow/logs"))
+        assert subject.delete_local_copy is True
+        assert subject.gcp_key_path == "/tmp/gcs-logging-key.json"
+
+    @conf_vars(
+        {
+            ("logging", "base_log_folder"): "/tmp/airflow/logs",
+            ("logging", "remote_base_log_folder"): "gs://bucket/remote/log/location",
+            ("logging", "delete_local_logs"): "False",
+            ("logging", "remote_task_handler_kwargs"): '{"delete_local_copy": true, "max_bytes": 1024}',
+        }
+    )
+    def test_from_config_applies_io_kwargs_and_filters_file_handler_kwargs(self):
+        subject = GCSRemoteLogIO.from_config()
+
+        assert subject.delete_local_copy is True
+        assert not hasattr(subject, "max_bytes")
+
+    @conf_vars({("logging", "remote_task_handler_kwargs"): '["not", "a", "dict"]'})
+    def test_from_config_rejects_non_dict_remote_task_handler_kwargs(self):
+        with pytest.raises(ValueError, match="remote_task_handler_kwargs"):
+            GCSRemoteLogIO.from_config()
+
+    def test_provider_registers_gs_scheme(self):
+        from airflow.providers_manager import ProvidersManager
+
+        manager = ProvidersManager()
+        if not hasattr(manager, "remote_logging_handler_by_scheme"):
+            pytest.skip("Airflow core does not support remote logging provider dispatch")
+
+        info = manager.remote_logging_handler_by_scheme("gs")
+
+        assert info is not None
+        assert info.classpath == "airflow.providers.google.cloud.log.gcs_task_handler.GCSRemoteLogIO"
+
+    @pytest.mark.parametrize(
+        "manager_classpath",
+        [
+            pytest.param("airflow.providers_manager.ProvidersManager", id="core"),
+            pytest.param(
+                "airflow.sdk.providers_manager_runtime.ProvidersManagerTaskRuntime", id="task-runtime"
+            ),
+        ],
+    )
+    @conf_vars(
+        {
+            ("logging", "remote_logging"): "True",
+            ("logging", "remote_base_log_folder"): "gs://bucket/remote/log/location",
+            ("logging", "remote_log_conn_id"): "google_cloud_default",
+        }
+    )
+    def test_resolve_remote_task_log_uses_provider_dispatch_not_local_settings(self, manager_classpath):
+        factory = pytest.importorskip("airflow._shared.logging.factory")
+        from airflow._shared.module_loading import import_string
+        from airflow.configuration import conf
+
+        with mock.patch.object(factory, "discover_remote_log_handler", autospec=True) as legacy_discover:
+            remote_task_log, conn_id = factory.resolve_remote_task_log(
+                conf=conf,
+                providers_manager=import_string(manager_classpath)(),
+                import_string=import_string,
+            )
+
+        assert isinstance(remote_task_log, GCSRemoteLogIO)
+        assert remote_task_log.remote_base == "gs://bucket/remote/log/location"
+        assert conn_id == "google_cloud_default"
+        legacy_discover.assert_not_called()
+
+
+@pytest.mark.db_test
+@mock.patch(
+    "airflow.providers.google.cloud.log.gcs_task_handler.get_credentials_and_project_id",
+    return_value=("TEST_CREDENTIALS", "TEST_PROJECT_ID"),
+)
+class TestGCSRemoteLogIO:
+    @pytest.fixture(autouse=True)
+    def setup_tests(self, create_task_instance, session):
+        # setup remote IO
+        self.base_log_folder = "local/airflow/logs"
+        self.gcs_log_folder = "gs://bucket/airflow/logs"
+        # setup TaskInstance
+        self.ti = ti = create_task_instance(task_id="task_1")
+        ti.try_number = 1
+        ti.raw = False
+        session.add(ti)
+        session.commit()
+        yield
+        clear_db_runs()
+        clear_db_dags()
+
+    @pytest.mark.parametrize(
+        "is_absolute",
+        [pytest.param(True, id="absolute"), pytest.param(False, id="relative")],
+    )
+    @pytest.mark.parametrize(
+        "file_exists",
+        [pytest.param(True, id="file-exists"), pytest.param(False, id="file-not-exists")],
+    )
+    @pytest.mark.parametrize(
+        "delete_local_copy",
+        [pytest.param(True, id="delete-local"), pytest.param(False, id="keep-local")],
+    )
+    @pytest.mark.parametrize(
+        "mock_write_method_result",
+        [pytest.param(True, id="write-success"), pytest.param(False, id="write-fail")],
+    )
+    @mock.patch("google.cloud.storage.Client")
+    @mock.patch("google.cloud.storage.Blob")
+    @mock.patch("shutil.rmtree")
+    def test_upload(
+        self,
+        mock_rmtree,
+        mock_blob,
+        mock_client,
+        mock_creds,
+        mock_write_method_result: bool,
+        delete_local_copy: bool,
+        file_exists: bool,
+        is_absolute: bool,
+        tmp_path: Path,
+    ):
+        # setup
+        gcs_remote_log_io = GCSRemoteLogIO(
+            remote_base=self.gcs_log_folder,
+            base_log_folder=tmp_path.as_posix(),
+            delete_local_copy=delete_local_copy,
+        )
+        if file_exists:
+            file_path = tmp_path / "existing.log" if is_absolute else "existing.log"
+            with open(tmp_path / "existing.log", "w") as f:
+                f.write("log content")
+        else:
+            file_path = tmp_path / "non_existing.log"
+
+        # action
+        with mock.patch.object(
+            gcs_remote_log_io,
+            "write",
+            return_value=mock_write_method_result,
+        ) as mock_write_method:
+            gcs_remote_log_io.upload(file_path, self.ti)
+
+            # verify
+            if file_exists:
+                mock_write_method.assert_called_once()
+                if delete_local_copy and mock_write_method_result:
+                    mock_rmtree.assert_called_once_with(tmp_path.as_posix())
+                    # shutil.rmtree is mocked here, so it never actually removes the file from
+                    # disk; the assertion above already confirms the delete path was taken. We
+                    # don't assert on-disk deletion in this branch since it would be asserting
+                    # against a mock's real side effects, which don't exist.
+                elif mock_write_method_result:
+                    # Upload succeeded but delete_local_copy is False: the local file must be
+                    # truncated so a later lifecycle (e.g. the next poke of a reschedule-mode
+                    # sensor landing on the same worker) doesn't re-upload already-stored content.
+                    mock_rmtree.assert_not_called()
+                    assert (tmp_path / "existing.log").read_text() == ""
+                else:
+                    # Upload failed: keep the local content untouched so a retry can still send it.
+                    mock_rmtree.assert_not_called()
+                    assert (tmp_path / "existing.log").read_text() == "log content"
+            else:
+                mock_write_method.assert_not_called()
+                mock_rmtree.assert_not_called()
+
+    def test_upload_repeated_cycles_no_duplication(self, mock_creds, tmp_path: Path):
+        """Simulate reschedule-mode sensor: each cycle appends to the local log, then uploads.
+
+        Without truncation after upload, the GCS object accumulates duplicate lines and
+        grows O(N^2). The correct behavior is that each line appears in GCS exactly once.
+        """
+        remote_store: dict[str, str] = {}
+
+        class FakeBlob:
+            def __init__(self, remote_log_location):
+                self.remote_log_location = remote_log_location
+
+            def download_as_bytes(self):
+                if self.remote_log_location not in remote_store:
+                    raise Exception("No such object: fake-bucket")
+                return remote_store[self.remote_log_location].encode()
+
+            def upload_from_string(self, content, content_type=None):
+                remote_store[self.remote_log_location] = content
+
+        gcs_remote_log_io = GCSRemoteLogIO(
+            remote_base=self.gcs_log_folder,
+            base_log_folder=tmp_path.as_posix(),
+            delete_local_copy=False,
+        )
+        local_log = tmp_path / "1.log"
+
+        with (
+            mock.patch("google.cloud.storage.Client"),
+            mock.patch("google.cloud.storage.Blob") as mock_blob,
+        ):
+            mock_blob.from_string.side_effect = lambda remote_log_location, client: FakeBlob(
+                remote_log_location
+            )
+
+            for cycle in range(1, 4):
+                with open(local_log, "a") as f:
+                    f.write(f"cycle {cycle}\n")
+                gcs_remote_log_io.upload(local_log, self.ti)
+
+        # GCSRemoteLogIO.write() joins old and new content with an unconditional "\n" separator
+        # (pre-existing behavior, not part of this fix), so each upload after the first adds a
+        # blank line. What matters here is that each cycle's line appears exactly once.
+        final_content = next(iter(remote_store.values()))
+        assert final_content == "cycle 1\n\ncycle 2\n\ncycle 3\n"
+        for cycle in range(1, 4):
+            assert final_content.count(f"cycle {cycle}") == 1
+        assert local_log.read_text() == ""
+
+    @pytest.mark.parametrize(
+        "upload_success",
+        [pytest.param(True, id="upload-success"), pytest.param(False, id="upload-fail")],
+    )
+    @pytest.mark.parametrize(
+        "old_log_exists",
+        [
+            pytest.param(True, id="old-log-exists"),
+            pytest.param(False, id="old-log-not-exists"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "old_log_read_error",
+        [
+            pytest.param(None, id="old-log-read-success"),
+            pytest.param(Exception("Read error"), id="old-log-read-error"),
+        ],
+    )
+    @mock.patch("google.cloud.storage.Client")
+    @mock.patch("google.cloud.storage.Blob")
+    def test_write(
+        self,
+        mock_blob,
+        mock_client,
+        mock_creds,
+        upload_success: bool,
+        old_log_exists: bool,
+        old_log_read_error: Exception | None,
+    ):
+        # setup
+        remote_log_location = f"{self.gcs_log_folder}/task_1/attempt_1.log"
+        new_log_content = "NEW LOG CONTENT"
+        old_log_content = "OLD LOG CONTENT"
+
+        # mock download_as_bytes for reading old log
+        if old_log_read_error:
+            mock_blob.from_string.return_value.download_as_bytes.side_effect = old_log_read_error
+        elif old_log_exists:
+            mock_blob.from_string.return_value.download_as_bytes.return_value = old_log_content.encode()
+        else:
+            # Simulate 404 error for no log found
+            not_found_error = Exception("No such object: bucket/airflow/logs/task_1/attempt_1.log")
+            mock_blob.from_string.return_value.download_as_bytes.side_effect = not_found_error
+
+        # mock upload_from_string
+        if not upload_success:
+            mock_blob.from_string.return_value.upload_from_string.side_effect = Exception("Upload failed")
+
+        gcs_remote_log_io = GCSRemoteLogIO(
+            remote_base=self.gcs_log_folder,
+            base_log_folder=self.base_log_folder,
+            delete_local_copy=False,
+        )
+
+        # action
+        result = gcs_remote_log_io.write(new_log_content, remote_log_location)
+
+        # verify
+        # If reading the existing blob failed for a reason other than "not found", the
+        # handler now fails closed (returns False without uploading) rather than overwriting
+        # the existing blob with only the new content. The 404 case still proceeds to upload.
+        if old_log_read_error is not None:
+            assert result is False
+            mock_blob.from_string.return_value.upload_from_string.assert_not_called()
+        else:
+            assert result == upload_success
+            # verify the content that was uploaded
+            if upload_success:
+                call_args = mock_blob.from_string.return_value.upload_from_string.call_args
+                if call_args:
+                    uploaded_content = call_args[0][0]
+                    if old_log_exists:
+                        assert uploaded_content == f"{old_log_content}\n{new_log_content}"
+                    else:
+                        assert uploaded_content == new_log_content
+
+    @pytest.mark.parametrize(
+        "is_stream_method",
+        [pytest.param(True, id="is-stream"), pytest.param(False, id="not-stream")],
+    )
+    @pytest.mark.parametrize(
+        "blob_names",
+        [
+            pytest.param(
+                ["airflow/logs/task_1/attempt_1.log", "airflow/logs/task_1/attempt_2.log"], id="blobs-exists"
+            ),
+            pytest.param([], id="blobs-not-exists"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "read_success",
+        [pytest.param(True, id="read-success"), pytest.param(False, id="read-fail")],
+    )
+    @mock.patch("google.cloud.storage.Client")
+    @mock.patch("google.cloud.storage.Blob")
+    def test_stream_and_read_methods(
+        self,
+        mock_blob,
+        mock_client,
+        mock_creds,
+        read_success: bool,
+        blob_names: list[str],
+        is_stream_method: bool,
+    ):
+        # setup
+        patch_mock_client_for_list_blobs(mock_client, blob_names)
+        if read_success:
+            mock_blob.from_string.return_value.open.side_effect = lambda mode: io.TextIOWrapper(
+                io.BytesIO(b"LOG\nCONTENT"), encoding="utf-8"
+            )
+        else:
+            mock_blob.from_string.return_value.open.side_effect = Exception("Read failed")
+
+        gcs_remote_log_io = GCSRemoteLogIO(
+            remote_base=self.gcs_log_folder,
+            base_log_folder=self.base_log_folder,
+            delete_local_copy=False,
+        )
+        # action
+        if is_stream_method:
+            messages, log_streams = gcs_remote_log_io.stream("airflow/logs/task_1", self.ti)
+            logs = log_streams  # type: ignore[assignment]
+        else:
+            messages, logs = gcs_remote_log_io.read("airflow/logs/task_1", self.ti)  # type: ignore[assignment]
+
+        # early return for no blobs
+        if not blob_names:
+            assert messages == []
+            if is_stream_method:
+                assert logs == []
+            else:
+                assert logs is None
+            return
+
+        # verify messages
+        expected_uris = [
+            f"{self.gcs_log_folder}/task_1/attempt_1.log",
+            f"{self.gcs_log_folder}/task_1/attempt_2.log",
+        ]
+        if AIRFLOW_V_3_0_PLUS:
+            expected_messages = expected_uris
+        else:
+            expected_messages = ["Found remote logs:", *[f"  * {x}" for x in sorted(expected_uris)]]
+        if not read_success and not AIRFLOW_V_3_0_PLUS:
+            expected_messages = expected_messages + ["Unable to read remote log Read failed"]
+        assert messages == expected_messages
+
+        # verify logs
+        expected_logs = ["LOG\nCONTENT", "LOG\nCONTENT"]
+        if is_stream_method:
+            for log_stream, expected_log in zip(logs, expected_logs):
+                assert isinstance(log_stream, GeneratorType)
+                assert "".join(log_stream) == expected_log
+        else:
+            if read_success:
+                assert logs == expected_logs
+            else:
+                assert logs is None
+
+
+@pytest.mark.db_test
+class TestGCSTaskHandler:
+    @pytest.fixture(autouse=True)
+    def task_instance(self, create_task_instance, session):
+        self.ti = ti = create_task_instance(
+            dag_id="dag_for_testing_gcs_task_handler",
+            task_id="task_for_testing_gcs_task_handler",
+            logical_date=timezone.datetime(2020, 1, 1),
+            state=TaskInstanceState.RUNNING,
+        )
+        ti.try_number = 1
+        ti.raw = False
+        session.add(ti)
+        session.commit()
+        yield
+        clear_db_runs()
+        clear_db_dags()
+
+    @pytest.fixture(autouse=True)
+    def local_log_location(self, tmp_path_factory):
+        return str(tmp_path_factory.mktemp("local-gcs-log-location"))
+
+    @pytest.fixture(autouse=True)
+    def gcs_task_handler(self, create_log_template, local_log_location):
+        create_log_template("{try_number}.log")
+        self.gcs_task_handler = GCSTaskHandler(
+            base_log_folder=local_log_location,
+            gcs_log_folder="gs://bucket/remote/log/location",
+        )
+        return self.gcs_task_handler
+
+    @mock.patch("airflow.providers.google.cloud.log.gcs_task_handler.GCSHook")
+    @mock.patch("google.cloud.storage.Client")
+    @mock.patch("airflow.providers.google.cloud.log.gcs_task_handler.get_credentials_and_project_id")
+    @pytest.mark.parametrize(
+        "conn_id",
+        [pytest.param("", id="no-conn"), pytest.param("my_gcs_conn", id="with-conn")],
+    )
+    def test_client_conn_id_behavior(self, mock_get_cred, mock_client, mock_hook, conn_id):
+        """When remote log conn id configured, hook will be used"""
+        mock_hook.return_value.get_credentials_and_project_id.return_value = (
+            "test_cred",
+            "test_proj",
+        )
+        mock_get_cred.return_value = ("test_cred", "test_proj")
+        with conf_vars({("logging", "remote_log_conn_id"): conn_id}):
+            return_value = self.gcs_task_handler.io.client
+        if conn_id:
+            mock_hook.assert_called_once_with(gcp_conn_id="my_gcs_conn")
+            mock_get_cred.assert_not_called()
+        else:
+            mock_hook.assert_not_called()
+            mock_get_cred.assert_called()
+
+        mock_client.assert_called_once_with(
+            client_info=mock.ANY, credentials="test_cred", project="test_proj"
+        )
+        assert mock_client.return_value == return_value
+
+    @conf_vars({("logging", "remote_log_conn_id"): "gcs_default"})
+    @mock.patch(
+        "airflow.providers.google.cloud.log.gcs_task_handler.get_credentials_and_project_id",
+        return_value=("TEST_CREDENTIALS", "TEST_PROJECT_ID"),
+    )
+    @mock.patch("google.cloud.storage.Client")
+    @mock.patch("google.cloud.storage.Blob")
+    def test_should_read_logs_from_remote(
+        self, mock_blob, mock_client, mock_creds, session, sdk_connection_not_found
+    ):
+        blob_name = "remote/log/location/1.log"
+        patch_mock_client_for_list_blobs(mock_client, [blob_name])
+        mock_blob.from_string.return_value.open.return_value = io.TextIOWrapper(
+            io.BytesIO(b"CONTENT"), encoding="utf-8"
+        )
+        ti = copy.copy(self.ti)
+        ti.state = TaskInstanceState.SUCCESS
+        session.add(ti)
+        session.commit()
+        logs, metadata = self.gcs_task_handler._read(ti, self.ti.try_number)
+        expected_gs_uri = f"gs://bucket/{blob_name}"
+
+        mock_blob.from_string.assert_called_once_with(expected_gs_uri, mock_client.return_value)
+
+        if AIRFLOW_V_3_2_2_PLUS:
+            logs = list(logs)
+            assert logs[0].event == "::group::Log message source details"
+            assert logs[1].event == expected_gs_uri
+            assert logs[2].event == "::endgroup::"
+            assert logs[3].event == "CONTENT"
+            assert metadata["end_of_log"] is True
+        elif AIRFLOW_V_3_0_PLUS:
+            logs = list(logs)
+            assert logs[0].event == "::group::Log message source details"
+            assert logs[0].sources == [expected_gs_uri]
+            assert logs[1].event == "::endgroup::"
+            assert logs[2].event == "CONTENT"
+            assert metadata == {"end_of_log": True, "log_pos": 1}
+        else:
+            assert f"*** Found remote logs:\n***   * {expected_gs_uri}\n" in logs
+            assert logs.endswith("CONTENT")
+            assert metadata == {"end_of_log": True, "log_pos": 7}
+
+    # TODO: Remove when we stop testing for 2.11 compatibility
+    @conf_vars({("core", "use_historical_filename_templates"): "True"})
+    @mock.patch(
+        "airflow.providers.google.cloud.log.gcs_task_handler.get_credentials_and_project_id",
+        return_value=("TEST_CREDENTIALS", "TEST_PROJECT_ID"),
+    )
+    @mock.patch("google.cloud.storage.Client")
+    @mock.patch("google.cloud.storage.Blob")
+    def test_should_read_from_local_on_logs_read_error(self, mock_blob, mock_client, mock_creds):
+        blob_name = "remote/log/location/1.log"
+        patch_mock_client_for_list_blobs(mock_client, [blob_name])
+        mock_blob.from_string.return_value.open.side_effect = Exception("Failed to connect")
+
+        self.gcs_task_handler.set_context(self.ti)
+        ti = copy.copy(self.ti)
+        ti.state = TaskInstanceState.SUCCESS
+        log, metadata = self.gcs_task_handler._read(ti, self.ti.try_number)
+        expected_gs_uri = f"gs://bucket/{blob_name}"
+
+        if AIRFLOW_V_3_2_2_PLUS:
+            log = list(log)
+            assert log[0].event == "::group::Log message source details"
+            assert log[1].event == expected_gs_uri
+            assert log[2].event == f"{self.gcs_task_handler.local_base}/1.log"
+            assert log[3].event == "::endgroup::"
+            assert metadata["end_of_log"] is True
+        elif AIRFLOW_V_3_0_PLUS:
+            log = list(log)
+            assert log[0].event == "::group::Log message source details"
+            assert log[0].sources == [
+                expected_gs_uri,
+                f"{self.gcs_task_handler.local_base}/1.log",
+            ]
+            assert log[1].event == "::endgroup::"
+            assert metadata == {"end_of_log": True, "log_pos": 0}
+        else:
+            assert (
+                "*** Found remote logs:\n"
+                "***   * gs://bucket/remote/log/location/1.log\n"
+                "*** Unable to read remote log Failed to connect\n"
+                "*** Found local files:\n"
+                f"***   * {self.gcs_task_handler.local_base}/1.log\n"
+            ) in log
+            assert metadata == {"end_of_log": True, "log_pos": 0}
+        mock_blob.from_string.assert_called_once_with(expected_gs_uri, mock_client.return_value)
+
+    # TODO: Remove when we stop testing for 2.11 compatibility
+    @conf_vars({("core", "use_historical_filename_templates"): "True"})
+    @mock.patch(
+        "airflow.providers.google.cloud.log.gcs_task_handler.get_credentials_and_project_id",
+        return_value=("TEST_CREDENTIALS", "TEST_PROJECT_ID"),
+    )
+    @mock.patch("google.cloud.storage.Client")
+    @mock.patch("google.cloud.storage.Blob")
+    def test_write_to_remote_on_close(self, mock_blob, mock_client, mock_creds):
+        mock_blob.from_string.return_value.download_as_bytes.return_value = b"CONTENT"
+
+        self.gcs_task_handler.set_context(self.ti)
+        self.gcs_task_handler.emit(
+            logging.LogRecord(
+                name="NAME",
+                level="DEBUG",
+                pathname=None,
+                lineno=None,
+                msg="MESSAGE",
+                args=None,
+                exc_info=None,
+            )
+        )
+        self.gcs_task_handler.close()
+
+        mock_blob.assert_has_calls(
+            [
+                mock.call.from_string("gs://bucket/remote/log/location/1.log", mock_client.return_value),
+                mock.call.from_string().download_as_bytes(),
+                mock.call.from_string("gs://bucket/remote/log/location/1.log", mock_client.return_value),
+                mock.call.from_string().upload_from_string("CONTENT\nMESSAGE\n", content_type="text/plain"),
+            ],
+            any_order=False,
+        )
+        mock_blob.from_string.return_value.upload_from_string(data="CONTENT\nMESSAGE\n")
+        assert self.gcs_task_handler.closed is True
+
+    # TODO: Remove when we stop testing for 2.11 compatibility
+    @conf_vars({("core", "use_historical_filename_templates"): "True"})
+    @mock.patch(
+        "airflow.providers.google.cloud.log.gcs_task_handler.get_credentials_and_project_id",
+        return_value=("TEST_CREDENTIALS", "TEST_PROJECT_ID"),
+    )
+    @mock.patch("google.cloud.storage.Client")
+    @mock.patch("google.cloud.storage.Blob")
+    def test_failed_write_to_remote_on_close(self, mock_blob, mock_client, mock_creds, caplog):
+        caplog.at_level(logging.ERROR, logger=self.gcs_task_handler.log.name)
+        mock_blob.from_string.return_value.upload_from_string.side_effect = Exception("Failed to connect")
+        mock_blob.from_string.return_value.download_as_bytes.return_value = b"Old log"
+
+        self.gcs_task_handler.set_context(self.ti)
+        self.gcs_task_handler.emit(
+            logging.LogRecord(
+                name="NAME",
+                level="DEBUG",
+                pathname=None,
+                lineno=None,
+                msg="MESSAGE",
+                args=None,
+                exc_info=None,
+            )
+        )
+        self.gcs_task_handler.close()
+
+        assert caplog.record_tuples == [
+            (
+                "airflow.providers.google.cloud.log.gcs_task_handler.GCSRemoteLogIO",
+                logging.ERROR,
+                "Could not write logs to gs://bucket/remote/log/location/1.log: Failed to connect",
+            ),
+        ]
+        mock_blob.assert_has_calls(
+            [
+                mock.call.from_string("gs://bucket/remote/log/location/1.log", mock_client.return_value),
+                mock.call.from_string().download_as_bytes(),
+                mock.call.from_string("gs://bucket/remote/log/location/1.log", mock_client.return_value),
+                mock.call.from_string().upload_from_string("Old log\nMESSAGE\n", content_type="text/plain"),
+            ],
+            any_order=False,
+        )
+
+    # TODO: Remove when we stop testing for 2.11 compatibility
+    @conf_vars({("core", "use_historical_filename_templates"): "True"})
+    @mock.patch(
+        "airflow.providers.google.cloud.log.gcs_task_handler.get_credentials_and_project_id",
+        return_value=("TEST_CREDENTIALS", "TEST_PROJECT_ID"),
+    )
+    @mock.patch("google.cloud.storage.Client")
+    @mock.patch("google.cloud.storage.Blob")
+    def test_write_to_remote_on_close_failed_read_old_logs(self, mock_blob, mock_client, mock_creds):
+        mock_blob.from_string.return_value.download_as_bytes.side_effect = Exception("Fail to download")
+
+        self.gcs_task_handler.set_context(self.ti)
+        self.gcs_task_handler.emit(
+            logging.LogRecord(
+                name="NAME",
+                level="DEBUG",
+                pathname=None,
+                lineno=None,
+                msg="MESSAGE",
+                args=None,
+                exc_info=None,
+            )
+        )
+        self.gcs_task_handler.close()
+
+        # Fail-closed contract: when reading the existing blob fails for a reason other than
+        # "object does not exist", the handler must not overwrite the remote log with only
+        # the new content. Expect the read attempt but no upload.
+        mock_blob.from_string.assert_called_once_with(
+            "gs://bucket/remote/log/location/1.log", mock_client.return_value
+        )
+        mock_blob.from_string.return_value.download_as_bytes.assert_called_once()
+        mock_blob.from_string.return_value.upload_from_string.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("delete_local_copy", "expected_existence_of_local_copy"),
+        [(True, False), (False, True)],
+    )
+    @mock.patch(
+        "airflow.providers.google.cloud.log.gcs_task_handler.get_credentials_and_project_id",
+        return_value=("TEST_CREDENTIALS", "TEST_PROJECT_ID"),
+    )
+    @mock.patch("google.cloud.storage.Client")
+    @mock.patch("google.cloud.storage.Blob")
+    def test_close_with_delete_local_copy_conf(
+        self,
+        mock_blob,
+        mock_client,
+        mock_creds,
+        local_log_location,
+        delete_local_copy,
+        expected_existence_of_local_copy,
+    ):
+        mock_blob.from_string.return_value.open.return_value = io.TextIOWrapper(
+            io.BytesIO(b"CONTENT"), encoding="utf-8"
+        )
+        with conf_vars({("logging", "delete_local_logs"): str(delete_local_copy)}):
+            handler = GCSTaskHandler(
+                base_log_folder=local_log_location,
+                gcs_log_folder="gs://bucket/remote/log/location",
+            )
+
+        handler.log.info("test")
+        handler.set_context(self.ti)
+        assert handler.upload_on_close
+
+        handler.close()
+        assert os.path.exists(handler.handler.baseFilename) == expected_existence_of_local_copy
+
+    @pytest.fixture(autouse=True)
+    def test_filename_template_for_backward_compatibility(self, local_log_location):
+        # filename_template arg support for running the latest provider on airflow 2
+        GCSTaskHandler(
+            base_log_folder=local_log_location,
+            gcs_log_folder="gs://bucket/remote/log/location",
+            filename_template=None,
+        )
+
+
+class TestGCSRemoteLogIOMisconfiguredConn:
+    """A misconfigured ``remote_log_conn_id`` must surface as a warning.
+
+    Silently swallowing the ``AirflowNotFoundException`` lets an operator believe they had
+    configured a specific service-account key for log uploads when in fact Application
+    Default Credentials are being used — a security-control failure that should be visible.
+    """
+
+    @mock.patch("airflow.providers.google.cloud.log.gcs_task_handler.GCSHook")
+    def test_hook_warns_when_remote_log_conn_id_missing(self, mock_hook, caplog):
+        mock_hook.side_effect = AirflowNotFoundException("conn 'nonexistent' not found")
+        remote_io = GCSRemoteLogIO(
+            remote_base="gs://bucket/remote/log/location",
+            base_log_folder="/tmp/airflow-test-logs",
+            delete_local_copy=False,
+        )
+
+        with conf_vars({("logging", "remote_log_conn_id"): "nonexistent"}):
+            with caplog.at_level(logging.WARNING):
+                assert remote_io.hook is None
+
+        warnings_emitted = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("nonexistent" in r.getMessage() for r in warnings_emitted), (
+            "expected a warning mentioning the misconfigured conn_id, got: "
+            f"{[r.getMessage() for r in warnings_emitted]}"
+        )
+
+    @mock.patch("airflow.providers.google.cloud.log.gcs_task_handler.GCSHook")
+    def test_hook_silent_when_no_remote_log_conn_id_configured(self, mock_hook, caplog):
+        """No ``remote_log_conn_id`` set → silent fall-through to ADC; no warning."""
+        remote_io = GCSRemoteLogIO(
+            remote_base="gs://bucket/remote/log/location",
+            base_log_folder="/tmp/airflow-test-logs",
+            delete_local_copy=False,
+        )
+
+        with conf_vars({("logging", "remote_log_conn_id"): ""}):
+            with caplog.at_level(logging.WARNING):
+                assert remote_io.hook is None
+
+        assert not any(
+            "remote_log_conn_id" in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        )
+        mock_hook.assert_not_called()
+
+
+def test_upload_skips_path_outside_base_log_folder(tmp_path, caplog):
+    """A traversing log path is refused before the file is read or its parent removed.
+
+    ``base_log_folder.joinpath(path)`` is purely lexical, so a ``..``-bearing relative path
+    escapes the log folder. Without the containment check the file would be uploaded to the
+    remote log store and, with ``delete_local_copy``, its parent directory deleted.
+    """
+    base = tmp_path / "logs"
+    base.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "secret.log"
+    secret.write_text("sensitive")
+
+    subject = GCSRemoteLogIO(remote_base="gs://bucket/remote", base_log_folder=base, delete_local_copy=True)
+    with caplog.at_level(logging.WARNING):
+        subject.upload(os.path.join("..", "outside", "secret.log"))
+
+    assert secret.exists()
+    assert outside.exists()
+    assert "outside base_log_folder" in caplog.text

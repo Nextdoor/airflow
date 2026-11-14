@@ -45,7 +45,7 @@ As described in [4. Using Docker images as test environment](0004-using-docker-i
 Airflow CI system uses CI Docker image as consistent test execution environment. This environment provides
 cacheability and rebuild capabilities that allow the image to be rebuilt quickly, incrementally based on
 previous version of the images - whenever any of the source code, Python dependencies, System dependencies
-are changed (in optimal way depending on the change). However, even with optimalizations, rebuilding
+are changed (in optimal way depending on the change). However, even with optimizations, rebuilding
 the image might take quite some time (when only sources change ~ 1 minute, but when system dependencies
 change ~ 10 minutes). In certain cases we run (for the same Python version) 20 jobs that require the same
 image as the environment, which in extreme cases would mean 20x10 = 200 build minutes on CI to
@@ -108,7 +108,7 @@ but to make sure that the following rules are in-place:
    to our repository
 
 ```yaml
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           ref: ${{ env.TARGET_COMMIT_SHA }}
           persist-credentials: false
@@ -119,6 +119,9 @@ but to make sure that the following rules are in-place:
    GitHub managed actions). Submodules provide few features such as - automated linking to specific commit
    SHA (not tag) and integration with Pull Request Review process when someone creates a PR to upgrade the
    action, which makes it ideal to securely and seamlessly keep the action updated if needed.
+
+   UPDATE: The decision for using submodules have been changed in subsequent ADR
+   [0013-get-rid-of-submodules.md](0013-get-rid-of-submodules.md) to use full-length SHA references.
 
 3) No user code coming from the PR can be executed directly in the "Build image" workflow. For example, the
    build scripts should not import `setup.py` or execute bash scripts coming from other places than:
@@ -156,5 +159,5 @@ Thanks to combination of features available in GitHub, the builds are secured ag
 code by users contributing PRs, that could get uncontrolled write access to Airflow repository.
 
 The negative consequence of this is that the build process becomes much more complex
-(see [CI](../../../../CI.rst) for complete description) and that some cases (like modifying build behaviour
+(see [CI](../ci/README.md) for complete description) and that some cases (like modifying build behaviour
 require additional process of testing by pushing the changes as `main` branch to a fork of Apache Airflow)

@@ -1,0 +1,198 @@
+ .. Licensed to the Apache Software Foundation (ASF) under one
+    or more contributor license agreements.  See the NOTICE file
+    distributed with this work for additional information
+    regarding copyright ownership.  The ASF licenses this file
+    to you under the Apache License, Version 2.0 (the
+    "License"); you may not use this file except in compliance
+    with the License.  You may obtain a copy of the License at
+
+ ..   http://www.apache.org/licenses/LICENSE-2.0
+
+ .. Unless required by applicable law or agreed to in writing,
+    software distributed under the License is distributed on an
+    "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+    KIND, either express or implied.  See the License for the
+    specific language governing permissions and limitations
+    under the License.
+
+.. _howto/hook:langchain:
+
+LangChain models: ``LangChainHook``
+===================================
+
+.. note::
+
+    Experimental: this can change or be removed in a minor release of this provider.
+    See :ref:`howto/stability`.
+
+.. toctree::
+    :titlesonly:
+    :hidden:
+    :maxdepth: 1
+
+    LangChain connection <../connections/langchain>
+
+Use :class:`~airflow.providers.common.ai.hooks.langchain.LangChainHook` to
+bridge an Airflow connection to `LangChain <https://python.langchain.com/>`__
+chat and embedding models. The hook reads credentials (API key, optional base
+URL) from the connection and returns configured LangChain model objects via
+two universal entry-point functions:
+
+- ``langchain.chat_models.init_chat_model`` for chat models, dispatching to
+  the right vendor based on the ``provider:name`` prefix.
+- ``langchain.embeddings.init_embeddings`` for embedding models, same
+  dispatch story.
+
+Chat model usage
+----------------
+
+Pass ``llm_model`` to the constructor (or set ``extra["model"]`` on the
+connection) and call ``get_chat_model()``:
+
+.. exampleinclude:: /../../ai/src/airflow/providers/common/ai/example_dags/example_langchain_hook.py
+    :language: python
+    :start-after: [START howto_hook_langchain_chat]
+    :end-before: [END howto_hook_langchain_chat]
+
+The returned model is a LangChain ``BaseChatModel``, so it composes with the
+rest of LangChain's runnable surface
+(``ChatPromptTemplate`` / ``StrOutputParser`` / ``RunnableSequence`` / ...).
+
+Supported chat providers
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+Any model identifier accepted by
+`langchain.chat_models.init_chat_model <https://python.langchain.com/api_reference/langchain/chat_models/langchain.chat_models.base.init_chat_model.html>`__
+works when the provider's chat class accepts ``api_key`` and ``base_url``.
+Common identifiers:
+
+- ``openai:gpt-5``, ``openai:gpt-5-mini`` -- requires ``langchain-openai``
+- ``anthropic:claude-sonnet-5`` -- requires ``langchain-anthropic``
+- ``groq:llama-3.3-70b-versatile`` -- requires ``langchain-groq``
+- ``mistralai:mistral-large-latest`` -- requires ``langchain-mistralai``
+- ``ollama:llama3`` -- requires ``langchain-ollama`` (point ``host`` at the Ollama URL)
+- ``deepseek:deepseek-chat`` -- requires ``langchain-deepseek``
+
+Cloud providers with non-standard auth (AWS Bedrock, Google Vertex AI, Azure
+OpenAI) are not covered by the ``api_key`` + ``base_url`` surface here.
+
+Embedding model usage
+---------------------
+
+Pass ``embed_model`` to the constructor (or set ``extra["embed_model"]`` on
+the connection) and call ``get_embedding_model()``:
+
+.. exampleinclude:: /../../ai/src/airflow/providers/common/ai/example_dags/example_langchain_hook.py
+    :language: python
+    :start-after: [START howto_hook_langchain_embedding]
+    :end-before: [END howto_hook_langchain_embedding]
+
+The same hook instance can serve both chat and embedding models when both
+identifiers are set:
+
+.. exampleinclude:: /../../ai/src/airflow/providers/common/ai/example_dags/example_langchain_hook.py
+    :language: python
+    :start-after: [START howto_hook_langchain_chat_and_embedding]
+    :end-before: [END howto_hook_langchain_chat_and_embedding]
+
+Supported embedding providers
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The hook passes ``api_key`` and (optional) ``base_url`` from the connection to
+`langchain.embeddings.init_embeddings <https://reference.langchain.com/python/langchain/embeddings/base/init_embeddings>`__.
+Providers whose embedding classes accept this kwarg shape work directly:
+
+- ``openai:text-embedding-3-small``, ``openai:text-embedding-3-large`` -- requires ``langchain-openai``
+- ``openai:<model>`` against an OpenAI-compatible endpoint (point ``host`` at
+  Ollama / vLLM / LM Studio) -- requires ``langchain-openai``
+
+``init_embeddings`` advertises more providers (Cohere, Mistral AI, HuggingFace,
+Bedrock, Vertex AI, Azure OpenAI, ...), but their embedding classes expect
+provider-specific credential kwargs (``cohere_api_key``, AWS auth chain, GCP
+service-account, ...) rather than the generic ``api_key`` / ``base_url`` this
+hook forwards.
+
+Different connections for chat and embeddings
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+If chat and embeddings live on different API keys (e.g. premium chat key vs
+free-tier embeddings key), pass an explicit ``embed_conn_id``. When unset it
+falls back to ``llm_conn_id``, so the common one-provider case stays simple:
+
+.. exampleinclude:: /../../ai/src/airflow/providers/common/ai/example_dags/example_langchain_hook.py
+    :language: python
+    :start-after: [START howto_hook_langchain_different_conns]
+    :end-before: [END howto_hook_langchain_different_conns]
+
+Connection Configuration
+------------------------
+
+The hook reads credentials from the Airflow connection of type ``langchain``:
+
+- **password** -- API key (passed as ``api_key`` to ``init_chat_model`` and
+  ``init_embeddings``).
+- **host** -- Optional base URL (passed as ``base_url``; useful for custom
+  OpenAI-compatible endpoints, Ollama, vLLM).
+- **extra** JSON -- ``{"model": "openai:gpt-5", "embed_model": "openai:text-embedding-3-small"}``
+  to set default chat and embedding model identifiers on the connection.
+
+Parameters
+----------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 25 50
+
+   * - Parameter
+     - Default
+     - Description
+   * - ``llm_conn_id``
+     - ``langchain_default``
+     - Airflow connection ID for the LLM provider.
+   * - ``embed_conn_id``
+     - ``None`` (falls back to ``llm_conn_id``)
+     - Optional separate Airflow connection ID for the embedding provider.
+       Useful when chat and embeddings live on different API keys; in the
+       common one-provider case, leave unset and the hook reuses ``llm_conn_id``.
+   * - ``llm_model``
+     - ``None`` (falls back to ``extra["model"]`` on the connection)
+     - Chat model identifier in ``provider:name`` form, e.g. ``openai:gpt-5``.
+       Only required when calling ``get_chat_model()``.
+   * - ``embed_model``
+     - ``None`` (falls back to ``extra["embed_model"]`` on the connection)
+     - Embedding model identifier in ``provider:name`` form, e.g.
+       ``openai:text-embedding-3-small``. Only required when calling
+       ``get_embedding_model()``. When ``embedding_kwargs`` supplies
+       ``provider`` explicitly, use a model name without the provider prefix.
+   * - ``embedding_kwargs``
+     - ``None``
+     - Additional keyword arguments passed to the embedding model constructor,
+       for example ``{"dimensions": 128}``. Values are forwarded without
+       filtering and can override hook-provided settings, including the endpoint
+       and credentials. In particular, ``provider`` takes precedence over the
+       provider inferred from ``embed_model``. When ``provider`` is set,
+       LangChain treats the entire ``embed_model`` value as the model name rather
+       than parsing a ``provider:name`` identifier. The hook logs a warning when
+       both forms are supplied. Connection ``api_key`` and ``base_url`` values
+       take precedence over the same top-level keys, but the underlying integration
+       may accept alternative or nested options that take precedence. Only pass
+       trusted values.
+
+.. seealso::
+   `langchain.embeddings.init_embeddings <https://reference.langchain.com/python/langchain/embeddings/base/init_embeddings>`__
+   for valid ``embedding_kwargs`` keys.
+
+Dependencies
+------------
+
+Install the ``langchain`` extra to use this hook::
+
+    pip install "apache-airflow-providers-common-ai[langchain]"
+
+That extra installs only ``langchain`` itself, since the framework is
+vendor-agnostic. Install the LangChain integration package for whichever
+provider(s) you intend to use:
+
+- ``langchain-openai`` -- OpenAI and OpenAI-compatible endpoints (Ollama, vLLM)
+- ``langchain-anthropic`` -- Anthropic
+- ``langchain-groq``, ``langchain-mistralai``, ``langchain-deepseek``, ``langchain-ollama``, ...

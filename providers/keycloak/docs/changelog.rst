@@ -1,0 +1,532 @@
+ .. Licensed to the Apache Software Foundation (ASF) under one
+    or more contributor license agreements.  See the NOTICE file
+    distributed with this work for additional information
+    regarding copyright ownership.  The ASF licenses this file
+    to you under the Apache License, Version 2.0 (the
+    "License"); you may not use this file except in compliance
+    with the License.  You may obtain a copy of the License at
+
+ ..   http://www.apache.org/licenses/LICENSE-2.0
+
+ .. Unless required by applicable law or agreed to in writing,
+    software distributed under the License is distributed on an
+    "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+    KIND, either express or implied.  See the License for the
+    specific language governing permissions and limitations
+    under the License.
+
+.. NOTE TO CONTRIBUTORS:
+    Please, only add notes to the Changelog just below the "Changelog" header when there are some breaking changes
+    and you want to add an explanation to the users on how they are supposed to deal with them.
+    The changelog is updated and maintained semi-automatically by release manager.
+
+``apache-airflow-providers-keycloak``
+
+Changelog
+---------
+
+0.12.0
+......
+
+.. note::
+    Airflow 3.4.1 adds a Dag bundles view, which in multi-team mode is checked against the
+    ``AdminView`` resource, so only ``SuperAdmin`` holds it. Multi-team deployments must upgrade this
+    provider together with Airflow 3.4.1: older releases check the view against ``View``, which every
+    team role can read.
+    Multi-team deployments upgrading from Airflow 3.4.0 must also re-run
+    ``airflow keycloak-auth-manager create-team`` for each team, which removes the Dag bundles menu
+    entry that team roles can no longer open.
+
+Features
+~~~~~~~~
+
+* ``Restrict the Dag bundles view to SuperAdmin in multi-team mode on Airflow 3.4.1+ (#76329)``
+
+Bug Fixes
+~~~~~~~~~
+
+* ``Keep the Dag bundles menu entry for team roles on Airflow 3.4.0 (#76474)``
+* ``Make refresh_token optional in Keycloak login and token services (#75871)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``Clarify Dag bundle permission upgrade notes (#76499)``
+   * ``[main] Upgrade important CI environment (#76278)``
+   * ``Remove duplicate Keycloak token-binding test (#75882)``
+
+0.11.2
+......
+
+Bug Fixes
+~~~~~~~~~
+
+* ``Grant Keycloak SuperAdmin access to teamless resources (#74640)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``Stop parallel prek hooks racing on __pycache__ cleanup (#73823)``
+
+0.11.1
+......
+
+.. note::
+    In multi-team mode, the views covering records that are not tied to a Dag or a team -- audit log
+    entries not tied to a Dag, import errors for files with no registered Dag and reparsing such
+    files -- are now checked against a new ``AdminView`` Keycloak resource instead of ``View``.
+    Only ``SuperAdmin`` is granted access to it; team roles keep access to the other views through
+    ``View``. Until the Keycloak client is updated, access to these views is denied to every user.
+    Run ``airflow keycloak-auth-manager create-team <team>`` again for an existing team to create the
+    resource and the ``AdminViewAccess`` permission and grant it to ``SuperAdmin``. Deployments
+    without ``[core] multi_team`` are not affected.
+
+Bug Fixes
+~~~~~~~~~
+
+* ``Stop Keycloak middleware from reissuing a JWT revoked during the request (#73695)``
+* ``Check admin-only views against a dedicated Keycloak resource in multi-team mode (#73696)``
+
+Misc
+~~~~
+
+* ``Drop support for Python 3.10 (#74157)``
+
+Doc-only
+~~~~~~~~
+
+* ``Update provider READMEs for the Python 3.11 baseline (#74158)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``[main] Upgrade important CI environment (#73629)``
+
+0.11.0
+......
+
+Features
+~~~~~~~~
+
+* ``Include the Dag Bundles menu item in the team role resources generated for Keycloak (#72909)``
+* ``Support exchanging a Keycloak-issued access token for an Airflow API token with the JWT bearer grant, gated by the new jwt_federated_client_ids allow-list (#72978)``
+
+Bug Fixes
+~~~~~~~~~
+
+* ``Return 403 when Keycloak UMA ticket grant returns invalid_grant (#73234)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``Revert "[main] Upgrade important CI environment (#73308)" (#73621)``
+   * ``[main] Upgrade important CI environment (#73308)``
+   * ``Remove real sleeps from slow provider unit tests (#73478)``
+
+0.10.0
+......
+
+.. note::
+    The unauthenticated ``POST /auth/token`` endpoint now accepts the ``client_credentials``
+    grant only for the client configured in ``[keycloak_auth_manager] client_id``. Previously
+    the credentials of any confidential client in the realm were accepted and exchanged for an
+    Airflow token. If a deployment authenticates with a service account belonging to a different
+    client, either point ``[keycloak_auth_manager] client_id`` at that client or issue the
+    credentials against the configured one -- other clients now receive ``403``.
+
+Features
+~~~~~~~~
+
+* ``Scope asset API responses to the assets a user may read (#72682)``
+
+Bug Fixes
+~~~~~~~~~
+
+* ``Keep API tokens usable with the Authorization header (#72381)``
+* ``Bind Keycloak cookie tokens to the Airflow session identity (#72207)``
+* ``Accept only the configured client on the Keycloak client_credentials grant (#72205)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+
+0.9.0
+.....
+
+.. note::
+    Upgrading the provider does not update existing Keycloak permissions. For each existing team,
+    run ``airflow keycloak-auth-manager create-team <team>`` again to update the team-specific
+    permissions and repair the global ``ReadOnly`` and ``Admin`` permissions. For non-team
+    installations, run ``airflow keycloak-auth-manager create-permissions`` again without
+    ``--teams`` to update the global ``ReadOnly`` and ``Admin`` permissions.
+
+    Manually added policies attached to these permissions will also be evaluated under the
+    ``AFFIRMATIVE`` strategy after the update.
+
+.. note::
+    For Airflow v3.3.0+ Keycloak's access and refresh tokens are now stored in dedicated
+    ``_access_token`` and ``_refresh_token`` cookies instead of being carried inside the
+    Airflow JWT claims. Sessions established before this release carry the tokens in the old form,
+    so the first request after the upgrade cannot be refreshed and the session is cleared --
+    **every logged-in user is signed out once when you upgrade**. No action is required
+    beyond logging back in; this is a one-time effect of the move and does not recur.
+
+Features
+~~~~~~~~
+
+* ``Grant team Op role access to team Dags in Keycloak auth manager (#71572)``
+* ``Make KeycloakAuthManager '_CACHE_TTL_SECONDS' configurable (#70839)``
+* ``Add KeycloakJWTMiddleware to KeycloakAuthManager (#70800, #71077, #71506)``
+* ``Implement bulk authorization methods in KeycloakAuthManager (#70647)``
+* ``Add IMPORT_ERRORS_ALL permission for import errors of files with no registered Dag (#69790)``
+
+Bug Fixes
+~~~~~~~~~
+
+* ``Fix Keycloak multi-team permission repair (#71614)``
+* ``Make Keycloak permission creation quietly idempotent like its sibling helpers (#71505)``
+* ``Fix Keycloak access for individual roles (#70906)``
+* ``Move keycloak JWT tokens to separate cookies (#70550, #70981)``
+
+Misc
+~~~~
+
+* ``Remove groups claim from access tokens in the Keycloak client created by the KeycloakAuthManager CLI (#71093)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``Adopt flit 4 as the provider distribution build backend (#71186)``
+   * ``Correct the uv.lock versions and keycloak changelog after the 2026-08-01 wave (#70952)``
+   * ``Prepare providers release 2026-08-01 (#70932)``
+   * ``Add tests for Keycloak token models (#70689)``
+
+0.8.2
+.....
+
+Bug Fixes
+~~~~~~~~~
+
+* ``Derive keycloak oauth redirect_uri from configured base url (#69801)``
+* ``Set 'secure' flag on keycloak login cookies behind a tls proxy (#69594)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``Hide non-user-facing entries from ad-hoc provider release notes``
+   * ``Prepare ad-hoc providers release 2026-07-01 (cncf.kubernetes, common.io, keycloak) (#69223)``
+   * ``Prepare ad-hoc providers release 2026-07-01``
+
+
+0.8.1
+.....
+
+.. note::
+    The ``get_cli_user`` method added to the Keycloak auth manager in 0.8.0 has been
+    removed together with the revert of the airflowctl CLI client integration in Airflow
+    core. If you relied on ``airflowctl`` CLI authentication via the Keycloak service
+    account, provide an API token via the ``AIRFLOW_CLI_TOKEN`` environment variable
+    instead.
+
+Bug Fixes
+~~~~~~~~~
+
+* ``Fix keycloak missing resource error check (#69028)``
+* ``Handle missing Keycloak resources as access denied (#68951)``
+
+Misc
+~~~~
+
+* ``Parallelize per-dag auth checks in KeycloakAuthManager (#69107)``
+* ``Revert airflowctl dependency from airflow-core (#68856)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``Fix inconsistency between generated provider docs and pyproject.toml (#68991)``
+   * ``Prepare ad-hoc provider documentation 2026-06-26 (#69022)``
+
+0.8.0
+.....
+
+Features
+~~~~~~~~
+
+* ``Implement 'get_cli_user' in the Keycloak auth manager so airflowctl CLI commands can authenticate via a service account (#68175)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+
+0.7.3
+.....
+
+Misc
+~~~~
+
+* ``Replace Sphinx Redoc with Swagger API Docs (#67390)``
+* ``Add prek hook to enforce HTTPException is imported from fastapi (#67367)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+
+
+0.7.2
+.....
+
+Bug Fixes
+~~~~~~~~~
+
+* ``Attach default role policies (#67031)``
+
+Doc-only
+~~~~~~~~
+
+* ``Update Keycloak documentation to mention '[api] base_url' (#66023)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``Add explicit [tool.flit.sdist] sections to flit-based pyproject.tomls (#65861)``
+   * ``Isolate non-provider mypy hooks per distribution with dedicated .build/ venvs (#65492)``
+
+0.7.1
+.....
+
+Misc
+~~~~
+
+* ``Compat sdk conf follow-up for multiple providers (#64161)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+
+0.7.0
+.....
+
+Features
+~~~~~~~~
+
+* ``Add TTL cache with single-flight dedup to Keycloak filter_authorized_dag_ids (#63184)``
+
+Bug Fixes
+~~~~~~~~~
+
+* ``Adds a state param into keycloak login (#64114)``
+
+Misc
+~~~~
+
+* ``Add Python 3.14 Support (#63520)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``Add *.iml to .gitignore in all distributions (#63636)``
+
+0.6.0
+.....
+
+Features
+~~~~~~~~
+
+* ``Add method to retrieve teams from Keycloak as resources (#62715)``
+
+Bug Fixes
+~~~~~~~~~
+
+* ``Check 'id_token' format before redirecting in Keycloak auth manager (#62813)``
+* ``Do not get 'logout_callback_url' from request in keycloak auth manager (#62795)``
+* ``Scope session token in cookie to base_url (#62771)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``Add Apache Airflow Provider Registry (#62261)``
+
+0.5.3
+.....
+
+Features
+~~~~~~~~
+
+* ``Keycloak CLI: provision multi‑team resources for auth manager (AIP‑67) (#61256)``
+* ``Keycloak auth manager: enforce team‑scoped authorization (AIP‑67) (#61351)``
+
+Bug Fixes
+~~~~~~~~~
+
+* ``Fix HTTP 500 on /ui/teams endpoint when using Keycloak auth manager (#62471)``
+* ``Encode id_token to avoid special characters in it. (#62429)``
+
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``Revert "Fix race condition in auth manager initialization (#62214)" (#62404)``
+   * ``Fix race condition in auth manager initialization (#62214)``
+   * ``Add 'lifecycle' field to provider.yaml schema and all providers per AIP-95 (#62190)``
+
+0.5.2
+.....
+
+Bug Fixes
+~~~~~~~~~
+
+* ``Amend DAG-level RBAC by using claim_token per UMA spec (#61283)``
+* ``Fix double-slash URL generation in Keycloak (#61121) (#61305)``
+
+Misc
+~~~~
+
+* ``Deprecate 'is_authorized_backfill' in Keycloak auth manager (#61402)``
+* ``Upgrade fastapi and conform openapi schema changes (#61476)``
+* ``Amend new Python Keycloak dependency changes (#61174)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+
+0.5.1
+.....
+
+Bug Fixes
+~~~~~~~~~
+
+* ``Logout the user when the refresh token is no longer valid (#60781)``
+* ``Fix logout flow in Keycloak auth manager (#60649)``
+
+Misc
+~~~~
+
+* ``Delete refresh token API in Keycloak auth manager (#60838)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``Update version compatibility for 'AuthManagerRefreshTokenExpiredException' in tests (#60882)``
+
+0.5.0
+.....
+
+Features
+~~~~~~~~
+
+* ``Keycloak: implement client_credentials grant flow (#59411)``
+
+Misc
+~~~~
+
+* ``Literal to str Enum for ResourceMethod & ExtendedResourceMethod (#60244)``
+* ``Change starlette import to fastapi (#60382)``
+* ``New year means updated Copyright notices (#60344)``
+* ``Introduce a "cli" section in provider metadata (#59805)``
+* ``Update conf imports for keycloak provider (#60092)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+
+0.4.1
+.....
+
+Bug Fixes
+~~~~~~~~~
+
+* ``Fix logout route in Keycloak provider so a KeycloakostError doesn't  lead to Internal Server Error in API server (#59382)``
+* ``Fix Internal Server Error in API server due to KeycloakPostError when refreshing user in Keycloak provider (#59361)``
+* ``Return 403 when the Keycloak access token is expired (#59281)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+
+0.4.0
+.....
+
+Features
+~~~~~~~~
+
+* ``Keycloak CLI: add dry run functionality (#59134)``
+* ``keycloak: enable client_secret retrieval from secrets backend (#59065)``
+* ``Passwords from stdin in Keycloak Provider (#59119)``
+* ``Keycloak: implement connection pooling (#59252)``
+
+Misc
+~~~~
+
+* ``Add backcompat for exceptions in providers (#58727)``
+* ``Bump minimum prek version to 0.2.0 (#58952)``
+
+Doc-only
+~~~~~~~~
+
+* ``Add Keycloak login settings management documentation (#58605)``
+* ``update keycloak command references in permissions documentation (#58590)``
+* ``Updates to release process of providers (#58316)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+
+0.3.0
+.....
+
+Features
+~~~~~~~~
+
+* ``Add 'LIST' permission to admin role in Keycloak auth manager (#57978)``
+
+Bug Fixes
+~~~~~~~~~
+
+* ``Fix logout in Fab and Keycloak auth managers (#57992)``
+
+Misc
+~~~~
+
+* ``Convert all airflow distributions to be compliant with ASF requirements (#58138)``
+
+Doc-only
+~~~~~~~~
+
+* ``[Doc] Fixing some typos and spelling errors (#57225)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``Delete all unnecessary LICENSE Files (#58191)``
+   * ``Enable PT006 rule to keycloak Provider test (#57923)``
+   * ``Synchronize default versions in all split .pre-commit-config.yaml (#57851)``
+   * ``Extract prek hooks for Keycloak provider (#57182)``
+
+0.2.0
+.....
+
+Features
+~~~~~~~~
+
+* ``Integrate KeycloakAuthManager with airflowctl (#55969)``
+
+Bug Fixes
+~~~~~~~~~
+
+* ``Update refresh token flow (#55506)``
+* ``Update authentication to handle JWT token in backend (#56633)``
+
+Doc-only
+~~~~~~~~
+
+* ``Remove placeholder Release Date in changelog and index files (#56056)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``Enable PT011 rule to prvoider tests (#56021)``
+
+0.1.0
+.....
+
+
+Features
+~~~~~~~~
+
+* ``Add 'LIST' scope in Keycloak auth manager (#54998)``
+
+Doc-only
+~~~~~~~~
+
+* ``docs(keycloak): Update documentation for Keycloak auth manager CLI usage and permission management (#54928)``
+
+.. Below changes are excluded from the changelog. Move them to
+   appropriate section above if needed. Do not delete the lines(!):
+   * ``Switch pre-commit to prek (#54258)``
+   * ``Fix Airflow 2 reference in README/index of providers (#55240)``
+
+0.0.1
+.....
+
+.. note::
+    Provider is still WIP. It can be used with production but we may introduce breaking changes without following semver until version 1.0.0
+
+* ``Initial version of the provider (#46694)``

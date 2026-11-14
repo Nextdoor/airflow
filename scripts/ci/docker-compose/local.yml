@@ -15,17 +15,20 @@
 # specific language governing permissions and limitations
 # under the License.
 ---
-version: "3.7"
 services:
   airflow:
     stdin_open: true  # docker run -i
     tty: true  # docker run -t
+    environment:
+      - AIRFLOW__CORE__PLUGINS_FOLDER=/files/plugins
     # We need to mount files and directories individually because some files
     # such apache_airflow.egg-info should not be mounted from host
     # we only mount those files, so that it makes sense to edit while developing
     # or those that might be useful to see in the host as output of the
     # tests (such as logs)
     volumes:
+      - root-airflow-volume:/root/airflow/
+      - airflow-cache-volume:/root/.cache
       # START automatically generated volumes from VOLUMES_FOR_SELECTED_MOUNTS in docker_command_utils.py
       - type: bind
         source: ../../../.bash_aliases
@@ -36,9 +39,6 @@ services:
       - type: bind
         source: ../../../.build
         target: /opt/airflow/.build
-      - type: bind
-        source: ../../../.coveragerc
-        target: /opt/airflow/.coveragerc
       - type: bind
         source: ../../../.dockerignore
         target: /opt/airflow/.dockerignore
@@ -52,26 +52,26 @@ services:
         source: ../../../.rat-excludes
         target: /opt/airflow/.rat-excludes
       - type: bind
-        source: ../../../BREEZE.rst
-        target: /opt/airflow/BREEZE.rst
-      - type: bind
         source: ../../../LICENSE
         target: /opt/airflow/LICENSE
-      - type: bind
-        source: ../../../MANIFEST.in
-        target: /opt/airflow/MANIFEST.in
-      - type: bind
-        source: ../../../NOTICE
-        target: /opt/airflow/NOTICE
       - type: bind
         source: ../../../RELEASE_NOTES.rst
         target: /opt/airflow/RELEASE_NOTES.rst
       - type: bind
-        source: ../../../airflow
-        target: /opt/airflow/airflow
+        source: ../../../airflow-core
+        target: /opt/airflow/airflow-core
       - type: bind
-        source: ../../../provider_packages
-        target: /opt/airflow/provider_packages
+        source: ../../../airflow-ctl
+        target: /opt/airflow/airflow-ctl
+      - type: bind
+        source: ../../../chart
+        target: /opt/airflow/chart
+      - type: bind
+        source: ../../../clients
+        target: /opt/airflow/clients
+      - type: bind
+        source: ../../../constraints
+        target: /opt/airflow/constraints
       - type: bind
         source: ../../../dags
         target: /opt/airflow/dags
@@ -79,26 +79,44 @@ services:
         source: ../../../dev
         target: /opt/airflow/dev
       - type: bind
+        source: ../../../devel-common
+        target: /opt/airflow/devel-common
+      - type: bind
+        source: ../../../docker-stack-docs
+        target: /opt/airflow/docker-stack-docs
+      - type: bind
+        source: ../../../docker-tests
+        target: /opt/airflow/docker-tests
+      - type: bind
         source: ../../../docs
         target: /opt/airflow/docs
       - type: bind
         source: ../../../generated
         target: /opt/airflow/generated
       - type: bind
-        source: ../../../hooks
-        target: /opt/airflow/hooks
+        source: ../../../go-sdk
+        target: /opt/airflow/go-sdk
       - type: bind
-        source: ../../../images
-        target: /opt/airflow/images
+        source: ../../../java-sdk
+        target: /opt/airflow/java-sdk
+      - type: bind
+        source: ../../../kubernetes-tests
+        target: /opt/airflow/kubernetes-tests
       - type: bind
         source: ../../../logs
         target: /root/airflow/logs
       - type: bind
+        source: ../../../providers
+        target: /opt/airflow/providers
+      - type: bind
+        source: ../../../providers-summary-docs
+        target: /opt/airflow/providers-summary-docs
+      - type: bind
+        source: ../../../registry
+        target: /opt/airflow/registry
+      - type: bind
         source: ../../../pyproject.toml
         target: /opt/airflow/pyproject.toml
-      - type: bind
-        source: ../../../pytest.ini
-        target: /opt/airflow/pytest.ini
       - type: bind
         source: ../../../scripts
         target: /opt/airflow/scripts
@@ -106,21 +124,23 @@ services:
         source: ../../../scripts/docker/entrypoint_ci.sh
         target: /entrypoint
       - type: bind
-        source: ../../../setup.cfg
-        target: /opt/airflow/setup.cfg
+        source: ../../../shared
+        target: /opt/airflow/shared
       - type: bind
-        source: ../../../setup.py
-        target: /opt/airflow/setup.py
+        source: ../../../task-sdk
+        target: /opt/airflow/task-sdk
       - type: bind
-        source: ../../../tests
-        target: /opt/airflow/tests
-      - type: bind
-        source: ../../../kubernetes_tests
-        target: /opt/airflow/kubernetes_tests
-      - type: bind
-        source: ../../../docker_tests
-        target: /opt/airflow/docker_tests
-      - type: bind
-        source: ../../../chart
-        target: /opt/airflow/chart
+        source: ../../../ts-sdk
+        target: /opt/airflow/ts-sdk
         # END automatically generated volumes from VOLUMES_FOR_SELECTED_MOUNTS in docker_command_utils.py
+volumes:
+  root-airflow-volume:
+    labels:
+      org.apache.airflow.breeze: "true"
+      org.apache.airflow.breeze.worktree: "${BREEZE_WORKTREE_PATH:-}"
+      org.apache.airflow.breeze.host: "${BREEZE_HOST_ID:-}"
+  airflow-cache-volume:
+    labels:
+      org.apache.airflow.breeze: "true"
+      org.apache.airflow.breeze.worktree: "${BREEZE_WORKTREE_PATH:-}"
+      org.apache.airflow.breeze.host: "${BREEZE_HOST_ID:-}"

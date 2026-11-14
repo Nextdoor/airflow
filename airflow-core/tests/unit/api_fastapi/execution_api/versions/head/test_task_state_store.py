@@ -1,0 +1,453 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+import json
+from datetime import datetime
+from typing import TYPE_CHECKING
+from uuid import uuid4
+
+import pendulum
+import pytest
+from fastapi import Request
+from fastapi.testclient import TestClient
+from sqlalchemy import Select, delete, event, select
+
+from airflow import settings
+from airflow._shared.timezones import timezone
+from airflow.api_fastapi.app import cached_app
+from airflow.api_fastapi.execution_api.datamodels.token import TIClaims, TIToken
+from airflow.api_fastapi.execution_api.security import _jwt_bearer
+from airflow.models.dagrun import DagRun
+from airflow.models.dynamic_region import DynamicRegion
+from airflow.models.task_state_store import TaskStateStoreModel
+from airflow.models.taskinstance import TaskInstance
+from airflow.utils.session import create_session
+from airflow.utils.state import TaskInstanceState
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
+
+    from tests_common.pytest_plugin import CreateTaskInstance
+
+
+pytestmark = pytest.mark.db_test
+
+
+@pytest.fixture(autouse=True)
+def reset_state_tables():
+    with create_session() as session:
+        session.execute(delete(TaskStateStoreModel))
+        session.execute(delete(DagRun))
+
+
+def _api_url(ti_id, key: str | None = None) -> str:
+    base = f"/execution/store/ti/{ti_id}"
+    return f"{base}/{key}" if key else base
+
+
+@pytest.mark.parametrize("clear_all", [False, True])
+def test_task_uuid_isolates_state_in_different_regions(client, create_task_instance, session, clear_all):
+    first = create_task_instance(session=session)
+    region = DynamicRegion(dag_id=first.dag_id, run_id=first.run_id, node_id="loop")
+    session.add(region)
+    session.flush()
+    second = TaskInstance(task=first.task, run_id=first.run_id, dag_version_id=first.dag_version_id)
+    second.region_id = region.id
+    second.region_index = first.region_index
+    session.add(second)
+    session.commit()
+
+    assert client.put(_api_url(first.id, "key"), json={"value": "first"}).status_code == 204
+    assert client.put(_api_url(second.id, "key"), json={"value": "second"}).status_code == 204
+    assert client.get(_api_url(first.id, "key")).json() == {"value": "first"}
+    assert client.get(_api_url(second.id, "key")).json() == {"value": "second"}
+    assert client.delete(_api_url(second.id, None if clear_all else "key")).status_code == 204
+    assert client.get(_api_url(second.id, "key")).status_code == 404
+    assert client.get(_api_url(first.id, "key")).json() == {"value": "first"}
+
+
+class TestGetTaskState:
+    def test_get_stored_null_returns_404(self, client: TestClient, create_task_instance: CreateTaskInstance):
+        ti = create_task_instance()
+        with create_session() as session:
+            session.add(
+                TaskStateStoreModel(
+                    dag_run_id=ti.dag_run.id,
+                    dag_id=ti.dag_id,
+                    run_id=ti.run_id,
+                    task_id=ti.task_id,
+                    region_id=ti.region_id,
+                    region_index=ti.region_index,
+                    key="job_id",
+                    value="null",
+                    updated_at=timezone.utcnow(),
+                )
+            )
+
+        response = client.get(_api_url(ti.id, "job_id"))
+
+        assert response.status_code == 404
+        assert response.json()["detail"]["reason"] == "not_found"
+
+    def test_get_returns_value(self, client: TestClient, create_task_instance: CreateTaskInstance):
+        ti = create_task_instance()
+        client.put(_api_url(ti.id, "job_id"), json={"value": "spark_001"})
+
+        response = client.get(_api_url(ti.id, "job_id"))
+
+        assert response.status_code == 200
+        assert response.json() == {"value": "spark_001"}
+
+    def test_get_missing_key_returns_404(self, client: TestClient, create_task_instance: CreateTaskInstance):
+        ti = create_task_instance()
+
+        response = client.get(_api_url(ti.id, "never_set"))
+
+        assert response.status_code == 404
+        assert response.json()["detail"]["reason"] == "not_found"
+
+    def test_get_missing_ti_returns_404(self, client: TestClient):
+        response = client.get(_api_url(uuid4(), "any_key"))
+
+        assert response.status_code == 404
+        assert "Task instance" in response.json()["detail"]["message"]
+
+    def test_get_key_with_slash(self, client: TestClient, create_task_instance: CreateTaskInstance):
+        ti = create_task_instance()
+        client.put(_api_url(ti.id, "spark/job_id"), json={"value": "spark_001"})
+
+        response = client.get(_api_url(ti.id, "spark/job_id"))
+
+        assert response.status_code == 200
+        assert response.json() == {"value": "spark_001"}
+
+    @pytest.mark.parametrize("method", ["get", "put", "delete"])
+    def test_archived_attempt_returns_404(
+        self, client: TestClient, create_task_instance: CreateTaskInstance, session, method
+    ):
+        ti = create_task_instance(state=TaskInstanceState.RUNNING)
+        session.commit()
+        old_id = ti.id
+        ti.prepare_db_for_next_try(session)
+        session.commit()
+        client.headers["Airflow-API-Version"] = "2026-06-30"
+        kwargs = {"json": {"value": "stale"}} if method == "put" else {}
+
+        response = getattr(client, method)(_api_url(old_id, "job_id"), **kwargs)
+
+        assert response.status_code == 404
+        assert "Task instance" in response.json()["detail"]["message"]
+
+
+class TestPutTaskState:
+    def test_put_creates_row(self, client: TestClient, create_task_instance: CreateTaskInstance):
+        ti = create_task_instance()
+
+        response = client.put(_api_url(ti.id, "job_id"), json={"value": "spark_001"})
+
+        assert response.status_code == 204
+        with create_session() as session:
+            row = session.scalar(
+                select(TaskStateStoreModel).where(
+                    TaskStateStoreModel.dag_id == ti.dag_id,
+                    TaskStateStoreModel.run_id == ti.run_id,
+                    TaskStateStoreModel.task_id == ti.task_id,
+                    TaskStateStoreModel.key == "job_id",
+                )
+            )
+            assert row is not None
+            # DB stores a json string
+            assert row.value == '"spark_001"'
+
+    def test_put_int_value_roundtrip(self, client: TestClient, create_task_instance: CreateTaskInstance):
+        ti = create_task_instance()
+
+        response = client.put(_api_url(ti.id, "retry_count"), json={"value": 3})
+
+        assert response.status_code == 204
+        assert client.get(_api_url(ti.id, "retry_count")).json() == {"value": 3}
+
+    def test_put_dict_value_roundtrip(self, client: TestClient, create_task_instance: CreateTaskInstance):
+        ti = create_task_instance()
+
+        response = client.put(
+            _api_url(ti.id, "poll_result"),
+            json={"value": {"status": "succeeded", "rows": 1234}},
+        )
+
+        assert response.status_code == 204
+        assert client.get(_api_url(ti.id, "poll_result")).json() == {
+            "value": {"status": "succeeded", "rows": 1234}
+        }
+
+    def test_put_list_value_roundtrip(self, client: TestClient, create_task_instance: CreateTaskInstance):
+        ti = create_task_instance()
+
+        response = client.put(_api_url(ti.id, "checkpoints"), json={"value": [1, 2, 3]})
+
+        assert response.status_code == 204
+        assert client.get(_api_url(ti.id, "checkpoints")).json() == {"value": [1, 2, 3]}
+
+    def test_put_with_expires_at_creates_row(
+        self, client: TestClient, create_task_instance: CreateTaskInstance, time_machine
+    ):
+
+        ti = create_task_instance()
+        time_machine.move_to(datetime(2026, 5, 5, 12, 0, 0), tick=False)
+        response = client.put(
+            _api_url(ti.id, "job_id"),
+            json={
+                "value": "spark_001",
+                "expires_at": datetime(2026, 5, 15, 12, 0, 0, tzinfo=pendulum.UTC).isoformat(),
+            },
+        )
+
+        assert response.status_code == 204
+        with create_session() as session:
+            row = session.scalar(
+                select(TaskStateStoreModel).where(
+                    TaskStateStoreModel.dag_id == ti.dag_id,
+                    TaskStateStoreModel.run_id == ti.run_id,
+                    TaskStateStoreModel.task_id == ti.task_id,
+                    TaskStateStoreModel.key == "job_id",
+                )
+            )
+            assert row is not None
+            assert row.value == '"spark_001"'
+            assert row.expires_at == datetime(2026, 5, 15, 12, 0, 0, tzinfo=pendulum.UTC)
+
+    def test_put_overwrites_existing(self, client: TestClient, create_task_instance: CreateTaskInstance):
+        ti = create_task_instance()
+        client.put(_api_url(ti.id, "job_id"), json={"value": "spark_001"})
+
+        response = client.put(_api_url(ti.id, "job_id"), json={"value": "spark_002"})
+
+        assert response.status_code == 204
+        assert client.get(_api_url(ti.id, "job_id")).json() == {"value": "spark_002"}
+
+    def test_put_empty_body_returns_422(self, client: TestClient, create_task_instance: CreateTaskInstance):
+        ti = create_task_instance()
+
+        response = client.put(_api_url(ti.id, "job_id"), json={})
+
+        assert response.status_code == 422
+
+    def test_put_extra_field_returns_422(self, client: TestClient, create_task_instance: CreateTaskInstance):
+        ti = create_task_instance()
+
+        response = client.put(_api_url(ti.id, "job_id"), json={"value": "x", "extra": "y"})
+
+        assert response.status_code == 422
+
+    def test_put_null_value_returns_422(self, client: TestClient, create_task_instance: CreateTaskInstance):
+        ti = create_task_instance()
+
+        response = client.put(_api_url(ti.id, "job_id"), json={"value": None})
+
+        assert response.status_code == 422
+
+    @pytest.mark.parametrize("bad_float", [float("nan"), float("inf"), float("-inf")])
+    def test_put_non_finite_float_returns_422(
+        self, client: TestClient, create_task_instance: CreateTaskInstance, bad_float: float
+    ):
+        ti = create_task_instance()
+        with pytest.raises(ValueError, match="Out of range float values are not JSON compliant"):
+            _ = client.put(
+                _api_url(ti.id, "job_id"),
+                content=json.dumps({"value": bad_float}, allow_nan=True).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+
+    def test_put_missing_ti_returns_404(self, client: TestClient):
+        response = client.put(_api_url(uuid4(), "job_id"), json={"value": "x"})
+
+        assert response.status_code == 404
+
+    def test_put_dagrun_deleted_after_scope_lookup_returns_404(
+        self, client: TestClient, session: Session, create_task_instance: CreateTaskInstance
+    ):
+        ti = create_task_instance()
+        dag_run_id = ti.dag_run.id
+        session.commit()
+        deleted = False
+
+        def delete_run_before_lookup(conn, statement, multiparams, params, execution_options):
+            nonlocal deleted
+            if (
+                deleted
+                or not isinstance(statement, Select)
+                or statement.column_descriptions[0]["expr"] is not DagRun.id
+            ):
+                return
+            deleted = True
+            with create_session(scoped=False) as cleanup_session:
+                cleanup_session.execute(delete(DagRun).where(DagRun.id == dag_run_id))
+
+        event.listen(settings.engine, "before_execute", delete_run_before_lookup)
+        try:
+            response = client.put(_api_url(ti.id, "job_id"), json={"value": "spark_001"})
+        finally:
+            event.remove(settings.engine, "before_execute", delete_run_before_lookup)
+
+        assert deleted
+        assert response.status_code == 404
+        assert response.json()["detail"] == {
+            "reason": "not_found",
+            "message": f"DagRun with dag_id={ti.dag_id} and run_id={ti.run_id} not found",
+        }
+
+    def test_put_key_with_slash(self, client: TestClient, create_task_instance: CreateTaskInstance):
+        ti = create_task_instance()
+
+        response = client.put(_api_url(ti.id, "spark/job_id"), json={"value": "spark_001"})
+
+        assert response.status_code == 204
+        assert client.get(_api_url(ti.id, "spark/job_id")).json() == {"value": "spark_001"}
+
+
+class TestDeleteTaskState:
+    def test_delete_removes_key(self, client: TestClient, create_task_instance: CreateTaskInstance):
+        ti = create_task_instance()
+        client.put(_api_url(ti.id, "job_id"), json={"value": "spark_001"})
+
+        response = client.delete(_api_url(ti.id, "job_id"))
+
+        assert response.status_code == 204
+        assert client.get(_api_url(ti.id, "job_id")).status_code == 404
+
+    def test_delete_missing_key_is_noop(self, client: TestClient, create_task_instance: CreateTaskInstance):
+        ti = create_task_instance()
+
+        response = client.delete(_api_url(ti.id, "never_existed"))
+
+        assert response.status_code == 204
+
+    def test_delete_only_targets_one_key(self, client: TestClient, create_task_instance: CreateTaskInstance):
+        ti = create_task_instance()
+        client.put(_api_url(ti.id, "job_id"), json={"value": "a"})
+        client.put(_api_url(ti.id, "checkpoint"), json={"value": "b"})
+
+        client.delete(_api_url(ti.id, "job_id"))
+
+        assert client.get(_api_url(ti.id, "job_id")).status_code == 404
+        assert client.get(_api_url(ti.id, "checkpoint")).json() == {"value": "b"}
+
+    def test_delete_key_with_slash(self, client: TestClient, create_task_instance: CreateTaskInstance):
+        ti = create_task_instance()
+        client.put(_api_url(ti.id, "spark/job_id"), json={"value": "spark_001"})
+
+        response = client.delete(_api_url(ti.id, "spark/job_id"))
+
+        assert response.status_code == 204
+        assert client.get(_api_url(ti.id, "spark/job_id")).status_code == 404
+
+
+class TestClearTaskState:
+    def test_clear_removes_all_keys(self, client: TestClient, create_task_instance: CreateTaskInstance):
+        ti = create_task_instance()
+        for k, v in [("job_id", "a"), ("checkpoint", "b"), ("retry_count", "c")]:
+            client.put(_api_url(ti.id, k), json={"value": v})
+
+        response = client.delete(_api_url(ti.id))
+
+        assert response.status_code == 204
+        with create_session() as session:
+            remaining = session.scalars(
+                select(TaskStateStoreModel.key).where(
+                    TaskStateStoreModel.dag_id == ti.dag_id,
+                    TaskStateStoreModel.task_id == ti.task_id,
+                )
+            ).all()
+            assert remaining == []
+
+    def test_clear_when_empty_is_noop(self, client: TestClient, create_task_instance: CreateTaskInstance):
+        ti = create_task_instance()
+
+        response = client.delete(_api_url(ti.id))
+
+        assert response.status_code == 204
+
+    def _seed_fleet_rows(self, ti, indices: tuple[int, ...]) -> None:
+        with create_session() as session:
+            now = timezone.utcnow()
+            for idx in indices:
+                session.add(
+                    TaskStateStoreModel(
+                        dag_run_id=ti.dag_run.id,
+                        dag_id=ti.dag_id,
+                        run_id=ti.run_id,
+                        task_id=ti.task_id,
+                        region_index=idx,
+                        key="job_id",
+                        value=f"app_{idx}",
+                        updated_at=now,
+                    )
+                )
+            session.commit()
+
+    def test_clear_default_only_clears_this_map_index(
+        self, client: TestClient, create_task_instance: CreateTaskInstance
+    ):
+        """Clear without the query param only wipes the requesting TI's own map_index."""
+        ti = create_task_instance(map_index=2)
+        self._seed_fleet_rows(ti, (0, 1, 2))
+
+        response = client.delete(_api_url(ti.id))
+
+        assert response.status_code == 204
+        with create_session() as session:
+            remaining_indices = sorted(
+                session.scalars(
+                    select(TaskStateStoreModel.region_index).where(
+                        TaskStateStoreModel.dag_id == ti.dag_id,
+                        TaskStateStoreModel.task_id == ti.task_id,
+                    )
+                ).all()
+            )
+            assert remaining_indices == [0, 1]
+
+
+class TestTiSelfEnforcement:
+    @pytest.fixture
+    def wrong_ti_client(self):
+        """TestClient using the real require_auth, JWT bound to a random TI UUID."""
+        app = cached_app(apps="execution")
+        other_ti_id = uuid4()
+
+        async def mock_jwt(request: Request) -> TIToken:
+            return TIToken(id=other_ti_id, claims=TIClaims(scope="execution"))
+
+        app.dependency_overrides[_jwt_bearer] = mock_jwt
+        with TestClient(app, headers={"Authorization": "Bearer fake"}) as client:
+            yield client
+        app.dependency_overrides.pop(_jwt_bearer, None)
+
+    def test_get_with_wrong_ti_token_returns_403(self, wrong_ti_client: TestClient, create_task_instance):
+        ti = create_task_instance()
+        response = wrong_ti_client.get(_api_url(ti.id, "some_key"))
+        assert response.status_code == 403
+
+    def test_put_with_wrong_ti_token_returns_403(self, wrong_ti_client: TestClient, create_task_instance):
+        ti = create_task_instance()
+        response = wrong_ti_client.put(_api_url(ti.id, "some_key"), json={"value": "x"})
+        assert response.status_code == 403
+
+    def test_clear_with_wrong_ti_token_returns_403(self, wrong_ti_client: TestClient, create_task_instance):
+        ti = create_task_instance()
+        response = wrong_ti_client.delete(_api_url(ti.id))
+        assert response.status_code == 403

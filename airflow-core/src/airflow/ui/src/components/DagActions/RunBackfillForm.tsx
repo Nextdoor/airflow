@@ -1,0 +1,320 @@
+/*!
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import { useEffect, useState } from "react";
+
+import { Box, Button, Field, Flex, HStack, Input, Spacer, Text, VStack } from "@chakra-ui/react";
+import dayjs from "dayjs";
+import { Controller, useForm, useWatch } from "react-hook-form";
+import { useTranslation } from "react-i18next";
+
+import { useDagServiceGetDagDetails } from "openapi/queries";
+import type { BackfillPostBody, DAGResponse, DAGWithLatestDagRunsResponse } from "openapi/requests/types.gen";
+
+import { Alert, Checkbox, RadioCardItem, RadioCardLabel, RadioCardRoot } from "src/system-components";
+
+import { useRerunWithLatestVersion } from "src/components/Clear/useRerunWithLatestVersion";
+
+import { isReprocessBehavior, reprocessBehaviors } from "src/constants/reprocessBehaviourParams";
+import { useCreateBackfill } from "src/queries/useCreateBackfill";
+import { useCreateBackfillDryRun } from "src/queries/useCreateBackfillDryRun";
+import { useDagParams } from "src/queries/useDagParams";
+import { useParamStore } from "src/queries/useParamStore";
+import { useTogglePause } from "src/queries/useTogglePause";
+
+import ConfigForm from "../ConfigForm";
+import { DateTimeInput } from "../DateTimeInput";
+import { ErrorAlert, type ExpandedApiError } from "../ErrorAlert";
+import PausedDagOptions from "../TriggerDag/PausedDagOptions";
+import type { DagRunTriggerParams, PausedDagAction } from "../TriggerDag/types";
+import { getInlineMessage } from "./inlineMessage";
+
+type RunBackfillFormProps = {
+  readonly dag: DAGResponse | DAGWithLatestDagRunsResponse;
+  readonly disabled?: boolean;
+  readonly onClose: () => void;
+};
+type BackfillFormProps = DagRunTriggerParams & Omit<BackfillPostBody, "dag_run_conf">;
+
+const RunBackfillForm = ({ dag, disabled = false, onClose }: RunBackfillFormProps) => {
+  const { t: translate } = useTranslation(["components", "common"]);
+  const [errors, setErrors] = useState<{ conf?: string; date?: unknown }>({});
+  const [pausedDagAction, setPausedDagAction] = useState<PausedDagAction>("unpause");
+  const [overrideParams, setOverrideParams] = useState(false);
+  const [formError, setFormError] = useState(false);
+  const initialParamsDict = useDagParams(dag.dag_id, true);
+  const { conf } = useParamStore();
+  const { data: dagDetails } = useDagServiceGetDagDetails({ dagId: dag.dag_id });
+  const { value: resolvedRunOnLatest } = useRerunWithLatestVersion({
+    dagLevelConfig: dagDetails?.rerun_with_latest_version,
+    fallback: true,
+  });
+  const { control, handleSubmit, reset, watch } = useForm<BackfillFormProps>({
+    mode: "onBlur",
+    resetOptions: { keepDirtyValues: true },
+    values: {
+      conf,
+      dag_id: dag.dag_id,
+      from_date: "",
+      max_active_runs: 1,
+      reprocess_behavior: "none",
+      run_backwards: false,
+      run_on_latest_version: resolvedRunOnLatest,
+      to_date: "",
+    } as BackfillFormProps,
+  });
+  const values = useWatch<BackfillFormProps>({
+    control,
+  });
+  const {
+    data,
+    error: dryRunError,
+    isPending: isPendingDryRun,
+  } = useCreateBackfillDryRun({
+    requestBody: {
+      requestBody: {
+        dag_id: dag.dag_id,
+        dag_run_conf: undefined,
+        from_date: values.from_date ?? "",
+        max_active_runs: values.max_active_runs ?? 1,
+        reprocess_behavior: values.reprocess_behavior,
+        run_backwards: values.run_backwards ?? false,
+        run_on_latest_version: values.run_on_latest_version,
+        to_date: values.to_date ?? "",
+      },
+    },
+  });
+  const { mutate: togglePause } = useTogglePause({ dagId: dag.dag_id });
+  const { createBackfill, dateValidationError, error, isPending, resetError } = useCreateBackfill({
+    onSuccessConfirm: onClose,
+  });
+
+  useEffect(() => {
+    if (Boolean(dateValidationError)) {
+      setErrors((prev) => ({ ...prev, date: dateValidationError }));
+    }
+  }, [dateValidationError]);
+  useEffect(() => {
+    if (conf) {
+      reset((prevValues) => ({ ...prevValues, conf }));
+    }
+  }, [conf, reset]);
+  const dataIntervalStart = watch("from_date");
+  const dataIntervalEnd = watch("to_date");
+  const noDataInterval = !Boolean(dataIntervalStart) || !Boolean(dataIntervalEnd);
+  const dataIntervalInvalid = dayjs(dataIntervalStart).isAfter(dayjs(dataIntervalEnd));
+
+  const onSubmit = (fdata: BackfillFormProps) => {
+    if (disabled) {
+      return;
+    }
+    if (pausedDagAction === "unpause" && dag.is_paused) {
+      togglePause({
+        dagId: dag.dag_id,
+        requestBody: {
+          is_paused: false,
+        },
+      });
+    }
+    createBackfill({
+      requestBody: {
+        ...fdata,
+        dag_run_conf: overrideParams ? (JSON.parse(fdata.conf) as Record<string, unknown>) : null,
+        drain_dag: dag.is_paused && pausedDagAction === "drain",
+      },
+    });
+  };
+
+  const onCancel = (fdata: BackfillFormProps) => {
+    reset(fdata);
+    onClose();
+  };
+
+  const resetDateError = () => setErrors((prev) => ({ ...prev, date: undefined }));
+  const affectedTasks = data ?? { backfills: [], total_entries: 0 };
+  const isPartitioned = dag.timetable_partitioned;
+
+  // Check if the dry run error is a permission error (403)
+  const isPermissionError =
+    dryRunError !== undefined && dryRunError !== null && (dryRunError as ExpandedApiError).status === 403;
+
+  const inlineMessage = getInlineMessage({
+    backfills: affectedTasks.backfills,
+    isPartitioned,
+    isPendingDryRun,
+    totalEntries: affectedTasks.total_entries,
+    translate,
+  });
+
+  return (
+    <>
+      {isPermissionError ? (
+        <Alert status="error">{translate("backfill.permissionDenied")}</Alert>
+      ) : (
+        <ErrorAlert error={errors.date ?? dryRunError ?? error} />
+      )}
+      <VStack alignItems="stretch" gap={2} pt={4}>
+        <Alert status="info">{translate("backfill.schedulerPriorityHint")}</Alert>
+        <Box>
+          <Text fontSize="md" fontWeight="semibold" mb={3}>
+            {isPartitioned ? translate("backfill.partitionRange") : translate("backfill.dateRange")}
+          </Text>
+          <HStack alignItems="flex-start" w="full">
+            <Controller
+              control={control}
+              name="from_date"
+              render={({ field }) => (
+                <Field.Root invalid={Boolean(errors.date) || dataIntervalInvalid} required>
+                  <Field.Label>{translate("common:table.from")}</Field.Label>
+                  <DateTimeInput {...field} onBlur={resetDateError} />
+                  <Field.ErrorText>{translate("backfill.errorStartDateBeforeEndDate")}</Field.ErrorText>
+                </Field.Root>
+              )}
+            />
+            <Controller
+              control={control}
+              name="to_date"
+              render={({ field }) => (
+                <Field.Root invalid={Boolean(errors.date) || dataIntervalInvalid} required>
+                  <Field.Label>{translate("common:table.to")}</Field.Label>
+                  <DateTimeInput {...field} endOfDay onBlur={resetDateError} />
+                </Field.Root>
+              )}
+            />
+          </HStack>
+        </Box>
+        {noDataInterval || dataIntervalInvalid || isPermissionError ? undefined : <Box>{inlineMessage}</Box>}
+        <Spacer />
+        <Controller
+          control={control}
+          name="reprocess_behavior"
+          render={({ field }) => (
+            <RadioCardRoot
+              onValueChange={(details) => {
+                if (isReprocessBehavior(details.value)) {
+                  field.onChange(details.value);
+                }
+              }}
+              value={field.value}
+            >
+              <RadioCardLabel fontSize="md" fontWeight="semibold" mb={3}>
+                {translate("backfill.reprocessBehavior")}
+              </RadioCardLabel>
+              <HStack align="stretch">
+                {reprocessBehaviors.map((item) => (
+                  <RadioCardItem
+                    indicatorPlacement="start"
+                    key={item.value}
+                    label={translate(item.label)}
+                    value={item.value}
+                  />
+                ))}
+              </HStack>
+            </RadioCardRoot>
+          )}
+        />
+        <Spacer />
+        <Controller
+          control={control}
+          name="max_active_runs"
+          render={({ field }) => (
+            <HStack>
+              <Input
+                {...field}
+                max={dag.max_active_runs ?? undefined}
+                min={1}
+                placeholder=""
+                type="number"
+                width={24}
+              />
+              <Flex>{translate("backfill.maxRuns")}</Flex>
+            </HStack>
+          )}
+        />
+        <Spacer />
+        <Controller
+          control={control}
+          name="run_backwards"
+          render={({ field }) => (
+            <Checkbox checked={field.value} onChange={field.onChange}>
+              {translate("backfill.backwards")}
+            </Checkbox>
+          )}
+        />
+        <Spacer />
+        <Controller
+          control={control}
+          name="run_on_latest_version"
+          render={({ field }) => (
+            <Checkbox checked={field.value ?? undefined} colorPalette="brand" onChange={field.onChange}>
+              {translate("dags:runAndTaskActions.options.runOnLatestVersion")}
+            </Checkbox>
+          )}
+        />
+        <Spacer />
+        {dag.is_paused ? (
+          <>
+            <PausedDagOptions
+              dagId={dag.dag_id}
+              onChange={(action) => {
+                setPausedDagAction(action);
+                if (Boolean(error)) {
+                  resetError();
+                }
+              }}
+              value={pausedDagAction}
+            />
+            <Spacer />
+          </>
+        ) : undefined}
+        <Checkbox checked={overrideParams} onChange={() => setOverrideParams(!overrideParams)}>
+          {translate("backfill.overrideExistingParams")}
+        </Checkbox>
+        <Spacer />
+        <ConfigForm
+          control={control}
+          errors={errors}
+          initialParamsDict={initialParamsDict}
+          setErrors={setErrors}
+          setFormError={setFormError}
+        />
+      </VStack>
+      <Box as="footer" display="flex" justifyContent="flex-end" mt={4}>
+        <HStack w="full">
+          <Spacer />
+          <Button onClick={() => void handleSubmit(onCancel)()}>{translate("common:modal.cancel")}</Button>
+          <Button
+            disabled={
+              disabled ||
+              Boolean(errors.date) ||
+              isPendingDryRun ||
+              formError ||
+              affectedTasks.total_entries === 0
+            }
+            loading={isPending}
+            onClick={() => void handleSubmit(onSubmit)()}
+          >
+            {translate("backfill.run")}
+          </Button>
+        </HStack>
+      </Box>
+    </>
+  );
+};
+
+export default RunBackfillForm;

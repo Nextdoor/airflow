@@ -16,13 +16,16 @@
 # under the License.
 from __future__ import annotations
 
+import os
+import re
+from collections.abc import Sequence
 from dataclasses import dataclass
-from re import match
-from typing import Any, Sequence
+from typing import Any
 
 import click
 from click import Context, Parameter, ParamType
 
+from airflow_breeze.global_constants import GITHUB_REPO_BRANCH_PATTERN, PR_NUMBER_PATTERN
 from airflow_breeze.utils.cache import (
     check_if_values_allowed,
     read_and_validate_value_from_cache,
@@ -30,7 +33,7 @@ from airflow_breeze.utils.cache import (
     write_to_cache_file,
 )
 from airflow_breeze.utils.coertions import coerce_bool_value
-from airflow_breeze.utils.console import get_console
+from airflow_breeze.utils.console import console_print
 from airflow_breeze.utils.recording import generating_command_images
 from airflow_breeze.utils.shared_options import set_dry_run, set_forced_answer, set_verbose
 
@@ -48,7 +51,7 @@ class BetterChoice(click.Choice):
         super().__init__(*args)
         self.all_choices: Sequence[str] = self.choices
 
-    def get_metavar(self, param) -> str:
+    def get_metavar(self, param, ctx=None) -> str:
         choices_str = " | ".join(self.all_choices)
         # Use curly braces to indicate a required argument.
         if param.required and param.param_type_name == "argument":
@@ -60,6 +63,22 @@ class BetterChoice(click.Choice):
 
         # Use square braces to indicate an option or optional argument.
         return f"[{choices_str}]"
+
+
+class HiddenChoiceWithCompletion(BetterChoice):
+    """
+    Like NotVerifiedBetterChoice, but hides the choices list from --help output.
+    Autocomplete still works in the shell, and any value is accepted (not just
+    the listed choices).
+    """
+
+    name = "TEXT"
+
+    def get_metavar(self, param, ctx=None) -> str:
+        return "TEXT"
+
+    def convert(self, value: Any, param: Parameter | None, ctx: Context | None) -> Any:
+        return value
 
 
 class NotVerifiedBetterChoice(BetterChoice):
@@ -112,6 +131,8 @@ class VerboseOption(ParamType):
     Stores and allows to retrieve verbose option
     """
 
+    name = "VerboseOption"
+
     def convert(self, value, param, ctx):
         set_verbose(coerce_bool_value(value))
         return super().convert(value, param, ctx)
@@ -121,6 +142,8 @@ class DryRunOption(ParamType):
     """
     Stores and allows to retrieve dry_run option
     """
+
+    name = "DryRunOption"
 
     def convert(self, value, param, ctx):
         set_dry_run(coerce_bool_value(value))
@@ -145,22 +168,23 @@ class CacheableChoice(click.Choice):
         if isinstance(value, CacheableDefault):
             is_cached, new_value = read_and_validate_value_from_cache(param_name, value.value)
             if not is_cached:
-                get_console().print(f"\n[info]Default value of {param.name} parameter {new_value} used.[/]\n")
+                console_print(f"\n[info]Default value of {param.name} parameter {new_value} used.[/]\n")
         else:
             allowed, allowed_values = check_if_values_allowed(param_name, value)
             if allowed:
                 new_value = value
-                write_to_cache_file(param_name, new_value, check_allowed_values=False)
+                if not os.environ.get("SKIP_SAVING_CHOICES"):
+                    write_to_cache_file(param_name, new_value, check_allowed_values=False)
             else:
                 new_value = allowed_values[0]
-                get_console().print(
+                console_print(
                     f"\n[warning]The value {value} is not allowed for parameter {param.name}. "
                     f"Setting default value to {new_value}"
                 )
                 write_to_cache_file(param_name, new_value, check_allowed_values=False)
         return super().convert(new_value, param, ctx)
 
-    def get_metavar(self, param) -> str:
+    def get_metavar(self, param, ctx=None) -> str:
         param_name = param.envvar if param.envvar else param.name.upper()
         current_value = (
             read_from_cache_file(param_name) if not generating_command_images() else param.default.value
@@ -168,9 +192,9 @@ class CacheableChoice(click.Choice):
         if not current_value:
             current_choices = self.choices
         else:
-            current_choices = [
+            current_choices = tuple(
                 f">{choice}<" if choice == current_value else choice for choice in self.choices
-            ]
+            )
         choices_str = " | ".join(current_choices)
         # Use curly braces to indicate a required argument.
         if param.required and param.param_type_name == "argument":
@@ -187,14 +211,61 @@ class CacheableChoice(click.Choice):
         super().__init__(choices=choices, case_sensitive=case_sensitive)
 
 
+class BackendVersionChoice(CacheableChoice):
+    """
+    This specialized type of parameter allows to override the value of parameter with the BACKEND_VERSION
+    environment variable if it is set.
+
+    It's used to pass single matrix element in the matrix of tests when we run tests in CI - so that we do
+    not have to pass different matrices for different backends (which will be used to get the workflows
+    muvh more DRY).
+    """
+
+    name = "BackendVersionChoice"
+
+    def convert(self, value: Any, param: Parameter | None, ctx: Context | None) -> Any:
+        backend_version_env_value = os.environ.get("BACKEND_VERSION")
+        if backend_version_env_value:
+            if backend_version_env_value in self.choices:
+                value = backend_version_env_value
+        return super().convert(value, param, ctx)
+
+
+class MySQLBackendVersionChoice(BackendVersionChoice):
+    def convert(self, value, param, ctx):
+        if isinstance(value, CacheableDefault):
+            param_name = param.envvar if param.envvar else param.name.upper()
+            mysql_version = read_from_cache_file(param_name)
+            if mysql_version == "8":
+                value = "8.0"
+                console_print(
+                    f"\n[warning]Found outdated cached value {mysql_version} for parameter {param.name}. "
+                    f"Replaced by {value}"
+                )
+                write_to_cache_file(param_name, "8.0", check_allowed_values=False)
+        else:
+            if value == "8":
+                value = "8.0"
+                console_print(
+                    f"\n[warning]Provided outdated value {8} for parameter {param.name}. "
+                    f"Will use {value} instead"
+                )
+        return super().convert(value, param, ctx)
+
+
 class UseAirflowVersionType(BetterChoice):
     """Extends choice with dynamic version number."""
 
     def __init__(self, *args):
         super().__init__(*args)
-        self.all_choices = [*self.choices, "<airflow_version>"]
+        self.all_choices = [*self.choices, "<airflow_version>", "<owner/repo:branch>", "<pr_number>"]
 
     def convert(self, value, param, ctx):
-        if match(r"^\d*\.\d*\.\d*\S*$", value):
+        if re.match(r"^\d*\.\d*\.\d*\S*$", value):
+            return value
+        if re.match(GITHUB_REPO_BRANCH_PATTERN, value):
+            return value
+        # Check if it's a PR number (digits only)
+        if re.match(PR_NUMBER_PATTERN, value):
             return value
         return super().convert(value, param, ctx)

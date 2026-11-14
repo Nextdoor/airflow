@@ -15,10 +15,14 @@
 # specific language governing permissions and limitations
 # under the License.
 ---
-version: "3.7"
 services:
   kdc-server-example-com:
     image: ghcr.io/apache/airflow-krb5-kdc-server:2021.07.04
+    labels:
+      org.apache.airflow.breeze: "true"
+      org.apache.airflow.breeze.worktree: "${BREEZE_WORKTREE_PATH:-}"
+      org.apache.airflow.breeze.host: "${BREEZE_HOST_ID:-}"
+      breeze.description: "Integration that provides Kerberos authentication."
     hostname: krb5-kdc-server-example-com
     domainname: example.com
     networks:
@@ -27,7 +31,6 @@ services:
 
     volumes:
       - kerberos-keytabs:/root/kerberos-keytabs
-      - /dev/urandom:/dev/random   # Required to get non-blocking entropy source
 
     environment:
       - KRB5_TRACE=/dev/stderr
@@ -48,6 +51,8 @@ services:
         "
       interval: 5s
       timeout: 30s
+      start_period: 30s
+      start_interval: 1s
       retries: 50
     restart: "on-failure"
 
@@ -76,9 +81,15 @@ services:
 
 volumes:
   kerberos-keytabs:
+    labels:
+      org.apache.airflow.breeze: "true"
+      org.apache.airflow.breeze.worktree: "${BREEZE_WORKTREE_PATH:-}"
+      org.apache.airflow.breeze.host: "${BREEZE_HOST_ID:-}"
 
 networks:
   example.com:
+    labels:
+      org.apache.airflow.breeze: "true"
     name: example.com
     driver: bridge
     ipam:

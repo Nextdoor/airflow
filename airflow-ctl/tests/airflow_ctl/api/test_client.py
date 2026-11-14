@@ -1,0 +1,1049 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import MagicMock, create_autospec, patch
+from urllib.parse import urlparse
+
+import httpx
+import keyring
+import pytest
+import structlog.testing
+import tenacity
+import time_machine
+from httpx import URL
+from keyring.errors import KeyringLocked
+from tenacity import stop_after_attempt, wait_none
+
+from airflowctl.api.client import (
+    Client,
+    ClientKind,
+    Credentials,
+    _bounded_get_new_password,
+    _request_method,
+    _should_retry_api_request,
+    get_client,
+    get_default_api_url,
+    get_json_error,
+    provide_api_client,
+)
+from airflowctl.api.operations import ServerResponseError
+from airflowctl.exceptions import (
+    AirflowCtlCredentialInvalidException,
+    AirflowCtlCredentialNotFoundException,
+    AirflowCtlException,
+    AirflowCtlKeyringException,
+)
+
+
+def make_client_w_responses(responses: list[httpx.Response]) -> Client:
+    """Get a client with custom responses."""
+
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        return responses.pop(0)
+
+    return Client(base_url="", token="", mounts={"'http://": httpx.MockTransport(handle_request)})
+
+
+def make_unread_json_response(
+    status_code: int, payload: Any, content_type: str = "application/json", **kwargs
+) -> httpx.Response:
+    """
+    Build a JSON response whose body has not been read yet.
+
+    ``httpx.Response(json=...)`` eagerly loads the body, which hides the fact that response
+    event hooks run before httpx reads a real server's body. Passing an iterator keeps the
+    body streaming, matching what the hooks see against a live API server.
+    """
+    return httpx.Response(
+        status_code,
+        headers={"content-type": content_type},
+        content=iter([json.dumps(payload).encode()]),
+        **kwargs,
+    )
+
+
+@pytest.fixture(autouse=True)
+def unique_config_dir():
+    temp_dir = tempfile.mkdtemp()
+    try:
+        with patch.dict(os.environ, {"AIRFLOW_HOME": temp_dir}, clear=True):
+            yield
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+class TestClient:
+    def test_error_parsing(self):
+        def handle_request(request: httpx.Request) -> httpx.Response:
+            """
+            A transport handle that always returns errors
+            """
+
+            return httpx.Response(422, json={"detail": [{"loc": ["#0"], "msg": "err", "type": "required"}]})
+
+        client = Client(base_url="", token="", mounts={"'http://": httpx.MockTransport(handle_request)})
+
+        with pytest.raises(ServerResponseError) as err:
+            client.get("http://error")
+
+        assert isinstance(err.value, ServerResponseError)
+        assert err.value.args == (
+            "Client error message: {'detail': [{'loc': ['#0'], 'msg': 'err', 'type': 'required'}]}",
+        )
+
+    def test_error_parsing_plain_text(self):
+        def handle_request(request: httpx.Request) -> httpx.Response:
+            """
+            A transport handle that always returns errors
+            """
+
+            return httpx.Response(422, content=b"Internal Server Error")
+
+        client = Client(base_url="", token="", mounts={"'http://": httpx.MockTransport(handle_request)})
+
+        with pytest.raises(httpx.HTTPStatusError) as err:
+            client.get("http://error")
+        assert not isinstance(err.value, ServerResponseError)
+
+    def test_error_parsing_other_json(self):
+        def handle_request(request: httpx.Request) -> httpx.Response:
+            # Some other json than an error body.
+            return httpx.Response(404, json={"detail": "Not found"})
+
+        client = Client(base_url="", token="", mounts={"'http://": httpx.MockTransport(handle_request)})
+
+        with pytest.raises(ServerResponseError) as err:
+            client.get("http://error")
+        assert err.value.args == ("Client error message: {'detail': 'Not found'}",)
+
+    @pytest.mark.parametrize(
+        ("status_code", "expected_message"),
+        [
+            pytest.param(404, "Client error message: {'detail': 'boom'}", id="client-error"),
+            pytest.param(500, "Server error message: {'detail': 'boom'}", id="server-error"),
+        ],
+    )
+    def test_error_parsing_with_unread_body(self, status_code, expected_message):
+        response = make_unread_json_response(
+            status_code, {"detail": "boom"}, request=httpx.Request("GET", "http://error")
+        )
+
+        with pytest.raises(ServerResponseError) as err:
+            get_json_error(response)
+
+        assert err.value.args == (expected_message,)
+
+    @pytest.mark.parametrize(
+        "content_type",
+        [
+            pytest.param("application/json; charset=utf-8", id="charset"),
+            pytest.param("application/json;charset=UTF-8", id="charset-no-space"),
+            pytest.param("Application/JSON", id="mixed-case"),
+            pytest.param("application/problem+json", id="problem-json"),
+        ],
+    )
+    def test_error_parsing_json_media_type_variants(self, content_type):
+        response = make_unread_json_response(
+            404,
+            {"detail": "boom"},
+            content_type=content_type,
+            request=httpx.Request("GET", "http://error"),
+        )
+
+        with pytest.raises(ServerResponseError):
+            get_json_error(response)
+
+    def test_error_parsing_media_type_merely_prefixed_with_json(self):
+        response = make_unread_json_response(
+            404,
+            {"detail": "boom"},
+            content_type="application/jsonp",
+            request=httpx.Request("GET", "http://error"),
+        )
+
+        assert get_json_error(response) is None
+
+    def test_error_parsing_undecodable_json_body(self):
+        response = httpx.Response(
+            404,
+            headers={"content-type": "application/json"},
+            content=iter([b"{truncated"]),
+            request=httpx.Request("GET", "http://error"),
+        )
+
+        assert get_json_error(response) is None
+
+    @pytest.mark.parametrize(
+        ("payload", "expected_extra"),
+        [
+            pytest.param(["a", "b"], {"detail": ["a", "b"]}, id="array"),
+            pytest.param("plain message", {"detail": "plain message"}, id="string"),
+        ],
+    )
+    @patch("airflowctl.api.client.log.warning", autospec=True)
+    def test_error_log_accepts_non_object_json_body(self, mock_warning, payload, expected_extra):
+        response = make_unread_json_response(404, payload, request=httpx.Request("GET", "http://error"))
+
+        with pytest.raises(ServerResponseError):
+            get_json_error(response)
+
+        assert mock_warning.call_args.kwargs["extra"] == expected_extra
+
+    @pytest.mark.parametrize(
+        ("suppress_error_log", "expected_warning_count"),
+        [
+            pytest.param(False, 1, id="logs-error"),
+            pytest.param(True, 0, id="suppresses-error-log"),
+        ],
+    )
+    @patch("airflowctl.api.client.log.warning")
+    def test_error_log_suppression(self, mock_warning, suppress_error_log, expected_warning_count):
+        request = httpx.Request(
+            "GET",
+            "http://error",
+            extensions={"airflowctl_suppress_error_log": suppress_error_log},
+        )
+        response = httpx.Response(404, request=request, json={"detail": "Not found"})
+
+        with pytest.raises(ServerResponseError):
+            get_json_error(response)
+
+        assert mock_warning.call_count == expected_warning_count
+
+    @pytest.mark.parametrize(
+        ("base_url", "client_kind", "expected_base_url"),
+        [
+            ("http://localhost:8080", ClientKind.CLI, "http://localhost:8080/api/v2/"),
+            ("http://localhost:8080", ClientKind.AUTH, "http://localhost:8080/auth/"),
+            ("http://localhost:8080", ClientKind.NO_AUTH, "http://localhost:8080/api/v2/"),
+            ("https://example.com", ClientKind.CLI, "https://example.com/api/v2/"),
+            ("https://example.com", ClientKind.AUTH, "https://example.com/auth/"),
+            ("https://example.com", ClientKind.NO_AUTH, "https://example.com/api/v2/"),
+            ("http://localhost:8080/", ClientKind.CLI, "http://localhost:8080/api/v2/"),
+            ("http://localhost:8080/", ClientKind.AUTH, "http://localhost:8080/auth/"),
+            ("http://localhost:8080/", ClientKind.NO_AUTH, "http://localhost:8080/api/v2/"),
+            ("https://example.com/", ClientKind.CLI, "https://example.com/api/v2/"),
+            ("https://example.com/", ClientKind.AUTH, "https://example.com/auth/"),
+            ("https://example.com/", ClientKind.NO_AUTH, "https://example.com/api/v2/"),
+        ],
+    )
+    def test_refresh_base_url(self, base_url, client_kind, expected_base_url):
+        client = Client(base_url="", token="", mounts={})
+        client.refresh_base_url(base_url=base_url, kind=client_kind)
+        assert client.base_url == URL(expected_base_url)
+
+    @pytest.mark.parametrize(
+        ("client_kind", "expected_authorization"),
+        [
+            pytest.param(ClientKind.CLI, "Bearer STORED_TOKEN", id="cli"),
+            pytest.param(ClientKind.AUTH, None, id="auth"),
+        ],
+    )
+    def test_authorization_header_by_kind(self, client_kind, expected_authorization):
+        requests: list[httpx.Request] = []
+
+        def handle_request(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(201, json={})
+
+        client = Client(
+            base_url="http://other-server",
+            token="STORED_TOKEN",
+            kind=client_kind,
+            transport=httpx.MockTransport(handle_request),
+        )
+        client.post("token/cli", json={})
+
+        assert requests[0].headers.get("Authorization") == expected_authorization
+
+
+class TestRequestRetries:
+    @pytest.fixture(autouse=True)
+    def configure_retries(self, monkeypatch):
+        monkeypatch.setattr(Client.request.retry, "wait", wait_none())
+        monkeypatch.setattr(Client.request.retry, "stop", stop_after_attempt(3))
+
+    @pytest.mark.parametrize("method", ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE", "TRACE"])
+    @pytest.mark.parametrize("status_code", [500, 503])
+    @pytest.mark.parametrize("json_response", [True, False])
+    def test_server_errors_only_replay_safe_methods(self, method, status_code, json_response):
+        requests = []
+
+        def handle_request(request):
+            requests.append(request)
+            if json_response:
+                return httpx.Response(status_code, json={"detail": "boom"})
+            return httpx.Response(status_code, text="boom")
+
+        with Client(base_url="http://localhost", transport=httpx.MockTransport(handle_request)) as client:
+            with pytest.raises(httpx.HTTPStatusError):
+                client.request(method, "/operation")
+
+        assert len(requests) == (3 if method in {"GET", "HEAD", "OPTIONS"} else 1)
+
+    @pytest.mark.parametrize("method", ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE", "TRACE"])
+    @pytest.mark.parametrize(
+        ("error_type", "before_send"),
+        [
+            (httpx.ConnectError, True),
+            (httpx.ConnectTimeout, True),
+            (httpx.PoolTimeout, True),
+            (httpx.ReadTimeout, False),
+            (httpx.WriteTimeout, False),
+            (httpx.ReadError, False),
+            (httpx.WriteError, False),
+            (httpx.RemoteProtocolError, False),
+        ],
+    )
+    def test_transport_errors_only_replay_safe_requests(self, method, error_type, before_send):
+        requests = []
+
+        def handle_request(request):
+            requests.append(request)
+            raise error_type("connection failed", request=request)
+
+        with Client(base_url="http://localhost", transport=httpx.MockTransport(handle_request)) as client:
+            with pytest.raises(error_type):
+                client.request(method, "/operation")
+
+        assert len(requests) == (3 if before_send or method in {"GET", "HEAD", "OPTIONS"} else 1)
+
+    @pytest.mark.parametrize("error", [httpx.ReadTimeout("timed out"), httpx.ReadError("disconnected")])
+    def test_missing_request_does_not_allow_replay(self, error):
+        assert not _should_retry_api_request(error)
+
+
+class TestRequestMethod:
+    def test_returns_the_method_of_the_attached_request(self):
+        error = httpx.ReadTimeout("timed out", request=httpx.Request("PATCH", "http://localhost/dags/d"))
+
+        assert _request_method(error) == "PATCH"
+
+    def test_returns_none_when_httpx_attached_no_request(self):
+        assert _request_method(httpx.ReadTimeout("timed out")) is None
+
+
+class TestCredentials:
+    @patch.dict(os.environ, {"AIRFLOW_CLI_TOKEN": "TEST_TOKEN"})
+    @patch.dict(os.environ, {"AIRFLOW_CLI_ENVIRONMENT": "TEST_SAVE"})
+    @patch("airflowctl.api.client.keyring")
+    def test_save(self, mock_keyring):
+        mock_keyring.set_password.return_value = MagicMock()
+        env = "TEST_SAVE"
+        cli_client = ClientKind.CLI
+        credentials = Credentials(
+            api_url="http://localhost:8080", api_token="NO_TOKEN", api_environment=env, client_kind=cli_client
+        )
+        credentials.save()
+
+        config_dir = os.environ.get("AIRFLOW_HOME", os.path.expanduser("~/airflow"))
+        assert os.path.exists(config_dir)
+        with open(os.path.join(config_dir, f"{env}.json")) as f:
+            credentials = Credentials(client_kind=cli_client).load()
+            assert json.load(f) == {
+                "api_url": credentials.api_url,
+            }
+
+    @patch.dict(os.environ, {"AIRFLOW_CLI_ENVIRONMENT": "TEST_SAVE_NO_KEYRING"})
+    @patch("airflowctl.api.client.keyring")
+    def test_save_no_keyring(self, mock_keyring):
+        from keyring.errors import NoKeyringError
+
+        cli_client = ClientKind.CLI
+        mock_keyring.set_password.side_effect = NoKeyringError("no backend")
+
+        with pytest.raises(AirflowCtlKeyringException, match="Keyring backend is not available"):
+            Credentials(client_kind=cli_client, api_token="TEST_TOKEN").save()
+
+    @patch.dict(os.environ, {"AIRFLOW_CLI_ENVIRONMENT": "TEST_SAVE_KEYRING_TYPE_ERROR"})
+    @patch("airflowctl.api.client.keyring")
+    def test_save_propagates_unexpected_keyring_error(self, mock_keyring):
+        mock_keyring.set_password.side_effect = TypeError("password must be a string")
+
+        with pytest.raises(TypeError, match="password must be a string"):
+            Credentials(
+                api_url="http://localhost:8080",
+                api_token="TEST_TOKEN",
+                client_kind=ClientKind.AUTH,
+            ).save()
+
+    @patch.dict(os.environ, {"AIRFLOW_CLI_ENVIRONMENT": "TEST_SAVE_NO_TOKEN"})
+    @patch("airflowctl.api.client.keyring")
+    def test_save_without_token(self, mock_keyring):
+        with pytest.raises(AirflowCtlCredentialNotFoundException, match="No API token found"):
+            Credentials(api_url="http://localhost:8080", client_kind=ClientKind.AUTH).save()
+
+        mock_keyring.set_password.assert_not_called()
+
+    @patch.dict(os.environ, {"AIRFLOW_CLI_ENVIRONMENT": "TEST_SAVE_SKIP_KEYRING"})
+    @patch("airflowctl.api.client.keyring")
+    def test_save_no_keyring_backend_skip_keyring(self, mock_keyring):
+
+        env = "TEST_SAVE_SKIP_KEYRING"
+        cli_client = ClientKind.CLI
+        mock_keyring.set_password = MagicMock()
+        mock_keyring.get_password = MagicMock()
+
+        Credentials(api_url="http://localhost:8080", client_kind=cli_client).save(skip_keyring=True)
+
+        config_dir = os.environ.get("AIRFLOW_HOME", os.path.expanduser("~/airflow"))
+        assert os.path.exists(config_dir)
+        with open(os.path.join(config_dir, f"{env}.json")) as f:
+            credentials = Credentials(client_kind=cli_client, api_token="TEST_TOKEN").load()
+            assert json.load(f) == {
+                "api_url": credentials.api_url,
+                "token_in_keyring": False,
+            }
+        mock_keyring.set_password.assert_not_called()
+        mock_keyring.get_password.assert_not_called()
+
+    @pytest.fixture
+    def keyring_store(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("AIRFLOW_HOME", str(tmp_path))
+        stored: dict[tuple[str, str], str] = {}
+        mock_keyring = create_autospec(keyring)
+        mock_keyring.set_password.side_effect = lambda service, username, token: stored.update(
+            {(service, username): token}
+        )
+        mock_keyring.get_password.side_effect = lambda service, username: stored.get((service, username))
+        monkeypatch.setattr("airflowctl.api.client.keyring", mock_keyring)
+        return mock_keyring
+
+    def test_save_skip_keyring_does_not_reuse_token_of_earlier_login(self, keyring_store):
+        Credentials(api_url="http://old:8080", api_token="OLD_TOKEN", api_environment="prod").save()
+        Credentials(api_url="http://new:8080", api_token="NEW_TOKEN", api_environment="prod").save(
+            skip_keyring=True
+        )
+
+        credentials = Credentials(client_kind=ClientKind.CLI, api_environment="prod").load()
+        assert (credentials.api_url, credentials.api_token) == ("http://new:8080", None)
+
+    def test_save_in_debug_mode_does_not_reuse_token_of_earlier_login(self, keyring_store, monkeypatch):
+        Credentials(api_url="http://old:8080", api_token="OLD_TOKEN", api_environment="prod").save()
+        monkeypatch.setenv("AIRFLOW_CLI_DEBUG_MODE", "true")
+        Credentials(api_url="http://new:8080", api_token="NEW_TOKEN", api_environment="prod").save()
+        monkeypatch.delenv("AIRFLOW_CLI_DEBUG_MODE")
+
+        credentials = Credentials(client_kind=ClientKind.CLI, api_environment="prod").load()
+        assert (credentials.api_url, credentials.api_token) == ("http://new:8080", None)
+
+    def test_save_in_debug_mode_failing_to_write_token_does_not_reuse_debug_token_of_earlier_login(
+        self, keyring_store, monkeypatch
+    ):
+        monkeypatch.setenv("AIRFLOW_CLI_DEBUG_MODE", "true")
+        Credentials(api_url="http://old:8080", api_token="OLD_TOKEN", api_environment="prod").save()
+
+        def open_failing_for_debug_file(file, mode="r", *args, **kwargs):
+            if os.path.basename(file) == "debug_creds_prod.json" and mode == "w":
+                raise PermissionError(file)
+            return open(file, mode, *args, **kwargs)
+
+        monkeypatch.setattr("airflowctl.api.client.open", open_failing_for_debug_file, raising=False)
+        with pytest.raises(PermissionError):
+            Credentials(api_url="http://new:8080", api_token="NEW_TOKEN", api_environment="prod").save()
+        monkeypatch.delattr("airflowctl.api.client.open")
+
+        with pytest.raises(AirflowCtlCredentialNotFoundException, match="Debug credentials file not found"):
+            Credentials(client_kind=ClientKind.CLI, api_environment="prod").load()
+
+    @pytest.mark.parametrize("skip_keyring", [False, True])
+    def test_save_outside_debug_mode_does_not_reuse_debug_token_of_earlier_login(
+        self, keyring_store, skip_keyring, monkeypatch
+    ):
+        monkeypatch.setenv("AIRFLOW_CLI_DEBUG_MODE", "true")
+        Credentials(api_url="http://old:8080", api_token="OLD_TOKEN", api_environment="prod").save()
+        monkeypatch.delenv("AIRFLOW_CLI_DEBUG_MODE")
+        Credentials(api_url="http://new:8080", api_token="NEW_TOKEN", api_environment="prod").save(
+            skip_keyring=skip_keyring
+        )
+        monkeypatch.setenv("AIRFLOW_CLI_DEBUG_MODE", "true")
+
+        with pytest.raises(AirflowCtlCredentialNotFoundException, match="Debug credentials file not found"):
+            Credentials(client_kind=ClientKind.CLI, api_environment="prod").load()
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            pytest.param(ValueError("Incorrect Password"), id="wrong-keyring-password"),
+            pytest.param(KeyringLocked("Can't store password on keychain"), id="locked-keychain"),
+        ],
+    )
+    def test_save_failing_to_store_token_does_not_reuse_token_of_earlier_login(self, keyring_store, error):
+        Credentials(api_url="http://old:8080", api_token="OLD_TOKEN", api_environment="prod").save()
+        keyring_store.set_password.side_effect = error
+
+        with pytest.raises(type(error)):
+            Credentials(api_url="http://new:8080", api_token="NEW_TOKEN", api_environment="prod").save()
+
+        credentials = Credentials(client_kind=ClientKind.CLI, api_environment="prod").load()
+        assert (credentials.api_url, credentials.api_token) == ("http://new:8080", None)
+
+    @patch.dict(os.environ, {"AIRFLOW_CLI_ENVIRONMENT": "TEST_LOAD"})
+    @patch.dict(os.environ, {"AIRFLOW_CLI_TOKEN": "TEST_TOKEN"})
+    @patch("airflowctl.api.client.keyring")
+    def test_load_cli_kind(self, mock_keyring):
+        mock_keyring.set_password.return_value = MagicMock()
+        mock_keyring.get_password.return_value = "NO_TOKEN"
+        env = "TEST_LOAD"
+        cli_client = ClientKind.CLI
+        credentials = Credentials(
+            api_url="http://localhost:8080", api_token="NO_TOKEN", api_environment=env, client_kind=cli_client
+        )
+        credentials.save()
+        config_dir = os.environ.get("AIRFLOW_HOME", os.path.expanduser("~/airflow"))
+        with open(os.path.join(config_dir, f"{env}.json")) as f:
+            credentials = Credentials(client_kind=cli_client).load()
+            assert json.load(f) == {
+                "api_url": credentials.api_url,
+            }
+
+    @patch.dict(os.environ, {"AIRFLOW_CLI_ENVIRONMENT": "TEST_LOAD"})
+    @patch.dict(os.environ, {"AIRFLOW_CLI_TOKEN": "TEST_TOKEN"})
+    @patch("airflowctl.api.client.keyring")
+    def test_load_auth_kind(self, mock_keyring):
+        mock_keyring.set_password.return_value = MagicMock()
+        mock_keyring.get_password.return_value = "NO_TOKEN"
+        auth_client = ClientKind.AUTH
+        credentials = Credentials(client_kind=auth_client)
+        assert credentials.api_url is None
+
+    @patch.dict(os.environ, {"AIRFLOW_CLI_ENVIRONMENT": "TEST_NO_CREDENTIALS"})
+    @patch.dict(os.environ, {"AIRFLOW_CLI_TOKEN": "TEST_TOKEN"})
+    @patch("airflowctl.api.client.keyring")
+    def test_load_no_credentials(self, mock_keyring):
+        cli_client = ClientKind.CLI
+        config_dir = os.environ.get("AIRFLOW_HOME", os.path.expanduser("~/airflow"))
+        if os.path.exists(config_dir):
+            shutil.rmtree(config_dir)
+        with pytest.raises(AirflowCtlCredentialNotFoundException, match="No credentials file found"):
+            Credentials(client_kind=cli_client).load()
+
+        assert not os.path.exists(config_dir)
+
+    @patch.dict(os.environ, {"AIRFLOW_CLI_ENVIRONMENT": "TEST_EMPTY_CREDENTIALS"})
+    @patch("airflowctl.api.client.keyring")
+    def test_load_empty_or_corrupt_credentials(self, mock_keyring):
+        cli_client = ClientKind.CLI
+        config_dir = os.environ.get("AIRFLOW_HOME", os.path.expanduser("~/airflow"))
+        os.makedirs(config_dir, exist_ok=True)
+        with open(os.path.join(config_dir, "TEST_EMPTY_CREDENTIALS.json"), "w") as f:
+            f.write("")
+        with pytest.raises(AirflowCtlCredentialNotFoundException, match="No credentials file found"):
+            Credentials(client_kind=cli_client).load()
+
+    @patch.dict(os.environ, {"AIRFLOW_CLI_ENVIRONMENT": "TEST_NO_CONFIG_WITH_EXPLICIT_TOKEN"})
+    @patch("airflowctl.api.client.keyring")
+    def test_load_no_config_with_explicit_token(self, mock_keyring):
+        cli_client = ClientKind.CLI
+        credentials = Credentials(client_kind=cli_client, api_token="TEST_TOKEN").load()
+
+        assert credentials.api_token == "TEST_TOKEN"
+        assert credentials.api_url is None
+        mock_keyring.get_password.assert_not_called()
+
+    @patch.dict(os.environ, {"AIRFLOW_CLI_ENVIRONMENT": "TEST_NO_CONFIG_NO_AUTH"})
+    @patch("airflowctl.api.client.keyring")
+    def test_load_no_config_no_auth_kind(self, mock_keyring):
+        credentials = Credentials(client_kind=ClientKind.NO_AUTH).load()
+
+        assert credentials.api_token is None
+        assert credentials.api_url is None
+        mock_keyring.get_password.assert_not_called()
+
+    @patch.dict(os.environ, {"AIRFLOW_CLI_ENVIRONMENT": "TEST_KEYRING_VALUE_ERROR"})
+    @patch("airflowctl.api.client.keyring")
+    def test_load_incorrect_keyring_password(self, mock_keyring):
+        cli_client = ClientKind.CLI
+        config_dir = os.environ.get("AIRFLOW_HOME", os.path.expanduser("~/airflow"))
+        os.makedirs(config_dir, exist_ok=True)
+        with open(os.path.join(config_dir, "TEST_KEYRING_VALUE_ERROR.json"), "w") as f:
+            json.dump({"api_url": "http://localhost:8080"}, f)
+        mock_keyring.get_password.side_effect = ValueError("incorrect password")
+
+        with pytest.raises(AirflowCtlKeyringException, match="Incorrect keyring password"):
+            Credentials(client_kind=cli_client).load()
+
+    @patch.dict(os.environ, {"AIRFLOW_CLI_ENVIRONMENT": "TEST_NO_KEYRING_BACKEND"})
+    @patch("airflowctl.api.client.keyring")
+    def test_load_no_keyring_backend(self, mock_keyring):
+        from keyring.errors import NoKeyringError
+
+        cli_client = ClientKind.CLI
+        config_dir = os.environ.get("AIRFLOW_HOME", os.path.expanduser("~/airflow"))
+        os.makedirs(config_dir, exist_ok=True)
+        with open(os.path.join(config_dir, "TEST_NO_KEYRING_BACKEND.json"), "w") as f:
+            json.dump({"api_url": "http://localhost:8080"}, f)
+        mock_keyring.get_password.side_effect = NoKeyringError("no backend")
+
+        with pytest.raises(AirflowCtlKeyringException, match="Keyring backend is not available"):
+            Credentials(client_kind=cli_client).load()
+
+    @patch.dict(os.environ, {"AIRFLOW_CLI_ENVIRONMENT": "TEST_NO_KEYRING_BACKEND"})
+    @patch("airflowctl.api.client.keyring")
+    def test_load_no_keyring_backend_token_provided(self, mock_keyring):
+        from keyring.errors import NoKeyringError
+
+        cli_client = ClientKind.CLI
+        config_dir = os.environ.get("AIRFLOW_HOME", os.path.expanduser("~/airflow"))
+        os.makedirs(config_dir, exist_ok=True)
+        with open(os.path.join(config_dir, "TEST_NO_KEYRING_BACKEND.json"), "w") as f:
+            json.dump({"api_url": "http://localhost:8080"}, f)
+        mock_keyring.get_password.side_effect = NoKeyringError("no backend")
+
+        credentials = Credentials(client_kind=cli_client, api_token="TEST_TOKEN").load()
+        assert credentials.api_token == "TEST_TOKEN"
+
+    @pytest.mark.parametrize(
+        ("contents", "mode", "expected"),
+        [
+            pytest.param(b"\xff\xfe", None, "could not be read.*Log in again", id="not-utf8"),
+            pytest.param(
+                b'{"api_url": "http://x"}', 0o000, "could not be read.*Check its permissions", id="unreadable"
+            ),
+            pytest.param(json.dumps(["a"]).encode(), None, "is not a JSON object", id="not-an-object"),
+            pytest.param(
+                json.dumps({"other": 1}).encode(), None, "does not contain an api_url", id="no-api-url"
+            ),
+            pytest.param(
+                json.dumps({"api_url": None}).encode(), None, "does not contain an api_url", id="null-api-url"
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("client_kind", [ClientKind.CLI, ClientKind.NO_AUTH])
+    def test_load_unusable_credentials_file_reports_an_error(
+        self, monkeypatch, tmp_path, contents, mode, expected, client_kind
+    ):
+        """A file airflowctl cannot use must reach the user as a message, not a traceback."""
+        monkeypatch.setenv("AIRFLOW_HOME", str(tmp_path))
+        monkeypatch.setenv("AIRFLOW_CLI_ENVIRONMENT", "TEST_BAD_CONFIG")
+        config = tmp_path / "TEST_BAD_CONFIG.json"
+        config.write_bytes(contents)
+        if mode is not None:
+            config.chmod(mode)
+
+        with pytest.raises(AirflowCtlCredentialInvalidException, match=expected):
+            Credentials(client_kind=client_kind).load()
+
+    def test_load_unusable_debug_credentials_file_reports_an_error(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("AIRFLOW_HOME", str(tmp_path))
+        monkeypatch.setenv("AIRFLOW_CLI_ENVIRONMENT", "TEST_BAD_CONFIG")
+        monkeypatch.setenv("AIRFLOW_CLI_DEBUG_MODE", "true")
+        (tmp_path / "TEST_BAD_CONFIG.json").write_text(json.dumps({"api_url": "http://x"}), encoding="utf-8")
+        (tmp_path / "debug_creds_TEST_BAD_CONFIG.json").write_text(json.dumps(["a"]), encoding="utf-8")
+
+        with pytest.raises(AirflowCtlCredentialInvalidException, match="is not a JSON object"):
+            Credentials(client_kind=ClientKind.CLI).load()
+
+    def test_load_tolerates_an_unusable_file_for_auth_login(self, monkeypatch, tmp_path):
+        """`auth login` is the recovery the error recommends, so it must survive an unusable file."""
+        monkeypatch.setenv("AIRFLOW_HOME", str(tmp_path))
+        monkeypatch.setenv("AIRFLOW_CLI_ENVIRONMENT", "TEST_BAD_CONFIG")
+        (tmp_path / "TEST_BAD_CONFIG.json").write_text(json.dumps({"other": 1}), encoding="utf-8")
+
+        assert Credentials(client_kind=ClientKind.AUTH).load().api_url is None
+
+
+class TestBoundedGetNewPassword:
+    @patch("airflowctl.api.client.getpass.getpass")
+    def test_success_on_first_attempt(self, mock_getpass):
+        mock_getpass.side_effect = ["mypassword", "mypassword"]
+        assert _bounded_get_new_password() == "mypassword"
+
+    @patch("airflowctl.api.client.getpass.getpass")
+    def test_success_after_mismatch(self, mock_getpass, capsys):
+        mock_getpass.side_effect = ["wrong1", "wrong2", "mypassword", "mypassword"]
+        assert _bounded_get_new_password() == "mypassword"
+        assert "Your passwords didn't match" in capsys.readouterr().err
+
+    @patch("airflowctl.api.client.getpass.getpass")
+    def test_success_after_blank(self, mock_getpass, capsys):
+        mock_getpass.side_effect = ["", "", "mypassword", "mypassword"]
+        assert _bounded_get_new_password() == "mypassword"
+        assert "Blank passwords aren't allowed" in capsys.readouterr().err
+
+    @patch("airflowctl.api.client.getpass.getpass")
+    def test_exhausts_attempts_on_mismatch(self, mock_getpass):
+        mock_getpass.side_effect = ["a", "b", "c", "d", "e", "f"]
+        with pytest.raises(
+            AirflowCtlKeyringException, match="Failed to set keyring password after 3 attempts"
+        ):
+            _bounded_get_new_password()
+
+    @patch("airflowctl.api.client.getpass.getpass")
+    def test_exhausts_attempts_on_blank(self, mock_getpass):
+        mock_getpass.side_effect = ["", "", "  ", "  ", " ", " "]
+        with pytest.raises(
+            AirflowCtlKeyringException, match="Failed to set keyring password after 3 attempts"
+        ):
+            _bounded_get_new_password()
+
+
+class TestSaveKeyringPatching:
+    @patch("airflowctl.api.client.keyring")
+    def test_save_patches_direct_encrypted_keyring_backend(self, mock_keyring):
+        mock_backend = MagicMock()
+        mock_backend.backends = []  # no chained children
+        mock_keyring.get_keyring.return_value = mock_backend
+        mock_keyring.set_password.return_value = None
+
+        Credentials(api_url="http://localhost:8080", api_token="token", client_kind=ClientKind.CLI).save()
+
+        assert mock_backend._get_new_password == _bounded_get_new_password
+
+    @patch("airflowctl.api.client.keyring")
+    def test_save_patches_encrypted_keyring_inside_chainer(self, mock_keyring):
+        encrypted_backend = MagicMock()  # has _get_new_password (MagicMock default)
+        chainer = MagicMock(spec=object)  # no _get_new_password on chainer itself
+        chainer.backends = [encrypted_backend]
+        mock_keyring.get_keyring.return_value = chainer
+        mock_keyring.set_password.return_value = None
+
+        Credentials(api_url="http://localhost:8080", api_token="token", client_kind=ClientKind.CLI).save()
+
+        assert not hasattr(chainer, "_get_new_password")
+        assert encrypted_backend._get_new_password == _bounded_get_new_password
+
+    @patch("airflowctl.api.client.keyring")
+    def test_save_skips_patch_for_non_encrypted_backend(self, mock_keyring):
+        mock_backend = MagicMock(spec=object)
+        mock_keyring.get_keyring.return_value = mock_backend
+        mock_keyring.set_password.return_value = None
+
+        Credentials(api_url="http://localhost:8080", api_token="token", client_kind=ClientKind.CLI).save()
+
+        assert not hasattr(mock_backend, "_get_new_password")
+        mock_keyring.set_password.assert_called_once_with("airflowctl", "api_token_production", "token")
+
+    def test_retry_handling_unrecoverable_error(self):
+        with time_machine.travel("2023-01-01T00:00:00Z", tick=False):
+            responses: list[httpx.Response] = [
+                *[httpx.Response(500, text="Internal Server Error")] * 6,
+                httpx.Response(200, json={"detail": "Recovered from error - but will fail before"}),
+                httpx.Response(400, json={"detail": "Should not get here"}),
+            ]
+            client = make_client_w_responses(responses)
+
+            with pytest.raises(httpx.HTTPStatusError) as err:
+                client.get("http://error")
+            assert not isinstance(err.value, ServerResponseError)
+            assert len(responses) == 5
+
+    def test_retry_handling_recovered(self):
+        with time_machine.travel("2023-01-01T00:00:00Z", tick=False):
+            responses: list[httpx.Response] = [
+                *[httpx.Response(500, text="Internal Server Error")] * 2,
+                httpx.Response(200, json={"detail": "Recovered from error"}),
+                httpx.Response(400, json={"detail": "Should not get here"}),
+            ]
+            client = make_client_w_responses(responses)
+
+            response = client.get("http://error")
+            assert response.status_code == 200
+            assert len(responses) == 1
+
+    def test_retry_handling_server_error_with_unread_body(self):
+        with time_machine.travel("2023-01-01T00:00:00Z", tick=False):
+            responses: list[httpx.Response] = [
+                make_unread_json_response(500, {"detail": "boom"}),
+                httpx.Response(200, json={"detail": "Recovered from error"}),
+                httpx.Response(400, json={"detail": "Should not get here"}),
+            ]
+            client = make_client_w_responses(responses)
+
+            response = client.get("http://error")
+            assert response.status_code == 200
+            assert len(responses) == 1
+
+    @patch("airflowctl.api.client.Client.request.retry.wait", tenacity.wait_fixed(2))
+    @patch("airflowctl.api.client.Client.request.retry.sleep", autospec=True)
+    def test_retry_logs_error_and_wait_before_sleep(self, mock_sleep):
+        outcomes: list[httpx.Response | httpx.ConnectError] = [
+            httpx.ConnectError("Connection refused"),
+            httpx.Response(200, json={"detail": "Recovered from error"}),
+        ]
+
+        def handle_request(request: httpx.Request) -> httpx.Response:
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, httpx.ConnectError):
+                raise outcome
+            return outcome
+
+        client = Client(base_url="", token="", transport=httpx.MockTransport(handle_request))
+
+        with structlog.testing.capture_logs() as captured_logs:
+            response = client.get("http://error")
+
+        assert response.status_code == 200
+        mock_sleep.assert_called_once_with(2)
+        assert [(entry["log_level"], entry["event"]) for entry in captured_logs] == [
+            (
+                "warning",
+                "Retrying airflowctl.api.client.Client.request in 2 seconds "
+                "as it raised ConnectError: Connection refused.",
+            )
+        ]
+
+    def test_retry_handling_non_retry_error(self):
+        with time_machine.travel("2023-01-01T00:00:00Z", tick=False):
+            responses: list[httpx.Response] = [
+                httpx.Response(422, json={"detail": "Somehow this is a bad request"}),
+                httpx.Response(400, json={"detail": "Should not get here"}),
+            ]
+            client = make_client_w_responses(responses)
+
+            with pytest.raises(ServerResponseError) as err:
+                client.get("http://error")
+            assert len(responses) == 1
+            assert err.value.args == ("Client error message: {'detail': 'Somehow this is a bad request'}",)
+
+    def test_retry_handling_ok(self):
+        with time_machine.travel("2023-01-01T00:00:00Z", tick=False):
+            responses: list[httpx.Response] = [
+                httpx.Response(200, json={"detail": "Recovered from error"}),
+                httpx.Response(400, json={"detail": "Should not get here"}),
+            ]
+            client = make_client_w_responses(responses)
+
+            response = client.get("http://error")
+            assert response.status_code == 200
+            assert len(responses) == 1
+
+    def test_debug_mode_missing_debug_creds_reports_correct_error(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("AIRFLOW_HOME", str(tmp_path))
+        monkeypatch.setenv("AIRFLOW_CLI_DEBUG_MODE", "true")
+        monkeypatch.setenv("AIRFLOW_CLI_ENVIRONMENT", "TEST_DEBUG")
+
+        config_path = tmp_path / "TEST_DEBUG.json"
+        config_path.write_text(json.dumps({"api_url": "http://localhost:8080"}), encoding="utf-8")
+        # Intentionally do not create debug_creds_TEST_DEBUG.json to simulate a missing file
+
+        creds = Credentials(client_kind=ClientKind.CLI, api_environment="TEST_DEBUG")
+        with pytest.raises(AirflowCtlCredentialNotFoundException, match="Debug credentials file not found"):
+            creds.load()
+
+
+def test_credentials_accepts_safe_env():
+    creds = Credentials(client_kind=ClientKind.CLI, api_environment="prod-us_1")
+    assert creds.api_environment == "prod-us_1"
+
+
+@patch.dict(os.environ, {"AIRFLOW_CLI_ENVIRONMENT": "TEST_GET_CLIENT_WITH_TOKEN_ONLY"})
+def test_get_client_allows_explicit_token_without_config():
+    with get_client(kind=ClientKind.CLI, api_token="TEST_TOKEN") as client:
+        assert str(client.base_url) == "http://localhost:8080/api/v2/"
+
+
+@pytest.mark.parametrize(
+    ("env_value", "expected"),
+    [
+        (None, "http://localhost:8080"),
+        ("", "http://localhost:8080"),
+        ("http://localhost:18080", "http://localhost:18080"),
+    ],
+)
+def test_get_default_api_url(monkeypatch, env_value, expected):
+    if env_value is None:
+        monkeypatch.delenv("AIRFLOW_CLI_API_URL", raising=False)
+    else:
+        monkeypatch.setenv("AIRFLOW_CLI_API_URL", env_value)
+    assert get_default_api_url() == expected
+
+
+@patch.dict(
+    os.environ,
+    {
+        "AIRFLOW_CLI_ENVIRONMENT": "TEST_GET_CLIENT_API_URL_FROM_ENV",
+        "AIRFLOW_CLI_API_URL": "http://localhost:18080",
+    },
+)
+def test_get_client_falls_back_to_api_url_env_var():
+    with get_client(kind=ClientKind.CLI, api_token="TEST_TOKEN") as client:
+        assert str(client.base_url) == "http://localhost:18080/api/v2/"
+
+
+@patch.dict(os.environ, {"AIRFLOW_CLI_ENVIRONMENT": "TEST_GET_CLIENT_NO_AUTH_WITHOUT_CONFIG"})
+@patch("airflowctl.api.client.keyring")
+def test_get_client_no_auth_without_config(mock_keyring):
+    with get_client(kind=ClientKind.NO_AUTH) as client:
+        assert str(client.base_url) == "http://localhost:8080/api/v2/"
+
+    mock_keyring.get_password.assert_not_called()
+
+
+@pytest.mark.parametrize("api_environment", ["../evil", "..\\evil", "a/b", "a\\b"])
+def test_credentials_rejects_unsafe_env_argument(api_environment):
+    with pytest.raises(AirflowCtlException, match="environment"):
+        Credentials(client_kind=ClientKind.CLI, api_environment=api_environment)
+
+
+@pytest.mark.parametrize("api_environment", ["../evil", "..\\evil", "a/b", "a\\b"])
+def test_credentials_rejects_unsafe_env_from_environment_variable(monkeypatch, api_environment):
+    monkeypatch.setenv("AIRFLOW_CLI_ENVIRONMENT", api_environment)
+    with pytest.raises(AirflowCtlException, match="environment"):
+        Credentials(client_kind=ClientKind.CLI)
+
+
+class TestRetryConfigurationEnvVars:
+    """The knobs are read at import time, so a bad value used to take down even ``--help``."""
+
+    @pytest.fixture(autouse=True)
+    def unique_config_dir(self, monkeypatch, tmp_path):
+        """
+        Override the module fixture, which clears ``os.environ`` wholesale.
+
+        These tests hand the environment to a child interpreter, and starting one needs more
+        than ``AIRFLOW_HOME``: a ``--enable-shared`` Python cannot find ``libpython`` without
+        the ``LD_LIBRARY_PATH`` its installer exported. Only the knobs under test are dropped,
+        so a value in the developer's own shell cannot decide the result.
+        """
+        monkeypatch.setenv("AIRFLOW_HOME", str(tmp_path))
+        for name in (
+            "AIRFLOW_CLI_API_RETRIES",
+            "AIRFLOW_CLI_API_RETRY_WAIT_MIN",
+            "AIRFLOW_CLI_API_RETRY_WAIT_MAX",
+            "AIRFLOW_CLI_API_TIMEOUT",
+        ):
+            monkeypatch.delenv(name, raising=False)
+
+    @staticmethod
+    def _import_with(**env: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, "-c", "import airflowctl.api.client as c; print(c.API_RETRIES)"],
+            env={**os.environ, **env},
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+
+    @pytest.mark.parametrize(
+        ("value", "expected", "warns"),
+        [
+            pytest.param("7", "7", False, id="integer-is-used"),
+            pytest.param("", "3", False, id="empty-means-unset"),
+            pytest.param("abc", "3", True, id="typo-falls-back"),
+            pytest.param("-5", "3", True, id="negative-falls-back"),
+            pytest.param("0", "3", True, id="zero-would-disable-retries"),
+        ],
+    )
+    def test_retries_env_var(self, value, expected, warns):
+        result = self._import_with(AIRFLOW_CLI_API_RETRIES=value)
+
+        assert result.returncode == 0, result.stderr
+        # An exact match also pins that the warning never reaches stdout.
+        assert result.stdout.strip() == expected
+        assert ("AIRFLOW_CLI_API_RETRIES" in result.stderr) is warns
+
+    @pytest.mark.parametrize(
+        ("value", "expected", "warns"),
+        [
+            pytest.param("120", "120", False, id="integer-is-used"),
+            pytest.param("", "30", False, id="empty-means-unset"),
+            pytest.param("0", "30", True, id="zero-falls-back"),
+            pytest.param("-5", "30", True, id="negative-falls-back"),
+            pytest.param("abc", "30", True, id="typo-falls-back"),
+        ],
+    )
+    def test_timeout_env_var(self, value, expected, warns):
+        result = subprocess.run(
+            [sys.executable, "-c", "import airflowctl.api.client as c; print(c.API_TIMEOUT)"],
+            env={**os.environ, "AIRFLOW_CLI_API_TIMEOUT": value},
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == expected
+        assert ("AIRFLOW_CLI_API_TIMEOUT" in result.stderr) is warns
+
+    def test_zero_wait_is_allowed(self):
+        """Only the retry count needs a floor of 1; waiting 0 seconds between retries is valid."""
+        result = subprocess.run(
+            [sys.executable, "-c", "import airflowctl.api.client as c; print(c.API_RETRY_WAIT_MIN)"],
+            env={**os.environ, "AIRFLOW_CLI_API_RETRY_WAIT_MIN": "0"},
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "0"
+        assert result.stderr == ""
+
+
+class TestClientTimeout:
+    @pytest.mark.parametrize(
+        ("kwargs", "expected"),
+        [
+            pytest.param({}, httpx.Timeout(45, connect=5.0), id="default"),
+            pytest.param({"timeout": 2}, httpx.Timeout(2), id="explicit"),
+        ],
+    )
+    @patch("airflowctl.api.client.API_TIMEOUT", new=45)
+    def test_timeout(self, kwargs, expected):
+        assert Client(base_url="http://localhost:8080", **kwargs).timeout == expected
+
+
+class TestGetClientEnvironment:
+    """``get_client`` and ``@provide_api_client`` commands resolve the config file for the requested environment."""
+
+    @staticmethod
+    def _write_environment_config(airflow_home, environment: str, api_url: str) -> None:
+        (airflow_home / f"{environment}.json").write_text(json.dumps({"api_url": api_url}), encoding="utf-8")
+
+    @pytest.fixture(autouse=True)
+    def environments(self, tmp_path):
+        """The module fixture already clears the environment; pin AIRFLOW_HOME to tmp_path."""
+        os.environ["AIRFLOW_HOME"] = str(tmp_path)
+        self._write_environment_config(tmp_path, "production", "https://prod.example.com")
+        self._write_environment_config(tmp_path, "staging", "https://staging.example.com")
+        yield tmp_path
+        del os.environ["AIRFLOW_HOME"]
+
+    def test_uses_the_requested_environment(self):
+        with get_client(kind=ClientKind.CLI, api_token="TOKEN", api_environment="staging") as client:
+            assert urlparse(str(client.base_url)).hostname == "staging.example.com"
+
+    def test_no_auth_uses_the_requested_environment(self):
+        with get_client(kind=ClientKind.NO_AUTH, api_environment="staging") as client:
+            assert urlparse(str(client.base_url)).hostname == "staging.example.com"
+
+    def test_environment_variable_beats_the_explicit_argument(self, monkeypatch):
+        """AIRFLOW_CLI_ENVIRONMENT keeps precedence, matching Credentials' own contract."""
+        monkeypatch.setenv("AIRFLOW_CLI_ENVIRONMENT", "staging")
+        with get_client(kind=ClientKind.CLI, api_token="TOKEN", api_environment="production") as client:
+            assert urlparse(str(client.base_url)).hostname == "staging.example.com"
+
+    def test_decorator_forwards_the_env_argument(self):
+        @provide_api_client(kind=ClientKind.CLI)
+        def command_under_test(args, api_client=None):
+            # Inspect the client inside the command: the wrapper closes it
+            # before returning.
+            return urlparse(str(api_client.base_url)).hostname == "staging.example.com"
+
+        args = SimpleNamespace(env="staging", api_token="TOKEN")
+        assert command_under_test(args) is True

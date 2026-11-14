@@ -43,7 +43,7 @@ def get_size(bytes):
     return value_gb
 
 
-def resoure_check():
+def resource_check():
     """
     Use gsutil to get resources in bytes for memory and disk
     """
@@ -71,14 +71,12 @@ def resoure_check():
     return resources
 
 
-def resoure_validate():
-
-    resources = resoure_check()
+def resource_validate():
+    resources = resource_check()
     warning_resources = False
     check = "OK"
 
     for resource, capacity in resources.items():
-
         check = "" if resource == "Cpus" else "GB"
 
         if capacity.current < capacity.minimumAllowed:
@@ -95,7 +93,7 @@ def resoure_validate():
         console.print("[yellow]WARNING!!!: You have not enough resources to run Airflow (see above)!")
         print("Please follow the instructions to increase amount of resources available:")
         console.print(
-            " Please check https://github.com/apache/airflow/blob/main/BREEZE.rst#resources-required"
+            " Please check https://github.com/apache/airflow/blob/main/dev/breeze/doc/01_installation.rst#resources-required"
             " for details"
         )
     else:
@@ -103,4 +101,4 @@ def resoure_validate():
 
 
 if __name__ == "__main__":
-    resoure_validate()
+    resource_validate()

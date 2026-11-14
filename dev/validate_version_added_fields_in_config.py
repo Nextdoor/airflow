@@ -25,53 +25,88 @@ from pprint import pprint
 import requests
 import semver
 import yaml
+from packaging import version
 
 ROOT_DIR = Path(__file__).resolve().parent / ".."
 
 KNOWN_FALSE_DETECTIONS = {
     # This option has been added in v2.0.0, but we had mistake in config.yml file until v2.2.0.
     # https://github.com/apache/airflow/pull/17808
-    ("logging", "extra_logger_names", "2.2.0")
+    ("logging", "extra_logger_names", "2.2.0"),
+    # This option has been added in v2.0.0, but was missing from config.yml file until v2.5.1.
+    # https://github.com/apache/airflow/pull/27993
+    ("core", "mp_start_method", "2.5.1"),
 }
 
 # Renamed sections: (new_section, old_section, version_before_renaming)
 RENAMED_SECTIONS = [("kubernetes_executor", "kubernetes", "2.4.3")]
 
+# Release version of the format update https://github.com/apache/airflow/pull/28417
+CONFIG_TEMPLATE_FORMAT_UPDATE = "2.6.0"
+
 
 def fetch_pypi_versions() -> list[str]:
-    r = requests.get("https://pypi.org/pypi/apache-airflow/json")
+    r = requests.get("https://pypi.org/pypi/apache-airflow/json", headers={"User-Agent": "Python requests"})
     r.raise_for_status()
     all_version = r.json()["releases"].keys()
     released_versions = [d for d in all_version if not (("rc" in d) or ("b" in d))]
     return released_versions
 
 
-@functools.lru_cache()
-def fetch_config_options_for_version(version: str) -> set[tuple[str, str]]:
-    r = requests.get(
-        f"https://raw.githubusercontent.com/apache/airflow/{version}/airflow/config_templates/config.yml"
-    )
-    r.raise_for_status()
-    config_sections = yaml.safe_load(r.text)
-    config_options = {
+def parse_config_template_new_format(config_content: str) -> set[tuple[str, str, str]]:
+    """
+    Parses config_template.yaml new format and returns config_options
+    """
+    config_sections = yaml.safe_load(config_content)
+
+    return {
+        (config_section_name, config_option_name, config_option_value["version_added"])
+        for config_section_name, config_section_value in config_sections.items()
+        for config_option_name, config_option_value in config_section_value["options"].items()
+    }
+
+
+def parse_config_template_old_format(config_content: str) -> set[tuple[str, str, str]]:
+    """
+    Parses config_template.yaml old format and returns config_options
+    """
+    config_sections = yaml.safe_load(config_content)
+
+    return {
         (
             config_section["name"],
             config_option["name"],
+            config_option.get("version_added"),
         )
         for config_section in config_sections
         for config_option in config_section["options"]
     }
-    return config_options
+
+
+@functools.lru_cache
+def fetch_config_options_for_version(version_str: str) -> set[tuple[str, str]]:
+    url = f"https://raw.githubusercontent.com/apache/airflow/{version_str}/"
+    if version.parse(version_str) >= version.parse("3.0.0"):
+        url += "airflow-core/src/airflow/config_templates/config.yml"
+    else:
+        url += "airflow/config_templates/config.yml"
+
+    r = requests.get(url)
+    r.raise_for_status()
+    content = r.text
+    if version.parse(version_str) >= version.parse(CONFIG_TEMPLATE_FORMAT_UPDATE):
+        config_options = parse_config_template_new_format(content)
+    else:
+        config_options = parse_config_template_old_format(content)
+
+    return {(section_name, option_name) for section_name, option_name, _ in config_options}
 
 
 def read_local_config_options() -> set[tuple[str, str, str]]:
-    config_sections = yaml.safe_load((ROOT_DIR / "airflow" / "config_templates" / "config.yml").read_text())
-    config_options = {
-        (config_section["name"], config_option["name"], config_option["version_added"])
-        for config_section in config_sections
-        for config_option in config_section["options"]
-    }
-    return config_options
+    # main is on new format
+    return parse_config_template_new_format(
+        (ROOT_DIR / "airflow-core/src/airflow/config_templates/config.yml").read_text()
+    )
 
 
 computed_option_new_section = set()
@@ -83,9 +118,8 @@ for new_section, old_section, version_before_renaming in RENAMED_SECTIONS:
     computed_option_new_section.update(options)
 
 # 1. Prepare versions to checks
-airflow_version = fetch_pypi_versions()
-airflow_version = sorted(airflow_version, key=semver.VersionInfo.parse)
-to_check_versions: list[str] = [d for d in airflow_version if d.startswith("2.")]
+to_check_versions: list[str] = [d for d in fetch_pypi_versions() if d.startswith("2.")]
+to_check_versions.sort(key=semver.VersionInfo.parse)
 
 # 2. Compute expected options set with version added fields
 expected_computed_options: set[tuple[str, str, str]] = set()

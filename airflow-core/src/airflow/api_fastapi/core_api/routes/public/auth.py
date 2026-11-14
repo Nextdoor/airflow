@@ -1,0 +1,117 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+from urllib.parse import urlencode
+
+import structlog
+from fastapi import Depends, HTTPException, Request, status
+from fastapi.responses import RedirectResponse
+from fastapi.security import HTTPAuthorizationCredentials
+
+from airflow.api_fastapi.app import get_cookie_path
+from airflow.api_fastapi.auth.managers.base_auth_manager import COOKIE_NAME_JWT_TOKEN
+from airflow.api_fastapi.common.router import AirflowRouter
+from airflow.api_fastapi.core_api.datamodels.auth import CliLoginMetadataResponse
+from airflow.api_fastapi.core_api.openapi.exceptions import create_openapi_http_exception_doc
+from airflow.api_fastapi.core_api.security import (
+    AuthManagerDep,
+    bearer_scheme,
+    collect_request_tokens,
+    is_safe_url,
+    oauth2_scheme,
+)
+from airflow.configuration import conf
+
+log = structlog.get_logger(logger_name=__name__)
+
+auth_router = AirflowRouter(tags=["Login"], prefix="/auth")
+
+
+@auth_router.get(
+    "/login",
+    responses=create_openapi_http_exception_doc(
+        [status.HTTP_307_TEMPORARY_REDIRECT, status.HTTP_400_BAD_REQUEST]
+    ),
+)
+def login(request: Request, auth_manager: AuthManagerDep, next: None | str = None) -> RedirectResponse:
+    """Redirect to the login URL depending on the AuthManager configured."""
+    login_url = auth_manager.get_url_login()
+
+    if next and not is_safe_url(next, request=request):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="Invalid or unsafe next URL")
+
+    if next:
+        login_url += f"?{urlencode({'next': next})}"
+
+    return RedirectResponse(login_url)
+
+
+@auth_router.get("/cli/metadata")
+def get_cli_login_metadata(auth_manager: AuthManagerDep) -> CliLoginMetadataResponse:
+    """Return the login methods the AuthManager configured offers to command-line clients."""
+    methods = auth_manager.get_cli_login_methods()
+    return CliLoginMetadataResponse(
+        grant_types_supported=methods.grant_types_supported,
+        code_challenge_methods_supported=methods.code_challenge_methods_supported,
+        authorization_endpoint=methods.authorization_endpoint,
+        device_authorization_endpoint=methods.device_authorization_endpoint,
+        token_endpoint=methods.token_endpoint,
+    )
+
+
+@auth_router.get(
+    "/logout",
+    responses=create_openapi_http_exception_doc([status.HTTP_307_TEMPORARY_REDIRECT]),
+)
+def logout(
+    request: Request,
+    auth_manager: AuthManagerDep,
+    # Kept for the OpenAPI security spec so ``/docs`` still renders the OAuth2 password
+    # login form. It resolves to the same ``Authorization: Bearer`` header
+    # ``bearer_scheme`` reads, so the value is unused at runtime.
+    _oauth_token: str | None = Depends(oauth2_scheme),
+    bearer_credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+) -> RedirectResponse:
+    """Logout the user."""
+    # Invalidate both tokens from the Authorization header and the _token cookie, if present.
+    for token_str in collect_request_tokens(request, bearer_credentials):
+        auth_manager.revoke_token(token_str)
+
+    # The local session cookie is cleared on every path, including the redirect to an external
+    # logout URL: revocation above is recorded server side and can fail, so it must not be the
+    # only thing that ends the browser's session.
+    secure = request.base_url.scheme == "https" or bool(conf.get("api", "ssl_cert", fallback=""))
+    cookie_path = get_cookie_path()
+    response = RedirectResponse(auth_manager.get_url_logout() or auth_manager.get_url_login())
+    response.delete_cookie(
+        key=COOKIE_NAME_JWT_TOKEN,
+        path=cookie_path,
+        secure=secure,
+        httponly=True,
+    )
+    # Clear any stale _token cookie at root path "/" left by
+    # older Airflow instances to prevent redirect loops.
+    if cookie_path != "/":
+        response.delete_cookie(
+            key=COOKIE_NAME_JWT_TOKEN,
+            path="/",
+            secure=secure,
+            httponly=True,
+        )
+
+    return response

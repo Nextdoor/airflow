@@ -1,0 +1,362 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+"""Amazon MWAA Serverless operators."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any, Literal
+
+from botocore.exceptions import ClientError
+
+from airflow.providers.amazon.aws.hooks.base_aws import AwsBaseHook
+from airflow.providers.amazon.aws.operators.base_aws import AwsBaseOperator
+from airflow.providers.amazon.aws.utils.mixins import aws_template_fields
+from airflow.utils.helpers import prune_dict
+
+if TYPE_CHECKING:
+    from airflow.sdk import Context
+
+
+class MwaaServerlessStartWorkflowRunOperator(AwsBaseOperator[AwsBaseHook]):
+    """
+    Start a new execution of an Amazon MWAA Serverless workflow.
+
+    This operator triggers a workflow run that executes the tasks defined in the
+    workflow. MWAA Serverless handles task scheduling, worker scaling, dependency
+    resolution, and monitoring.
+
+    .. seealso::
+        For more information on how to use this operator, take a look at the guide:
+        :ref:`howto/operator:MwaaServerlessStartWorkflowRunOperator`
+
+    :param workflow_arn: The ARN of the workflow to run. (templated)
+    :param override_parameters: Optional parameters to override defaults for this run. (templated)
+    :param workflow_version: Optional version of the workflow to execute. (templated)
+    """
+
+    template_fields: tuple[str, ...] = aws_template_fields(
+        "workflow_arn",
+        "override_parameters",
+        "workflow_version",
+    )
+    template_fields_renderers = {"override_parameters": "json"}
+    aws_hook_class = AwsBaseHook
+
+    def __init__(
+        self,
+        *,
+        workflow_arn: str,
+        override_parameters: dict[str, Any] | None = None,
+        workflow_version: str | None = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.workflow_arn = workflow_arn
+        self.override_parameters = override_parameters
+        self.workflow_version = workflow_version
+
+    @property
+    def _hook_parameters(self) -> dict[str, Any]:
+        return {**super()._hook_parameters, "client_type": "mwaa-serverless"}
+
+    def execute(self, context: Context) -> str:
+        self.log.info("Starting MWAA Serverless workflow run for %s", self.workflow_arn)
+        kwargs: dict[str, Any] = prune_dict(
+            {
+                "WorkflowArn": self.workflow_arn,
+                "OverrideParameters": self.override_parameters,
+                "WorkflowVersion": self.workflow_version,
+            }
+        )
+        response = self.hook.conn.start_workflow_run(**kwargs)
+        run_id = response["RunId"]
+        self.log.info("Started workflow run %s (status: %s)", run_id, response.get("Status"))
+        return run_id
+
+
+class MwaaServerlessCreateWorkflowOperator(AwsBaseOperator[AwsBaseHook]):
+    """
+    Create an Amazon MWAA Serverless workflow.
+
+    .. seealso::
+        For more information on how to use this operator, take a look at the guide:
+        :ref:`howto/operator:MwaaServerlessCreateWorkflowOperator`
+
+    :param workflow_name: The name of the workflow. (templated)
+    :param definition_s3_location: Dict with ``Bucket`` and ``ObjectKey`` for the YAML definition. (templated)
+    :param code: Optional code location for ``PythonOperator`` and ``BashOperator`` tasks,
+        as a dict with an ``S3Location`` key containing ``Bucket``, ``ObjectKey``, and
+        optionally ``VersionId``. (templated)
+    :param role_arn: The execution role ARN. (templated)
+    :param description: Optional description. (templated)
+    :param environment_variables: Optional mapping of environment variable names to values
+        to set for tasks in the workflow. Sent to the API as ``Environment.Variables``.
+        If not specified, the workflow has no environment variables. Requires
+        ``botocore>=1.43.124``. (templated)
+    :param tags: Optional tags dict.
+    :param create_workflow_kwargs: Optional parameters to pass to the ``CreateWorkflow`` API for
+        inputs this operator does not expose, such as ``NetworkConfiguration``,
+        ``LoggingConfiguration``, ``EngineVersion``, ``TriggerMode``, ``EncryptionConfiguration``
+        and ``ClientToken``. (templated)
+    :param if_exists: Behavior when the workflow already exists.
+        ``"fail"`` raises an error, ``"skip"`` returns the existing ARN.
+    """
+
+    aws_hook_class = AwsBaseHook
+    template_fields: tuple[str, ...] = aws_template_fields(
+        "workflow_name",
+        "definition_s3_location",
+        "code",
+        "role_arn",
+        "description",
+        "environment_variables",
+        "create_workflow_kwargs",
+    )
+    template_fields_renderers = {
+        "definition_s3_location": "json",
+        "code": "json",
+        "environment_variables": "json",
+        "create_workflow_kwargs": "json",
+    }
+
+    def __init__(
+        self,
+        *,
+        workflow_name: str,
+        definition_s3_location: dict[str, str],
+        code: dict[str, Any] | None = None,
+        role_arn: str,
+        description: str | None = None,
+        environment_variables: dict[str, str] | None = None,
+        tags: dict[str, str] | None = None,
+        create_workflow_kwargs: dict[str, Any] | None = None,
+        if_exists: Literal["fail", "skip"] = "skip",
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.workflow_name = workflow_name
+        self.definition_s3_location = definition_s3_location
+        self.code = code
+        self.role_arn = role_arn
+        self.description = description
+        self.environment_variables = environment_variables
+        self.tags = tags
+        self.create_workflow_kwargs = create_workflow_kwargs or {}
+        self.if_exists = if_exists
+
+    @property
+    def _hook_parameters(self) -> dict[str, Any]:
+        return {**super()._hook_parameters, "client_type": "mwaa-serverless"}
+
+    def execute(self, context: Context) -> str:
+        self.log.info("Creating MWAA Serverless workflow %s", self.workflow_name)
+        kwargs: dict[str, Any] = prune_dict(
+            {
+                "Name": self.workflow_name,
+                "DefinitionS3Location": self.definition_s3_location,
+                "Code": self.code,
+                "RoleArn": self.role_arn,
+                "Description": self.description,
+                "Tags": self.tags,
+            }
+        )
+        if self.environment_variables is not None:
+            kwargs["Environment"] = {"Variables": self.environment_variables}
+        try:
+            response = self.hook.conn.create_workflow(**kwargs, **self.create_workflow_kwargs)
+            workflow_arn = response["WorkflowArn"]
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConflictException" and self.if_exists == "skip":
+                self.log.info("Workflow %s already exists, skipping.", self.workflow_name)
+                resource_id = e.response["ResourceId"]
+                workflow_arn = (
+                    f"arn:{self.hook.conn_partition}:airflow-serverless"
+                    f":{self.hook.conn_region_name}:{self.hook.account_id}"
+                    f":workflow/{resource_id}"
+                )
+            else:
+                raise
+        self.log.info("Workflow %s: %s", self.workflow_name, workflow_arn)
+        return workflow_arn
+
+
+class MwaaServerlessUpdateWorkflowOperator(AwsBaseOperator[AwsBaseHook]):
+    """
+    Update an existing Amazon MWAA Serverless workflow.
+
+    .. seealso::
+        For more information on how to use this operator, take a look at the guide:
+        :ref:`howto/operator:MwaaServerlessUpdateWorkflowOperator`
+
+    :param workflow_arn: The ARN of the workflow to update. (templated)
+    :param definition_s3_location: Dict with ``Bucket``, ``ObjectKey``, and optionally
+        ``VersionId`` for the updated YAML definition. (templated)
+    :param code: Optional code location for ``PythonOperator`` and ``BashOperator`` tasks,
+        as a dict with an ``S3Location`` key containing ``Bucket``, ``ObjectKey``, and
+        optionally ``VersionId``. (templated)
+    :param role_arn: The execution role ARN. (templated)
+    :param description: Optional updated description. (templated)
+    :param environment_variables: Optional mapping of environment variable names to values
+        to set for tasks in the workflow. Sent to the API as ``Environment.Variables``.
+        The variables specified replace all existing environment variables of the workflow;
+        if not specified, the updated workflow has no environment variables. Requires
+        ``botocore>=1.43.124``. (templated)
+    :param update_workflow_kwargs: Optional parameters to pass to the ``UpdateWorkflow`` API for
+        inputs this operator does not expose, such as ``NetworkConfiguration``,
+        ``LoggingConfiguration``, ``EngineVersion`` and ``TriggerMode``. (templated)
+    """
+
+    aws_hook_class = AwsBaseHook
+    template_fields: tuple[str, ...] = aws_template_fields(
+        "workflow_arn",
+        "definition_s3_location",
+        "code",
+        "role_arn",
+        "description",
+        "environment_variables",
+        "update_workflow_kwargs",
+    )
+    template_fields_renderers = {
+        "definition_s3_location": "json",
+        "code": "json",
+        "environment_variables": "json",
+        "update_workflow_kwargs": "json",
+    }
+
+    def __init__(
+        self,
+        *,
+        workflow_arn: str,
+        definition_s3_location: dict[str, str],
+        code: dict[str, Any] | None = None,
+        role_arn: str,
+        description: str | None = None,
+        environment_variables: dict[str, str] | None = None,
+        update_workflow_kwargs: dict[str, Any] | None = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.workflow_arn = workflow_arn
+        self.definition_s3_location = definition_s3_location
+        self.code = code
+        self.role_arn = role_arn
+        self.description = description
+        self.environment_variables = environment_variables
+        self.update_workflow_kwargs = update_workflow_kwargs or {}
+
+    @property
+    def _hook_parameters(self) -> dict[str, Any]:
+        return {**super()._hook_parameters, "client_type": "mwaa-serverless"}
+
+    def execute(self, context: Context) -> str:
+        self.log.info("Updating MWAA Serverless workflow %s", self.workflow_arn)
+        kwargs: dict[str, Any] = prune_dict(
+            {
+                "WorkflowArn": self.workflow_arn,
+                "DefinitionS3Location": self.definition_s3_location,
+                "Code": self.code,
+                "RoleArn": self.role_arn,
+                "Description": self.description,
+            }
+        )
+        if self.environment_variables is not None:
+            kwargs["Environment"] = {"Variables": self.environment_variables}
+        response = self.hook.conn.update_workflow(**kwargs, **self.update_workflow_kwargs)
+        workflow_arn = response["WorkflowArn"]
+        self.log.info("Workflow %s updated to version %s", workflow_arn, response.get("WorkflowVersion"))
+        return workflow_arn
+
+
+class MwaaServerlessDeleteWorkflowOperator(AwsBaseOperator[AwsBaseHook]):
+    """
+    Delete an Amazon MWAA Serverless workflow.
+
+    .. seealso::
+        For more information on how to use this operator, take a look at the guide:
+        :ref:`howto/operator:MwaaServerlessDeleteWorkflowOperator`
+
+    :param workflow_arn: The ARN of the workflow to delete. (templated)
+    :param workflow_version: Optional specific version to delete. If not specified,
+        all versions are deleted. (templated)
+    """
+
+    aws_hook_class = AwsBaseHook
+    template_fields: tuple[str, ...] = aws_template_fields("workflow_arn", "workflow_version")
+
+    def __init__(
+        self,
+        *,
+        workflow_arn: str,
+        workflow_version: str | None = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.workflow_arn = workflow_arn
+        self.workflow_version = workflow_version
+
+    @property
+    def _hook_parameters(self) -> dict[str, Any]:
+        return {**super()._hook_parameters, "client_type": "mwaa-serverless"}
+
+    def execute(self, context: Context) -> None:
+        self.log.info("Deleting MWAA Serverless workflow %s", self.workflow_arn)
+        kwargs: dict[str, Any] = prune_dict(
+            {
+                "WorkflowArn": self.workflow_arn,
+                "WorkflowVersion": self.workflow_version,
+            }
+        )
+        self.hook.conn.delete_workflow(**kwargs)
+        self.log.info("Workflow %s deleted.", self.workflow_arn)
+
+
+class MwaaServerlessStopWorkflowRunOperator(AwsBaseOperator[AwsBaseHook]):
+    """
+    Stop a running Amazon MWAA Serverless workflow run.
+
+    .. seealso::
+        For more information on how to use this operator, take a look at the guide:
+        :ref:`howto/operator:MwaaServerlessStopWorkflowRunOperator`
+
+    :param workflow_arn: The ARN of the workflow. (templated)
+    :param run_id: The ID of the run to stop. (templated)
+    """
+
+    aws_hook_class = AwsBaseHook
+    template_fields: tuple[str, ...] = aws_template_fields("workflow_arn", "run_id")
+
+    def __init__(
+        self,
+        *,
+        workflow_arn: str,
+        run_id: str,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.workflow_arn = workflow_arn
+        self.run_id = run_id
+
+    @property
+    def _hook_parameters(self) -> dict[str, Any]:
+        return {**super()._hook_parameters, "client_type": "mwaa-serverless"}
+
+    def execute(self, context: Context) -> str:
+        self.log.info("Stopping workflow run %s", self.run_id)
+        response = self.hook.conn.stop_workflow_run(WorkflowArn=self.workflow_arn, RunId=self.run_id)
+        status = response["Status"]
+        self.log.info("Workflow run %s status: %s", self.run_id, status)
+        return status

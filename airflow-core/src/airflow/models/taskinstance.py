@@ -1,0 +1,3813 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+import hashlib
+import itertools
+import json
+import logging
+import math
+import warnings
+from collections import defaultdict
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from datetime import datetime, timedelta
+from typing import TYPE_CHECKING, Any, NamedTuple
+from urllib.parse import quote, urlencode
+from uuid import UUID
+
+import attrs
+import dill
+import uuid6
+from opentelemetry import trace
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    Float,
+    ForeignKey,
+    ForeignKeyConstraint,
+    Index,
+    Integer,
+    PrimaryKeyConstraint,
+    String,
+    Text,
+    UniqueConstraint,
+    Uuid,
+    and_,
+    case,
+    cast,
+    delete,
+    event as sqlalchemy_event,
+    extract,
+    false,
+    func,
+    insert,
+    inspect,
+    or_,
+    select,
+    text,
+    true,
+    tuple_,
+    update,
+)
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.associationproxy import association_proxy
+from sqlalchemy.ext.hybrid import hybrid_property
+from sqlalchemy.ext.mutable import MutableDict
+from sqlalchemy.orm import (
+    Mapped,
+    Session,
+    lazyload,
+    mapped_column,
+    reconstructor,
+    relationship,
+    synonym,
+    with_loader_criteria,
+)
+from sqlalchemy.orm.attributes import NO_VALUE, set_committed_value
+from sqlalchemy.orm.exc import DetachedInstanceError, ObjectDeletedError
+from sqlalchemy.sql import visitors
+from sqlalchemy.sql.elements import BindParameter, ColumnElement
+
+from airflow import settings
+from airflow._shared.observability.metrics import stats
+from airflow._shared.observability.traces import (
+    TASK_SPAN_DETAIL_LEVEL_KEY,
+    new_dagrun_trace_carrier,
+    new_task_run_carrier,
+)
+from airflow._shared.timezones import timezone
+from airflow.assets.manager import asset_manager
+from airflow.configuration import conf
+from airflow.exceptions import RemovedInAirflow4Warning
+from airflow.executors.workloads import BaseWorkload
+from airflow.listeners.listener import get_listener_manager
+from airflow.models.asset import AssetModel
+from airflow.models.base import Base, StringID
+from airflow.models.dag_version import DagVersion
+from airflow.models.dagbag import DBDagBag
+from airflow.models.deadline import (
+    DAGRUN_QUEUED_TIMING,
+    EVALUATION_TIMING_FIELD,
+    Deadline,
+    ReferenceModels,
+)
+from airflow.models.deadline_alert import DeadlineAlert as DeadlineAlertModel
+from airflow.models.dynamic_region import (
+    SENTINEL_REGION_ID,
+    DynamicRegion,
+    ProducerContext,
+    is_regional,
+    load_region_ancestry,
+    loop_position,
+    public_region_filter,
+)
+
+# Import HITLDetail at runtime so SQLAlchemy can resolve the relationship
+from airflow.models.hitl import HITLDetail  # noqa: F401
+from airflow.models.log import Log
+from airflow.models.taskinstancekey import TaskInstanceKey
+from airflow.models.taskreschedule import TaskReschedule
+from airflow.models.xcom import XCOM_RETURN_KEY, LazyXComPrimitivesSelectSequence, LazyXComSelectSequence
+from airflow.serialization.enums import stringify_encoding_keys
+from airflow.settings import task_instance_mutation_hook
+from airflow.task.priority_strategy import validate_and_load_priority_weight_strategy
+from airflow.ti_deps.dep_context import DepContext
+from airflow.ti_deps.dependencies_deps import REQUEUEABLE_DEPS, RUNNING_DEPS
+from airflow.ti_deps.deps.ready_to_reschedule import ReadyToRescheduleDep
+from airflow.utils.db import exists_query
+from airflow.utils.log.logging_mixin import LoggingMixin
+from airflow.utils.net import get_hostname
+from airflow.utils.platform import getuser
+from airflow.utils.retries import run_with_db_retries
+from airflow.utils.session import NEW_SESSION, create_session, provide_session
+from airflow.utils.sqlalchemy import (
+    CompactUUID,
+    ExecutorConfigType,
+    ExtendedJSON,
+    UtcDateTime,
+    compact_uuid_default,
+    with_row_locks,
+)
+from airflow.utils.state import DagRunState, State, TaskInstanceState
+
+TR = TaskReschedule
+
+log = logging.getLogger(__name__)
+
+# Columns describing one attempt's execution; a successor attempt starts with them empty.
+_PER_ATTEMPT_COLUMNS = (
+    "start_date",
+    "end_date",
+    "duration",
+    "hostname",
+    "unixname",
+    "pid",
+    "queued_dttm",
+    "scheduled_dttm",
+    "queued_by_job_id",
+    "last_heartbeat_at",
+)
+tracer = trace.get_tracer(__name__)
+
+if TYPE_CHECKING:
+    from datetime import datetime
+    from typing import Literal
+
+    from sqlalchemy.engine import Connection as SAConnection, Engine
+    from sqlalchemy.orm import ORMExecuteState
+    from sqlalchemy.sql import Update
+    from sqlalchemy.sql.elements import ColumnElement
+
+    from airflow.api_fastapi.execution_api.datamodels.asset import AssetProfile
+    from airflow.models.dag import DagModel
+    from airflow.models.dagrun import DagRun
+    from airflow.serialization.definitions.dag import SerializedDAG
+    from airflow.serialization.definitions.mappedoperator import Operator
+    from airflow.serialization.definitions.taskgroup import SerializedLoopTaskGroup, SerializedTaskGroup
+    from airflow.triggers.base import StartTriggerArgs
+
+PAST_DEPENDS_MET = "past_depends_met"
+
+
+class OutletEventPayload(NamedTuple):
+    """A single outlet emission carrying its ``extra`` payload and optional per-emission ``partition_key``."""
+
+    extra: dict
+    partition_key: str | None
+
+
+@provide_session
+def _add_log(
+    event,
+    task_instance=None,
+    owner=None,
+    owner_display_name=None,
+    extra=None,
+    *,
+    session: Session = NEW_SESSION,
+    **kwargs,
+):
+    session.add(
+        Log(
+            event,
+            task_instance,
+            owner,
+            owner_display_name,
+            extra,
+            **kwargs,
+        )
+    )
+
+
+def _stop_remaining_tasks(*, task_instance: TaskInstance, task_teardown_map=None, session: Session):
+    """
+    Stop non-teardown tasks in dag.
+
+    :meta private:
+    """
+    if not task_instance.dag_run:
+        raise ValueError("``task_instance`` must have ``dag_run`` set")
+    tis = task_instance.dag_run.get_task_instances(session=session)
+    if TYPE_CHECKING:
+        assert task_instance.task
+        assert task_instance.task.dag
+
+    for ti in tis:
+        if ti.task_id == task_instance.task_id or ti.state in (
+            TaskInstanceState.SUCCESS,
+            TaskInstanceState.FAILED,
+        ):
+            continue
+        if task_teardown_map:
+            teardown = task_teardown_map[ti.task_id]
+        else:
+            teardown = task_instance.task.dag.task_dict[ti.task_id].is_teardown
+        if not teardown:
+            if ti.state == TaskInstanceState.RUNNING:
+                log.info("Forcing task %s to fail due to dag's `fail_fast` setting", ti.task_id)
+                msg = "Forcing task to fail due to dag's `fail_fast` setting."
+                session.add(Log(event="fail task", extra=msg, task_instance=ti))
+                ti.error(session=session)
+            else:
+                log.info("Setting task %s to SKIPPED due to dag's `fail_fast` setting.", ti.task_id)
+                msg = "Skipping task due to dag's `fail_fast` setting."
+                session.add(Log(event="skip task", extra=msg, task_instance=ti))
+                ti.set_state(state=TaskInstanceState.SKIPPED, session=session)
+        else:
+            log.info("Not skipping teardown task '%s'", ti.task_id)
+
+
+def _add_and_prime_mapped_ti(
+    ti: TaskInstance,
+    task: Operator,
+    dag_run: DagRun,
+    *,
+    session: Session,
+    context_carrier: dict | None = None,
+) -> None:
+    """
+    Attach a newly-created mapped TI to the session and prime its ``dag_run`` cache.
+
+    :meta private:
+    """
+    task_instance_mutation_hook(ti, dag_run=dag_run)
+    session.add(ti)
+    if context_carrier is not None:
+        ti.context_carrier = context_carrier
+    ti.refresh_from_task(task, dag_run=dag_run)
+    set_committed_value(ti, "dag_run", dag_run)
+
+
+def _recalculate_dagrun_queued_at_deadlines(dagrun: DagRun, *, session: Session) -> None:
+    """
+    Recalculate deadline times for deadlines that reference dagrun.queued_at.
+
+    :param dagrun: The DagRun whose deadlines should be recalculated
+    :param session: Database session
+
+    :meta private:
+    """
+    results = session.execute(
+        select(Deadline, DeadlineAlertModel)
+        .join(DeadlineAlertModel, Deadline.deadline_alert_id == DeadlineAlertModel.id)
+        .where(
+            Deadline.dagrun_id == dagrun.id,
+            Deadline.missed == false(),
+            or_(
+                DeadlineAlertModel.reference[EVALUATION_TIMING_FIELD].as_string() == DAGRUN_QUEUED_TIMING,
+                # Alerts serialized before the timing was persisted only identify the built-in
+                # queued reference by name.
+                DeadlineAlertModel.reference[ReferenceModels.REFERENCE_TYPE_FIELD].as_string()
+                == ReferenceModels.DagRunQueuedAtDeadline.__name__,
+            ),
+        )
+    ).all()
+
+    if not results:
+        return
+
+    # Local import to avoid a circular import between models and serialization.
+    from airflow.serialization.decoders import decode_deadline_alert_model, resolve_deadline_alert_interval
+
+    for deadline, deadline_alert in results:
+        try:
+            decoded_alert = decode_deadline_alert_model(deadline_alert)
+            interval = resolve_deadline_alert_interval(decoded_alert, session=session)
+            new_deadline_time = decoded_alert.reference.evaluate_with(
+                session=session,
+                interval=interval,
+                dagrun=dagrun,
+                dag_id=dagrun.dag_id,
+                run_id=dagrun.run_id,
+            )
+        except Exception:
+            # Any step can fail: the alert may hold a payload the decoder refuses, a
+            # variable-backed interval may point at a Variable that is missing or non-numeric,
+            # and the evaluation is the Dag author's own code, which may raise anything at all.
+            # Leave this deadline alone rather than failing the whole clear.
+            log.warning(
+                "Error while recalculating deadline %s for DagRun %s.%s, leaving it unchanged",
+                deadline.id,
+                dagrun.dag_id,
+                dagrun.run_id,
+                exc_info=True,
+            )
+            continue
+
+        if new_deadline_time is None:
+            continue
+
+        log.debug(
+            "Recalculating deadline %s for DagRun %s.%s: old=%s, new=%s",
+            deadline.id,
+            dagrun.dag_id,
+            dagrun.run_id,
+            deadline.deadline_time,
+            new_deadline_time,
+        )
+        deadline.deadline_time = new_deadline_time
+    # Do not flush/commit here in order to keep the scheduler loop atomic.
+    # These changes are committed by the calling function.
+
+
+def _get_new_task_ids(
+    dag_id: str,
+    run_id: str,
+    session: Session,
+) -> list[str]:
+    """
+    Get task ids for newly added tasks in the latest DAG version.
+
+    This is a read-only operation that compares the current DAG version
+    with the latest DAG version to identify new tasks.
+
+    :param dag_id: The dag_id for the DAG
+    :param run_id: The run_id for the DAG run
+    :param session: SQLAlchemy session
+    :return: List of task IDs for newly added tasks
+    """
+    from airflow.models.dagrun import DagRun
+
+    dag_run = session.scalar(select(DagRun).filter_by(dag_id=dag_id, run_id=run_id))
+    if not dag_run:
+        raise ValueError(f"DagRun with run_id '{run_id}' not found")
+
+    scheduler_dagbag = DBDagBag(load_op_links=False)
+    latest_dag = scheduler_dagbag.get_latest_version_of_dag(dag_id, session=session)
+
+    if not latest_dag:
+        raise ValueError(f"Latest DAG version for '{dag_id}' not found")
+
+    # Use created_dag_version_id directly to get the DAG version the run was
+    # originally created with. We cannot use get_dag_for_run here because it
+    # falls back to the latest version when bundle_version is not set (e.g.
+    # LocalDagBundle), which would make current_dag == latest_dag and the diff
+    # always empty.
+    current_dag = None
+    if dag_run.created_dag_version_id:
+        current_dag = scheduler_dagbag.get_dag(version_id=dag_run.created_dag_version_id, session=session)
+    new_task_ids = set(latest_dag.task_ids) - set(current_dag.task_ids) if current_dag else set()
+
+    return list(new_task_ids)
+
+
+def _update_dagrun_to_latest_version(
+    dag_id: str,
+    run_id: str,
+    session: Session,
+) -> None:
+    """
+    Update the DAG run to the latest DAG version and create task instances for new tasks.
+
+    This mutates the DAG run by updating its created_dag_version_id, bundle_version,
+    updating all existing task instances to the new dag_version_id,
+    and creating task instances for newly added tasks.
+
+    :param dag_id: The dag_id for the DAG
+    :param run_id: The run_id for the DAG run
+    :param session: SQLAlchemy session
+    """
+    from airflow.models.dagrun import DagRun
+
+    # Without the lock a concurrent scheduler pass and this clear can both expand the same placeholder.
+    dag_run = session.scalar(select(DagRun).filter_by(dag_id=dag_id, run_id=run_id).with_for_update())
+    if not dag_run:
+        raise ValueError(f"DagRun with run_id '{run_id}' not found")
+
+    dag_version = DagVersion.get_latest_version(dag_id, session=session)
+    if not dag_version:
+        return
+
+    scheduler_dagbag = DBDagBag(load_op_links=False)
+    latest_dag = scheduler_dagbag.get_latest_version_of_dag(dag_id, session=session)
+    if not latest_dag:
+        raise ValueError(f"Latest DAG version for '{dag_id}' not found")
+
+    dag_run.created_dag_version_id = dag_version.id
+    dag_run.bundle_version = dag_version.bundle_version
+    dag_run.dag = latest_dag
+
+    for ti in dag_run.get_task_instances(session=session):
+        ti.dag_version_id = dag_version.id
+
+    dag_run.verify_integrity(session=session, dag_version_id=dag_version.id)
+
+    session.flush()
+
+
+def _pin_versionless_tis_to_run_version(dag_run: DagRun, dag_version_id: UUID, session: Session) -> None:
+    """
+    Give the run's unfinished task instances a dag version if they have none.
+
+    Once the run is pinned the scheduler stops backfilling versions onto them, and one
+    without a version is never enqueued.
+    """
+    session.execute(
+        update(TaskInstance)
+        .where(
+            TaskInstance.dag_id == dag_run.dag_id,
+            TaskInstance.run_id == dag_run.run_id,
+            TaskInstance.dag_version_id.is_(None),
+            # State.unfinished holds None, which SQL IN never matches.
+            or_(TaskInstance.state.is_(None), TaskInstance.state.in_(State.unfinished)),
+        )
+        .values(dag_version_id=dag_version_id)
+        .execution_options(synchronize_session="evaluate")
+    )
+
+
+def clear_task_instances(
+    tis: list[TaskInstance],
+    session: Session,
+    dag_run_state: DagRunState | Literal[False] = DagRunState.QUEUED,
+    run_on_latest_version: bool = False,
+    prevent_running_task: bool | None = None,
+    *,
+    whole_task_keys: Collection[tuple[str, str, str]] = (),
+    superseded_ti_ids: Collection[UUID] = (),
+) -> list[TaskInstance]:
+    """
+    Clear a set of task instances, but make sure the running ones get killed.
+
+    Also sets Dagrun's `state` to QUEUED and `start_date` to the time of execution.
+    But only for finished DRs (SUCCESS and FAILED).
+    Doesn't clear DR's `state` and `start_date`for running
+    DRs (QUEUED and RUNNING) because clearing the state for already
+    running DR is redundant and clearing `start_date` affects DR's duration.
+
+    :param tis: a list of task instances
+    :param session: current session
+    :param dag_run_state: state to set finished DagRuns to.
+        If set to False, DagRuns state will not be changed.
+    :param run_on_latest_version: whether to run on latest serialized DAG and Bundle version.
+        A run with no version of its own uses the latest either way, since there is nothing
+        else for it to run on; a task instance with no version joins its run's.
+    :param whole_task_keys: ``(dag_id, run_id, task_id)`` of tasks cleared as a whole. A pre-region
+        mapped expansion of such a task is archived and regenerated in a new region.
+    :param superseded_ti_ids: executions whose generated work is replaced rather than retried; they
+        are archived in place instead of receiving a successor.
+
+    :meta private:
+    """
+    from airflow.exceptions import AirflowClearRunningTaskException
+    from airflow.models.dagrun import DagRun, lock_dag_runs
+
+    lock_dag_runs(
+        session, {(ti.dag_id, ti.run_id) for ti in tis if is_regional(ti.region_id, ti.region_index)}
+    )
+
+    legacy_keys = {
+        (ti.dag_id, ti.run_id, ti.task_id)
+        for ti in tis
+        if ti.region_id == SENTINEL_REGION_ID
+        and ti.region_index >= 0
+        and (ti.dag_id, ti.run_id, ti.task_id) in whole_task_keys
+    }
+    if legacy_keys:
+        existing_keys = {
+            (region.dag_id, region.run_id, region.node_id)
+            for region in session.scalars(
+                select(DynamicRegion).where(
+                    tuple_(DynamicRegion.dag_id, DynamicRegion.run_id, DynamicRegion.node_id).in_(
+                        legacy_keys
+                    ),
+                    DynamicRegion.parent_region_id.is_(None),
+                    DynamicRegion.forked_from_region_id.is_(None),
+                )
+            )
+        }
+        session.add_all(
+            DynamicRegion(dag_id=dag_id, run_id=run_id, node_id=task_id)
+            for dag_id, run_id, task_id in legacy_keys - existing_keys
+        )
+        session.flush()
+
+    scheduler_dagbag = DBDagBag(load_op_links=False)
+    latest_dag_versions: dict[str, DagVersion | None] = {}
+
+    def get_cached_latest_dag_version(dag_id: str) -> DagVersion | None:
+        if dag_id not in latest_dag_versions:
+            latest_dag_versions[dag_id] = DagVersion.get_latest_version(dag_id, session=session)
+        return latest_dag_versions[dag_id]
+
+    cleared = []
+    for original in tis:
+        ti = original if original in session else session.get(TaskInstance, original.id)
+        if ti is None or ti.working_set is not True:
+            raise ValueError("An archived task instance cannot be cleared")
+        if ti.state in (TaskInstanceState.RUNNING, TaskInstanceState.RESTARTING):
+            if prevent_running_task:
+                raise AirflowClearRunningTaskException(
+                    "AirflowClearRunningTaskException: Disable 'prevent_running_task' to proceed, or wait until the task is not running, queued, or scheduled state."
+                )
+                # Prevents the task from re-running and clearing when prevent_running_task from the frontend and the tas is running is True.
+
+            ti.state = TaskInstanceState.RESTARTING
+        # If a task is cleared when running and the prevent_running_task is false,
+        # set its state to RESTARTING so that
+        # the task is terminated and becomes eligible for retry.
+        elif ti.id in superseded_ti_ids or (
+            ti.region_id == SENTINEL_REGION_ID and (ti.dag_id, ti.run_id, ti.task_id) in legacy_keys
+        ):
+            ti.archive(reason="superseded", session=session)
+        else:
+            if ti.state in (None, TaskInstanceState.UP_FOR_RETRY):
+                # The pending attempt hasn't run, so base its retry budget on the preceding attempt.
+                previous_try_number = max(0, ti.try_number - 1)
+            else:
+                previous_try_number = ti.try_number
+                ti = ti.prepare_db_for_next_try(session)
+            dr = ti.dag_run
+            # A run with no version of its own has nothing to re-run on but the latest, and the
+            # run loop below moves it there.
+            use_latest_version = run_on_latest_version or dr.created_dag_version_id is None
+            if use_latest_version:
+                ti_dag = scheduler_dagbag.get_latest_version_of_dag(ti.dag_id, session=session)
+            else:
+                ti_dag = scheduler_dagbag.get_dag_for_run(dag_run=dr, session=session)
+            if not ti_dag:
+                log.warning("No serialized dag found for dag '%s'", dr.dag_id)
+            task_id = ti.task_id
+            if ti_dag and ti_dag.has_task(task_id):
+                task = ti_dag.get_task(task_id)
+                ti.refresh_from_task(task, dag_run=dr)
+                if TYPE_CHECKING:
+                    assert ti.task
+                ti.max_tries = previous_try_number + task.retries
+            else:
+                # Ignore errors when updating max_tries if the DAG or
+                # task are not found since database records could be
+                # outdated. We make max_tries the maximum value of its
+                # original max_tries or the last attempted try number.
+                ti.max_tries = max(ti.max_tries or 0, previous_try_number)
+            ti.state = None
+            ti.external_executor_id = None
+            # retry_delay_override is the functional one: next_retry_datetime() prefers it over
+            # the task's own retry_delay, so a stale value would retime the next retry.
+            ti.retry_reason = None
+            ti.retry_delay_override = None
+            ti.retry_at = None
+            ti.clear_next_method_args()
+            # Match DagVersion to latest serialized DAG when running on the latest version.
+            if use_latest_version:
+                latest_dag_version = get_cached_latest_dag_version(ti.dag_id)
+                if latest_dag_version is not None:
+                    ti.dag_version_id = latest_dag_version.id
+            elif ti.dag_version_id is None:
+                # One without a version is never enqueued, and the run keeps its own, so it can
+                # only go there.
+                ti.dag_version_id = dr.created_dag_version_id
+            session.merge(ti)
+        cleared.append(ti)
+
+    tis = cleared
+    reset_dag_runs = dag_run_state is not False
+    if tis and (reset_dag_runs or run_on_latest_version):
+        from airflow.models.dagrun import (  # Avoid circular import
+            DagRun,
+            dagrun_trace_attributes,
+            parent_trace_context,
+            trace_sampled_override,
+        )
+
+        run_ids_by_dag_id = defaultdict(set)
+        for instance in tis:
+            run_ids_by_dag_id[instance.dag_id].add(instance.run_id)
+
+        drs: Iterable[DagRun] = session.scalars(
+            select(DagRun).where(
+                or_(
+                    *(
+                        and_(DagRun.dag_id == dag_id, DagRun.run_id.in_(run_ids))
+                        for dag_id, run_ids in run_ids_by_dag_id.items()
+                    )
+                )
+            )
+        ).all()
+        if reset_dag_runs:
+            dag_run_state = DagRunState(dag_run_state)  # Validate the state value.
+        for dr in drs:
+            was_finished = dr.state in State.finished_dr_states
+            if reset_dag_runs:
+                # Always update clear_number and queued_at when clearing tasks, regardless of state
+                dr.clear_number += 1
+                dr.queued_at = timezone.utcnow()
+                dr.context_carrier = new_dagrun_trace_carrier(
+                    task_span_detail_level=dr.conf.get(TASK_SPAN_DETAIL_LEVEL_KEY) if dr.conf else None,
+                    attributes=dagrun_trace_attributes(dr),
+                    force_sampled=trace_sampled_override(dr.conf),
+                    parent_context=parent_trace_context(dr.conf),
+                )
+
+                _recalculate_dagrun_queued_at_deadlines(dr, session=session)
+
+                if was_finished:
+                    dr.state = dag_run_state
+                    dr.start_date = timezone.utcnow()
+
+            # The run selects the code for cleared tasks, including successors of restarting attempts.
+            # Refresh the bundle even if an unchanged serialized Dag reused its version row.
+            use_latest_version = run_on_latest_version or dr.created_dag_version_id is None
+            if use_latest_version:
+                dr_dag = scheduler_dagbag.get_latest_version_of_dag(dr.dag_id, session=session)
+                dag_version = get_cached_latest_dag_version(dr.dag_id)
+                if not dr_dag:
+                    log.warning("No serialized dag found for dag '%s'", dr.dag_id)
+                elif dag_version:
+                    # Change the dr.created_dag_version_id so the scheduler doesn't reject this
+                    # version when it sets the dag_run.dag
+                    dr.created_dag_version = dag_version
+                    dr.dag = dr_dag
+                    dr.verify_integrity(session=session, dag_version_id=dag_version.id)
+                    dr.bundle_version = (
+                        None if dr_dag.disable_bundle_versioning else dr.dag_model.bundle_version
+                    )
+            elif was_finished and not scheduler_dagbag.get_dag_for_run(dag_run=dr, session=session):
+                log.warning("No serialized dag found for dag '%s'", dr.dag_id)
+
+            if reset_dag_runs and was_finished and dag_run_state == DagRunState.QUEUED:
+                dr.last_scheduling_decision = None
+                dr.start_date = None
+
+            if dr.created_dag_version_id:
+                _pin_versionless_tis_to_run_version(dr, dr.created_dag_version_id, session)
+    for ti in tis:
+        if ti.working_set is True:
+            ti.context_carrier = new_task_run_carrier(ti.dag_run.context_carrier)
+    session.flush()
+    if legacy_keys:
+        legacy_run_keys = {(dag_id, run_id) for dag_id, run_id, _ in legacy_keys}
+        for legacy_run in session.scalars(
+            select(DagRun).where(tuple_(DagRun.dag_id, DagRun.run_id).in_(legacy_run_keys))
+        ):
+            legacy_run.reconcile_legacy_expansions(session=session)
+    return cleared
+
+
+@attrs.define(frozen=True)
+class LoopClearScope:
+    """Live executions to retry and generated executions to archive."""
+
+    retry_ids: frozenset[UUID]
+    archive_ids: frozenset[UUID]
+
+
+def _get_setup_teardown_pairs(task: Operator) -> list[Operator]:
+    if task.is_setup:
+        return [relative for relative in task.downstream_list if relative.is_teardown]
+    if task.is_teardown:
+        return []
+    return list(task.get_upstreams_only_setups_and_teardowns())
+
+
+def select_loop_clear_scope(
+    selected: Collection[TaskInstance],
+    *,
+    whole_expansion_ids: Collection[UUID] = (),
+    upstream: bool = False,
+    downstream: bool = True,
+    later_loop_iterations: bool = True,
+    include_setups_and_teardowns: bool = False,
+    session: Session,
+) -> LoopClearScope:
+    """
+    Select loop clear executions; mutation callers must hold the DagRun lock.
+
+    With ``include_setups_and_teardowns`` the setups and teardowns of every selected task are
+    retried as well, as a clear by task id does outside loops.
+    """
+    from airflow.models.dagbag import DBDagBag
+    from airflow.models.task_coordinates import TaskCoordinateResolver, enclosing_loop
+    from airflow.serialization.definitions.mappedoperator import get_mapped_ti_count
+
+    if not selected:
+        return LoopClearScope(frozenset(), frozenset())
+    runs = {(ti.dag_id, ti.run_id) for ti in selected}
+    if len(runs) != 1:
+        raise ValueError("Loop clear selection must belong to one DagRun")
+    dag_id, run_id = runs.pop()
+    live = {
+        ti.id: ti
+        for ti in session.scalars(
+            select(TaskInstance)
+            .where(
+                TaskInstance.dag_id == dag_id,
+                TaskInstance.run_id == run_id,
+                TaskInstance.working_set.is_(True),
+            )
+            .execution_options(populate_existing=True)
+        )
+    }
+    selected_ids = {ti.id for ti in selected}
+    if not selected_ids <= live.keys():
+        raise ValueError("Loop clear selection contains executions that are no longer live")
+    if not set(whole_expansion_ids) <= selected_ids:
+        raise ValueError("Whole-task selection requires an explicitly selected execution")
+    resolver = TaskCoordinateResolver(DBDagBag(), session)
+    regions = load_region_ancestry(
+        {ti.region_id for ti in live.values()}, dag_id=dag_id, run_id=run_id, session=session
+    )
+    retry = {ti_id: live[ti_id] for ti_id in selected_ids}
+    for ti in tuple(retry.values()):
+        task = resolver.get_task(dag_id, run_id, ti.task_id, dag_version_id=ti.dag_version_id)
+        group = enclosing_loop(task)
+        if group is not None and loop_position(regions, ti.region_id, ti.region_index, group.node_id) is None:
+            raise ValueError("Loop clear selection requires an execution inside its pinned loop")
+        if ti.id in whole_expansion_ids:
+            if not task.get_needs_expansion():
+                raise ValueError("Whole-expansion selection requires a mapped task")
+            retry.update(
+                (other.id, other)
+                for other in resolver.resolve(dag_id=dag_id, run_id=run_id, task_id=ti.task_id, caller=ti)
+            )
+    mapped_counts: dict[tuple[UUID | None, str, frozenset], int | None] = {}
+    matched_relatives: dict[tuple, tuple[TaskInstance, ...]] = {}
+
+    def add_relatives(ti: TaskInstance, relatives: Iterable[Operator]) -> None:
+        task = resolver.get_task(dag_id, run_id, ti.task_id, dag_version_id=ti.dag_version_id)
+        contexts = resolver.producer_contexts(ti)
+        count = None
+        if task.get_needs_expansion() and ti.region_index >= 0:
+            count_key = (ti.dag_version_id, ti.task_id, frozenset(contexts.items()))
+            if count_key not in mapped_counts:
+                mapped_counts[count_key] = get_mapped_ti_count(
+                    task, run_id, session=session, producer_contexts=contexts
+                )
+            count = mapped_counts[count_key]
+        task_loop = enclosing_loop(task)
+        map_index = resolver.public_map_index(ti)
+        for relative in relatives:
+            indexes = _get_relevant_map_indexes(
+                task=task,
+                run_id=run_id,
+                map_index=map_index,
+                relative=relative,
+                ti_count=count,
+                session=session,
+                producer_contexts=contexts,
+            )
+            relative_loop = enclosing_loop(relative)
+            in_other_loop = relative_loop is not None and (
+                task_loop is None or task_loop.group_id != relative_loop.group_id
+            )
+            key = (
+                relative.task_id,
+                indexes,
+                in_other_loop,
+                ti.dag_version_id,
+                (ti.region_id, ti.region_index) if relative_loop is not None and not in_other_loop else None,
+            )
+            if key not in matched_relatives:
+                matches: Collection[TaskInstance]
+                if in_other_loop:
+                    matches = [
+                        other
+                        for other in live.values()
+                        if other.task_id == relative.task_id
+                        and (
+                            indexes is None
+                            or (isinstance(indexes, int) and resolver.public_map_index(other) == indexes)
+                            or (isinstance(indexes, range) and resolver.public_map_index(other) in indexes)
+                        )
+                    ]
+                else:
+                    matches = resolver.resolve(
+                        dag_id=dag_id,
+                        run_id=run_id,
+                        task_id=relative.task_id,
+                        caller=ti,
+                        map_indexes=indexes,
+                    )
+                matched_relatives[key] = tuple(matches)
+            retry.update((other.id, other) for other in matched_relatives[key])
+
+    # Both directions start from the selection only. Walking downstream from upstream relatives
+    # would also select their other descendants, including gates whose later passes then get archived.
+    seeds = tuple(retry.values())
+    for is_upstream, enabled in ((True, upstream), (False, downstream)):
+        if not enabled:
+            continue
+        for ti in seeds:
+            task = resolver.get_task(dag_id, run_id, ti.task_id, dag_version_id=ti.dag_version_id)
+            add_relatives(ti, task.get_flat_relatives(upstream=is_upstream))
+    if include_setups_and_teardowns:
+        for ti in tuple(retry.values()):
+            task = resolver.get_task(dag_id, run_id, ti.task_id, dag_version_id=ti.dag_version_id)
+            add_relatives(ti, _get_setup_teardown_pairs(task))
+    archived: set[UUID] = set()
+    if later_loop_iterations:
+        for ti in retry.values():
+            task = resolver.get_task(dag_id, run_id, ti.task_id, dag_version_id=ti.dag_version_id)
+            group = enclosing_loop(task)
+            if group is None or ti.task_id != group.gate_task_id:
+                continue
+            position = loop_position(regions, ti.region_id, ti.region_index, group.node_id)
+            if position is None:
+                raise ValueError("Gate coordinates do not belong to its pinned loop")
+            for other in live.values():
+                other_position = loop_position(regions, other.region_id, other.region_index, group.node_id)
+                if (
+                    other_position is not None
+                    and other_position[0] == position[0]
+                    and other_position[1] > position[1]
+                ):
+                    archived.add(other.id)
+    return LoopClearScope(frozenset(retry.keys() - archived), frozenset(archived))
+
+
+def clear_loop_task_instances(
+    selected: Collection[TaskInstance],
+    *,
+    whole_expansion_ids: Collection[UUID] = (),
+    upstream: bool = False,
+    downstream: bool = True,
+    later_loop_iterations: bool = True,
+    session: Session,
+    dag_run_state: DagRunState | Literal[False] = DagRunState.QUEUED,
+    run_on_latest_version: bool = False,
+    prevent_running_task: bool | None = None,
+    whole_task_keys: Collection[tuple[str, str, str]] = (),
+) -> LoopClearScope:
+    """Clear selected loop tries and archive their replaced generated suffixes."""
+    from airflow.models.dagrun import lock_dag_runs
+
+    if not selected:
+        return LoopClearScope(frozenset(), frozenset())
+    run_keys = {(ti.dag_id, ti.run_id) for ti in selected}
+    if len(run_keys) != 1:
+        raise ValueError("Loop clear selection must belong to one DagRun")
+    lock_dag_runs(session, run_keys)
+    scope = select_loop_clear_scope(
+        selected,
+        whole_expansion_ids=whole_expansion_ids,
+        upstream=upstream,
+        downstream=downstream,
+        later_loop_iterations=later_loop_iterations,
+        session=session,
+    )
+    apply_loop_clear_scope(
+        scope,
+        later_loop_iterations=later_loop_iterations,
+        session=session,
+        dag_run_state=dag_run_state,
+        run_on_latest_version=run_on_latest_version,
+        prevent_running_task=prevent_running_task,
+        whole_task_keys=whole_task_keys,
+    )
+    return scope
+
+
+def clear_task_instances_for_runs(
+    tis: Collection[TaskInstance],
+    *,
+    session: Session,
+    dag_run_state: DagRunState | Literal[False] = DagRunState.QUEUED,
+    run_on_latest_version: bool = False,
+    prevent_running_task: bool | None = None,
+    whole_task_keys: Collection[tuple[str, str, str]] = (),
+    later_loop_iterations: bool = True,
+) -> None:
+    """
+    Clear exactly the given executions, archiving the later passes of any loop gate among them.
+
+    Runs without a selected gate are retried in place as an ordinary clear.
+    """
+    from airflow.models.dagrun import lock_dag_runs
+    from airflow.models.task_coordinates import LOOP_GATE_OPERATOR
+
+    if not tis:
+        return
+    lock_dag_runs(session, {(ti.dag_id, ti.run_id) for ti in tis})
+    gate_runs = {(ti.dag_id, ti.run_id) for ti in tis if ti.operator == LOOP_GATE_OPERATOR}
+    clear_task_instances(
+        [ti for ti in tis if (ti.dag_id, ti.run_id) not in gate_runs],
+        session=session,
+        dag_run_state=dag_run_state,
+        run_on_latest_version=run_on_latest_version,
+        prevent_running_task=prevent_running_task,
+        whole_task_keys=whole_task_keys,
+    )
+    for run_key in sorted(gate_runs):
+        clear_loop_task_instances(
+            [ti for ti in tis if (ti.dag_id, ti.run_id) == run_key],
+            downstream=False,
+            later_loop_iterations=later_loop_iterations,
+            session=session,
+            dag_run_state=dag_run_state,
+            run_on_latest_version=run_on_latest_version,
+            prevent_running_task=prevent_running_task,
+            whole_task_keys=whole_task_keys,
+        )
+
+
+def apply_loop_clear_scope(
+    scope: LoopClearScope,
+    *,
+    later_loop_iterations: bool = True,
+    session: Session,
+    dag_run_state: DagRunState | Literal[False] = DagRunState.QUEUED,
+    run_on_latest_version: bool = False,
+    prevent_running_task: bool | None = None,
+    whole_task_keys: Collection[tuple[str, str, str]] = (),
+) -> list[TaskInstance]:
+    """Apply a planned clear while the caller holds its DagRun lock."""
+    from airflow.exceptions import AirflowClearRunningTaskException
+    from airflow.models.dagbag import DBDagBag
+    from airflow.models.task_coordinates import LOOP_GATE_OPERATOR, TaskCoordinateResolver, enclosing_loop
+
+    selected_ids = scope.retry_ids | scope.archive_ids
+    if not selected_ids:
+        return []
+    tis = list(
+        session.scalars(
+            select(TaskInstance)
+            .where(TaskInstance.id.in_(selected_ids), TaskInstance.working_set.is_(True))
+            .execution_options(populate_existing=True)
+        )
+    )
+    if {ti.id for ti in tis} != selected_ids:
+        raise ValueError("Clear selection contains executions that are no longer live")
+    run_keys = {(ti.dag_id, ti.run_id) for ti in tis}
+    if len(run_keys) != 1:
+        raise ValueError("Clear selection must belong to one DagRun")
+    dag_id, run_id = run_keys.pop()
+    if prevent_running_task and any(
+        ti.state in (TaskInstanceState.RUNNING, TaskInstanceState.RESTARTING) for ti in tis
+    ):
+        raise AirflowClearRunningTaskException("Cannot clear running task instances")
+    if later_loop_iterations:
+        resolver = TaskCoordinateResolver(DBDagBag(), session)
+        regions = DynamicRegion.load_for_run(tis[0].dag_id, tis[0].run_id, session=session)
+        cuts: dict[UUID, int] = {}
+        for ti in tis:
+            if ti.id not in scope.retry_ids or ti.operator != LOOP_GATE_OPERATOR:
+                continue
+            task = resolver.get_task(dag_id, run_id, ti.task_id, dag_version_id=ti.dag_version_id)
+            group = enclosing_loop(task)
+            if group is None or group.gate_task_id != ti.task_id:
+                raise ValueError("Gate coordinates require a pinned loop definition")
+            family = loop_position(regions, ti.region_id, ti.region_index, group.node_id)
+            if family is None:
+                raise ValueError("Gate coordinates do not belong to its pinned loop")
+            cuts[family[0]] = min(cuts.get(family[0], ti.region_index + 1), ti.region_index + 1)
+        for family_id, index in cuts.items():
+            DynamicRegion.fork_family(family_id, index, regions, session=session)
+        session.flush()
+    return clear_task_instances(
+        tis,
+        session=session,
+        superseded_ti_ids=scope.archive_ids,
+        dag_run_state=dag_run_state,
+        run_on_latest_version=run_on_latest_version,
+        prevent_running_task=prevent_running_task,
+        whole_task_keys=whole_task_keys,
+    )
+
+
+def _creator_note(val):
+    """Creator for the ``note`` association proxy."""
+    if isinstance(val, str):
+        return TaskInstanceNote(content=val)
+    if isinstance(val, dict):
+        return TaskInstanceNote(**val)
+    return TaskInstanceNote(*val)
+
+
+def _log_state(*, task_instance: TaskInstance, lead_msg: str = "") -> None:
+    """
+    Log task state.
+
+    :param task_instance: the task instance
+    :param lead_msg: lead message
+
+    :meta private:
+    """
+    params: list[str | int] = [
+        lead_msg,
+        str(task_instance.state).upper(),
+        task_instance.dag_id,
+        task_instance.task_id,
+        task_instance.run_id,
+    ]
+    message = "%sMarking task as %s. dag_id=%s, task_id=%s, run_id=%s, "
+    for name, value in task_instance.get_display_coordinates().items():
+        params.append(value)
+        message += f"{name}=%s, "
+    message += "logical_date=%s, start_date=%s, end_date=%s"
+    log.info(
+        message,
+        *params,
+        _date_or_empty(task_instance=task_instance, attr="logical_date"),
+        _date_or_empty(task_instance=task_instance, attr="start_date"),
+        _date_or_empty(task_instance=task_instance, attr="end_date"),
+        stacklevel=2,
+    )
+
+
+def _date_or_empty(*, task_instance: TaskInstance, attr: str) -> str:
+    """
+    Fetch a date attribute or None of it does not exist.
+
+    :param task_instance: the task instance
+    :param attr: the attribute name
+
+    :meta private:
+    """
+    result: datetime | None = getattr(task_instance, attr, None)
+    return result.strftime("%Y%m%dT%H%M%S") if result else ""
+
+
+def _resolve_stored_index(map_index: int | None, region_index: int | None) -> int:
+    if map_index is not None and region_index is not None and map_index != region_index:
+        raise ValueError("map_index and region_index must identify the same stored index")
+    if region_index is not None:
+        return region_index
+    return map_index if map_index is not None else -1
+
+
+def uuid7() -> UUID:
+    """Generate a new UUID7."""
+    return uuid6.uuid7()
+
+
+class LegacyTaskDataOwner(Base):
+    """Map the dag, task, run and map index of pre-3.4 XCom and rendered fields rows to their attempt UUID."""
+
+    __tablename__ = "legacy_task_data_owner"
+
+    dag_id: Mapped[str] = mapped_column(StringID(), nullable=False)
+    task_id: Mapped[str] = mapped_column(StringID(), nullable=False)
+    run_id: Mapped[str] = mapped_column(StringID(), nullable=False)
+    map_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    task_instance_id: Mapped[UUID] = mapped_column(Uuid(), nullable=False)
+
+    __table_args__ = (
+        PrimaryKeyConstraint("dag_id", "task_id", "run_id", "map_index", name="legacy_task_data_owner_pkey"),
+        ForeignKeyConstraint(
+            ["task_instance_id"],
+            ["task_instance.id"],
+            name="legacy_task_data_owner_ti_fkey",
+            ondelete="CASCADE",
+        ),
+        Index("idx_legacy_task_data_owner_ti", "task_instance_id"),
+    )
+
+
+class TaskInstance(Base, LoggingMixin, BaseWorkload):
+    """
+    Task instances store the state of a task instance.
+
+    This table is the authority and single source of truth around what tasks
+    have run and the state they are in.
+
+    The SqlAlchemy model doesn't have a SqlAlchemy foreign key to the task or
+    dag model deliberately to have more control over transactions.
+
+    Database transactions on this table should insure double triggers and
+    any confusion around what task instances are or aren't ready to run
+    even while multiple schedulers may be firing task instances.
+
+    A value of -1 in map_index represents any of: a TI without mapped tasks;
+    a TI with mapped tasks that has yet to be expanded (state=pending);
+    a TI with mapped tasks that expanded to an empty list (state=skipped).
+
+    Every try of a task is its own row with its own UUID. Only the latest try is live (``working_set`` is
+    true); earlier tries are archived (``working_set`` is NULL) and kept as history.
+
+    ORM queries see only live rows by default: a session hook adds ``working_set IS TRUE`` to every ORM
+    select, update and delete, including joins to this model. To include archived rows, set the execution
+    option on the statement::
+
+        session.scalars(select(TaskInstance).where(...).execution_options(include_all_attempts=True))
+
+    The default does not apply to:
+
+    * primary key lookups (``Session.get``, ``merge``, ``refresh``), which return the row with that UUID
+      whether or not it is archived;
+    * relationship loads, which follow the join the relationship defines (``DagRun.task_instances`` is live,
+      ``DagRun.historical_task_instances`` is archived);
+    * Core statements on ``TaskInstance.__table__``, and an ``exists()`` that does not name this model in a
+      FROM clause. These see every row unless they filter ``working_set`` themselves.
+    """
+
+    __tablename__ = "task_instance"
+    id: Mapped[UUID] = mapped_column(
+        Uuid(),
+        primary_key=True,
+        default=uuid7,
+        nullable=False,
+    )
+    task_id: Mapped[str] = mapped_column(StringID(), nullable=False)
+    dag_id: Mapped[str] = mapped_column(StringID(), nullable=False)
+    run_id: Mapped[str] = mapped_column(StringID(), nullable=False)
+    # The slot this instance fills in its region, so its meaning follows the region's node: a loop
+    # region numbers its iterations from one and a mapped expansion numbers its slots from zero.
+    # -1 covers both a plain task, which belongs to no region at all and is the common case, and a
+    # mapped task that has not been expanded yet. Code that reads the column without knowing which
+    # node the region executes cannot tell an iteration from a map index.
+    region_index: Mapped[int] = mapped_column(Integer, nullable=False, server_default="-1")
+    map_index = synonym("region_index")
+    region_id: Mapped[UUID] = mapped_column(
+        CompactUUID(),
+        nullable=False,
+        default=SENTINEL_REGION_ID,
+        server_default=compact_uuid_default(SENTINEL_REGION_ID),
+    )
+
+    start_date: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    end_date: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    duration: Mapped[float | None] = mapped_column(Float, nullable=True)
+    state: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    try_number: Mapped[int] = mapped_column(Integer, default=0)
+    max_tries: Mapped[int] = mapped_column(Integer, server_default="-1", nullable=False)
+    working_set: Mapped[bool | None] = mapped_column(Boolean, default=True, server_default=true())
+    archived_reason: Mapped[str | None] = mapped_column(String(50))
+    hostname: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    unixname: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    pool: Mapped[str] = mapped_column(String(256), nullable=False)
+    pool_slots: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    queue: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    priority_weight: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    operator: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    custom_operator_name: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    # Denormalized from the task so ti_run can tell a stub (foreign-runtime) task from a regular one
+    # without loading the serialized Dag. Null on rows written before the column existed. A row moved
+    # to a new Dag version without being refreshed from its task keeps the value it was created with,
+    # which fails closed: a task that has become a stub loses its arg_bindings rather than running wrong.
+    is_stub: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    queued_dttm: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    scheduled_dttm: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    queued_by_job_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    executor: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    executor_config: Mapped[dict | None] = mapped_column(ExecutorConfigType(pickler=dill), nullable=True)
+    updated_at: Mapped[datetime | None] = mapped_column(
+        UtcDateTime, default=timezone.utcnow, onupdate=timezone.utcnow, nullable=True
+    )
+    _rendered_map_index: Mapped[str | None] = mapped_column("rendered_map_index", String(250), nullable=True)
+    context_carrier: Mapped[dict | None] = mapped_column(MutableDict.as_mutable(ExtendedJSON), nullable=True)
+
+    external_executor_id: Mapped[str | None] = mapped_column(Text(), nullable=True)
+
+    # The trigger to resume on if we are in state DEFERRED
+    trigger_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # Optional timeout utcdatetime for the trigger (past this, we'll fail)
+    trigger_timeout: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+
+    # The method to call next, and any extra arguments to pass to it.
+    # Usually used when resuming from DEFERRED.
+    next_method: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    next_kwargs: Mapped[dict | None] = mapped_column(
+        MutableDict.as_mutable(JSON().with_variant(postgresql.JSONB, "postgresql")), nullable=True
+    )
+
+    _task_display_property_value: Mapped[str | None] = mapped_column(
+        "task_display_name", String(2000), nullable=True
+    )
+    # Legacy rows can predate DAG versioning; migration 0142 sets history references to missing dag versions to NULL.
+    dag_version_id: Mapped[UUID | None] = mapped_column(
+        Uuid(),
+        ForeignKey("dag_version.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    dag_version = relationship("DagVersion", back_populates="task_instances")
+
+    # Retry policy overrides: set by the task worker when a RetryPolicy is configured.
+    # Cleared on clear, on scheduling or deferring the next attempt, and on task start (ti_run).
+    # Read by next_retry_datetime().
+    retry_delay_override: Mapped[float | None] = mapped_column(Float, nullable=True)
+    retry_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # When an UP_FOR_RETRY attempt becomes due; written by the scheduler on its first pass after the
+    # attempt is created.
+    retry_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+
+    __table_args__ = (
+        Index("ti_dag_state", dag_id, state),
+        Index("ti_dag_run", dag_id, run_id),
+        Index("ti_state", state),
+        Index("ti_state_lkp", dag_id, task_id, run_id, state),
+        Index("ti_pool", pool, state, priority_weight),
+        Index("ti_trigger_id", trigger_id),
+        Index("ti_heartbeat", last_heartbeat_at),
+        Index("ti_dag_version_id", dag_version_id),
+        Index(
+            "ti_current_state",
+            working_set,
+            state,
+            postgresql_where=working_set.is_(True),
+            sqlite_where=working_set.is_(True),
+        ),
+        Index(
+            "ti_current_dag_run",
+            working_set,
+            dag_id,
+            run_id,
+            state,
+            postgresql_where=working_set.is_(True),
+            sqlite_where=working_set.is_(True),
+        ),
+        PrimaryKeyConstraint("id", name="task_instance_pkey"),
+        UniqueConstraint(
+            "dag_id",
+            "task_id",
+            "run_id",
+            "region_id",
+            "region_index",
+            "working_set",
+            name="task_instance_current_key",
+        ),
+        UniqueConstraint(
+            "dag_id",
+            "task_id",
+            "run_id",
+            "region_id",
+            "region_index",
+            "try_number",
+            name="task_instance_try_key",
+        ),
+        ForeignKeyConstraint(
+            [trigger_id],
+            ["trigger.id"],
+            name="task_instance_trigger_id_fkey",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            [dag_id, run_id],
+            ["dag_run.dag_id", "dag_run.run_id"],
+            name="task_instance_dag_run_fkey",
+            ondelete="CASCADE",
+        ),
+    )
+
+    dag_model: Mapped[DagModel] = relationship(
+        "DagModel",
+        primaryjoin="TaskInstance.dag_id == DagModel.dag_id",
+        foreign_keys=dag_id,
+        uselist=False,
+        innerjoin=True,
+        viewonly=True,
+    )
+
+    trigger = relationship("Trigger", uselist=False, back_populates="task_instance")
+    triggerer_job = association_proxy("trigger", "triggerer_job")
+    dag_run = relationship("DagRun", back_populates="task_instances", lazy="joined", innerjoin=True)
+    rendered_task_instance_fields = relationship(
+        "RenderedTaskInstanceFields",
+        primaryjoin="TaskInstance.id == foreign(RenderedTaskInstanceFields.task_instance_id)",
+        viewonly=True,
+        lazy="raise",
+        uselist=False,
+    )
+    hitl_detail = relationship("HITLDetail", lazy="raise", uselist=False, passive_deletes=True)
+
+    run_after = association_proxy("dag_run", "run_after")
+    logical_date = association_proxy("dag_run", "logical_date")
+    team_name = association_proxy("dag_run", "team_name")
+    task_instance_note = relationship(
+        "TaskInstanceNote",
+        back_populates="task_instance",
+        uselist=False,
+        cascade="all, delete, delete-orphan",
+    )
+    note = association_proxy("task_instance_note", "content", creator=_creator_note)
+
+    task: Operator | None = None
+    test_mode: bool = False
+    is_trigger_log_context: bool = False
+    run_as_user: str | None = None
+    raw: bool | None = None
+    """Indicate to FileTaskHandler that logging context should be set up for trigger logging.
+
+    :meta private:
+    """
+    _logger_name = "airflow.task"
+
+    def __init__(
+        self,
+        task: Operator,
+        dag_version_id: UUID | None,
+        run_id: str | None = None,
+        state: str | None = None,
+        map_index: int | None = None,
+        *,
+        region_id: UUID = SENTINEL_REGION_ID,
+        region_index: int | None = None,
+    ):
+        super().__init__()
+        self.dag_id = task.dag_id
+        self.task_id = task.task_id
+        self.region_index = _resolve_stored_index(map_index, region_index)
+        self.region_id = region_id
+        if run_id is not None:
+            self.run_id = run_id
+        self.try_number = 0
+
+        self.refresh_from_task(task)
+        if TYPE_CHECKING:
+            assert self.task
+        # init_on_load will config the log
+        self.init_on_load()
+
+        self.max_tries = self.task.retries
+        if not self.id:
+            self.id = uuid7()
+        self.unixname = getuser()
+        if state:
+            self.state = state
+        self.hostname = ""
+        # Is this TaskInstance being currently running within `airflow tasks run --raw`.
+        # Not persisted to the database so only valid for the current process
+        self.raw = False
+        # can be changed when calling 'run'
+        self.test_mode = False
+        self.dag_version_id = dag_version_id
+
+    def __hash__(self):
+        return hash((self.task_id, self.dag_id, self.run_id, self.region_index))
+
+    @property
+    def stats_tags(self) -> dict[str, str]:
+        """Returns task instance tags."""
+        # Reuse the dag run's tags and add the task-level ones.
+        return {**self.dag_run.stats_tags, "task_id": self.task_id}
+
+    @staticmethod
+    def insert_mapping(
+        run_id: str,
+        task: Operator,
+        map_index: int | None = None,
+        *,
+        dag_version_id: UUID | None,
+        dag_run: DagRun,
+        region_id: UUID = SENTINEL_REGION_ID,
+        region_index: int | None = None,
+    ) -> dict[str, Any]:
+        """
+        Insert mapping.
+
+        :meta private:
+        """
+        region_index = _resolve_stored_index(map_index, region_index)
+        weight_rule = task.weight_rule
+        if not hasattr(weight_rule, "get_weight"):
+            weight_rule = validate_and_load_priority_weight_strategy(weight_rule)
+        priority_weight = weight_rule.get_weight(
+            TaskInstance(
+                task=task,
+                run_id=run_id,
+                region_index=region_index,
+                region_id=region_id,
+                dag_version_id=dag_version_id,
+            )
+        )
+        context_carrier = new_task_run_carrier(dag_run.context_carrier)
+
+        return {
+            "dag_id": task.dag_id,
+            "task_id": task.task_id,
+            "run_id": run_id,
+            "try_number": 0,
+            "hostname": "",
+            "unixname": getuser(),
+            "queue": task.queue,
+            "pool": task.pool,
+            "pool_slots": task.pool_slots,
+            "priority_weight": priority_weight,
+            "run_as_user": task.run_as_user,
+            "max_tries": task.retries,
+            "executor": task.executor,
+            "executor_config": task.executor_config,
+            "operator": task.task_type,
+            "custom_operator_name": getattr(task, "operator_name", None),
+            "is_stub": task.is_stub,
+            "region_index": region_index,
+            "region_id": region_id,
+            "_task_display_property_value": task.task_display_name,
+            "dag_version_id": dag_version_id,
+            "context_carrier": context_carrier,
+        }
+
+    @reconstructor
+    def init_on_load(self) -> None:
+        """Initialize the attributes that aren't stored in the DB."""
+        self.test_mode = False  # can be changed when calling 'run'
+
+    @property
+    def operator_name(self) -> str | None:
+        """@property: use a more friendly display name for the operator, if set."""
+        return self.custom_operator_name or self.operator
+
+    @hybrid_property
+    def task_display_name(self) -> str:
+        return self._task_display_property_value or self.task_id
+
+    @task_display_name.expression  # type: ignore[no-redef]
+    def task_display_name(cls):
+        return func.coalesce(cls._task_display_property_value, cls.task_id)
+
+    @hybrid_property
+    def rendered_map_index(self) -> str | None:
+        if self._rendered_map_index is not None:
+            return self._rendered_map_index
+        if self.region_index >= 0:
+            return str(self.region_index)
+        return None
+
+    @rendered_map_index.expression  # type: ignore[no-redef]
+    def rendered_map_index(cls):
+        from airflow.models.task_coordinates import public_map_index_expression
+
+        return case(
+            (cls._rendered_map_index.isnot(None), cls._rendered_map_index),
+            (public_map_index_expression(cls) >= 0, cast(cls.region_index, String)),
+            else_=None,
+        )
+
+    @property
+    def log_url(self) -> str:
+        """Log URL for TaskInstance."""
+        run_id = quote(self.run_id)
+        base_url = conf.get("api", "base_url", fallback="http://localhost:8080/")
+        _log_uri = f"{base_url.rstrip('/')}/dags/{self.dag_id}/runs/{run_id}/tasks/{self.task_id}"
+        query: dict[str, Any] = {}
+        if self.region_id == SENTINEL_REGION_ID:
+            if self.region_index >= 0:
+                _log_uri += f"/mapped/{self.region_index}"
+        else:
+            # In a region, region_index is a map index only for a mapped task (in a loop it is the iteration
+            # otherwise), and the UI selects the task instance by its region, which tells loop iterations apart
+            if (task := getattr(self, "task", None)) is not None and task.get_needs_expansion():
+                _log_uri += f"/mapped/{self.region_index}"
+            query.update(region_id=self.region_id, region_index=self.region_index)
+        if self.try_number > 0:
+            query["try_number"] = self.try_number
+        return f"{_log_uri}?{urlencode(query)}" if query else _log_uri
+
+    @property
+    def mark_success_url(self) -> str:
+        """URL to mark TI success."""
+        return self.log_url
+
+    @provide_session
+    def error(self, *, session: Session = NEW_SESSION) -> None:
+        """
+        Force the task instance's state to FAILED in the database.
+
+        :param session: SQLAlchemy ORM Session
+        """
+        self.log.error("Recording the task instance as FAILED")
+        self.state = TaskInstanceState.FAILED
+        session.merge(self)
+        session.commit()
+
+    @classmethod
+    @provide_session
+    def get_task_instance(
+        cls,
+        dag_id: str,
+        run_id: str,
+        task_id: str,
+        map_index: int,
+        lock_for_update: bool = False,
+        *,
+        region_id: UUID | None = None,
+        session: Session = NEW_SESSION,
+    ) -> TaskInstance | None:
+        query = (
+            select(TaskInstance)
+            .options(lazyload(TaskInstance.dag_run))  # lazy load dag run to avoid locking it
+            .filter_by(
+                dag_id=dag_id,
+                run_id=run_id,
+                task_id=task_id,
+                region_index=map_index,
+            )
+            .where(
+                public_region_filter(TaskInstance, dag_ids=dag_id, run_ids=run_id, task_ids=task_id)
+                if region_id is None
+                else TaskInstance.region_id == region_id
+            )
+        )
+
+        if lock_for_update:
+            for attempt in run_with_db_retries(logger=cls.logger()):
+                with attempt:
+                    return session.execute(query.with_for_update()).scalar_one_or_none()
+        else:
+            return session.execute(query).scalar_one_or_none()
+
+        return None
+
+    @provide_session
+    def refresh_from_db(
+        self,
+        *,
+        session: Session = NEW_SESSION,
+        lock_for_update: bool = False,
+        keep_local_changes: bool = False,
+    ) -> None:
+        """
+        Refresh the task instance from the database based on the primary key.
+
+        :param session: SQLAlchemy ORM Session
+        :param lock_for_update: if True, indicates that the database should
+            lock the TaskInstance (issuing a FOR UPDATE clause) until the
+            session is committed.
+        :param keep_local_changes: Force all attributes to the values from the database if False (the default),
+            or if True don't overwrite locally set attributes
+        """
+        query = (
+            select(
+                # Select the columns, not the ORM object, to bypass any session/ORM caching layer
+                *TaskInstance.__table__.columns
+            )
+            .where(TaskInstance.id == self.id)
+            .execution_options(include_all_attempts=True)
+        )
+
+        if lock_for_update:
+            query = query.with_for_update()
+
+        source = session.execute(query).mappings().one_or_none()
+        if source:
+            target_state: Any = inspect(self)
+            if target_state is None:
+                raise RuntimeError(f"Unable to inspect SQLAlchemy state of {type(self)}: {self}")
+
+            # To deal with `@hybrid_property` we need to get the names from `mapper.columns`
+            for attr_name, col in target_state.mapper.columns.items():
+                if keep_local_changes and target_state.attrs[attr_name].history.has_changes():
+                    continue
+
+                set_committed_value(self, attr_name, source[col.name])
+
+            if target_state.attrs.dag_run.loaded_value is not NO_VALUE:
+                dr_key = session.identity_key(type(self.dag_run), (self.dag_run.id,))
+                if (dr := session.identity_map.get(dr_key)) is not None:
+                    set_committed_value(self, "dag_run", dr)
+
+        else:
+            self.state = None
+
+    def refresh_from_task(
+        self, task: Operator, pool_override: str | None = None, *, dag_run: DagRun | None = None
+    ) -> None:
+        """
+        Copy common attributes from the given task.
+
+        :param task: The task object to copy from
+        :param pool_override: Use the pool_override instead of task's pool
+        :param dag_run: the DagRun this task instance belongs to, forwarded to the mutation hook so a
+            cluster policy can route on ``dag_run.conf``; ``None`` when no run is available yet
+        """
+        self.task = task
+        self.queue = task.queue
+        self.pool = pool_override or task.pool
+        self.pool_slots = task.pool_slots
+        weight_rule = self.task.weight_rule
+        if not hasattr(weight_rule, "get_weight"):
+            weight_rule = validate_and_load_priority_weight_strategy(weight_rule)
+        self.priority_weight = weight_rule.get_weight(self)
+        self.run_as_user = task.run_as_user
+        # Do not set max_tries to task.retries here because max_tries is a cumulative
+        # value that needs to be stored in the db.
+        self.executor = task.executor
+        self.executor_config = task.executor_config
+        self.operator = task.task_type
+        op_name = getattr(task, "operator_name", None)
+        self.custom_operator_name = op_name if isinstance(op_name, str) else ""
+        self.is_stub = task.is_stub
+        # Re-apply cluster policy here so that task default do not overload previous data
+        task_instance_mutation_hook(self, dag_run=dag_run)
+
+    @property
+    def key(self) -> TaskInstanceKey:
+        """Returns a tuple that identifies the task instance uniquely."""
+        return TaskInstanceKey(self.dag_id, self.task_id, self.run_id, self.try_number, self.region_index)
+
+    def get_dag_id(self) -> str:
+        """Return the DAG ID for scheduler routing."""
+        return self.dag_id
+
+    def get_executor_name(self) -> str | None:
+        """Return the executor name for scheduler routing."""
+        return self.executor
+
+    @provide_session
+    def set_state(self, state: str | None, *, session: Session = NEW_SESSION) -> bool:
+        """
+        Set TaskInstance state.
+
+        :param state: State to set for the TI
+        :param session: SQLAlchemy ORM Session
+        :return: Was the state changed
+        """
+        if self.state == state or (self.working_set is None and inspect(self).has_identity):
+            return False
+
+        current_time = timezone.utcnow()
+        self.log.debug("Setting task state for %s to %s", self, state)
+        if self not in session:
+            self.refresh_from_db(session=session)
+        previous_state = self.state
+        self.state = state
+        self.start_date = self.start_date or current_time
+        if previous_state == TaskInstanceState.UP_FOR_RETRY and state != TaskInstanceState.UP_FOR_RETRY:
+            # The pending attempt never runs, so it must not keep the previous one's values:
+            # prepare_db_for_next_try() would otherwise archive them under this try number.
+            self.retry_reason = None
+            self.retry_delay_override = None
+            self.retry_at = None
+        if self.state in State.finished or self.state == TaskInstanceState.UP_FOR_RETRY:
+            self.end_date = self.end_date or current_time
+            self.duration = (self.end_date - self.start_date).total_seconds()
+        session.merge(self)
+        session.flush()
+        return True
+
+    @property
+    def is_premature(self) -> bool:
+        """Returns whether a task is in UP_FOR_RETRY state and its retry interval has elapsed."""
+        # is the task still in the retry waiting period?
+        return self.state == TaskInstanceState.UP_FOR_RETRY and not self.ready_for_retry()
+
+    def is_replaced_generated_work(self, *, session: Session) -> bool:
+        """Whether a pre-region mapped expansion was cleared as a whole and now has a replacement region."""
+        if self.region_id != SENTINEL_REGION_ID or self.region_index < 0:
+            return False
+        return (
+            session.scalar(
+                select(DynamicRegion.id)
+                .where(
+                    DynamicRegion.dag_id == self.dag_id,
+                    DynamicRegion.run_id == self.run_id,
+                    DynamicRegion.node_id == self.task_id,
+                    DynamicRegion.parent_region_id.is_(None),
+                    DynamicRegion.forked_from_region_id.is_(None),
+                )
+                .limit(1)
+            )
+            is not None
+        )
+
+    def archive(self, *, reason: str, session: Session) -> None:
+        """Remove this attempt from the working set while retaining its UUID and children."""
+        current = session.execute(
+            select(
+                TaskInstance.working_set,
+                TaskInstance.state,
+                TaskInstance.start_date,
+                TaskInstance.end_date,
+            )
+            .where(TaskInstance.id == self.id)
+            .with_for_update()
+        ).one_or_none()
+        if current is None or current.working_set is not True:
+            raise ValueError("An archived task instance cannot be archived again")
+        state: Any = inspect(self)
+        for name in ("state", "start_date", "end_date"):
+            if not state.attrs[name].history.has_changes():
+                setattr(self, name, getattr(current, name))
+        never_started = reason == "superseded" and self.state in (
+            None,
+            TaskInstanceState.SCHEDULED,
+            TaskInstanceState.QUEUED,
+            TaskInstanceState.UP_FOR_RETRY,
+        )
+        if self.state not in State.finished and not never_started:
+            self.state = TaskInstanceState.FAILED
+            if self.end_date is None:
+                self.end_date = timezone.utcnow()
+                self.set_duration()
+        self.working_set = None
+        self.archived_reason = reason
+        self.trigger_id = None
+        session.flush()
+
+    @classmethod
+    def delete_attempts(
+        cls,
+        *,
+        dag_id: str,
+        run_id: str,
+        task_id: str,
+        map_index: int | None = None,
+        region_id: UUID | None = None,
+        session: Session,
+    ) -> None:
+        """Delete every attempt, current and archived, of a task; all map indexes if ``map_index`` is None."""
+        statement = (
+            delete(cls)
+            .where(cls.dag_id == dag_id, cls.run_id == run_id, cls.task_id == task_id)
+            .execution_options(include_all_attempts=True)
+        )
+        if map_index is not None:
+            statement = statement.where(cls.region_index == map_index)
+        if region_id is not None:
+            statement = statement.where(cls.region_id == region_id)
+        session.execute(statement)
+
+    @classmethod
+    def get_last_try_numbers(
+        cls,
+        *,
+        dag_id: str,
+        task_id: str,
+        run_id: str,
+        map_indexes: Collection[int] | None = None,
+        region_id: UUID = SENTINEL_REGION_ID,
+        session: Session,
+    ) -> dict[int, int]:
+        """
+        Return the highest try number per map index across current and historical task instances.
+
+        Pre-region rows of the same task are included, since a region minted by a whole-task clear
+        renders the same log paths as the sentinel rows it replaces.
+        """
+        if map_indexes is not None and not map_indexes:
+            return {}
+        statement = (
+            select(cls.region_index, func.max(cls.try_number))
+            .where(
+                cls.dag_id == dag_id,
+                cls.task_id == task_id,
+                cls.run_id == run_id,
+                cls.region_id.in_({region_id, SENTINEL_REGION_ID}),
+            )
+            .group_by(cls.region_index)
+            .execution_options(include_all_attempts=True)
+        )
+        if map_indexes is not None:
+            statement = statement.where(cls.region_index.in_(map_indexes))
+        return {map_index: last_try for map_index, last_try in session.execute(statement)}
+
+    def prepare_db_for_next_try(self, session: Session) -> TaskInstance:
+        """Archive this UUID and return its successor in the caller's transaction."""
+        successor_state = self.state
+        dag_version_id = self.dag_version_id
+        retry_at = None
+        # The execution API doesn't load the task, so a worker-reported retry without a policy
+        # override is left for DagRun._get_ready_tis.
+        if successor_state == TaskInstanceState.UP_FOR_RETRY and (
+            self.retry_delay_override is not None or self.task is not None
+        ):
+            retry_at = self._compute_retry_deadline(
+                failed_try_number=self.try_number, failed_end_date=self.end_date
+            )
+        self.archive(reason="retry", session=session)
+        values = {
+            attribute.columns[0].name: getattr(self, attribute.key)
+            for attribute in inspect(TaskInstance).column_attrs
+        }
+        values.update(
+            {name: None for name in _PER_ATTEMPT_COLUMNS},
+            id=uuid7(),
+            try_number=self.try_number + 1,
+            working_set=True,
+            archived_reason=None,
+            trigger_id=None,
+            external_executor_id=None,
+            dag_version_id=dag_version_id,
+            state=successor_state,
+            retry_at=retry_at,
+        )
+        session.execute(insert(TaskInstance.__table__).values(values))
+        successor = session.scalars(select(TaskInstance).where(TaskInstance.id == values["id"])).one()
+        successor.task = self.task
+        if (
+            note := session.scalar(select(TaskInstanceNote).where(TaskInstanceNote.ti_id == self.id))
+        ) is not None:
+            carried = TaskInstanceNote(content=note.content, user_id=note.user_id)
+            carried.created_at, carried.updated_at = note.created_at, note.updated_at
+            successor.task_instance_note = carried
+        return successor
+
+    def complete_restart(
+        self, *, session: Session, terminal_outcome: TaskInstanceState | None = None
+    ) -> TaskInstance:
+        """
+        Release a cleared attempt after termination; the caller must hold its row lock.
+
+        A task instance whose generated work was replaced is archived in place instead of receiving a
+        successor, ending in ``terminal_outcome`` when one is given.
+        """
+        if self.state != TaskInstanceState.RESTARTING or self.working_set is not True:
+            raise ValueError("Only a current restarting task instance can complete a restart")
+        if terminal_outcome is not None and terminal_outcome not in State.finished:
+            raise ValueError("An archival outcome must be terminal")
+        if self.is_replaced_generated_work(session=session) or (
+            self.region_id != SENTINEL_REGION_ID and self.is_loop_execution_superseded(session=session)
+        ):
+            if terminal_outcome is not None:
+                self.set_state(terminal_outcome, session=session)
+            self.archive(reason="superseded", session=session)
+            if self.region_id == SENTINEL_REGION_ID:
+                self.dag_run.reconcile_legacy_expansions(session=session)
+            return self
+        if terminal_outcome is not None:
+            raise ValueError("A terminal archival outcome requires a superseded execution")
+        successor = self.prepare_db_for_next_try(session)
+        # Keep the terminated attempt's version; the successor follows the run's current code.
+        if dag_version_id := DBDagBag._version_from_dag_run(self.dag_run, session=session):
+            successor.dag_version_id = dag_version_id
+        if self.task is not None:
+            successor.max_tries = self.try_number + self.task.retries
+        else:
+            successor.max_tries = max(self.max_tries or 0, self.try_number)
+        successor.state = None
+        successor.clear_next_method_args()
+        session.flush()
+        return successor
+
+    def is_loop_execution_superseded(self, *, session: Session) -> bool:
+        """Identify an archiving loop coordinate for termination acknowledgement."""
+        regions = DynamicRegion.load_for_run(self.dag_id, self.run_id, session=session)
+        return DynamicRegion.is_coordinate_superseded(self.region_id, self.region_index, regions)
+
+    def has_later_loop_pass(self, group: SerializedLoopTaskGroup, *, session: Session) -> bool:
+        """Find a live gate of a later pass in the same loop family, ignoring passes a fork superseded."""
+        gate = self
+        regions = DynamicRegion.load_for_run(gate.dag_id, gate.run_id, session=session)
+        position = loop_position(regions, gate.region_id, gate.region_index, group.node_id)
+        if position is None:
+            raise ValueError("Gate coordinates do not belong to its pinned loop")
+        for region_id, region_index in session.execute(
+            select(TaskInstance.region_id, TaskInstance.region_index).where(
+                TaskInstance.working_set.is_(True),
+                TaskInstance.dag_id == gate.dag_id,
+                TaskInstance.run_id == gate.run_id,
+                TaskInstance.task_id == gate.task_id,
+                TaskInstance.region_index > gate.region_index,
+            )
+        ):
+            if DynamicRegion.is_coordinate_superseded(region_id, region_index, regions):
+                continue
+            other = loop_position(regions, region_id, region_index, group.node_id)
+            if other is not None and other[0] == position[0]:
+                return True
+        return False
+
+    def get_loop_successor_region_id(self, *, session: Session) -> UUID:
+        """Choose the region for the pass that follows this gate."""
+        regions = DynamicRegion.load_for_run(self.dag_id, self.run_id, session=session)
+        return DynamicRegion.get_successor_region_id(self.region_id, self.region_index + 1, regions)
+
+    @provide_session
+    def are_dependents_done(self, *, session: Session = NEW_SESSION) -> bool:
+        """
+        Check whether the immediate dependents of this task instance have succeeded or have been skipped.
+
+        This is meant to be used by wait_for_downstream.
+
+        This is useful when you do not want to start processing the next
+        schedule of a task until the dependents are done. For instance,
+        if the task DROPs and recreates a table.
+
+        :param session: SQLAlchemy ORM Session
+        """
+        task = self.task
+        if TYPE_CHECKING:
+            assert task
+
+        if not task.downstream_task_ids:
+            return True
+
+        ti = select(func.count(TaskInstance.task_id)).where(
+            TaskInstance.dag_id == self.dag_id,
+            TaskInstance.task_id.in_(task.downstream_task_ids),
+            TaskInstance.run_id == self.run_id,
+            TaskInstance.state.in_((TaskInstanceState.SKIPPED, TaskInstanceState.SUCCESS)),
+        )
+        count = session.scalar(ti)
+        return count == len(task.downstream_task_ids)
+
+    @provide_session
+    def get_previous_dagrun(
+        self,
+        state: DagRunState | None = None,
+        *,
+        session: Session | None = None,
+    ) -> DagRun | None:
+        """
+        Return the DagRun that ran before this task instance's DagRun.
+
+        :param state: If passed, it only take into account instances of a specific state.
+        :param session: SQLAlchemy ORM Session.
+        """
+        if TYPE_CHECKING:
+            assert self.task
+            assert session is not None
+
+        dag = self.task.dag
+        if dag is None:
+            return None
+
+        dr = self.get_dagrun(session=session)
+        dr.dag = dag
+
+        from airflow.models.dagrun import DagRun  # Avoid circular import
+
+        # We always ignore schedule in dagrun lookup when `state` is given
+        # or the DAG is never scheduled. For legacy reasons, when
+        # `catchup=True`, we use `get_previous_scheduled_dagrun` unless
+        # `ignore_schedule` is `True`.
+        ignore_schedule = state is not None or not dag.timetable.can_be_scheduled
+        if dag.catchup is True and not ignore_schedule:
+            last_dagrun = DagRun.get_previous_scheduled_dagrun(dr.id, session=session)
+        else:
+            last_dagrun = DagRun.get_previous_dagrun(dag_run=dr, session=session, state=state)
+
+        if last_dagrun:
+            return last_dagrun
+
+        return None
+
+    @provide_session
+    def get_previous_ti(
+        self,
+        state: DagRunState | None = None,
+        *,
+        session: Session = NEW_SESSION,
+    ) -> TaskInstance | None:
+        """
+        Return the task instance for the task that ran before this task instance.
+
+        :param session: SQLAlchemy ORM Session
+        :param state: If passed, it only take into account instances of a specific state.
+        """
+        dagrun = self.get_previous_dagrun(state, session=session)
+        if dagrun is None:
+            return None
+        return dagrun.get_task_instance(self.task_id, session=session)
+
+    @provide_session
+    def are_dependencies_met(
+        self, dep_context: DepContext | None = None, *, session: Session = NEW_SESSION, verbose: bool = False
+    ) -> bool:
+        """
+        Are all conditions met for this task instance to be run given the context for the dependencies.
+
+        (e.g. a task instance being force run from the UI will ignore some dependencies).
+
+        :param dep_context: The execution context that determines the dependencies that should be evaluated.
+        :param session: database session
+        :param verbose: whether log details on failed dependencies on info or debug log level
+        """
+        dep_context = dep_context or DepContext()
+        if self.state == TaskInstanceState.UP_FOR_RESCHEDULE:
+            # Tasks can be put into UP_FOR_RESCHEDULE by the task runner itself (e.g. when
+            # the worker cannot load the DAG or task). The scheduler must respect the
+            # reschedule_date before scheduling it again.
+            #
+            # We use attrs.evolve to create a *new* DepContext with ReadyToRescheduleDep added,
+            # instead of mutating the caller's dep_context.deps set in-place.  The same
+            # dep_context is shared across all TIs in a scheduler loop, so mutating it would
+            # permanently leak the dep into subsequent, unrelated TIs.
+            dep_context = attrs.evolve(dep_context, deps=dep_context.deps | {ReadyToRescheduleDep()})
+        failed = False
+        verbose_aware_logger = self.log.info if verbose else self.log.debug
+        for dep_status in self.get_failed_dep_statuses(dep_context=dep_context, session=session):
+            failed = True
+
+            verbose_aware_logger(
+                "Dependencies not met for %s, dependency '%s' FAILED: %s",
+                self,
+                dep_status.dep_name,
+                dep_status.reason,
+            )
+
+        if failed:
+            return False
+
+        verbose_aware_logger("Dependencies all met for dep_context=%s ti=%s", dep_context.description, self)
+        return True
+
+    @provide_session
+    def get_failed_dep_statuses(
+        self, dep_context: DepContext | None = None, *, session: Session = NEW_SESSION
+    ):
+        """Get failed Dependencies."""
+        if TYPE_CHECKING:
+            assert self.task is not None
+        dep_context = dep_context or DepContext()
+        for dep in dep_context.deps | self.task.deps:
+            for dep_status in dep.get_dep_statuses(self, dep_context, session=session):
+                self.log.debug(
+                    "%s dependency '%s' PASSED: %s, %s",
+                    self,
+                    dep_status.dep_name,
+                    dep_status.passed,
+                    dep_status.reason,
+                )
+
+                if not dep_status.passed:
+                    yield dep_status
+
+    def __repr__(self) -> str:
+        # ``__repr__`` is used in logging and must never raise. Real values are printed
+        # whenever they can be read (including a normal lazy-load on an *attached* instance);
+        # we only fall back to a placeholder when SQLAlchemy cannot produce the value at all:
+        # a deferred column on a *detached* instance (DetachedInstanceError), or a row deleted
+        # out from under an expired instance (ObjectDeletedError).
+        def field(name: str) -> Any:
+            try:
+                return getattr(self, name)
+            except (DetachedInstanceError, ObjectDeletedError):
+                return "<deferred>"
+
+        prefix = f"<TaskInstance: {field('dag_id')}.{field('task_id')} {field('run_id')} "
+        try:
+            coordinates = self.get_display_coordinates()
+        except (DetachedInstanceError, ObjectDeletedError):
+            coordinates = {}
+        prefix += "".join(f"{name}={value} " for name, value in coordinates.items())
+        return prefix + f"[{field('state')}] ti_id={field('id')}>"
+
+    def get_display_coordinates(
+        self, *, include_unmapped: bool = False, task: Operator | None = None
+    ) -> dict[str, Any]:
+        """
+        Return the coordinates that identify this instance in messages shown to users.
+
+        An instance outside a loop shows its ``map_index`` whatever region holds it, because every mapped
+        expansion has its own region and the region id means nothing to a user. An unmapped loop-body
+        instance shows its iteration. Any other instance shows its region and index, which is the only
+        unambiguous form. The definition is never loaded here; a caller that holds it for an instance loaded
+        without one passes it as ``task``. Without a definition, an instance attached to a session that sits
+        in its own task's top-level region is known to be a plain mapped expansion from the region row.
+        """
+        from airflow.models.task_coordinates import enclosing_loop
+
+        index = self.region_index
+        task = task if task is not None else getattr(self, "task", None)
+        if (
+            self.region_id == SENTINEL_REGION_ID
+            or (task is not None and enclosing_loop(task) is None)
+            or (task is None and self._is_in_own_top_level_region())
+        ):
+            return {"map_index": index} if include_unmapped or index != -1 else {}
+        if task is not None and not task.get_needs_expansion():
+            return {"iteration": index}
+        return {"region_id": str(self.region_id), "region_index": index}
+
+    def _is_in_own_top_level_region(self) -> bool:
+        if (session := Session.object_session(self)) is None:
+            return False
+        try:
+            # Reached from __repr__ and log messages, which must neither flush nor raise.
+            with session.no_autoflush:
+                region = session.get(DynamicRegion, self.region_id)
+        except SQLAlchemyError:
+            return False
+        return region is not None and region.node_id == self.task_id and region.parent_region_id is None
+
+    def next_retry_datetime(self, *, session: Session | None = None) -> datetime:
+        """
+        Get datetime of the next retry if the task instance fails.
+
+        ``retry_at`` is usually written by the scheduler on its first pass after an
+        ``UP_FOR_RETRY`` attempt is created. Until then, or for a row from before that column, the
+        deadline is computed from the previous attempt's end date.
+        """
+        if self.state == TaskInstanceState.UP_FOR_RETRY:
+            if self.retry_at is not None:
+                return self.retry_at
+            return self._compute_retry_deadline(
+                failed_try_number=self.try_number - 1,
+                failed_end_date=self._get_previous_attempt_end_date(session=session) or self.end_date,
+            )
+        return self._compute_retry_deadline(failed_try_number=self.try_number, failed_end_date=self.end_date)
+
+    def _get_previous_attempt_end_date(self, *, session: Session | None) -> datetime | None:
+        session = session or inspect(self).session
+        if session is None:
+            return None
+        return session.scalar(
+            select(TaskInstance.end_date)
+            .where(
+                TaskInstance.dag_id == self.dag_id,
+                TaskInstance.run_id == self.run_id,
+                TaskInstance.task_id == self.task_id,
+                TaskInstance.region_id == self.region_id,
+                TaskInstance.region_index == self.region_index,
+                TaskInstance.try_number == self.try_number - 1,
+            )
+            .execution_options(include_all_attempts=True)
+        )
+
+    def _compute_retry_deadline(
+        self, *, failed_try_number: int, failed_end_date: datetime | None
+    ) -> datetime:
+        """
+        Compute when the attempt after ``failed_try_number`` may start.
+
+        When a :class:`~airflow.sdk.definitions.retry_policy.RetryPolicy` has
+        overridden the delay, ``retry_delay_override`` takes precedence over the
+        static ``retry_delay`` / exponential-backoff calculation.
+
+        For exponential backoff, retry_delay is used as base and will be converted to seconds.
+        """
+        base = failed_end_date if failed_end_date is not None else timezone.utcnow()
+        if self.retry_delay_override is not None:
+            return base + timedelta(seconds=self.retry_delay_override)
+
+        from airflow.sdk.definitions._internal.abstractoperator import MAX_RETRY_DELAY
+
+        if TYPE_CHECKING:
+            assert self.task is not None
+        delay = self.task.retry_delay
+        multiplier = self.task.retry_exponential_backoff if self.task.retry_exponential_backoff != 0 else 1.0
+        if multiplier != 1.0 and multiplier > 0:
+            try:
+                # If the min_backoff calculation is below 1, it will be converted to 0 via int. Thus,
+                # we must round up prior to converting to an int, otherwise a divide by zero error
+                # will occur in the modded_hash calculation.
+                # this probably gives unexpected results if a task instance has previously been cleared,
+                # because try_number can increase without bound
+                min_backoff = math.ceil(delay.total_seconds() * (multiplier ** (failed_try_number - 1)))
+            except OverflowError:
+                min_backoff = MAX_RETRY_DELAY
+                self.log.warning(
+                    "OverflowError occurred while calculating min_backoff, using MAX_RETRY_DELAY for min_backoff."
+                )
+
+            # In the case when delay.total_seconds() is 0, min_backoff will not be rounded up to 1.
+            # To address this, we impose a lower bound of 1 on min_backoff. This effectively makes
+            # the ceiling function unnecessary, but the ceiling function was retained to avoid
+            # introducing a breaking change.
+            if min_backoff < 1:
+                min_backoff = 1
+
+            # deterministic per task instance
+            ti_hash = int(
+                hashlib.sha1(
+                    f"{self.dag_id}#{self.task_id}#{self.logical_date}#{failed_try_number}".encode(),
+                    usedforsecurity=False,
+                ).hexdigest(),
+                16,
+            )
+            # between 1 and 1.0 * delay * (multiplier^retry_number)
+            modded_hash = min_backoff + ti_hash % min_backoff
+            # timedelta has a maximum representable value. The exponentiation
+            # here means this value can be exceeded after a certain number
+            # of tries (around 50 if the initial delay is 1s, even fewer if
+            # the delay is larger). Cap the value here before creating a
+            # timedelta object so the operation doesn't fail with "OverflowError".
+            delay_backoff_in_seconds = min(modded_hash, MAX_RETRY_DELAY)
+            delay = timedelta(seconds=delay_backoff_in_seconds)
+            if self.task.max_retry_delay:
+                delay = min(self.task.max_retry_delay, delay)
+        return base + delay
+
+    def ready_for_retry(self) -> bool:
+        """Check on whether the task instance is in the right state and timeframe to be retried."""
+        return self.state == TaskInstanceState.UP_FOR_RETRY and self.next_retry_datetime() < timezone.utcnow()
+
+    @staticmethod
+    def _get_dagrun(dag_id, run_id, session) -> DagRun:
+        from airflow.models.dagrun import DagRun  # Avoid circular import
+
+        dr = session.execute(
+            select(DagRun).where(DagRun.dag_id == dag_id, DagRun.run_id == run_id)
+        ).scalar_one()
+        return dr
+
+    @provide_session
+    def get_dagrun(self, *, session: Session = NEW_SESSION) -> DagRun:
+        """
+        Return the DagRun for this TaskInstance.
+
+        :param session: SQLAlchemy ORM Session
+        :return: DagRun
+        """
+        info: Any = inspect(self)
+        # If dag_run is loaded and not None, return it.
+        # In early lifecycle phases (e.g. task_instance_mutation_hook),
+        # dag_run may be marked as loaded but still be None.
+        if info.attrs.dag_run.loaded_value is not NO_VALUE and self.dag_run is not None:
+            if getattr(self, "task", None) is not None:
+                if TYPE_CHECKING:
+                    assert self.task
+                self.dag_run.dag = self.task.dag
+            return self.dag_run
+
+        dr = self._get_dagrun(self.dag_id, self.run_id, session)
+        if getattr(self, "task", None) is not None:
+            if TYPE_CHECKING:
+                assert self.task
+            dr.dag = self.task.dag
+        # Record it in the instance for next time. This means that `self.logical_date` will work correctly
+        set_committed_value(self, "dag_run", dr)
+
+        return dr
+
+    @classmethod
+    @provide_session
+    def _check_and_change_state_before_execution(
+        cls,
+        task_instance: TaskInstance,
+        verbose: bool = True,
+        ignore_all_deps: bool = False,
+        ignore_depends_on_past: bool = False,
+        wait_for_past_depends_before_skipping: bool = False,
+        ignore_task_deps: bool = False,
+        ignore_ti_state: bool = False,
+        mark_success: bool = False,
+        test_mode: bool = False,
+        hostname: str = "",
+        pool: str | None = None,
+        external_executor_id: str | None = None,
+        *,
+        session: Session = NEW_SESSION,
+    ) -> bool:
+        """
+        Check dependencies and then sets state to RUNNING if they are met.
+
+        Returns True if and only if state is set to RUNNING, which implies that task should be
+        executed, in preparation for _run_raw_task.
+
+        :param verbose: whether to turn on more verbose logging
+        :param ignore_all_deps: Ignore all of the non-critical dependencies, just runs
+        :param ignore_depends_on_past: Ignore depends_on_past DAG attribute
+        :param wait_for_past_depends_before_skipping: Wait for past depends before mark the ti as skipped
+        :param ignore_task_deps: Don't check the dependencies of this TaskInstance's task
+        :param ignore_ti_state: Disregards previous task instance state
+        :param mark_success: Don't run the task, mark its state as success
+        :param test_mode: Doesn't record success or failure in the DB
+        :param hostname: The hostname of the worker running the task instance.
+        :param pool: specifies the pool to use to run the task instance
+        :param external_executor_id: The identifier of the celery executor
+        :param session: SQLAlchemy ORM Session
+        :return: whether the state was changed to running or not
+        """
+        if TYPE_CHECKING:
+            assert task_instance.task
+
+        ti: TaskInstance = task_instance
+        task = task_instance.task
+        ti.refresh_from_task(task, pool_override=pool)
+        ti.test_mode = test_mode
+        ti.refresh_from_db(session=session, lock_for_update=True)
+        ti.hostname = hostname
+        ti.pid = None
+
+        if not ignore_all_deps and not ignore_ti_state and ti.state == TaskInstanceState.SUCCESS:
+            stats.incr("previously_succeeded", tags=ti.stats_tags)
+
+        if not mark_success:
+            # Firstly find non-runnable and non-requeueable tis.
+            # Since mark_success is not set, we do nothing.
+            non_requeueable_dep_context = DepContext(
+                deps=RUNNING_DEPS - REQUEUEABLE_DEPS,
+                ignore_all_deps=ignore_all_deps,
+                ignore_ti_state=ignore_ti_state,
+                ignore_depends_on_past=ignore_depends_on_past,
+                wait_for_past_depends_before_skipping=wait_for_past_depends_before_skipping,
+                ignore_task_deps=ignore_task_deps,
+                description="non-requeueable deps",
+            )
+            if not ti.are_dependencies_met(
+                dep_context=non_requeueable_dep_context, session=session, verbose=True
+            ):
+                session.commit()
+                return False
+
+            # For reporting purposes, we report based on 1-indexed,
+            # not 0-indexed lists (i.e. Attempt 1 instead of
+            # Attempt 0 for the first attempt).
+            # Set the task start date. In case it was re-scheduled use the initial
+            # start date that is recorded in task_reschedule table
+            # If the task continues after being deferred (next_method is set), use the original start_date
+            ti.start_date = ti.start_date if ti.next_method else timezone.utcnow()
+            if ti.state == TaskInstanceState.UP_FOR_RESCHEDULE:
+                tr_start_date = session.scalar(
+                    TR.stmt_for_task_instance(ti, descending=False).with_only_columns(TR.start_date).limit(1)
+                )
+                if tr_start_date:
+                    ti.start_date = tr_start_date
+
+            # Secondly we find non-runnable but requeueable tis. We reset its state.
+            # This is because we might have hit concurrency limits,
+            # e.g. because of backfilling.
+            dep_context = DepContext(
+                deps=REQUEUEABLE_DEPS,
+                ignore_all_deps=ignore_all_deps,
+                ignore_depends_on_past=ignore_depends_on_past,
+                wait_for_past_depends_before_skipping=wait_for_past_depends_before_skipping,
+                ignore_task_deps=ignore_task_deps,
+                ignore_ti_state=ignore_ti_state,
+                description="requeueable deps",
+            )
+            if not ti.are_dependencies_met(dep_context=dep_context, session=session, verbose=True):
+                ti.state = None
+                cls.logger().warning(
+                    "Rescheduling due to concurrency limits reached "
+                    "at task runtime. Attempt %s of "
+                    "%s. State set to NONE.",
+                    ti.try_number,
+                    ti.max_tries + 1,
+                )
+                ti.queued_dttm = timezone.utcnow()
+                session.merge(ti)
+                session.commit()
+                return False
+
+        if ti.next_kwargs is not None:
+            cls.logger().info("Resuming after deferral")
+        else:
+            cls.logger().info("Starting attempt %s of %s", ti.try_number, ti.max_tries + 1)
+
+        if not test_mode:
+            session.add(Log(TaskInstanceState.RUNNING.value, ti))
+
+        ti.state = TaskInstanceState.RUNNING
+        ti.emit_state_change_metric(TaskInstanceState.RUNNING)
+
+        if external_executor_id:
+            ti.external_executor_id = external_executor_id
+
+        ti.end_date = None
+        if not test_mode:
+            session.merge(ti).task = task
+        session.commit()
+
+        # Closing all pooled connections to prevent
+        # "max number of connections reached"
+        if settings.engine is not None:
+            settings.engine.dispose()
+        if verbose:
+            if mark_success:
+                cls.logger().info("Marking success for %s on %s", ti.task, ti.logical_date)
+            else:
+                cls.logger().info("Executing %s on %s", ti.task, ti.logical_date)
+        return True
+
+    @provide_session
+    def check_and_change_state_before_execution(
+        self,
+        verbose: bool = True,
+        ignore_all_deps: bool = False,
+        ignore_depends_on_past: bool = False,
+        wait_for_past_depends_before_skipping: bool = False,
+        ignore_task_deps: bool = False,
+        ignore_ti_state: bool = False,
+        mark_success: bool = False,
+        test_mode: bool = False,
+        pool: str | None = None,
+        external_executor_id: str | None = None,
+        *,
+        session: Session = NEW_SESSION,
+    ) -> bool:
+        return TaskInstance._check_and_change_state_before_execution(
+            task_instance=self,
+            verbose=verbose,
+            ignore_all_deps=ignore_all_deps,
+            ignore_depends_on_past=ignore_depends_on_past,
+            wait_for_past_depends_before_skipping=wait_for_past_depends_before_skipping,
+            ignore_task_deps=ignore_task_deps,
+            ignore_ti_state=ignore_ti_state,
+            mark_success=mark_success,
+            test_mode=test_mode,
+            hostname=get_hostname(),
+            pool=pool,
+            external_executor_id=external_executor_id,
+            session=session,
+        )
+
+    def emit_state_change_metric(self, new_state: TaskInstanceState) -> None:
+        """
+        Send a time metric representing how much time a given state transition took.
+
+        The previous state and metric name is deduced from the state the task was put in.
+
+        :param new_state: The state that has just been set for this task.
+            We do not use `self.state`, because sometimes the state is updated directly in the DB and not in
+            the local TaskInstance object.
+            Supported states: QUEUED and RUNNING
+        """
+        if self.end_date:
+            # This try already ran once (e.g. a sensor reschedule); only its first scheduling is timed.
+            return
+
+        # switch on state and deduce which metric to send
+        if new_state == TaskInstanceState.RUNNING:
+            metric_name = "queued_duration"
+            if self.queued_dttm is None:
+                # this should not really happen except in tests or rare cases,
+                # but we don't want to create errors just for a metric, so we just skip it
+                self.log.warning(
+                    "cannot record %s for task %s because previous state change time has not been saved",
+                    metric_name,
+                    self.task_id,
+                )
+                return
+            timing = timezone.utcnow() - self.queued_dttm
+        elif new_state == TaskInstanceState.QUEUED:
+            metric_name = "scheduled_duration"
+            if self.scheduled_dttm is None:
+                self.log.warning(
+                    "cannot record %s for task %s because previous state change time has not been saved",
+                    metric_name,
+                    self.task_id,
+                )
+                return
+            timing = timezone.utcnow() - self.scheduled_dttm
+        else:
+            raise NotImplementedError("no metric emission setup for state %s", new_state)
+
+        stats.timing(
+            f"task.{metric_name}",
+            timing,
+            tags={**self.stats_tags, "queue": self.queue},
+        )
+
+    def clear_next_method_args(self) -> None:
+        """Ensure we unset next_method and next_kwargs to ensure that any retries don't reuse them."""
+        log.debug("Clearing next_method and next_kwargs.")
+
+        self.next_method = None
+        self.next_kwargs = None
+
+    @staticmethod
+    @provide_session
+    def register_asset_changes_in_db(
+        ti: TaskInstance,
+        task_outlets: list[AssetProfile],
+        outlet_events: list[dict[str, Any]],
+        *,
+        session: Session = NEW_SESSION,
+    ) -> Sequence[Callable[[], None]]:
+        # Fast path: a task with no outlets and no outlet events has nothing to
+        # register. Returning early avoids the AssetModel lookup below (which
+        # would run with empty IN () clauses) and all downstream work. This is
+        # the common case -- most tasks declare no outlets -- and it sits on the
+        # task-success path that gates scheduling the next task.
+        if not task_outlets and not outlet_events:
+            return ()
+
+        from airflow.serialization.definitions.assets import (
+            SerializedAsset,
+            SerializedAssetNameRef,
+            SerializedAssetUniqueKey,
+            SerializedAssetUriRef,
+        )
+
+        payloads_by_asset: dict[SerializedAssetUniqueKey, list[OutletEventPayload]] = defaultdict(list)
+        for outlet_event in outlet_events:
+            # Alias-emitted events are handled separately further down via
+            # register_asset_change_for_alias, which uses the DagRun-level
+            # partition_key. Per-emission partition keys do not fan out through
+            # the alias path — emission via an alias produces one event per
+            # resolved asset, all carrying the same dag_run_partition_key.
+            if "source_alias_name" in outlet_event:
+                continue
+            asset_key = SerializedAssetUniqueKey(**outlet_event["dest_asset_key"])
+            partition_key = outlet_event.get("partition_key")
+            payloads_by_asset[asset_key].append(
+                OutletEventPayload(extra=outlet_event["extra"], partition_key=partition_key)
+            )
+        dag_run_partition_key = ti.dag_run.partition_key
+        dag_run_partition_date = ti.dag_run.partition_date
+
+        callback_sink: list[Callable[[], None]] = []
+        asset_keys = {
+            SerializedAssetUniqueKey(o.name, o.uri)
+            for o in task_outlets
+            if o.type == "Asset" and o.name and o.uri
+        }
+        asset_name_refs = {
+            SerializedAssetNameRef(o.name) for o in task_outlets if o.type == "AssetNameRef" and o.name
+        }
+        asset_uri_refs = {
+            SerializedAssetUriRef(o.uri) for o in task_outlets if o.type == "AssetUriRef" and o.uri
+        }
+
+        asset_models: dict[SerializedAssetUniqueKey, AssetModel] = {
+            SerializedAssetUniqueKey.from_asset(am): am
+            for am in session.scalars(
+                select(AssetModel).where(
+                    AssetModel.active.has(),
+                    or_(
+                        tuple_(AssetModel.name, AssetModel.uri).in_(attrs.astuple(k) for k in asset_keys),
+                        AssetModel.name.in_(r.name for r in asset_name_refs),
+                        AssetModel.uri.in_(r.uri for r in asset_uri_refs),
+                    ),
+                )
+            )
+        }
+
+        def _register(am: AssetModel, key: SerializedAssetUniqueKey) -> None:
+            payloads_for_asset = payloads_by_asset.get(key, [])
+            if not payloads_for_asset:
+                asset_manager.register_asset_change(
+                    task_instance=ti,
+                    asset=am,
+                    extra=None,
+                    partition_key=dag_run_partition_key,
+                    partition_date=dag_run_partition_date,
+                    callback_sink=callback_sink,
+                    session=session,
+                )
+                return
+            for payload in payloads_for_asset:
+                effective_pk = (
+                    payload.partition_key if payload.partition_key is not None else dag_run_partition_key
+                )
+                # Carry partition_date only when the effective key matches the
+                # DagRun's — the run-level date refers to the run-level key and
+                # would mis-label an event emitted for a different partition.
+                if effective_pk == dag_run_partition_key:
+                    payload_partition_date = dag_run_partition_date
+                else:
+                    payload_partition_date = None
+                    if dag_run_partition_date is not None:
+                        ti.log.debug(
+                            "Task-emitted partition_key %r differs from DagRun partition_key %r; "
+                            "consumer partition_date will be None.",
+                            payload.partition_key,
+                            dag_run_partition_key,
+                        )
+                asset_manager.register_asset_change(
+                    task_instance=ti,
+                    asset=am,
+                    extra=payload.extra,
+                    partition_key=effective_pk,
+                    partition_date=payload_partition_date,
+                    callback_sink=callback_sink,
+                    session=session,
+                )
+
+        for key in asset_keys:
+            try:
+                am = asset_models[key]
+            except KeyError:
+                ti.log.warning(
+                    'Task has inactive assets "Asset(name=%s, uri=%s)" in inlets or outlets',
+                    key.name,
+                    key.uri,
+                )
+                continue
+            ti.log.debug("register event for asset %s", am)
+            _register(am, key)
+
+        if asset_name_refs:
+            asset_models_by_name: dict[str, tuple[SerializedAssetUniqueKey, AssetModel]] = {
+                key.name: (key, am) for key, am in asset_models.items()
+            }
+            for nref in asset_name_refs:
+                try:
+                    key, am = asset_models_by_name[nref.name]
+                except KeyError:
+                    ti.log.warning(
+                        'Task has inactive assets "Asset.ref(name=%s)" in inlets or outlets', nref.name
+                    )
+                    continue
+                ti.log.debug("register event for asset name ref %s", am)
+                _register(am, key)
+        if asset_uri_refs:
+            asset_models_by_uri: dict[str, tuple[SerializedAssetUniqueKey, AssetModel]] = {
+                key.uri: (key, am) for key, am in asset_models.items()
+            }
+            for uref in asset_uri_refs:
+                try:
+                    key, am = asset_models_by_uri[uref.uri]
+                except KeyError:
+                    ti.log.warning(
+                        'Task has inactive assets "Asset.ref(uri=%s)" in inlets or outlets', uref.uri
+                    )
+                    continue
+                ti.log.debug("register event for asset uri ref %s", am)
+                _register(am, key)
+
+        def _asset_event_extras_from_aliases() -> dict[tuple[SerializedAssetUniqueKey, str, str], set[str]]:
+            d = defaultdict(set)
+            for event in outlet_events:
+                try:
+                    alias_name = event["source_alias_name"]
+                except KeyError:
+                    continue
+                if alias_name not in outlet_alias_names:
+                    continue
+                asset_key = SerializedAssetUniqueKey(**event["dest_asset_key"])
+                # fallback for backward compatibility
+                asset_extra_json = json.dumps(event.get("dest_asset_extra", {}), sort_keys=True)
+                asset_event_extra_json = json.dumps(event["extra"], sort_keys=True)
+                d[asset_key, asset_extra_json, asset_event_extra_json].add(alias_name)
+            return d
+
+        outlet_alias_names = {o.name for o in task_outlets if o.type == "AssetAlias" and o.name}
+        if outlet_alias_names and (event_extras_from_aliases := _asset_event_extras_from_aliases()):
+            for (
+                asset_key,
+                asset_extra_json,
+                asset_event_extras_json,
+            ), event_aliase_names in event_extras_from_aliases.items():
+                asset_event_extra = json.loads(asset_event_extras_json)
+                asset = SerializedAsset(
+                    name=asset_key.name,
+                    uri=asset_key.uri,
+                    group="asset",
+                    extra=json.loads(asset_extra_json),
+                    watchers=[],
+                )
+                ti.log.debug("register event for asset %s with aliases %s", asset_key, event_aliase_names)
+                event = asset_manager.register_asset_change(
+                    task_instance=ti,
+                    asset=asset,
+                    source_alias_names=event_aliase_names,
+                    extra=asset_event_extra,
+                    partition_key=dag_run_partition_key,
+                    partition_date=dag_run_partition_date,
+                    callback_sink=callback_sink,
+                    session=session,
+                )
+                if event is None:
+                    ti.log.info("Dynamically creating AssetModel %s", asset_key)
+                    session.add(AssetModel.from_serialized(asset))
+                    session.flush()  # So event can set up its asset fk.
+                    asset_manager.register_asset_change(
+                        task_instance=ti,
+                        asset=asset,
+                        source_alias_names=event_aliase_names,
+                        extra=asset_event_extra,
+                        partition_key=dag_run_partition_key,
+                        partition_date=dag_run_partition_date,
+                        callback_sink=callback_sink,
+                        session=session,
+                    )
+
+        return callback_sink
+
+    @provide_session
+    def update_rtif(self, rendered_fields, *, session: Session = NEW_SESSION):
+        from airflow.models.renderedtifields import RenderedTaskInstanceFields
+
+        rtif = RenderedTaskInstanceFields(ti=self, render_templates=False, rendered_fields=rendered_fields)
+        rtif.write(session=session)
+        session.flush()
+        RenderedTaskInstanceFields.delete_old_records(self.task_id, self.dag_id, session=session)
+
+    def update_heartbeat(self):
+        with create_session() as session:
+            session.execute(
+                update(TaskInstance)
+                .where(TaskInstance.id == self.id)
+                .values(last_heartbeat_at=timezone.utcnow())
+            )
+
+    @property
+    def start_trigger_args(self) -> StartTriggerArgs | None:
+        if self.task and self.task.start_from_trigger is True:
+            return self.task.start_trigger_args
+        return None
+
+    # TODO: We have some code duplication here and in the _create_ti_state_update_query_and_update_state
+    #       method of the task_instances module in the execution api when a TIDeferredStatePayload is being
+    #       processed. This is because of a TaskInstance being updated differently using SQLAlchemy.
+    #       If we use the approach from the execution api as common code in the DagRun schedule_tis method,
+    #       the side effect is the changes done to the task instance aren't picked up by the scheduler and
+    #       thus the task instance isn't processed until the scheduler is restarted.
+    @provide_session
+    def defer_task(self, *, session: Session = NEW_SESSION) -> bool:
+        """
+        Mark the task as deferred and sets up the trigger that is needed to resume it when TaskDeferred is raised.
+
+        :meta: private
+        """
+        from airflow.models.trigger import Trigger
+
+        if TYPE_CHECKING:
+            assert self.start_date
+            assert isinstance(self.task, Operator)
+
+        if start_trigger_args := self.start_trigger_args:
+            trigger_kwargs = start_trigger_args.trigger_kwargs or {}
+            timeout = start_trigger_args.timeout
+
+            # Calculate timeout too if it was passed
+            if timeout is not None:
+                self.trigger_timeout = timezone.utcnow() + timeout
+            else:
+                self.trigger_timeout = None
+
+            team_name: str | None = None
+            if conf.getboolean("core", "multi_team"):
+                from airflow.models.dag import DagModel
+
+                team_name = DagModel.get_team_name(self.dag_id, session=session)
+
+            trigger_row = Trigger(
+                classpath=start_trigger_args.trigger_cls,
+                kwargs=trigger_kwargs,
+                team_name=team_name,
+                dag_id=self.dag_id,
+                owner_ref={"ti_id": str(self.id)},
+            )
+
+            # First, make the trigger entry
+            session.add(trigger_row)
+            session.flush()
+
+            # Then, update ourselves so it matches the deferral request
+            # Keep an eye on the logic in `check_and_change_state_before_execution()`
+            # depending on self.next_method semantics
+            self.state = TaskInstanceState.DEFERRED
+            # A start_from_trigger retry skips schedule_tis' UPDATE, so clear here too.
+            self.retry_reason = None
+            self.retry_delay_override = None
+            self.retry_at = None
+            self.trigger_id = trigger_row.id
+            self.next_method = start_trigger_args.next_method
+            self.next_kwargs = stringify_encoding_keys(start_trigger_args.next_kwargs or {})
+            self.start_date = timezone.utcnow()
+
+            # If an execution_timeout is set, set the timeout to the minimum of
+            # it and the trigger timeout
+            if execution_timeout := self.task.execution_timeout:
+                if self.trigger_timeout:
+                    self.trigger_timeout = min(self.start_date + execution_timeout, self.trigger_timeout)
+                else:
+                    self.trigger_timeout = self.start_date + execution_timeout
+            if self.try_number == 0:
+                self.try_number = 1
+            if self.test_mode:
+                _add_log(event=self.state, task_instance=self, session=session)
+            return True
+        return False
+
+    @classmethod
+    def fetch_handle_failure_context(
+        cls,
+        ti: TaskInstance,
+        error: None | str,
+        test_mode: bool | None = None,
+        *,
+        session: Session,
+        fail_fast: bool = False,
+    ):
+        """
+        Fetch the context needed to handle a failure.
+
+        :param ti: TaskInstance
+        :param error: if specified, log the specific exception if thrown
+        :param test_mode: doesn't record success or failure in the DB if True
+        :param session: SQLAlchemy ORM Session
+        :param fail_fast: if True, fail all downstream tasks
+        """
+        if error:
+            cls.logger().error("%s", error)
+        if not test_mode:
+            ti.refresh_from_db(session=session)
+
+        ti.end_date = timezone.utcnow()
+        ti.set_duration()
+
+        stats.incr(
+            "operator_failures",
+            tags={**ti.stats_tags, "operator_name": ti.operator},
+        )
+        stats.incr("ti_failures", tags=ti.stats_tags)
+
+        if not test_mode:
+            session.add(Log(TaskInstanceState.FAILED.value, ti))
+
+        ti.clear_next_method_args()
+
+        # Set state correctly and figure out how to log it and decide whether
+        # to email
+
+        # Since this function is called only when the TaskInstance state is running,
+        # try_number contains the current try_number (not the next). We
+        # only mark task instance as FAILED if the next task instance
+        # try_number exceeds the max_tries ... or if force_fail is truthy
+
+        # Actual callbacks are handled by the DAG processor, not the scheduler
+        task = getattr(ti, "task", None)
+
+        allocate_next_try = False
+        if not ti.is_eligible_to_retry():
+            ti.state = TaskInstanceState.FAILED
+
+            if task and fail_fast:
+                _stop_remaining_tasks(task_instance=ti, session=session)
+        else:
+            allocate_next_try = ti.state != TaskInstanceState.UP_FOR_RETRY
+            ti.state = State.UP_FOR_RETRY
+
+        ti.notify_failure(error)
+        if allocate_next_try and not test_mode:
+            ti = ti.prepare_db_for_next_try(session)
+
+        return ti
+
+    def notify_failure(self, error: str | None) -> None:
+        """Notify listeners before replacing this try's UUID and try number."""
+        try:
+            get_listener_manager().hook.on_task_instance_failed(
+                previous_state=TaskInstanceState.RUNNING, task_instance=self, error=error
+            )
+        except Exception:
+            log.exception("error calling listener")
+
+    @staticmethod
+    @provide_session
+    def save_to_db(ti: TaskInstance, *, session: Session = NEW_SESSION):
+        ti.updated_at = timezone.utcnow()
+        session.merge(ti)
+        session.flush()
+        session.commit()
+
+    @provide_session
+    def handle_failure(
+        self,
+        error: None | str,
+        test_mode: bool | None = None,
+        *,
+        session: Session = NEW_SESSION,
+    ) -> TaskInstance:
+        """
+        Handle Failure for a task instance.
+
+        :param error: if specified, log the specific exception if thrown
+        :param test_mode: doesn't record success or failure in the DB if True
+        :param session: SQLAlchemy ORM Session
+        """
+        if TYPE_CHECKING:
+            assert self.task
+            assert self.task.dag
+        try:
+            fail_fast = self.task.dag.fail_fast
+        except Exception:
+            fail_fast = False
+        if test_mode is None:
+            test_mode = self.test_mode
+        ti = TaskInstance.fetch_handle_failure_context(
+            ti=self,
+            error=error,
+            test_mode=test_mode,
+            session=session,
+            fail_fast=fail_fast,
+        )
+
+        _log_state(task_instance=ti)
+
+        if not test_mode:
+            TaskInstance.save_to_db(ti, session=session)
+        return ti
+
+    def is_eligible_to_retry(self) -> bool:
+        """Is task instance is eligible for retry."""
+        if self.state == TaskInstanceState.RESTARTING:
+            # If a task is cleared when running, it goes into RESTARTING state and is always
+            # eligible for retry
+            return True
+        if not getattr(self, "task", None):
+            # Couldn't load the task, don't know number of retries, guess:
+            return self.try_number <= self.max_tries
+
+        if TYPE_CHECKING:
+            assert self.task
+            assert self.task.retries
+
+        return bool(self.task.retries and self.try_number <= self.max_tries)
+
+    def set_duration(self) -> None:
+        """Set task instance duration."""
+        if self.end_date and self.start_date:
+            self.duration = (self.end_date - self.start_date).total_seconds()
+        else:
+            self.duration = None
+        log.debug("Task Duration set to %s", self.duration)
+
+    @provide_session
+    def xcom_push(
+        self,
+        key: str,
+        value: Any,
+        *,
+        session: Session = NEW_SESSION,
+    ) -> None:
+        """
+        Make an XCom available for tasks to pull.
+
+        :param key: Key to store the value under.
+        :param value: Value to store. Only be JSON-serializable may be used otherwise.
+        """
+        from airflow.models.xcom import XComModel
+
+        XComModel.set_for_attempt(task_instance_id=self.id, key=key, value=value, session=session)
+
+    @provide_session
+    def xcom_pull(
+        self,
+        task_ids: str | Iterable[str] | None = None,
+        dag_id: str | None = None,
+        key: str = XCOM_RETURN_KEY,
+        include_prior_dates: bool = False,
+        *,
+        session: Session = NEW_SESSION,
+        map_indexes: int | Iterable[int] | None = None,
+        default: Any = None,
+        run_id: str | None = None,
+        full: bool = True,
+    ) -> Any:
+        """:meta private:"""  # noqa: D400
+        # This is only kept for compatibility in tests for now while AIP-72 is in progress.
+        #
+        # `full=False` returns plain JSON types and never runs the Airflow
+        # serialization module, so a stored `__classname__` envelope is not imported or
+        # instantiated. Callers that evaluate task dependencies -- the ti_deps, run by
+        # the scheduler and by the API server's task instance dependencies endpoint --
+        # pass it, since they only need primitive values.
+
+        from airflow.models.xcom import XComModel, xcom_entity
+
+        if dag_id is None:
+            dag_id = self.dag_id
+        if run_id is None:
+            run_id = self.run_id
+
+        query = XComModel.get_many(
+            key=key,
+            run_id=run_id,
+            dag_ids=dag_id,
+            task_ids=task_ids,
+            map_indexes=map_indexes,
+            include_prior_dates=include_prior_dates,
+        )
+        entity = xcom_entity(query)
+
+        # NOTE: Since we're only fetching the value field and not the whole
+        # class, the @recreate annotation does not kick in. Therefore we need to
+        # call XCom.deserialize_value() manually.
+
+        # We are only pulling one single task.
+        if (task_ids is None or isinstance(task_ids, str)) and not isinstance(map_indexes, Iterable):
+            first = session.execute(
+                query.with_only_columns(
+                    entity.run_id,
+                    entity.task_id,
+                    entity.dag_id,
+                    entity.map_index,
+                    entity.value,
+                ).limit(1)
+            ).first()
+            if first is None:  # No matching XCom at all.
+                return default
+
+            if map_indexes is not None or first.map_index < 0:
+                if full:
+                    return XComModel.deserialize_value(first)
+                return XComModel.deserialize_value_primitives(first)
+
+            sequence_cls = LazyXComSelectSequence if full else LazyXComPrimitivesSelectSequence
+            return sequence_cls.from_select(
+                query.with_only_columns(entity.value).order_by(None),
+                order_by=[entity.map_index.expression],
+                session=session,
+            )
+
+        # At this point either task_ids or map_indexes is explicitly multi-value.
+        # Order return values to match task_ids and map_indexes ordering.
+        ordering: list[Any] = []
+        if task_ids is None or isinstance(task_ids, str):
+            ordering.append(entity.task_id)
+        elif task_id_whens := {tid: i for i, tid in enumerate(task_ids)}:
+            ordering.append(case(task_id_whens, value=entity.task_id))
+        else:
+            ordering.append(entity.task_id)
+        if map_indexes is None or isinstance(map_indexes, int):
+            ordering.append(entity.map_index)
+        elif isinstance(map_indexes, range):
+            if map_indexes.step < 0:
+                ordering.append(entity.map_index.desc())
+            else:
+                ordering.append(entity.map_index)
+        elif map_index_whens := {map_index: i for i, map_index in enumerate(map_indexes)}:
+            ordering.append(case(map_index_whens, value=entity.map_index))
+        else:
+            ordering.append(entity.map_index)
+        sequence_cls = LazyXComSelectSequence if full else LazyXComPrimitivesSelectSequence
+        return sequence_cls.from_select(
+            query.with_only_columns(entity.value).order_by(None),
+            order_by=ordering,
+            session=session,
+        )
+
+    @provide_session
+    def get_num_running_task_instances(self, *, session: Session, same_dagrun: bool = False) -> int:
+        """Count running TIs from the DB."""
+        warnings.warn(
+            "This function is deprecated and will be removed in Airflow.",
+            RemovedInAirflow4Warning,
+            stacklevel=2,
+        )
+        return self._get_num_task_instances_of_state(
+            [TaskInstanceState.RUNNING],
+            same_dagrun=same_dagrun,
+            session=session,
+        )
+
+    def get_num_active_task_instances(self, *, same_dagrun: bool = False, session: Session) -> int:
+        """
+        Count active (running, deferred, or awaiting-input) TIs for this task from the DB.
+
+        Deferred and awaiting-input TIs are included because they are still logically
+        in-flight and must count against max_active_tis_per_dag / max_active_tis_per_dagrun.
+
+        :meta private:
+        """
+        return self._get_num_task_instances_of_state(
+            [
+                TaskInstanceState.RUNNING,
+                TaskInstanceState.DEFERRED,
+                TaskInstanceState.AWAITING_INPUT,
+            ],
+            same_dagrun=same_dagrun,
+            session=session,
+        )
+
+    def _get_num_task_instances_of_state(
+        self,
+        states: Collection[TaskInstanceState],
+        *,
+        same_dagrun: bool = False,
+        session: Session,
+    ) -> int:
+        stmt = (
+            select(func.count())
+            .select_from(TaskInstance)
+            .where(TaskInstance.dag_id == self.dag_id, TaskInstance.task_id == self.task_id)
+        )
+        if states:
+            stmt = stmt.where(or_(*(TaskInstance.state == s for s in states)))
+        else:
+            return 0
+        if same_dagrun:
+            stmt = stmt.where(TaskInstance.run_id == self.run_id)
+        return session.scalar(stmt) or 0
+
+    @staticmethod
+    def filter_for_tis(tis: Iterable[TaskInstance | TaskInstanceKey]) -> ColumnElement[bool] | None:
+        """Return SQLAlchemy filter to query selected task instances."""
+        by_region: dict[UUID | None, list[TaskInstance | TaskInstanceKey]] = defaultdict(list)
+        # ``tis`` may be a one-shot iterable (dict keys view, generator); this loop is its only consumer.
+        for ti in tis:
+            by_region[None if isinstance(ti, TaskInstanceKey) else ti.region_id].append(ti)
+        if not by_region:
+            return None
+        return or_(
+            *(
+                and_(
+                    public_region_filter(
+                        TaskInstance,
+                        dag_ids={ti.dag_id for ti in group},
+                        run_ids={ti.run_id for ti in group},
+                        task_ids={ti.task_id for ti in group},
+                    )
+                    if region_id is None
+                    else TaskInstance.region_id == region_id,
+                    TaskInstance._filter_for_tis(group),
+                )
+                for region_id, group in by_region.items()
+            )
+        )
+
+    @staticmethod
+    def _filter_for_tis(tis: list[TaskInstance | TaskInstanceKey]) -> ColumnElement[bool]:
+        first = tis[0]
+
+        dag_id = first.dag_id
+        run_id = first.run_id
+        map_index = first.map_index
+        first_task_id = first.task_id
+
+        # pre-compute the set of dag_id, run_id, map_indices and task_ids
+        dag_ids, run_ids, map_indices, task_ids = set(), set(), set(), set()
+        for t in tis:
+            dag_ids.add(t.dag_id)
+            run_ids.add(t.run_id)
+            map_indices.add(t.map_index)
+            task_ids.add(t.task_id)
+
+        # Common path optimisations: when all TIs are for the same dag_id and run_id, or same dag_id
+        # and task_id -- this can be over 150x faster for huge numbers of TIs (20k+)
+        if dag_ids == {dag_id} and run_ids == {run_id} and map_indices == {map_index}:
+            return and_(
+                TaskInstance.dag_id == dag_id,
+                TaskInstance.run_id == run_id,
+                TaskInstance.region_index == map_index,
+                TaskInstance.task_id.in_(task_ids),
+            )
+        if dag_ids == {dag_id} and task_ids == {first_task_id} and map_indices == {map_index}:
+            return and_(
+                TaskInstance.dag_id == dag_id,
+                TaskInstance.run_id.in_(run_ids),
+                TaskInstance.region_index == map_index,
+                TaskInstance.task_id == first_task_id,
+            )
+        if dag_ids == {dag_id} and run_ids == {run_id} and task_ids == {first_task_id}:
+            return and_(
+                TaskInstance.dag_id == dag_id,
+                TaskInstance.run_id == run_id,
+                TaskInstance.region_index.in_(map_indices),
+                TaskInstance.task_id == first_task_id,
+            )
+
+        filter_condition = []
+        # create 2 nested groups, both primarily grouped by dag_id and run_id,
+        # and in the nested group 1 grouped by task_id the other by map_index.
+        task_id_groups: dict[tuple, dict[Any, list[Any]]] = defaultdict(lambda: defaultdict(list))
+        map_index_groups: dict[tuple, dict[Any, list[Any]]] = defaultdict(lambda: defaultdict(list))
+        for t in tis:
+            index = t.map_index
+            task_id_groups[(t.dag_id, t.run_id)][t.task_id].append(index)
+            map_index_groups[(t.dag_id, t.run_id)][index].append(t.task_id)
+
+        # this assumes that most dags have dag_id as the largest grouping, followed by run_id. even
+        # if its not, this is still  a significant optimization over querying for every single tuple key
+        for cur_dag_id, cur_run_id in itertools.product(dag_ids, run_ids):
+            # we compare the group size between task_id and map_index and use the smaller group
+            dag_task_id_groups = task_id_groups[(cur_dag_id, cur_run_id)]
+            dag_map_index_groups = map_index_groups[(cur_dag_id, cur_run_id)]
+
+            if len(dag_task_id_groups) <= len(dag_map_index_groups):
+                for cur_task_id, cur_map_indices in dag_task_id_groups.items():
+                    filter_condition.append(
+                        and_(
+                            TaskInstance.dag_id == cur_dag_id,
+                            TaskInstance.run_id == cur_run_id,
+                            TaskInstance.task_id == cur_task_id,
+                            TaskInstance.region_index.in_(cur_map_indices),
+                        )
+                    )
+            else:
+                for cur_map_index, cur_task_ids in dag_map_index_groups.items():
+                    filter_condition.append(
+                        and_(
+                            TaskInstance.dag_id == cur_dag_id,
+                            TaskInstance.run_id == cur_run_id,
+                            TaskInstance.task_id.in_(cur_task_ids),
+                            TaskInstance.region_index == cur_map_index,
+                        )
+                    )
+
+        return or_(*filter_condition)
+
+    @classmethod
+    def ti_selector_condition(cls, vals: Collection[str | tuple[str, int]]) -> ColumnElement[bool]:
+        """
+        Build an SQLAlchemy filter for a list of task_ids or tuples of (task_id,map_index).
+
+        :meta private:
+        """
+        # Compute a filter for TI.task_id and TI.map_index based on input values
+        # For each item, it will either be a task_id, or (task_id, map_index)
+        task_id_only = [v for v in vals if isinstance(v, str)]
+        with_map_index = [v for v in vals if not isinstance(v, str)]
+
+        filters: list[Any] = []
+        if task_id_only:
+            filters.append(cls.task_id.in_(task_id_only))
+        if with_map_index:
+            filters.append(tuple_(cls.task_id, cls.region_index).in_(with_map_index))
+
+        if not filters:
+            return false()
+        if len(filters) == 1:
+            return filters[0]
+        return or_(*filters)
+
+    def get_relevant_upstream_map_indexes(
+        self,
+        upstream: Operator,
+        ti_count: int | None,
+        *,
+        session: Session,
+        producer_contexts: Mapping[str, ProducerContext] | None = None,
+    ) -> int | range | None:
+        if TYPE_CHECKING:
+            assert self.task
+        return _get_relevant_map_indexes(
+            run_id=self.run_id,
+            map_index=self.region_index,
+            ti_count=ti_count,
+            task=self.task,
+            relative=upstream,
+            session=session,
+            producer_contexts=producer_contexts,
+        )
+
+    def clear_db_references(self, session: Session):
+        """
+        Clear db tables that have a reference to this instance.
+
+        :param session: ORM Session
+
+        :meta private:
+        """
+        from airflow.models.renderedtifields import RenderedTaskInstanceFields
+        from airflow.models.xcom import XComModel
+
+        producer_ids = select(TaskInstance.id).where(TaskInstance.id == self.id)
+        XComModel.delete_for_attempts(producer_ids=producer_ids, key=None, session=session)
+        RenderedTaskInstanceFields.delete_for_attempts(producer_ids=producer_ids, session=session)
+        tables_by_id: list[type[Base]] = [TaskInstanceNote, TaskReschedule]
+        for table in tables_by_id:
+            session.execute(delete(table).where(table.ti_id == self.id))
+
+    def expand_mapped_task(self, *, session: Session) -> tuple[Sequence[TaskInstance], int]:
+        """
+        Create the mapped task instances for mapped task.
+
+        A mapped task's region is born with its placeholder and keeps it through re-expansion. The
+        placeholder of a pre-region expansion lives in the sentinel region; it moves, with its
+        identity, into a newly minted region.
+
+        :raise NotMapped: If this task does not need expansion.
+        :return: The newly created mapped task instances (if any) in ascending
+            order by map index, and the maximum map index value.
+        """
+        from airflow.models.expandinput import NotFullyPopulated
+        from airflow.models.task_coordinates import TaskCoordinateResolver
+        from airflow.serialization.definitions.baseoperator import SerializedBaseOperator
+        from airflow.serialization.definitions.mappedoperator import (
+            SerializedMappedOperator,
+            get_mapped_ti_count,
+        )
+
+        task = self.task
+        run_id = self.run_id
+
+        if not isinstance(task, (SerializedMappedOperator, SerializedBaseOperator)):
+            raise RuntimeError(
+                f"cannot expand unrecognized operator type {type(task).__module__}.{type(task).__name__}"
+            )
+
+        try:
+            total_length: int | None = get_mapped_ti_count(
+                task,
+                run_id,
+                session=session,
+                producer_contexts=TaskCoordinateResolver.for_dag(task.dag, session).producer_contexts(self),
+            )
+        except NotFullyPopulated as e:
+            if not task.dag or not task.dag.partial:
+                task.log.error(
+                    "Cannot expand %r for run %s; missing upstream values: %s",
+                    task,
+                    run_id,
+                    sorted(e.missing),
+                )
+            total_length = None
+
+        region_id = self.region_id
+        unmapped_region_id = region_id
+        state: str | None = None
+        unmapped_ti: TaskInstance | None = session.scalars(
+            select(TaskInstance).where(
+                TaskInstance.dag_id == task.dag_id,
+                TaskInstance.task_id == task.task_id,
+                TaskInstance.run_id == run_id,
+                TaskInstance.region_index == -1,
+                TaskInstance.region_id == region_id,
+                or_(TaskInstance.state.in_(State.unfinished), TaskInstance.state.is_(None)),
+            )
+        ).one_or_none()
+
+        all_expanded_tis: list[TaskInstance] = []
+
+        if unmapped_ti and total_length is not None and region_id == SENTINEL_REGION_ID:
+            region = DynamicRegion.get_or_create(
+                dag_id=task.dag_id, run_id=run_id, node_id=task.task_id, session=session
+            )
+            region_id = region.id
+            unmapped_ti.region_id = region_id
+            session.flush()
+            if total_length < 1:
+                all_expanded_tis.append(unmapped_ti)
+
+        last_tries = TaskInstance.get_last_try_numbers(
+            dag_id=task.dag_id,
+            task_id=task.task_id,
+            run_id=run_id,
+            region_id=region_id,
+            session=session,
+        )
+
+        if unmapped_ti:
+            if TYPE_CHECKING:
+                assert task.dag is None
+
+            # The unmapped task instance still exists and is unfinished, i.e. we
+            # haven't tried to run it before.
+            if total_length is None:
+                # If the DAG is partial, it's likely that the upstream tasks
+                # are not done yet, so the task can't fail yet.
+                if not task.dag or not task.dag.partial:
+                    unmapped_ti.state = TaskInstanceState.UPSTREAM_FAILED
+            elif total_length < 1:
+                # If the upstream maps this to a zero-length value, simply mark
+                # the unmapped task instance as SKIPPED (if needed).
+                task.log.info(
+                    "Marking %s as SKIPPED since the map has %d values to expand",
+                    unmapped_ti,
+                    total_length,
+                )
+                unmapped_ti.state = TaskInstanceState.SKIPPED
+            else:
+                dr = unmapped_ti.dag_run
+                state = unmapped_ti.state
+                if unmapped_ti.try_number > 0:
+                    # Once the unmapped coordinate is gone its archived attempts are unreachable, and the
+                    # 0142 downgrade rejects them; their XCom and rendered fields are deleted with them.
+                    session.execute(
+                        delete(TaskInstance)
+                        .where(
+                            TaskInstance.dag_id == task.dag_id,
+                            TaskInstance.task_id == task.task_id,
+                            TaskInstance.run_id == run_id,
+                            TaskInstance.region_id == unmapped_region_id,
+                            TaskInstance.map_index == -1,
+                            TaskInstance.working_set.is_(None),
+                        )
+                        .execution_options(synchronize_session=False, include_all_attempts=True)
+                    )
+                zero_index_ti_exists = exists_query(
+                    TaskInstance.working_set.is_(True),
+                    TaskInstance.dag_id == task.dag_id,
+                    TaskInstance.task_id == task.task_id,
+                    TaskInstance.run_id == run_id,
+                    TaskInstance.region_index == 0,
+                    TaskInstance.region_id == region_id,
+                    session=session,
+                )
+                if not zero_index_ti_exists:
+                    # Otherwise convert this into the first mapped index, and create
+                    # TaskInstance for other indexes.
+                    promoted_try = max(unmapped_ti.try_number, last_tries.get(0, -1) + 1)
+                    unmapped_ti.max_tries = (
+                        (unmapped_ti.max_tries or 0) + promoted_try - unmapped_ti.try_number
+                    )
+                    unmapped_ti.try_number = promoted_try
+                    unmapped_ti.region_index = 0
+                    task.log.debug("Updated in place to become %s", unmapped_ti)
+                    all_expanded_tis.append(unmapped_ti)
+                    # execute hook for task instance map index 0
+                    task_instance_mutation_hook(unmapped_ti, dag_run=dr)
+                    session.flush()
+                else:
+                    task.log.debug("Deleting the original task instance: %s", unmapped_ti)
+                    session.delete(unmapped_ti)
+
+        if total_length is None or total_length < 1:
+            # Nothing to fixup.
+            indexes_to_map: Iterable[int] = ()
+        else:
+            # Only create "missing" ones.
+            current_max_mapping = (
+                session.scalar(
+                    select(func.max(TaskInstance.region_index)).where(
+                        TaskInstance.dag_id == task.dag_id,
+                        TaskInstance.task_id == task.task_id,
+                        TaskInstance.run_id == run_id,
+                        TaskInstance.region_id == region_id,
+                    )
+                )
+                or 0
+            )
+            indexes_to_map = range(current_max_mapping + 1, total_length)
+
+        if unmapped_ti:
+            dag_version_id = unmapped_ti.dag_version_id
+        elif dag_version := DagVersion.get_latest_version(task.dag_id, session=session):
+            dag_version_id = dag_version.id
+        else:
+            dag_version_id = None
+
+        if not unmapped_ti:
+            from airflow.models import DagRun
+
+            dr = session.scalar(
+                select(DagRun).where(
+                    DagRun.dag_id == task.dag_id,
+                    DagRun.run_id == run_id,
+                )
+            )
+
+        new_tis: list[TaskInstance] = []
+        for index in indexes_to_map:
+            ti = TaskInstance(
+                task,
+                run_id=run_id,
+                region_index=index,
+                region_id=region_id,
+                state=state,
+                dag_version_id=dag_version_id,
+            )
+            ti.try_number = last_tries.get(index, -1) + 1
+            ti.max_tries += ti.try_number
+            task.log.debug("Expanding TIs upserted %s", ti)
+            _add_and_prime_mapped_ti(
+                ti, task, dr, session=session, context_carrier=new_task_run_carrier(dr.context_carrier)
+            )
+            new_tis.append(ti)
+        if new_tis:
+            session.flush()
+        all_expanded_tis.extend(new_tis)
+
+        # Coerce the None case to 0 -- these two are almost treated identically,
+        # except the unmapped ti (if exists) is marked to different states.
+        total_expanded_ti_count = total_length or 0
+
+        # Any (old) task instances with inapplicable indexes (>= the total
+        # number we need) are set to "REMOVED".
+        query = select(TaskInstance).where(
+            TaskInstance.dag_id == task.dag_id,
+            TaskInstance.task_id == task.task_id,
+            TaskInstance.run_id == run_id,
+            TaskInstance.region_index >= total_expanded_ti_count,
+            TaskInstance.region_id == region_id,
+        )
+        to_update = session.scalars(with_row_locks(query, of=TaskInstance, session=session, skip_locked=True))
+        for ti in to_update:
+            ti.state = TaskInstanceState.REMOVED
+        session.flush()
+        return all_expanded_tis, total_expanded_ti_count - 1
+
+    @classmethod
+    def duration_expression_update(
+        cls, end_date: datetime, query: Update, bind: Engine | SAConnection
+    ) -> Update:
+        """Return a SQL expression for calculating the duration of this TI, based on the start and end date columns."""
+        # TODO: Compare it with self._set_duration method
+
+        if bind.dialect.name == "sqlite":
+            return query.values(
+                {
+                    "end_date": end_date,
+                    "duration": func.round(
+                        (func.julianday(end_date) - func.julianday(cls.start_date)) * 86400, 3
+                    ),
+                }
+            )
+        if bind.dialect.name == "postgresql":
+            return query.values(
+                {
+                    "end_date": end_date,
+                    "duration": extract("EPOCH", end_date - cls.start_date),
+                }
+            )
+
+        return query.values(
+            {
+                "end_date": end_date,
+                "duration": (
+                    func.timestampdiff(text("MICROSECOND"), cls.start_date, end_date)
+                    # Turn microseconds into floating point seconds.
+                    / 1_000_000
+                ),
+            }
+        )
+
+    @property
+    def is_schedulable(self):
+        """Determine if the task_instance should be scheduled or short-circuited to ``success``."""
+        return self.is_task_schedulable(self.task)
+
+    @staticmethod
+    def is_task_schedulable(task: Operator) -> bool:
+        """
+        Determine if the task should be scheduled instead of being short-circuited to ``success``.
+
+        A task requires scheduling if it is not a trivial EmptyOperator, i.e. one of the
+        following conditions holds:
+
+        * it does **not** inherit from ``EmptyOperator``
+        * it defines an ``on_execute_callback``
+        * it defines an ``on_success_callback``
+        * it declares any ``outlets``
+        * it declares any ``inlets``
+
+        If none of these are true, the task is considered empty and is immediately marked
+        successful without being scheduled.
+
+        Note: keeping this check as a separate public method is important so it can also be used
+        by listeners (when a task is not scheduled, listeners are never called). For example,
+        the OpenLineage listener checks all tasks at DAG start, and using this method lets
+        it consistently determine whether the listener will run for each task.
+        """
+        return bool(
+            not task.inherits_from_empty_operator
+            or task.has_on_execute_callback
+            or task.has_on_success_callback
+            or task.outlets
+            or task.inlets
+        )
+
+
+def _find_common_ancestor_mapped_group(node1: Operator, node2: Operator) -> SerializedTaskGroup | None:
+    """Given two operators, find their innermost common mapped task group."""
+    if node1.dag is None or node2.dag is None or node1.dag_id != node2.dag_id:
+        return None
+    parent_group_ids = {g.group_id for g in node1.iter_mapped_task_groups()}
+    common_groups = (g for g in node2.iter_mapped_task_groups() if g.group_id in parent_group_ids)
+    return next(common_groups, None)
+
+
+def _is_further_mapped_inside(operator: Operator, container: SerializedTaskGroup) -> bool:
+    """Whether given operator is *further* mapped inside a task group."""
+    from airflow.serialization.definitions.mappedoperator import is_mapped
+
+    if is_mapped(operator):
+        return True
+    task_group = operator.task_group
+    while task_group is not None and task_group.group_id != container.group_id:
+        if is_mapped(task_group):
+            return True
+        task_group = task_group.parent_group
+    return False
+
+
+def _get_relevant_map_indexes(
+    *,
+    task: Operator,
+    run_id: str,
+    map_index: int,
+    relative: Operator,
+    ti_count: int | None,
+    session: Session,
+    producer_contexts: Mapping[str, ProducerContext] | None = None,
+) -> int | range | None:
+    """
+    Infer the map indexes of a relative that's "relevant" to this ti.
+
+    The bulk of the logic mainly exists to solve the problem described by
+    the following example, where 'val' must resolve to different values,
+    depending on where the reference is being used::
+
+        @task
+        def this_task(v):  # This is self.task.
+            return v * 2
+
+
+        @task_group
+        def tg1(inp):
+            val = upstream(inp)  # This is the upstream task.
+            this_task(val)  # When inp is 1, val here should resolve to 2.
+            return val
+
+
+        # This val is the same object returned by tg1.
+        val = tg1.expand(inp=[1, 2, 3])
+
+
+        @task_group
+        def tg2(inp):
+            another_task(inp, val)  # val here should resolve to [2, 4, 6].
+
+
+        tg2.expand(inp=["a", "b"])
+
+    The surrounding mapped task groups of ``upstream`` and ``task`` are
+    inspected to find a common "ancestor". If such an ancestor is found,
+    we need to return specific map indexes to pull a partial value from
+    upstream XCom.
+
+    The same logic apply for finding downstream tasks.
+
+    :param task: Current task being inspected.
+    :param run_id: Current run ID.
+    :param map_index: Map index of the current task instance.
+    :param relative: The relative task to find relevant map indexes for.
+    :param ti_count: The total count of task instance this task was expanded
+        by the scheduler, i.e. ``expanded_ti_count`` in the template context.
+    :return: Specific map index or map indexes to pull, or ``None`` if we
+        want to "whole" return value (i.e. no mapped task groups involved).
+    """
+    from airflow.serialization.definitions.mappedoperator import get_mapped_ti_count
+
+    # This value should never be None since we already know the current task
+    # is in a mapped task group, and should have been expanded, despite that,
+    # we need to check that it is not None to satisfy Mypy.
+    # But this value can be 0 when we expand an empty list, for that it is
+    # necessary to check that ti_count is not 0 to avoid dividing by 0.
+    if not ti_count:
+        return None
+
+    # Find the innermost common mapped task group between the current task
+    # If the current task and the referenced task does not have a common
+    # mapped task group, the two are in different task mapping contexts
+    # (like another_task above), and we should use the "whole" value.
+    if (common_ancestor := _find_common_ancestor_mapped_group(task, relative)) is None:
+        return None
+
+    # At this point we know the two tasks share a mapped task group, and we
+    # should use a "partial" value. Let's break down the mapped ti count
+    # between the ancestor and further expansion happened inside it.
+
+    ancestor_ti_count = get_mapped_ti_count(
+        common_ancestor, run_id, session=session, producer_contexts=producer_contexts
+    )
+    ancestor_map_index = map_index * ancestor_ti_count // ti_count
+
+    # If the task is NOT further expanded inside the common ancestor, we
+    # only want to reference one single ti. We must walk the actual DAG,
+    # and "ti_count == ancestor_ti_count" does not work, since the further
+    # expansion may be of length 1.
+    if not _is_further_mapped_inside(relative, common_ancestor):
+        return ancestor_map_index
+
+    # Otherwise we need a partial aggregation for values from selected task
+    # instances in the ancestor's expansion context.
+    further_count = ti_count // ancestor_ti_count
+    map_index_start = ancestor_map_index * further_count
+    return range(map_index_start, map_index_start + further_count)
+
+
+def find_relevant_relatives(
+    normal_tasks: Iterable[str],
+    mapped_tasks: Iterable[tuple[str, int]],
+    *,
+    direction: Literal["upstream", "downstream"],
+    dag: SerializedDAG,
+    run_id: str,
+    session: Session,
+) -> Collection[str | tuple[str, int]]:
+    from airflow.serialization.definitions.mappedoperator import get_mapped_ti_count
+
+    visited: set[str | tuple[str, int]] = set()
+
+    def _visit_relevant_relatives_for_normal(task_ids: Iterable[str]) -> None:
+        partial_dag = dag.partial_subset(
+            task_ids=task_ids,
+            include_downstream=direction == "downstream",
+            include_upstream=direction == "upstream",
+            exclude_original=True,
+        )
+        visited.update(partial_dag.task_dict)
+
+    def _visit_relevant_relatives_for_mapped(mapped_tasks: Iterable[tuple[str, int]]) -> None:
+        from airflow.exceptions import NotMapped
+
+        for task_id, map_index in mapped_tasks:
+            task = dag.get_task(task_id)
+            try:
+                ti_count = get_mapped_ti_count(task, run_id, session=session)
+            except NotMapped:
+                # Task is not actually mapped (not a MappedOperator and not inside a mapped task group).
+                # Treat it as a normal task instead.
+                _visit_relevant_relatives_for_normal([task_id])
+                continue
+            for relative in task.get_flat_relatives(upstream=direction == "upstream"):
+                if relative.task_id in visited:
+                    continue
+                relative_map_indexes = _get_relevant_map_indexes(
+                    task=task,
+                    relative=relative,
+                    run_id=run_id,
+                    map_index=map_index,
+                    ti_count=ti_count,
+                    session=session,
+                )
+                visiting_mapped: set[tuple[str, int]] = set()
+                visiting_normal: set[str] = set()
+                match relative_map_indexes:
+                    case int():
+                        if (item := (relative.task_id, relative_map_indexes)) not in visited:
+                            visiting_mapped.add(item)
+                    case range():
+                        visiting_mapped.update((relative.task_id, i) for i in relative_map_indexes)
+                    case None:
+                        if (task_id := relative.task_id) not in visited:
+                            visiting_normal.add(task_id)
+                _visit_relevant_relatives_for_normal(visiting_normal)
+                _visit_relevant_relatives_for_mapped(visiting_mapped)
+                visited.update(visiting_mapped, visiting_normal)
+
+    _visit_relevant_relatives_for_normal(normal_tasks)
+    _visit_relevant_relatives_for_mapped(mapped_tasks)
+    return visited
+
+
+class TaskInstanceNote(Base):
+    """For storage of arbitrary notes concerning the task instance."""
+
+    __tablename__ = "task_instance_note"
+    ti_id: Mapped[UUID] = mapped_column(
+        Uuid(),
+        primary_key=True,
+        nullable=False,
+    )
+    user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    content: Mapped[str | None] = mapped_column(String(1000).with_variant(Text(1000), "mysql"))
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=timezone.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        UtcDateTime, default=timezone.utcnow, onupdate=timezone.utcnow, nullable=False
+    )
+
+    task_instance = relationship("TaskInstance", back_populates="task_instance_note", uselist=False)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            (ti_id,),
+            [
+                "task_instance.id",
+            ],
+            name="task_instance_note_ti_fkey",
+            ondelete="CASCADE",
+            onupdate="CASCADE",
+        ),
+    )
+
+    def __init__(self, content, user_id=None):
+        self.content = content
+        self.user_id = user_id
+
+    def __repr__(self):
+        prefix = f"<{self.__class__.__name__}: {self.task_instance.dag_id}.{self.task_instance.task_id} {self.task_instance.run_id}"
+        prefix += "".join(
+            f" {name}={value}" for name, value in self.task_instance.get_display_coordinates().items()
+        )
+        return prefix + f" TI ID: {self.ti_id}>"
+
+
+_CURRENT_ATTEMPTS = with_loader_criteria(
+    TaskInstance, TaskInstance.working_set.is_(True), include_aliases=True, propagate_to_loaders=False
+)
+
+
+def _is_primary_key_lookup(statement) -> bool:
+    criteria: Sequence[Any] = getattr(statement, "_where_criteria", ())
+    if len(criteria) != 1:
+        return False
+    binds = [node for node in visitors.iterate(criteria[0]) if isinstance(node, BindParameter)]
+    return bool(binds) and all(bind.key.startswith("pk_") for bind in binds)
+
+
+@sqlalchemy_event.listens_for(Session, "do_orm_execute")
+def _restrict_to_current_attempts(state: ORMExecuteState) -> None:
+    """
+    Hide archived attempts from ORM queries over task instances unless ``include_all_attempts`` is set.
+
+    Primary key lookups (``Session.get``, ``merge`` and ``refresh``) are exempt: asking for an attempt by
+    its UUID returns it whether or not it has been archived.
+    """
+    if (
+        state.is_column_load
+        or state.is_relationship_load
+        or state.execution_options.get("include_all_attempts")
+    ):
+        return
+    if not (state.is_select or state.is_update or state.is_delete):
+        return
+    if state.is_select and _is_primary_key_lookup(state.statement):
+        return
+    state.statement = state.statement.options(_CURRENT_ATTEMPTS)
+
+
+STATICA_HACK = True
+globals()["kcah_acitats"[::-1].upper()] = False
+if STATICA_HACK:  # pragma: no cover
+    from airflow.jobs.job import Job
+
+    TaskInstance.queued_by_job = relationship(Job)

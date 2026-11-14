@@ -15,15 +15,18 @@
 # specific language governing permissions and limitations
 # under the License.
 ---
-version: "3.7"
 services:
   cassandra:
     image: cassandra:3.0
+    labels:
+      org.apache.airflow.breeze: "true"
+      org.apache.airflow.breeze.worktree: "${BREEZE_WORKTREE_PATH:-}"
+      org.apache.airflow.breeze.host: "${BREEZE_HOST_ID:-}"
+      breeze.description: "Integration required for Cassandra hooks."
     environment:
       HEAP_NEWSIZE: 128M
       MAX_HEAP_SIZE: 256M
     volumes:
-      - /dev/urandom:/dev/random   # Required to get non-blocking entropy source
       - cassandra-db-volume:/var/lib/cassandra
     healthcheck:
       # We use IPv6 variant of the check to workaround the problem with 3.0.26 version
@@ -31,6 +34,8 @@ services:
       test: "[ $$(nodetool --host '::FFFF:127.0.0.1' statusgossip) = running ]"
       interval: 5s
       timeout: 30s
+      start_period: 30s
+      start_interval: 1s
       retries: 50
     restart: "on-failure"
 
@@ -43,3 +48,7 @@ services:
 
 volumes:
   cassandra-db-volume:
+    labels:
+      org.apache.airflow.breeze: "true"
+      org.apache.airflow.breeze.worktree: "${BREEZE_WORKTREE_PATH:-}"
+      org.apache.airflow.breeze.host: "${BREEZE_HOST_ID:-}"

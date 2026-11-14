@@ -16,7 +16,13 @@
 # under the License.
 from __future__ import annotations
 
-from airflow_breeze.utils import recording  # isort:skip # noqa
+from airflow_breeze.commands.issues_commands_config import ISSUES_COMMANDS, ISSUES_PARAMETERS
+from airflow_breeze.commands.registry_commands_config import REGISTRY_COMMANDS, REGISTRY_PARAMETERS
+from airflow_breeze.commands.sbom_commands_config import SBOM_COMMANDS, SBOM_PARAMETERS
+from airflow_breeze.commands.ui_commands_config import UI_COMMANDS, UI_PARAMETERS
+from airflow_breeze.commands.workflow_commands_config import WORKFLOW_RUN_COMMANDS, WORKFLOW_RUN_PARAMETERS
+
+from airflow_breeze.utils import recording  # isort:skip  # noqa: F401
 
 try:
     # We handle ImportError so that click autocomplete works
@@ -45,8 +51,14 @@ else:
         PRODUCTION_IMAGE_TOOLS_PARAMETERS,
     )
     from airflow_breeze.commands.release_management_commands_config import (
-        RELEASE_MANAGEMENT_COMMANDS,
+        RELEASE_AIRFLOW_COMMANDS,
+        RELEASE_AIRFLOW_CTL_COMMANDS,
+        RELEASE_AIRFLOW_TASK_SDK_COMMANDS,
+        RELEASE_HELM_COMMANDS,
         RELEASE_MANAGEMENT_PARAMETERS,
+        RELEASE_MYPY_COMMANDS,
+        RELEASE_OTHER_COMMANDS,
+        RELEASE_PROVIDERS_COMMANDS,
     )
     from airflow_breeze.commands.setup_commands_config import SETUP_COMMANDS, SETUP_PARAMETERS
     from airflow_breeze.commands.testing_commands_config import TESTING_COMMANDS, TESTING_PARAMETERS
@@ -58,7 +70,8 @@ else:
     click.rich_click.STYLE_ERRORS_SUGGESTION = "bright_blue italic"
     click.rich_click.ERRORS_SUGGESTION = "\nTry running the '--help' flag for more information.\n"
     click.rich_click.ERRORS_EPILOGUE = (
-        "\nTo find out more, visit [info]https://github.com/apache/airflow/blob/main/BREEZE.rst[/]\n"
+        "\nTo find out more, visit [info]https://github.com/apache/airflow/"
+        "blob/main/dev/breeze/doc/01_installation.rst[/]\n"
     )
     click.rich_click.OPTION_GROUPS = {
         **DEVELOPER_PARAMETERS,
@@ -68,17 +81,50 @@ else:
         **CI_IMAGE_TOOLS_PARAMETERS,
         **PRODUCTION_IMAGE_TOOLS_PARAMETERS,
         **CI_PARAMETERS,
+        **REGISTRY_PARAMETERS,
         **RELEASE_MANAGEMENT_PARAMETERS,
+        **SBOM_PARAMETERS,
+        **WORKFLOW_RUN_PARAMETERS,
+        **UI_PARAMETERS,
+        **ISSUES_PARAMETERS,
     }
     click.rich_click.COMMAND_GROUPS = {
         "breeze": [
             DEVELOPER_COMMANDS,
             {
-                "name": "Advanced command groups",
-                "commands": ["testing", "ci-image", "k8s", "prod-image", "setup", "release-management", "ci"],
+                "name": "Testing commands",
+                "commands": ["testing", "k8s"],
+            },
+            {
+                "name": "Image commands",
+                "commands": ["ci-image", "prod-image"],
+            },
+            {
+                "name": "Release management commands",
+                "commands": ["release-management", "sbom", "workflow-run"],
+            },
+            {
+                "name": "CI commands",
+                "commands": ["ci"],
+            },
+            {
+                "name": "Registry commands",
+                "commands": ["registry"],
+            },
+            {
+                "name": "UI commands",
+                "commands": ["ui"],
+            },
+            {
+                "name": "Issues commands",
+                "commands": ["issues"],
+            },
+            {
+                "name": "Setup commands",
+                "commands": ["setup"],
             },
         ],
-        "breeze testing": [TESTING_COMMANDS],
+        "breeze testing": TESTING_COMMANDS,
         "breeze k8s": [
             KUBERNETES_CLUSTER_COMMANDS,
             KUBERNETES_INSPECTION_COMMANDS,
@@ -86,7 +132,20 @@ else:
         ],
         "breeze ci-image": [CI_IMAGE_TOOLS_COMMANDS],
         "breeze prod-image": [PRODUCTION_IMAGE_TOOLS_COMMANDS],
-        "setup": [SETUP_COMMANDS],
-        "release-management": [RELEASE_MANAGEMENT_COMMANDS],
+        "breeze setup": [SETUP_COMMANDS],
+        "breeze release-management": [
+            RELEASE_AIRFLOW_COMMANDS,
+            RELEASE_HELM_COMMANDS,
+            RELEASE_PROVIDERS_COMMANDS,
+            RELEASE_AIRFLOW_TASK_SDK_COMMANDS,
+            RELEASE_AIRFLOW_CTL_COMMANDS,
+            RELEASE_MYPY_COMMANDS,
+            RELEASE_OTHER_COMMANDS,
+        ],
+        "breeze sbom": [SBOM_COMMANDS],
         "breeze ci": [CI_COMMANDS],
+        "breeze workflow-run": [WORKFLOW_RUN_COMMANDS],
+        "breeze registry": [REGISTRY_COMMANDS],
+        "breeze ui": [UI_COMMANDS],
+        "breeze issues": [ISSUES_COMMANDS],
     }

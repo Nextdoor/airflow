@@ -1,0 +1,368 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+from collections.abc import Iterable
+from datetime import datetime
+from typing import Annotated, Any, cast
+from uuid import UUID
+
+from pydantic import (
+    AliasPath,
+    AwareDatetime,
+    BeforeValidator,
+    Discriminator,
+    Field,
+    NonNegativeInt,
+    StringConstraints,
+    Tag,
+    field_validator,
+    model_validator,
+)
+
+from airflow._shared.secrets_masker import redact
+from airflow.api_fastapi.common.region import OmitsMissingRegion, RegionId, RegionIndex
+from airflow.api_fastapi.core_api.base import BaseModel, StrictBaseModel
+from airflow.api_fastapi.core_api.datamodels.dag_versions import DagVersionResponse
+from airflow.api_fastapi.core_api.datamodels.job import JobResponse
+from airflow.api_fastapi.core_api.datamodels.trigger import TriggerResponse
+from airflow.utils.state import TaskInstanceState
+
+
+class NewTaskResponse(BaseModel):
+    """Lightweight response for new tasks that don't have TaskInstances yet."""
+
+    task_id: str
+    task_display_name: str
+
+
+class LoopIterationResponse(BaseModel):
+    """A task execution's position in an enclosing loop."""
+
+    loop_id: str
+    iteration: int = Field(ge=1, description="Position in the enclosing loop, counting from one.")
+
+
+class TaskInstanceResponse(OmitsMissingRegion, BaseModel):
+    """TaskInstance serializer for responses."""
+
+    id: UUID
+    task_id: str
+    dag_id: str
+    run_id: str = Field(alias="dag_run_id")
+    map_index: int
+    region_id: RegionId = None
+    region_index: RegionIndex = None
+    in_loop: bool
+    loop_iteration: LoopIterationResponse | None = None
+    logical_date: datetime | None
+    run_after: datetime
+    start_date: datetime | None
+    end_date: datetime | None
+    duration: float | None
+    state: TaskInstanceState | None
+    try_number: int
+    max_tries: int
+    task_display_name: str
+    dag_display_name: str = Field(validation_alias=AliasPath("dag_run", "dag_model", "dag_display_name"))
+    hostname: str | None
+    unixname: str | None
+    pool: str
+    pool_slots: int
+    queue: str | None
+    priority_weight: int | None
+    operator: str | None
+    operator_name: str | None
+    queued_dttm: datetime | None = Field(alias="queued_when")
+    scheduled_dttm: datetime | None = Field(alias="scheduled_when")
+    pid: int | None
+    executor: str | None
+    executor_config: Annotated[str, BeforeValidator(str)]
+    note: str | None
+    rendered_map_index: str | None
+    rendered_fields: dict = Field(
+        validation_alias=AliasPath("rendered_task_instance_fields", "rendered_fields"),
+        default_factory=dict,
+    )
+    trigger: TriggerResponse | None
+    queued_by_job: JobResponse | None = Field(alias="triggerer_job")
+    dag_version: DagVersionResponse | None
+    team_name: str | None = None
+    state_reason: str | None = Field(
+        default=None,
+        validation_alias="retry_reason",
+        description=(
+            "The reason the task instance reached its current state, as recorded by a retry policy. May describe a previous attempt: a task waiting to be retried still carries the reason its last attempt ended. It is cleared when the task is cleared and when the next attempt is scheduled or deferred."
+        ),
+    )
+
+    retry_at: datetime | None = Field(
+        default=None,
+        description="When a task instance waiting to be retried becomes due. Only set in the up_for_retry state.",
+    )
+
+    @field_validator("state_reason", mode="after")
+    @classmethod
+    def redact_state_reason(cls, v: str | None) -> str | None:
+        # The worker already redacts this. Kept for rows written by an older task-sdk.
+        if v is None:
+            return None
+        return cast("str", redact(v))
+
+
+class TaskInstanceCollectionResponse(BaseModel):
+    """
+    Task instance collection response supporting both offset and cursor pagination.
+
+    A single flat model is used instead of a discriminated union
+    (``Annotated[Offset | Cursor, Field(discriminator=...)]``) because
+    the OpenAPI ``oneOf`` + ``discriminator`` construct is not handled
+    correctly by ``@hey-api/openapi-ts`` / ``@7nohe/openapi-react-query-codegen``:
+    return types degrade to ``unknown`` in JSDoc and can produce
+    incorrect TypeScript types (see hey-api/openapi-ts#1613, #3270).
+    """
+
+    task_instances: Iterable[TaskInstanceResponse]
+    total_entries: int | None = Field(
+        default=None,
+        description="Number of matching items. For offset pagination this is the exact total. "
+        "For cursor pagination it is capped at ``total_entries_limit``; a value equal to that "
+        "limit means at least that many items match.",
+    )
+    total_entries_limit: int | None = Field(
+        default=None,
+        description="Cap applied to ``total_entries`` under cursor pagination. ``null`` for offset "
+        "pagination, where ``total_entries`` is exact.",
+    )
+    next_cursor: str | None = Field(
+        default=None,
+        description="Token pointing to the next page. Populated for cursor pagination, "
+        "``null`` when using offset pagination or when there is no next page.",
+    )
+    previous_cursor: str | None = Field(
+        default=None,
+        description="Token pointing to the previous page. Populated for cursor pagination, "
+        "``null`` when using offset pagination or when on the first page.",
+    )
+
+
+def _task_instance_discriminator(v: Any) -> str:
+    """Discriminate between TaskInstanceResponse and NewTaskResponse in the union."""
+    if isinstance(v, NewTaskResponse):
+        return "new"
+    if isinstance(v, dict):
+        return "new" if "id" not in v else "full"
+    # ORM objects and TaskInstanceResponse instances
+    return "full"
+
+
+class ClearTaskInstanceCollectionResponse(BaseModel):
+    """Response for clear dag run dry run, which may contain new tasks without full TaskInstance data."""
+
+    task_instances: Iterable[
+        Annotated[
+            Annotated[TaskInstanceResponse, Tag("full")] | Annotated[NewTaskResponse, Tag("new")],
+            Discriminator(_task_instance_discriminator),
+        ]
+    ]
+    total_entries: int
+
+
+class TaskDependencyResponse(BaseModel):
+    """Task Dependency serializer for responses."""
+
+    name: str
+    reason: str
+
+
+class TaskDependencyCollectionResponse(BaseModel):
+    """Task scheduling dependencies collection serializer for responses."""
+
+    dependencies: list[TaskDependencyResponse]
+
+
+class TaskInstancesBatchBody(StrictBaseModel):
+    """Task Instance body for get batch."""
+
+    dag_ids: list[str] | None = None
+    dag_run_ids: list[str] | None = None
+    task_ids: list[str] | None = None
+    state: list[TaskInstanceState | None] | None = None
+
+    run_after_gte: AwareDatetime | None = None
+    run_after_gt: AwareDatetime | None = None
+    run_after_lte: AwareDatetime | None = None
+    run_after_lt: AwareDatetime | None = None
+
+    logical_date_gte: AwareDatetime | None = None
+    logical_date_gt: AwareDatetime | None = None
+    logical_date_lte: AwareDatetime | None = None
+    logical_date_lt: AwareDatetime | None = None
+
+    start_date_gte: AwareDatetime | None = None
+    start_date_gt: AwareDatetime | None = None
+    start_date_lte: AwareDatetime | None = None
+    start_date_lt: AwareDatetime | None = None
+
+    end_date_gte: AwareDatetime | None = None
+    end_date_gt: AwareDatetime | None = None
+    end_date_lte: AwareDatetime | None = None
+    end_date_lt: AwareDatetime | None = None
+
+    duration_gte: float | None = None
+    duration_gt: float | None = None
+    duration_lte: float | None = None
+    duration_lt: float | None = None
+
+    pool: list[str] | None = None
+    queue: list[str] | None = None
+    executor: list[str] | None = None
+    page_offset: NonNegativeInt = 0
+    page_limit: NonNegativeInt = 100
+    order_by: str | None = None
+
+
+class ClearTaskInstancesBody(StrictBaseModel):
+    """Request body for Clear Task Instances endpoint."""
+
+    dry_run: bool = True
+    start_date: AwareDatetime | None = None
+    end_date: AwareDatetime | None = None
+    only_failed: bool = True
+    only_running: bool = False
+    reset_dag_runs: bool = True
+    task_ids: list[str | tuple[str, int]] | None = Field(
+        default=None,
+        description="A list of `task_id` or [`task_id`, `map_index`]. "
+        "If only the `task_id` is provided for a mapped task, all of its map indices will be targeted.",
+    )
+    task_group_id: str | None = Field(
+        default=None,
+        description="Clear every task in this task group. Mutually exclusive with `task_ids`. "
+        "The group's tasks are resolved on the server from the dag structure, so all of them are "
+        "targeted regardless of how many there are.",
+    )
+    task_instance_ids: list[UUID] | None = Field(
+        default=None,
+        min_length=1,
+        description="Exact current executions in one DAG run. Mutually exclusive with task_ids and task_group_id.",
+    )
+    whole_expansion_ids: list[UUID] = Field(
+        default_factory=list,
+        description="Selected execution IDs whose entire mapped expansion should be cleared.",
+    )
+    include_later_loop_iterations: bool = Field(
+        default=True,
+        description="Clear later iterations when the selection includes a loop gate.",
+    )
+    dag_run_id: str | None = None
+    include_upstream: bool = False
+    include_downstream: bool = False
+    include_dependent_dags: bool | None = Field(
+        default=None,
+        description="Also clear the tasks in other Dags that the cleared tasks recorded as external "
+        "clear targets (for example through ``ExternalTaskMarker``), with their downstream tasks. "
+        "If not specified, follows ``include_downstream``.",
+    )
+    include_future: bool = False
+    include_past: bool = False
+    run_on_latest_version: bool | None = Field(
+        default=None,
+        description="(Experimental) Run on the latest bundle version of the dag after "
+        "clearing the task instances. "
+        "If not specified, falls back to the DAG-level ``rerun_with_latest_version`` parameter, "
+        "then the ``[core] rerun_with_latest_version`` config option, "
+        "and finally ``False`` (the historical default for clear/rerun).",
+    )
+    prevent_running_task: bool = False
+    keep_task_state: bool = Field(
+        default=False,
+        description="Keep the task state store entries of the cleared task instances so the next "
+        "attempt resumes from them. By default they are discarded, so the task starts over.",
+    )
+    note: Annotated[str, StringConstraints(max_length=1000)] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_model(cls, data: Any) -> Any:
+        """Validate clear task instance form."""
+        if data.get("only_failed") and data.get("only_running"):
+            raise ValueError("only_failed and only_running both are set to True")
+        if data.get("start_date") and data.get("end_date"):
+            if data.get("start_date") > data.get("end_date"):
+                raise ValueError("end_date is sooner than start_date")
+        if data.get("start_date") and data.get("end_date") and data.get("dag_run_id"):
+            raise ValueError("Exactly one of dag_run_id or (start_date and end_date) must be provided")
+        if data.get("start_date") and data.get("dag_run_id"):
+            raise ValueError("Exactly one of dag_run_id or start_date must be provided")
+        if data.get("end_date") and data.get("dag_run_id"):
+            raise ValueError("Exactly one of dag_run_id or end_date must be provided")
+        if isinstance(data.get("task_ids"), list) and len(data.get("task_ids")) < 1:
+            raise ValueError("task_ids list should have at least 1 element.")
+        if data.get("task_ids") and data.get("task_group_id"):
+            raise ValueError("Only one of task_ids or task_group_id may be provided")
+        return data
+
+    @model_validator(mode="after")
+    def validate_execution_selection(self):
+        if self.task_instance_ids is not None:
+            if self.task_ids is not None or self.task_group_id is not None:
+                raise ValueError("task_instance_ids cannot be combined with task_ids or task_group_id")
+            if self.dag_run_id is None or self.include_past or self.include_future:
+                raise ValueError(
+                    "task_instance_ids requires one dag_run_id without include_past or include_future"
+                )
+        if not set(self.whole_expansion_ids) <= set(self.task_instance_ids or ()):
+            raise ValueError("whole_expansion_ids must be a subset of task_instance_ids")
+        return self
+
+
+class PatchTaskInstanceBody(StrictBaseModel):
+    """Request body for patching task instance state."""
+
+    new_state: TaskInstanceState | None = None
+    region_id: UUID | None = None
+    region_index: int | None = None
+    note: Annotated[str, StringConstraints(max_length=1000)] | None = None
+    include_upstream: bool = False
+    include_downstream: bool = False
+    include_future: bool = False
+    include_past: bool = False
+
+    @field_validator("new_state", mode="before")
+    @classmethod
+    def validate_new_state(cls, ns: str | None) -> str:
+        """Validate new_state."""
+        valid_states = [
+            vs.name.lower()
+            for vs in (TaskInstanceState.SUCCESS, TaskInstanceState.FAILED, TaskInstanceState.SKIPPED)
+        ]
+        if ns is None:
+            raise ValueError("'new_state' should not be empty")
+        ns = ns.lower()
+        if ns not in valid_states:
+            raise ValueError(f"'{ns}' is not one of {valid_states}")
+        return ns
+
+
+class BulkTaskInstanceBody(PatchTaskInstanceBody, StrictBaseModel):
+    """Request body for bulk update, and delete task instances."""
+
+    task_id: str
+    map_index: int | None = None
+    dag_id: str | None = None
+    dag_run_id: str | None = None

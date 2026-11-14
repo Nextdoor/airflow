@@ -1,0 +1,219 @@
+/*!
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import { Box, HStack, Text, VStack } from "@chakra-ui/react";
+import { useTranslation } from "react-i18next";
+
+import type {
+  GanttTaskInstance,
+  LightGridTaskInstanceSummary,
+  TaskInstanceHistoryResponse,
+  TaskInstanceResponse,
+} from "openapi/requests/types.gen";
+
+import { Tooltip, type TooltipProps } from "src/system-components";
+
+import Time from "src/components/Time";
+
+import { formatNumber, sortStateEntries, useDurationFormat } from "src/utils";
+
+/** Grid summary plus optional schedule/queue hints (e.g. Gantt segment tooltips). */
+type LightGridTaskInstanceSummaryWithWhen = {
+  readonly loop_iteration?: GanttTaskInstance["loop_iteration"];
+  readonly queued_when?: string | null;
+  readonly scheduled_when?: string | null;
+} & LightGridTaskInstanceSummary;
+
+type Props = {
+  readonly loopMaxIterations?: number | null;
+  readonly runId?: string | null;
+  readonly taskInstance?:
+    | LightGridTaskInstanceSummaryWithWhen
+    | TaskInstanceHistoryResponse
+    | TaskInstanceResponse;
+  readonly tooltip?: string | null;
+} & Omit<TooltipProps, "content">;
+
+const TaskInstanceTooltip = ({
+  children,
+  loopMaxIterations,
+  positioning,
+  runId,
+  taskInstance,
+  tooltip,
+  ...rest
+}: Props) => {
+  const { i18n, t: translate } = useTranslation();
+  const { formatElapsed, renderDuration } = useDurationFormat();
+
+  const hasTooltip = tooltip !== undefined && tooltip !== null;
+
+  const childEntries =
+    taskInstance !== undefined && "child_states" in taskInstance && taskInstance.child_states !== null
+      ? sortStateEntries(taskInstance.child_states)
+      : [];
+
+  return taskInstance === undefined && !hasTooltip ? (
+    children
+  ) : (
+    <Tooltip
+      {...rest}
+      content={
+        <VStack align="start" gap={1}>
+          {hasTooltip ? <Text fontWeight="bold">{tooltip}</Text> : undefined}
+          {taskInstance ? (
+            <>
+              <Text>
+                {translate("taskId")}: {taskInstance.task_id}
+              </Text>
+              <Text>
+                {translate("state")}:{" "}
+                {taskInstance.state
+                  ? translate(`common:states.${taskInstance.state}`)
+                  : translate("common:states.no_status")}
+              </Text>
+              {"dag_run_id" in taskInstance || (runId !== undefined && runId !== null && runId !== "") ? (
+                <Text>
+                  {translate("runId")}: {"dag_run_id" in taskInstance ? taskInstance.dag_run_id : runId}
+                </Text>
+              ) : undefined}
+              {"loop_iteration" in taskInstance &&
+              taskInstance.loop_iteration !== null &&
+              taskInstance.loop_iteration !== undefined ? (
+                <Text>
+                  {translate("taskInstance.iteration")}: {taskInstance.loop_iteration.iteration}
+                </Text>
+              ) : undefined}
+              {"loop_iterations_count" in taskInstance &&
+              taskInstance.loop_iterations_count !== null &&
+              taskInstance.loop_iterations_count !== undefined ? (
+                <Text>
+                  {translate("taskInstance.loopIterations")}: {taskInstance.loop_iterations_count}
+                  {loopMaxIterations === null || loopMaxIterations === undefined
+                    ? undefined
+                    : `/${loopMaxIterations}`}
+                </Text>
+              ) : undefined}
+              {"scheduled_when" in taskInstance &&
+              taskInstance.scheduled_when !== null &&
+              taskInstance.scheduled_when !== "" ? (
+                <Text>
+                  {translate("taskInstance.scheduledWhen")}: <Time datetime={taskInstance.scheduled_when} />
+                </Text>
+              ) : undefined}
+              {"queued_when" in taskInstance &&
+              taskInstance.queued_when !== null &&
+              taskInstance.queued_when !== "" ? (
+                <Text>
+                  {translate("taskInstance.queuedWhen")}: <Time datetime={taskInstance.queued_when} />
+                </Text>
+              ) : undefined}
+              {/* Outside the branches below, which key off the shape a caller passes: the chart
+                  reports min_start_date rather than start_date, so a try nested in that branch
+                  never reached it. Shown for a first try too, since clearing a loop pass
+                  regenerates the later ones as fresh executions that start at try 1 -- two
+                  neighbouring bars can both be a first try, and this is what tells them apart. */}
+              {"try_number" in taskInstance && typeof taskInstance.try_number === "number" && (
+                <Text>
+                  {translate("tryNumber")}: {taskInstance.try_number}
+                </Text>
+              )}
+              {"start_date" in taskInstance ? (
+                <>
+                  <Text>
+                    {translate("startDate")}: <Time datetime={taskInstance.start_date} />
+                  </Text>
+                  <Text>
+                    {translate("endDate")}: <Time datetime={taskInstance.end_date} />
+                  </Text>
+                  <Text>
+                    {translate("duration")}:{" "}
+                    {taskInstance.state === "running" || taskInstance.state === "deferred"
+                      ? formatElapsed(
+                          taskInstance.start_date,
+                          taskInstance.end_date ?? new Date().toISOString(),
+                        )
+                      : renderDuration(taskInstance.duration)}
+                  </Text>
+                </>
+              ) : undefined}
+              {"retry_at" in taskInstance &&
+              taskInstance.state === "up_for_retry" &&
+              Boolean(taskInstance.retry_at) ? (
+                <Text>
+                  {translate("taskInstance.retryAt")}: <Time datetime={taskInstance.retry_at} />
+                </Text>
+              ) : undefined}
+              {"min_start_date" in taskInstance && taskInstance.min_start_date !== null ? (
+                <>
+                  <Text>
+                    {translate("startDate")}: <Time datetime={taskInstance.min_start_date} />
+                  </Text>
+                  {taskInstance.max_end_date !== null && (
+                    <>
+                      <Text>
+                        {translate("endDate")}: <Time datetime={taskInstance.max_end_date} />
+                      </Text>
+                      <Text>
+                        {translate("duration")}:{" "}
+                        {formatElapsed(taskInstance.min_start_date, taskInstance.max_end_date)}
+                      </Text>
+                    </>
+                  )}
+                </>
+              ) : undefined}
+              {childEntries.length > 0 ? (
+                <VStack align="start" gap={1} ps={2}>
+                  {childEntries.map(([state, count]) => (
+                    <HStack gap={2} key={state}>
+                      <Box
+                        bg={`${state}.solid`}
+                        border="1px solid"
+                        borderColor="border.emphasized"
+                        borderRadius="2px"
+                        height="10px"
+                        width="10px"
+                      />
+                      <Text fontSize="xs">
+                        {formatNumber(count, i18n.language)} {translate(`common:states.${state}`)}
+                      </Text>
+                    </HStack>
+                  ))}
+                </VStack>
+              ) : undefined}
+            </>
+          ) : undefined}
+        </VStack>
+      }
+      key={taskInstance?.task_id}
+      portalled
+      positioning={{
+        offset: {
+          crossAxis: 5,
+          mainAxis: 5,
+        },
+        placement: "bottom-start",
+        ...positioning,
+      }}
+    >
+      {children}
+    </Tooltip>
+  );
+};
+
+export default TaskInstanceTooltip;

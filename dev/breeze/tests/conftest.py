@@ -16,15 +16,82 @@
 # under the License.
 from __future__ import annotations
 
+from pathlib import Path
 
-# content of conftest.py
+import pytest
+
+from airflow_breeze.utils.functools_cache import clear_all_cached_functions
+from airflow_breeze.utils.shared_options import _SharedOptions
+
+
 def pytest_configure(config):
     import sys
 
     sys._called_from_test = True
+
+    # Register custom marker for integration tests
+    config.addinivalue_line(
+        "markers",
+        "integration_tests: mark test as integration test requiring external resources (SVN, network)",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    """
+    Automatically skip integration tests unless explicitly requested via -m flag.
+
+    This allows running `pytest` without any flags to run only unit tests,
+    while `pytest -m integration` will run integration tests.
+    """
+    # Check if user explicitly requested integration tests via -m
+    markexpr = config.getoption("-m", default="")
+    if markexpr and "integration_tests" in markexpr:
+        # User explicitly requested integration tests, don't skip
+        return
+
+    skip_integration = pytest.mark.skip(
+        reason="Did not run. This is tntegration test. Please run with: pytest -m integration_tests"
+    )
+
+    for item in items:
+        if "integration" in item.keywords:
+            item.add_marker(skip_integration)
 
 
 def pytest_unconfigure(config):
     import sys  # This was missing from the manual
 
     del sys._called_from_test
+
+
+@pytest.fixture(autouse=True)
+def clear_clearable_cache():
+    clear_all_cached_functions()
+
+
+@pytest.fixture(autouse=True)
+def unset_github_repository(monkeypatch):
+    # `--github-repository` reads this variable, which is a fork's name when CI runs in a fork.
+    monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
+
+
+@pytest.fixture
+def make_worktree(tmp_path):
+    """Create a linked git worktree whose ``.git`` file points at an existing gitdir."""
+
+    def make(path: Path) -> Path:
+        gitdir = tmp_path / "main-checkout" / ".git" / "worktrees" / path.name
+        gitdir.mkdir(parents=True, exist_ok=True)
+        path.mkdir(parents=True, exist_ok=True)
+        (path / ".git").write_text(f"gitdir: {gitdir}\n")
+        return path
+
+    return make
+
+
+@pytest.fixture(autouse=True)
+def restore_shared_options(monkeypatch):
+    # Invoking a command with --dry-run or --verbose sets these for the whole process, so later tests
+    # on the same xdist worker would run with them, and run_command would return empty output.
+    for name in ("verbose_value", "dry_run_value", "forced_answer"):
+        monkeypatch.setattr(_SharedOptions, name, getattr(_SharedOptions, name))

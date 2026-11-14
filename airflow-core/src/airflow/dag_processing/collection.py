@@ -1,0 +1,1564 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+"""
+Utility code that writes DAGs in bulk into the database.
+
+This should generally only be called by internal methods such as
+``DagBag._sync_to_db``, ``DAG.bulk_write_to_db``.
+
+:meta private:
+"""
+
+from __future__ import annotations
+
+import traceback
+from pathlib import PurePosixPath
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
+
+import structlog
+from sqlalchemy import delete, false, func, insert, or_, select, tuple_, update
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import Session, joinedload, load_only
+
+from airflow._shared.timezones.timezone import utcnow
+from airflow.assets.manager import asset_manager
+from airflow.configuration import conf
+from airflow.exceptions import DeserializationError
+from airflow.models.asset import (
+    AssetActive,
+    AssetAliasModel,
+    AssetModel,
+    DagScheduleAssetAliasReference,
+    DagScheduleAssetNameReference,
+    DagScheduleAssetReference,
+    DagScheduleAssetUriReference,
+    TaskInletAssetReference,
+    TaskOutletAssetReference,
+)
+from airflow.models.dag import DagModel, DagOwnerAttributes, DagTag
+from airflow.models.dag_version import DagVersion
+from airflow.models.dagbundle import DagBundleModel
+from airflow.models.dagrun import DagRun
+from airflow.models.dagwarning import DagWarning, DagWarningType
+from airflow.models.errors import ParseImportError
+from airflow.models.serialized_dag import SerializedDagModel
+from airflow.models.trigger import Trigger
+from airflow.plugins_manager import get_scheduling_class_teams
+from airflow.serialization.definitions.assets import (
+    SerializedAsset,
+    SerializedAssetAlias,
+    SerializedAssetNameRef,
+    SerializedAssetUriRef,
+)
+from airflow.serialization.definitions.dag import SerializedDAG
+from airflow.serialization.enums import Encoding
+from airflow.serialization.serialized_objects import BaseSerialization, DagSerialization, LazyDeserializedDAG
+from airflow.triggers.base import BaseEventTrigger
+from airflow.utils.retries import MAX_DB_RETRIES, run_with_db_retries
+from airflow.utils.sqlalchemy import build_upsert_stmt, get_dialect_name, with_row_locks
+from airflow.utils.types import DagRunType
+
+if TYPE_CHECKING:
+    from collections.abc import Collection, Iterable, Iterator
+
+    from sqlalchemy.sql import Select
+
+    from airflow.models.serialized_dag import DagWriteMetadata
+    from airflow.sdk.importers import DagSourceCode  # noqa: SDK001
+    from airflow.typing_compat import Self
+
+    AssetT = TypeVar("AssetT", SerializedAsset, SerializedAssetAlias)
+
+log = structlog.get_logger(__name__)
+
+
+class DagBundleOwnershipError(ValueError):
+    """A publication would replace a Dag owned by another bundle."""
+
+
+class DagPublicationValidationError(ValueError):
+    """A publication contains invalid Dag metadata."""
+
+
+def _is_dag_permission_validation_error(error: Exception) -> bool:
+    if isinstance(error, ValueError):
+        return True
+    # FAB 3.10.1 and earlier raise FabException for both ACL validation and backend failures; later
+    # releases raise DagAccessControlValidationError (a ValueError), so drop this once they are the minimum.
+    # Only the validation method's own raises have the former meaning; no FAB import is needed.
+    exception_type = type(error)
+    module = "airflow.providers.fab.auth_manager.security_manager.override"
+    if exception_type.__module__ != module or exception_type.__name__ != "FabException":
+        return False
+    origin = error.__traceback__
+    while origin is not None and origin.tb_next is not None:
+        origin = origin.tb_next
+    return (
+        origin is not None
+        and origin.tb_frame.f_globals.get("__name__") == module
+        and origin.tb_frame.f_code.co_name == "_sync_dag_view_permissions"
+    )
+
+
+def is_source_discovery_failed(relative_fileloc: str | None, failed_sources: Collection[str]) -> bool:
+    """Check the source and its enclosing containers without matching sibling path prefixes."""
+    if relative_fileloc is None or not failed_sources:
+        return False
+    return relative_fileloc in failed_sources or any(
+        str(parent) in failed_sources for parent in PurePosixPath(relative_fileloc).parents
+    )
+
+
+def validate_dag_bundle_ownership(dags: Iterable[DagModel], bundle_name: str, *, session: Session) -> None:
+    """Check locked Dag rows, allowing recovery of orphaned, unversioned legacy rows."""
+    for dag in dags:
+        if dag.bundle_name == bundle_name:
+            continue
+        if dag.is_stale and dag.relative_fileloc is None:
+            previous_bundle = session.scalar(
+                select(DagBundleModel)
+                .where(DagBundleModel.name == dag.bundle_name)
+                .with_for_update(key_share=True)
+            )
+            has_version = session.scalar(
+                select(DagVersion.id).where(DagVersion.dag_id == dag.dag_id).limit(1)
+            )
+            if previous_bundle is not None and not previous_bundle.active and has_version is None:
+                # Adopting a row also adopts its run history, which must not cross a team boundary.
+                if not conf.getboolean("core", "multi_team") or previous_bundle.team_name == (
+                    DagBundleModel.get_team_name(bundle_name, session=session)
+                ):
+                    continue
+        raise DagBundleOwnershipError(f"Dag {dag.dag_id!r} belongs to bundle {dag.bundle_name!r}")
+
+
+def _create_orm_dags(
+    bundle_name: str,
+    bundle_version: str | None,
+    dags: Iterable[LazyDeserializedDAG],
+    *,
+    session: Session,
+) -> Iterator[DagModel]:
+    for dag in dags:
+        orm_dag = DagModel(
+            dag_id=dag.dag_id,
+            bundle_name=bundle_name,
+            bundle_version=bundle_version,
+        )
+        if dag.is_paused_upon_creation is not None:
+            orm_dag.is_paused = dag.is_paused_upon_creation
+        log.info("Creating ORM DAG for %s", dag.dag_id)
+        session.add(orm_dag)
+        yield orm_dag
+
+
+def _build_latest_run_load_options() -> Any:
+    return load_only(
+        DagRun.dag_id,
+        DagRun.logical_date,
+        DagRun.run_after,
+        DagRun.data_interval_start,
+        DagRun.data_interval_end,
+        DagRun.partition_key,
+        DagRun.partition_date,
+    )
+
+
+def _get_latest_runs_stmt(dag_id: str) -> Select:
+    """Build a select statement to retrieve the last automated run for each dag."""
+    max_logical_date = (
+        select(func.max(DagRun.logical_date).label("max_logical_date"))
+        .where(
+            DagRun.dag_id == dag_id,
+            DagRun.run_type.in_(
+                (
+                    DagRunType.BACKFILL_JOB,
+                    DagRunType.SCHEDULED,
+                )
+            ),
+        )
+        .scalar_subquery()
+    )
+    return (
+        select(DagRun)
+        .where(
+            DagRun.dag_id == dag_id,
+            DagRun.logical_date == max_logical_date,
+        )
+        .options(_build_latest_run_load_options())
+    )
+
+
+def _get_latest_runs_stmt_partitioned(dag_id: str) -> Select:
+    """Build a select statement to retrieve the last partitioned run for each Dag."""
+    latest_run_id = (
+        select(DagRun.id)
+        .where(
+            DagRun.dag_id == dag_id,
+            DagRun.run_type.in_(
+                (
+                    DagRunType.BACKFILL_JOB,
+                    DagRunType.SCHEDULED,
+                )
+            ),
+            DagRun.partition_key.is_not(None),
+        )
+        .order_by(
+            DagRun.partition_date.is_(None),
+            DagRun.partition_date.desc(),
+            DagRun.run_after.desc(),
+        )
+        .limit(1)
+        .scalar_subquery()
+    )
+    return select(DagRun).where(DagRun.id == latest_run_id).options(_build_latest_run_load_options())
+
+
+class _RunInfo(NamedTuple):
+    latest_run: DagRun | None
+    num_active_runs: int
+
+    @classmethod
+    def calculate(cls, dag: LazyDeserializedDAG, *, session: Session) -> Self:
+        """
+        Query the run counts from the db.
+
+        :param dags: dict of dags to query
+        """
+        # Skip these queries entirely if no Dags can be scheduled to save time.
+        if not dag.timetable.can_be_scheduled:
+            return cls(None, 0)
+
+        if dag.timetable.partitioned:
+            log.debug("Getting latest run for partitioned Dag", dag_id=dag.dag_id)
+            latest_run = session.scalar(_get_latest_runs_stmt_partitioned(dag_id=dag.dag_id))
+        else:
+            log.debug("Getting latest run for non-partitioned Dag", dag_id=dag.dag_id)
+            latest_run = session.scalar(_get_latest_runs_stmt(dag_id=dag.dag_id))
+        if latest_run:
+            log.debug(
+                "got latest run",
+                dag_id=dag.dag_id,
+                logical_date=str(latest_run.logical_date),
+                partition_key=latest_run.partition_key,
+            )
+        else:
+            log.debug("no latest run found", dag_id=dag.dag_id)
+        active_run_counts = DagRun.active_runs_of_dags(
+            dag_ids=[dag.dag_id],
+            exclude_backfill=True,
+            session=session,
+        )
+        return cls(latest_run, active_run_counts.get(dag.dag_id, 0))
+
+
+def _update_dag_tags(tag_names: set[str], dm: DagModel, *, session: Session) -> None:
+    orm_tags = {t.name: t for t in dm.tags}
+    tags_to_delete = []
+    for name, orm_tag in orm_tags.items():
+        if name not in tag_names:
+            session.delete(orm_tag)
+            tags_to_delete.append(orm_tag)
+
+    tags_to_add = tag_names.difference(orm_tags)
+    if tags_to_delete:
+        # Remove deleted tags from the collection to keep it in sync
+        for tag in tags_to_delete:
+            dm.tags.remove(tag)
+
+        # Check if there's a potential case-only rename on MySQL (e.g., 'tag' -> 'TAG').
+        # MySQL uses case-insensitive collation for the (name, dag_id) primary key by default,
+        # which can cause duplicate key errors when renaming tags with only case changes.
+        if get_dialect_name(session) == "mysql":
+            orm_tags_lower = {name.lower(): name for name in orm_tags}
+            has_case_only_change = any(tag.lower() in orm_tags_lower for tag in tags_to_add)
+
+            if has_case_only_change:
+                # Force DELETE operations to execute before INSERT operations.
+                session.flush()
+                # Refresh the tags relationship from the database to reflect the deletions.
+                session.expire(dm, ["tags"])
+
+    dm.tags.extend(DagTag(name=name, dag_id=dm.dag_id) for name in tags_to_add)
+
+
+def _update_dag_owner_links(dag_owner_links: dict[str, str], dm: DagModel, *, session: Session) -> None:
+    orm_dag_owner_attributes = {obj.owner: obj for obj in dm.dag_owner_links}
+    for owner, obj in orm_dag_owner_attributes.items():
+        try:
+            link = dag_owner_links[owner]
+        except KeyError:
+            session.delete(obj)
+        else:
+            if obj.link != link:
+                obj.link = link
+    dm.dag_owner_links.extend(
+        DagOwnerAttributes(dag_id=dm.dag_id, owner=owner, link=link)
+        for owner, link in dag_owner_links.items()
+        if owner not in orm_dag_owner_attributes
+    )
+
+
+def _serialize_dag_capturing_errors(
+    dag: LazyDeserializedDAG,
+    bundle_name,
+    *,
+    session: Session,
+    bundle_version: str | None,
+    version_data: dict | None = None,
+    _prefetched: DagWriteMetadata | None = None,
+    dag_source_code: DagSourceCode | None = None,
+    atomic: bool = False,
+):
+    """
+    Try to serialize the dag to the DB, but make a note of any errors.
+
+    We can't place them directly in import_errors, as this may be retried, and work the next time
+    """
+    from airflow.api_fastapi.app import get_auth_manager_cls
+    from airflow.models.dagcode import DagCode
+
+    # Updating serialized DAG can not be faster than a minimum interval to reduce database write rate.
+    MIN_SERIALIZED_DAG_UPDATE_INTERVAL = conf.getint(
+        "core", "min_serialized_dag_update_interval", fallback=30
+    )
+
+    try:
+        # We can't use bulk_write_to_db as we want to capture each error individually
+        dag_was_updated = SerializedDagModel.write_dag(
+            dag,
+            bundle_name=bundle_name,
+            bundle_version=bundle_version,
+            version_data=version_data,
+            min_update_interval=MIN_SERIALIZED_DAG_UPDATE_INTERVAL,
+            dag_source_code=dag_source_code,
+            session=session,
+            _prefetched=_prefetched,
+        )
+        if not dag_was_updated:
+            # Check and update DagCode
+            DagCode.update_source_code(
+                dag.dag_id, dag.fileloc, dag_source_code=dag_source_code, session=session
+            )
+
+        sync_dag_perms = getattr(get_auth_manager_cls(), "sync_dag_perms", None)
+        if sync_dag_perms:
+            if atomic:
+                # Auth managers such as FAB commit internally. Savepoints keep those commits inside
+                # the publication transaction.
+                session.flush()
+                connection = session.connection()
+                driver_connection = connection.connection.driver_connection
+                if (
+                    connection.dialect.name == "sqlite"
+                    and driver_connection is not None
+                    and not driver_connection.in_transaction
+                ):
+                    # SQLite's legacy transaction mode does not start a transaction for SELECTs.
+                    connection.exec_driver_sql("BEGIN")
+                with Session(bind=connection, join_transaction_mode="create_savepoint") as perms:
+                    try:
+                        sync_dag_perms(dag, session=perms)
+                    except Exception as error:
+                        if _is_dag_permission_validation_error(error):
+                            raise DagPublicationValidationError(str(error)) from error
+                        raise
+                    perms.commit()
+            else:
+                sync_dag_perms(dag, session=session)
+
+        return []
+    except OperationalError:
+        raise
+    except Exception:
+        if atomic:
+            raise
+        log.exception("Failed to write serialized DAG dag_id=%s fileloc=%s", dag.dag_id, dag.fileloc)
+        dagbag_import_error_traceback_depth = conf.getint("core", "dagbag_import_error_traceback_depth")
+        return [
+            (
+                (bundle_name, dag.relative_fileloc),
+                traceback.format_exc(limit=-dagbag_import_error_traceback_depth),
+            )
+        ]
+
+
+def _build_duplicate_dag_id_warnings(
+    dags: Collection[LazyDeserializedDAG],
+    bundle_name: str,
+    session: Session,
+) -> set[DagWarning]:
+    """
+    Detect dag_ids that are defined in multiple files and return DagWarning objects for each.
+
+    A warning is emitted whenever the incoming file differs from the file already recorded in
+    DagModel. This covers both accidental duplicates and file renames while leaving the final
+    interpretation to the user.
+    """
+    dag_by_id = {dag.dag_id: dag for dag in dags}
+    if not dag_by_id:
+        return set()
+
+    existing_rows = session.execute(
+        select(DagModel.dag_id, DagModel.bundle_name, DagModel.relative_fileloc).where(
+            DagModel.dag_id.in_(dag_by_id),
+            DagModel.is_stale == false(),
+        )
+    )
+
+    warnings: set[DagWarning] = set()
+    for existing in existing_rows:
+        dag = dag_by_id[existing.dag_id]
+        if bundle_name == existing.bundle_name and dag.relative_fileloc == existing.relative_fileloc:
+            continue
+
+        message = (
+            f"Also registered from '{existing.relative_fileloc}' (bundle: '{existing.bundle_name}'), "
+            "which is now overwritten by this file. See the FAQ on duplicate dag_id warnings for details."
+        )
+        log.warning(
+            "Duplicate dag_id detected",
+            dag_id=dag.dag_id,
+            incoming_fileloc=dag.relative_fileloc,
+            incoming_bundle=bundle_name,
+            existing_fileloc=existing.relative_fileloc,
+            existing_bundle=existing.bundle_name,
+        )
+        warnings.add(DagWarning(dag.dag_id, DagWarningType.DUPLICATE_DAG_ID, message))
+
+    return warnings
+
+
+def _update_dag_warnings(
+    dag_ids: list[str],
+    warnings: set[DagWarning],
+    warning_types: tuple[DagWarningType, ...],
+    session: Session,
+):
+    stored_warnings = set(
+        session.scalars(
+            select(DagWarning).where(
+                DagWarning.dag_id.in_(dag_ids),
+                or_(
+                    DagWarning.warning_type.in_(warning_types),
+                    # Importer-namespaced types are only ever reported while parsing.
+                    DagWarning.warning_type.not_in([t.value for t in DagWarningType]),
+                ),
+            )
+        )
+    )
+
+    for warning_to_delete in stored_warnings - warnings:
+        session.delete(warning_to_delete)
+
+    for warning_to_add in warnings:
+        session.merge(warning_to_add)
+
+
+def _update_import_errors(
+    files_parsed: set[tuple[str, str]],
+    import_errors: dict[tuple[str, str], str],
+    session: Session,
+    *,
+    resolve_bundle_paths: bool = True,
+    mark_dags_stale: bool = True,
+):
+    from airflow.listeners.listener import get_listener_manager
+
+    # Read before the delete below, so an error still present is updated rather than recreated.
+    # Scoped to the keys being written: the table is not indexed on (bundle_name, filename) so this
+    # still scans, but it no longer builds a row per import error the deployment is carrying.
+    existing_import_error_files: set[tuple[str | None, str | None]] = set()
+    if import_errors:
+        existing_import_error_files = {
+            (bundle, filename)
+            for bundle, filename in session.execute(
+                select(ParseImportError.bundle_name, ParseImportError.filename).where(
+                    tuple_(ParseImportError.bundle_name, ParseImportError.filename).in_(list(import_errors))
+                )
+            )
+        }
+
+    # Delete errors for files that were parsed but don't have errors in import_errors
+    # (i.e., files that were successfully parsed without errors)
+    files_to_clear = files_parsed.difference(import_errors)
+    if files_to_clear:
+        session.execute(
+            delete(ParseImportError).where(
+                tuple_(ParseImportError.bundle_name, ParseImportError.filename).in_(files_to_clear)
+            )
+        )
+
+    # Add or update the errors of the processed files
+    for key, stacktrace in import_errors.items():
+        bundle_name_, relative_fileloc = key
+
+        if key in existing_import_error_files:
+            session.execute(
+                update(ParseImportError)
+                .where(
+                    ParseImportError.filename == relative_fileloc,
+                    ParseImportError.bundle_name == bundle_name_,
+                )
+                .values(
+                    filename=relative_fileloc,
+                    source_reference=relative_fileloc,
+                    bundle_name=bundle_name_,
+                    timestamp=utcnow(),
+                    stacktrace=stacktrace,
+                ),
+            )
+            # sending notification when an existing dag import error occurs
+            try:
+                import_error = session.scalar(
+                    select(ParseImportError).where(
+                        ParseImportError.bundle_name == bundle_name_,
+                        ParseImportError.filename == relative_fileloc,
+                    )
+                )
+                if import_error is not None:
+                    get_listener_manager().hook.on_existing_dag_import_error(
+                        filename=import_error.full_file_path() if resolve_bundle_paths else relative_fileloc,
+                        stacktrace=stacktrace,
+                        bundle_name=bundle_name_,
+                        relative_fileloc=relative_fileloc,
+                    )
+            except Exception:
+                log.exception("error calling listener")
+        else:
+            import_error = ParseImportError(
+                filename=relative_fileloc,
+                source_reference=relative_fileloc,
+                bundle_name=bundle_name_,
+                timestamp=utcnow(),
+                stacktrace=stacktrace,
+            )
+            session.add(import_error)
+            # sending notification when a new dag import error occurs
+            try:
+                get_listener_manager().hook.on_new_dag_import_error(
+                    filename=import_error.full_file_path() if resolve_bundle_paths else relative_fileloc,
+                    stacktrace=stacktrace,
+                    bundle_name=bundle_name_,
+                    relative_fileloc=relative_fileloc,
+                )
+            except Exception:
+                log.exception("error calling listener")
+        if mark_dags_stale:
+            session.execute(
+                update(DagModel)
+                .where(
+                    DagModel.relative_fileloc == relative_fileloc,
+                    DagModel.bundle_name == bundle_name_,
+                )
+                .values(
+                    has_import_errors=True,
+                    is_stale=True,
+                )
+                .execution_options(synchronize_session="fetch")
+            )
+
+
+def _iter_serialized_class_names(data: Any) -> Iterator[str]:
+    """
+    Yield every string in a serialized Dag, which includes every class name it records.
+
+    Timetables, partition mappers and windows are encoded as ``{"__type": <qualname>, ...}``,
+    a custom deadline reference carries ``"__class_path"``, and a task's ``weight_rule`` is
+    stored as the strategy's qualname. Yielding every string rather than reading known keys
+    means it does not matter where the encoders put a name; ordinary strings simply match
+    nothing in the plugin map.
+
+    This is what ``DagSerialization.to_dict`` returns, before it is dumped to JSON, so it
+    holds tuples as well as lists (a partition mapper config is a list of pairs), and names
+    can sit in keys as well as values. None of it is cyclic.
+    """
+    stack = [data]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            yield item
+        elif isinstance(item, dict):
+            stack.extend(item.keys())
+            stack.extend(item.values())
+        elif isinstance(item, (list, tuple, set, frozenset)):
+            stack.extend(item)
+
+
+def _reject_other_teams_plugin_classes(
+    bundle_name: str,
+    dags: Collection[LazyDeserializedDAG],
+    import_errors: dict[tuple[str, str], str],
+    *,
+    session: Session,
+) -> list[LazyDeserializedDAG]:
+    """
+    Drop Dags that name a scheduling class belonging to another team's plugin.
+
+    Timetables, partition mappers, windows, deadline references and priority weight
+    strategies are named by the Dag itself, with no team-aware lookup in between, so this is
+    the only thing keeping a team-scoped plugin's scheduling classes to that team.
+
+    It runs here, on the data about to be stored, because that is exactly what the scheduler
+    will resolve, and because on the Dag processor path this runs in the manager, which never
+    executes Dag code. Configuration read in the process that imported the Dag file cannot be
+    trusted: the file could have changed it.
+
+    A partition mapper a timetable picks inside ``get_partition_mapper()`` is not covered,
+    because nothing decides it until the timetable runs.
+    """
+    if not conf.getboolean("core", "multi_team"):
+        return list(dags)
+
+    # A class registered by any global plugin is available to every Dag, so only classes
+    # that every registering plugin scoped to a team can be refused.
+    restricted: dict[str, frozenset[str]] = {
+        name: frozenset(team for team in teams if team is not None)
+        for name, teams in get_scheduling_class_teams().items()
+        if None not in teams
+    }
+    if not restricted:
+        return list(dags)
+
+    accepted: list[LazyDeserializedDAG] = []
+    dag_team_name: str | None = None
+    team_looked_up = False
+    for dag in dags:
+        used = {
+            name: restricted[name] for name in _iter_serialized_class_names(dag.data) if name in restricted
+        }
+        if used and not team_looked_up:
+            dag_team_name = DagBundleModel.get_team_name(bundle_name, session=session)
+            team_looked_up = True
+        refused = {name: teams for name, teams in used.items() if dag_team_name not in teams}
+        if not refused:
+            accepted.append(dag)
+            continue
+
+        name, owning_teams = min(refused.items())
+        owners = ", ".join(sorted(owning_teams))
+        belongs_to = f"team '{dag_team_name}'" if dag_team_name else "no team"
+        log.warning(
+            "Refusing Dag that uses another team's plugin class",
+            dag_id=dag.dag_id,
+            class_name=name,
+            owning_teams=sorted(owning_teams),
+            dag_team=dag_team_name,
+        )
+        import_errors[(bundle_name, dag.relative_fileloc)] = (
+            f"Dag '{dag.dag_id}' uses {name}, which is provided by a plugin belonging to {owners}. "
+            f"This Dag belongs to {belongs_to}, so it cannot use it. Move the Dag into a bundle "
+            f"owned by {owners}, or have the plugin provide the class globally instead of for a "
+            "single team."
+        )
+    return accepted
+
+
+def _reject_dags_with_unloadable_timetables(
+    bundle_name: str,
+    dags: Collection[LazyDeserializedDAG],
+    import_errors: dict[tuple[str, str], str],
+) -> list[LazyDeserializedDAG]:
+    """
+    Drop Dags whose timetable raises when rebuilt, recording an import error for each.
+
+    A custom timetable runs user code when it is deserialized, for example ``Variable.get`` in
+    ``__init__``. Checking here keeps one failing Dag from aborting the save of every Dag in its file.
+    """
+    accepted: list[LazyDeserializedDAG] = []
+    for dag in dags:
+        try:
+            dag.timetable
+        except Exception:
+            log.exception("Failed to load timetable of Dag", dag_id=dag.dag_id)
+            depth = conf.getint("core", "dagbag_import_error_traceback_depth")
+            import_errors[(bundle_name, dag.relative_fileloc)] = (
+                f"Failed to load the timetable of Dag '{dag.dag_id}':\n{traceback.format_exc(limit=-depth)}"
+            )
+            continue
+        accepted.append(dag)
+    return accepted
+
+
+def _reject_invalid_serialized_dags(
+    bundle_name: str,
+    dags: Collection[LazyDeserializedDAG],
+    import_errors: dict[tuple[str, str], str],
+) -> list[LazyDeserializedDAG]:
+    """Drop Dags that ``validate_serialized_dag`` refuses, recording an import error for each."""
+    accepted: list[LazyDeserializedDAG] = []
+    for dag in dags:
+        try:
+            DagSerialization.validate_serialized_dag(dag.data)
+        except (DeserializationError, ValueError, TypeError, KeyError) as error:
+            log.warning("Refusing Dag that cannot be stored", dag_id=dag.dag_id, error=str(error))
+            import_errors[(bundle_name, dag.relative_fileloc)] = str(error)
+            continue
+        accepted.append(dag)
+    return accepted
+
+
+def reject_unpublishable_dags(
+    bundle_name: str,
+    dags: Collection[LazyDeserializedDAG],
+    import_errors: dict[tuple[str, str], str],
+    *,
+    session: Session,
+) -> list[LazyDeserializedDAG]:
+    """
+    Drop the Dags a Dag processor publication cannot store, recording an import error for each.
+
+    DB mode's plugin and timetable checks run first, so a refused plugin class is never deserialized
+    and a timetable that raises on load keeps its traceback. ``validate_serialized_dag`` runs last: a
+    Dag processor can publish documents the SDK did not build.
+    """
+    accepted = _reject_other_teams_plugin_classes(bundle_name, dags, import_errors, session=session)
+    accepted = _reject_dags_with_unloadable_timetables(bundle_name, accepted, import_errors)
+    return _reject_invalid_serialized_dags(bundle_name, accepted, import_errors)
+
+
+def update_dag_parsing_results_in_db(
+    bundle_name: str,
+    bundle_version: str | None,
+    dags: Collection[LazyDeserializedDAG],
+    import_errors: dict[tuple[str, str], str],
+    parse_duration: float | None,
+    warnings: set[DagWarning],
+    *,
+    session: Session,
+    atomic: bool = False,
+    enforce_bundle_ownership: bool = False,
+    resolve_bundle_paths: bool = True,
+    version_data: dict | None = None,
+    warning_types: tuple[DagWarningType, ...] = (
+        DagWarningType.DUPLICATE_DAG_ID,
+        DagWarningType.NONEXISTENT_POOL,
+        DagWarningType.RUNTIME_VARYING_VALUE,
+        DagWarningType.TASK_GROUP_CYCLE,
+    ),
+    files_parsed: set[tuple[str, str]] | None = None,
+    dag_source_codes: dict[str, DagSourceCode] | None = None,
+    dags_checked: bool = False,
+    mark_errored_dags_stale: bool = True,
+):
+    """
+    Update everything to do with DAG parsing in the DB.
+
+    This function will create or update rows in the following tables:
+
+    - DagModel (`dag` table), DagTag, DagCode and DagVersion
+    - SerializedDagModel (`serialized_dag` table)
+    - ParseImportError (including with any errors as a result of serialization, not just parsing)
+    - DagWarning
+    - DAG Permissions
+
+    This function will not remove any rows for dags not passed in. It will remove parse errors and warnings
+    from dags/dag files that are passed in. In order words, if a DAG is passed in with a fileloc of `a.py`
+    then all warnings and errors related to this file will be removed.
+
+    ``import_errors`` will be updated in place with an new errors
+
+    :param files_parsed: Set of (bundle_name, relative_fileloc) tuples for all files that were parsed.
+        If None, will be inferred from dags and import_errors. Passing this explicitly ensures that
+        import errors are cleared for files that were parsed but no longer contain DAGs.
+    :param dag_source_codes: Source code read by the Dag importers, keyed by dag_id. Dags
+        without an entry have their source read from ``fileloc``.
+    :param atomic: Let the caller roll back and retry the whole transaction, including authorization
+        and a publication receipt. Persistence and diagnostic failures propagate in this mode.
+    :param enforce_bundle_ownership: Check ownership on the locked rows used for persistence.
+    :param resolve_bundle_paths: Construct bundles to give import error listeners absolute paths. The
+        API server passes False: it does not host the processor's bundles, so listeners receive
+        bundle-relative paths instead.
+    :param dags_checked: The caller already dropped the Dags ``reject_unpublishable_dags`` refuses, and
+        their warnings. The API server passes True: it drops them before taking its locks and marking
+        missing Dags stale.
+    :param mark_errored_dags_stale: Mark the Dags at each import error's location stale and as having
+        import errors. The API server passes False when a processor has no result for a file: the error
+        is still recorded, but the file's Dags keep running until they outlast stale_dag_threshold, as
+        after a DB-mode timeout.
+    """
+    if not dags_checked:
+        accepted = _reject_other_teams_plugin_classes(bundle_name, dags, import_errors, session=session)
+        accepted = _reject_dags_with_unloadable_timetables(bundle_name, accepted, import_errors)
+        if len(accepted) != len(dags):
+            # A rejected Dag may have no ``dag`` row yet, and dag_warning has a foreign key to it.
+            rejected_ids = {dag.dag_id for dag in dags} - {dag.dag_id for dag in accepted}
+            warnings = {warning for warning in warnings if warning.dag_id not in rejected_ids}
+        dags = accepted
+
+    dag_source_codes = dag_source_codes or {}
+    # Retry 'DAG.bulk_write_to_db' & 'SerializedDagModel.bulk_sync_to_db' in case
+    # of any Operational Errors
+    # In case of failures, provide_session handles rollback
+    try:
+        duplicate_warnings = _build_duplicate_dag_id_warnings(dags, bundle_name, session)
+    except Exception:
+        if atomic:
+            raise
+        log.exception("Error building duplicate dag_id warnings.")
+    else:
+        warnings = set(warnings) | duplicate_warnings
+
+    for attempt in run_with_db_retries(max_retries=1 if atomic else MAX_DB_RETRIES, logger=log):
+        with attempt:
+            serialize_errors = []
+            log.debug(
+                "Running dagbag.bulk_write_to_db with retries. Try %d of %d",
+                attempt.retry_state.attempt_number,
+                MAX_DB_RETRIES,
+            )
+            log.debug("Calling the DAG.bulk_sync_to_db method")
+            try:
+                SerializedDAG.bulk_write_to_db(
+                    bundle_name,
+                    bundle_version,
+                    dags,
+                    parse_duration,
+                    enforce_bundle_ownership=enforce_bundle_ownership,
+                    session=session,
+                )
+                # Bulk prefetch metadata for all DAGs to avoid the standard per-DAG
+                # metadata lookups in write_dag. This replaces the update-interval,
+                # hash, and version queries with 2 bulk queries total; DAGs with
+                # deadlines may still do an additional lookup for deadline UUID reuse.
+                prefetched_metadata = SerializedDagModel._prefetch_dag_write_metadata(
+                    [dag.dag_id for dag in dags], session=session
+                )
+                # Write Serialized DAGs to DB, capturing errors
+                for dag in dags:
+                    serialize_errors.extend(
+                        _serialize_dag_capturing_errors(
+                            dag=dag,
+                            bundle_name=bundle_name,
+                            bundle_version=bundle_version,
+                            version_data=version_data,
+                            session=session,
+                            _prefetched=prefetched_metadata.get(dag.dag_id),
+                            dag_source_code=dag_source_codes.get(dag.dag_id),
+                            atomic=atomic,
+                        )
+                    )
+            except OperationalError:
+                if not atomic:
+                    session.rollback()
+                raise
+            # Only now we are "complete" do we update import_errors - don't want to record errors from
+            # previous failed attempts
+            import_errors.update(serialize_errors)
+    # Record import errors into the ORM - we don't retry on this one as it's not as critical that it works
+    try:
+        _update_import_errors(
+            files_parsed=files_parsed if files_parsed is not None else set(),
+            import_errors=import_errors,
+            session=session,
+            resolve_bundle_paths=resolve_bundle_paths,
+            mark_dags_stale=mark_errored_dags_stale,
+        )
+    except Exception:
+        if atomic:
+            raise
+        log.exception("Error logging import errors!")
+
+    # Record DAG warnings in the metadatabase.
+    try:
+        _update_dag_warnings([dag.dag_id for dag in dags], warnings, warning_types, session)
+    except Exception:
+        if atomic:
+            raise
+        log.exception("Error logging DAG warnings.")
+
+    session.flush()
+
+
+class DagModelOperation(NamedTuple):
+    """Collect DAG objects and perform database operations for them."""
+
+    dags: dict[str, LazyDeserializedDAG]
+    bundle_name: str
+    bundle_version: str | None
+    enforce_bundle_ownership: bool = False
+
+    def find_orm_dags(self, *, session: Session) -> dict[str, DagModel]:
+        """Find existing DagModel objects from DAG objects."""
+        stmt = (
+            select(DagModel)
+            .options(joinedload(DagModel.tags, innerjoin=False))
+            .where(DagModel.dag_id.in_(self.dags))
+            .order_by(DagModel.dag_id)
+            .options(joinedload(DagModel.schedule_asset_references))
+            .options(joinedload(DagModel.schedule_asset_alias_references))
+            .options(joinedload(DagModel.task_outlet_asset_references))
+            .options(joinedload(DagModel.dag_owner_links))
+        )
+        if self.enforce_bundle_ownership:
+            stmt = stmt.with_for_update(of=DagModel, key_share=True).execution_options(populate_existing=True)
+        else:
+            stmt = with_row_locks(stmt, of=DagModel, session=session)
+        return {dm.dag_id: dm for dm in session.scalars(stmt).unique()}
+
+    def add_dags(self, *, session: Session) -> dict[str, DagModel]:
+        orm_dags = self.find_orm_dags(session=session)
+        if self.enforce_bundle_ownership:
+            for dag_id in sorted(self.dags.keys() - orm_dags.keys()):
+                model = DagModel(
+                    dag_id=dag_id, bundle_name=self.bundle_name, bundle_version=self.bundle_version
+                )
+                values = {
+                    key: getattr(model, key)
+                    for key in (
+                        "dag_id",
+                        "bundle_name",
+                        "bundle_version",
+                        "max_active_tasks",
+                        "max_active_runs",
+                        "max_consecutive_failed_dag_runs",
+                        "has_task_concurrency_limits",
+                    )
+                }
+                if self.dags[dag_id].is_paused_upon_creation is not None:
+                    values["is_paused"] = self.dags[dag_id].is_paused_upon_creation
+                # A competing insert must retain its ownership until we inspect the locked row.
+                session.execute(
+                    build_upsert_stmt(
+                        get_dialect_name(session), DagModel, ["dag_id"], values, {"dag_id": DagModel.dag_id}
+                    )
+                )
+            orm_dags = self.find_orm_dags(session=session)
+            validate_dag_bundle_ownership(orm_dags.values(), self.bundle_name, session=session)
+            return orm_dags
+        orm_dags.update(
+            (model.dag_id, model)
+            for model in _create_orm_dags(
+                bundle_name=self.bundle_name,
+                bundle_version=self.bundle_version,
+                dags=(dag for dag_id, dag in self.dags.items() if dag_id not in orm_dags),
+                session=session,
+            )
+        )
+        return orm_dags
+
+    def update_dags(
+        self,
+        orm_dags: dict[str, DagModel],
+        parse_duration: float | None,
+        *,
+        session: Session,
+    ) -> None:
+        # we exclude backfill from active run counts since their concurrency is separate
+        for dag_id, dm in sorted(orm_dags.items()):
+            run_info = _RunInfo.calculate(dag=self.dags[dag_id], session=session)
+            dag = self.dags[dag_id]
+            dm.fileloc = dag.fileloc
+            dm.relative_fileloc = dag.relative_fileloc
+            dm.owners = dag.owner or conf.get("operators", "default_owner")
+            dm.is_stale = False
+            dm.has_import_errors = False
+            dm.last_parsed_time = utcnow()
+            dm.last_parse_duration = parse_duration
+            if hasattr(dag, "_dag_display_property_value"):
+                dm._dag_display_property_value = dag._dag_display_property_value
+            elif dag.dag_display_name != dag.dag_id:
+                dm._dag_display_property_value = dag.dag_display_name
+            dm.description = dag.description
+
+            # These "is not None" checks are because a LazySerializedDag object does not
+            # provide the default value if the user doesn't provide an explicit value.
+
+            # if dag.max_active_tasks come as None then default max_active_tasks should be updated
+            # similar for max_consecutive_failed_dag_runs, max_active_runs
+
+            if dag.max_active_tasks is None:
+                dm.max_active_tasks = conf.getint("core", "max_active_tasks_per_dag")
+            else:
+                dm.max_active_tasks = dag.max_active_tasks
+
+            if dag.max_active_runs is None:
+                dm.max_active_runs = conf.getint("core", "max_active_runs_per_dag")
+            else:
+                dm.max_active_runs = dag.max_active_runs
+
+            if dag.max_consecutive_failed_dag_runs is None:
+                dm.max_consecutive_failed_dag_runs = conf.getint(
+                    "core", "max_consecutive_failed_dag_runs_per_dag"
+                )
+            else:
+                dm.max_consecutive_failed_dag_runs = dag.max_consecutive_failed_dag_runs
+
+            if (deadline_uuids := dag.data.get("dag", {}).get("deadline")) is not None:
+                dm.deadline = deadline_uuids
+
+            if hasattr(dag, "has_task_concurrency_limits"):
+                dm.has_task_concurrency_limits = dag.has_task_concurrency_limits
+            else:
+                dm.has_task_concurrency_limits = any(
+                    t.max_active_tis_per_dag is not None or t.max_active_tis_per_dagrun is not None
+                    for t in dag.tasks
+                )
+            dm.timetable_type = dag.timetable.type_name
+            dm.timetable_summary = dag.timetable.summary
+            dm.timetable_description = dag.timetable.description
+            dm.timetable_partitioned = dag.timetable.partitioned
+            dm.timetable_periodic = dag.timetable.periodic
+            dm.timetable_asset_gated = dag.timetable.asset_gated
+            dm.partition_mapper_info = dag.timetable.partition_mapper_info
+            dm.fail_fast = dag.fail_fast if dag.fail_fast is not None else False
+
+            allowed_types = dag.allowed_run_types
+            if allowed_types:
+                dm.allowed_run_types = sorted(allowed_types)
+            else:
+                dm.allowed_run_types = None
+
+            dm.bundle_name = self.bundle_name
+            dm.bundle_version = self.bundle_version
+
+            reference_run: DagRun | None = run_info.latest_run
+            dm.exceeds_max_non_backfill = run_info.num_active_runs >= dm.max_active_runs
+            dm.calculate_dagrun_date_fields(dag, reference_run=reference_run)
+            if not dag.timetable.asset_condition:
+                dm.schedule_asset_references = []
+                dm.schedule_asset_alias_references = []
+            # FIXME: STORE NEW REFERENCES.
+
+            if dag.tags:
+                _update_dag_tags(set(dag.tags), dm, session=session)
+            else:  # Optimization: no references at all, just clear everything.
+                dm.tags = []
+            if dag.owner_links:
+                _update_dag_owner_links(dag.owner_links, dm, session=session)
+            else:  # Optimization: no references at all, just clear everything.
+                dm.dag_owner_links = []
+
+    def update_dag_asset_expression(
+        self,
+        *,
+        orm_dags: dict[str, DagModel],
+        orm_assets: dict[tuple[str, str], AssetModel],
+    ) -> None:
+        def expand_asset_obj_expr(asset_expr: dict) -> dict[str, dict[str, str]]:
+            asset_name = asset_expr["name"]
+            asset_uri = asset_expr["uri"]
+
+            asset_expr["id"] = orm_assets[(asset_name, asset_uri)].id
+            return asset_expr
+
+        def expand_composite_asset_expr(asset_exprs: list) -> list:
+            for expr_index, expr in enumerate(asset_exprs):
+                key = expr.keys()
+                expaned_expr: dict
+                if key == {"all"}:
+                    # e.g., {"all": [{"asset": {"name": ..., "uri": ...}}]}
+                    expaned_expr = {"all": expand_composite_asset_expr(expr["all"])}
+                elif key == {"any"}:
+                    # e.g., {"any": [{"asset": {"name": ..., "uri": ...}}]}
+                    expaned_expr = {"any": expand_composite_asset_expr(expr["any"])}
+                elif key == {"asset"}:
+                    # e.g., {"asset": {"name": ..., "uri": ...}}
+                    expaned_expr = {"asset": expand_asset_obj_expr(expr["asset"])}
+                else:
+                    # we don't need to handle asset aliases, asset refs
+                    continue
+
+                asset_exprs[expr_index] = expaned_expr
+
+            return asset_exprs
+
+        def expand_asset_expr(asset_expr: dict[str, list | dict]) -> dict[str, list | dict]:
+            for key, value in asset_expr.items():
+                # these isisntance checks are only used to make Mypy happy
+                if key == "asset" and isinstance(value, dict):
+                    # e.g., {"asset": {"name": ..., "uri": ...}}
+                    asset_expr[key] = expand_asset_obj_expr(value)
+                elif key in {"all", "any"} and isinstance(value, list):
+                    # e.g., {"all": [{"asset": {"name": ..., "uri": ...}}]}
+                    asset_expr[key] = expand_composite_asset_expr(value)
+
+                # we don't need to handle asset aliases and asset refs
+            return asset_expr
+
+        for dag_id, dm in sorted(orm_dags.items()):
+            asset_expression = self.dags[dag_id].timetable.asset_condition.as_expression()
+            if asset_expression is not None:
+                asset_expression = expand_asset_expr(asset_expression)
+            dm.asset_expression = asset_expression
+
+
+def _get_task_ports(data: dict, inlets: bool, outlets: bool) -> Iterable[str]:
+    if inlets:
+        yield from data.get("inlets") or ()
+    if outlets:
+        yield from data.get("outlets") or ()
+
+
+def _get_dag_assets(
+    dag: LazyDeserializedDAG,
+    of: type[AssetT],
+    *,
+    inlets: bool = True,
+    outlets: bool = True,
+) -> Iterable[tuple[str, AssetT]]:
+    for raw_task in dag.data["dag"]["tasks"]:
+        task = raw_task[Encoding.VAR]
+        ports = _get_task_ports(task["partial_kwargs"] if task.get("_is_mapped") else task, inlets, outlets)
+        for port in ports:
+            if isinstance(obj := BaseSerialization.deserialize(port), of):
+                yield task["task_id"], obj
+
+
+def _find_all_assets(dags: Iterable[LazyDeserializedDAG]) -> Iterator[SerializedAsset]:
+    for dag in dags:
+        for _, asset in dag.timetable.asset_condition.iter_assets():
+            yield asset
+        for _, asset in _get_dag_assets(dag, of=SerializedAsset):
+            yield asset
+
+
+def _find_all_asset_aliases(dags: Iterable[LazyDeserializedDAG]) -> Iterator[SerializedAssetAlias]:
+    for dag in dags:
+        for _, alias in dag.timetable.asset_condition.iter_asset_aliases():
+            yield alias
+        for _, alias in _get_dag_assets(dag, of=SerializedAssetAlias):
+            yield alias
+
+
+def _find_active_assets(name_uri_assets: Iterable[tuple[str, str]], session: Session) -> set[tuple[str, str]]:
+    return {
+        (str(row[0]), str(row[1]))
+        for row in session.execute(
+            select(AssetModel.name, AssetModel.uri).where(
+                tuple_(AssetModel.name, AssetModel.uri).in_(name_uri_assets),
+                AssetModel.active.has(),
+                AssetModel.scheduled_dags.any(
+                    DagScheduleAssetReference.dag.has(~DagModel.is_stale & ~DagModel.is_paused)
+                ),
+            )
+        )
+    }
+
+
+class AssetModelOperation(NamedTuple):
+    """Collect asset/alias objects from DAGs and perform database operations for them."""
+
+    schedule_asset_references: dict[str, list[SerializedAsset]]
+    schedule_asset_alias_references: dict[str, list[SerializedAssetAlias]]
+    schedule_asset_name_references: set[tuple[str, str]]  # dag_id, ref_name.
+    schedule_asset_uri_references: set[tuple[str, str]]  # dag_id, ref_uri.
+    inlet_references: dict[str, list[tuple[str, SerializedAsset]]]
+    outlet_references: dict[str, list[tuple[str, SerializedAsset]]]
+    assets: dict[tuple[str, str], SerializedAsset]
+    asset_aliases: dict[str, SerializedAssetAlias]
+
+    @classmethod
+    def collect(cls, dags: dict[str, LazyDeserializedDAG]) -> Self:
+        coll = cls(
+            schedule_asset_references={
+                dag_id: [asset for _, asset in dag.timetable.asset_condition.iter_assets()]
+                for dag_id, dag in dags.items()
+            },
+            schedule_asset_alias_references={
+                dag_id: [alias for _, alias in dag.timetable.asset_condition.iter_asset_aliases()]
+                for dag_id, dag in dags.items()
+            },
+            schedule_asset_name_references={
+                (dag_id, ref.name)
+                for dag_id, dag in dags.items()
+                for ref in dag.timetable.asset_condition.iter_asset_refs()
+                if isinstance(ref, SerializedAssetNameRef)
+            },
+            schedule_asset_uri_references={
+                (dag_id, ref.uri)
+                for dag_id, dag in dags.items()
+                for ref in dag.timetable.asset_condition.iter_asset_refs()
+                if isinstance(ref, SerializedAssetUriRef)
+            },
+            inlet_references={
+                dag_id: list(_get_dag_assets(dag, SerializedAsset, inlets=True, outlets=False))
+                for dag_id, dag in dags.items()
+            },
+            outlet_references={
+                dag_id: list(_get_dag_assets(dag, SerializedAsset, inlets=False, outlets=True))
+                for dag_id, dag in dags.items()
+            },
+            assets={(asset.name, asset.uri): asset for asset in _find_all_assets(dags.values())},
+            asset_aliases={alias.name: alias for alias in _find_all_asset_aliases(dags.values())},
+        )
+        return coll
+
+    def sync_assets(self, *, session: Session) -> dict[tuple[str, str], AssetModel]:
+        # Optimization: skip all database calls if no assets were collected.
+        if not self.assets:
+            return {}
+        orm_assets: dict[tuple[str, str], AssetModel] = {
+            (am.name, am.uri): am
+            for am in session.scalars(
+                select(AssetModel).where(tuple_(AssetModel.name, AssetModel.uri).in_(self.assets))
+            )
+        }
+        for key, model in orm_assets.items():
+            asset = self.assets[key]
+            model.group = asset.group
+            model.extra = asset.extra
+        orm_assets.update(
+            ((model.name, model.uri), model)
+            for model in asset_manager.create_assets(
+                [asset for name_uri, asset in self.assets.items() if name_uri not in orm_assets],
+                session=session,
+            )
+        )
+        return orm_assets
+
+    def sync_asset_aliases(self, *, session: Session) -> dict[str, AssetAliasModel]:
+        # Optimization: skip all database calls if no asset aliases were collected.
+        if not self.asset_aliases:
+            return {}
+        orm_aliases: dict[str, AssetAliasModel] = {
+            da.name: da
+            for da in session.scalars(
+                select(AssetAliasModel).where(AssetAliasModel.name.in_(self.asset_aliases))
+            )
+        }
+        for name, model in orm_aliases.items():
+            model.group = self.asset_aliases[name].group
+        orm_aliases.update(
+            (model.name, model)
+            for model in asset_manager.create_asset_aliases(
+                [alias for name, alias in self.asset_aliases.items() if name not in orm_aliases],
+                session=session,
+            )
+        )
+        return orm_aliases
+
+    def activate_assets_if_possible(self, models: Iterable[AssetModel], *, session: Session) -> None:
+        """
+        Try to activate assets eagerly.
+
+        This inserts a record to AssetActive for an asset so it is activated
+        on creation if its ``name`` and ``uri`` values do not conflict with
+        anything else. This is a best-effort operation; we simply give up if
+        there's a conflict. The scheduler makes a more comprehensive pass
+        through all assets in ``_update_asset_orphanage``.
+        """
+        if (dialect_name := get_dialect_name(session)) == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+
+            stmt: Any = postgresql_insert(AssetActive).on_conflict_do_nothing()
+        elif session.bind is not None and dialect_name == "mysql":
+            from sqlalchemy.dialects.mysql import insert as mysql_insert
+
+            # MySQL does not support "do nothing"; this updates the row in
+            # conflict with its own value to achieve the same idea.
+            stmt = mysql_insert(AssetActive).on_duplicate_key_update(name=AssetActive.name)
+        else:
+            from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+            stmt = sqlite_insert(AssetActive).on_conflict_do_nothing()
+        if values := [{"name": m.name, "uri": m.uri} for m in models]:
+            session.execute(stmt, values)
+
+    def add_dag_asset_references(
+        self,
+        dags: dict[str, DagModel],
+        assets: dict[tuple[str, str], AssetModel],
+        *,
+        session: Session,
+    ) -> None:
+        # Optimization: No assets means there are no references to update.
+        if not assets:
+            return
+        for dag_id, references in self.schedule_asset_references.items():
+            # Optimization: no references at all; this is faster than repeated delete().
+            if not references:
+                dags[dag_id].schedule_asset_references = []
+                continue
+            referenced_assets = {
+                assets[r.name, r.uri]: (
+                    r.access_control.get("producer_teams", []),
+                    r.access_control.get("allow_global", True),
+                )
+                for r in references
+            }
+            referenced_asset_ids = {a.id for a in referenced_assets}
+            orm_refs = {r.asset_id: r for r in dags[dag_id].schedule_asset_references}
+            for asset_id, ref in orm_refs.items():
+                if asset_id not in referenced_asset_ids:
+                    session.delete(ref)
+            for asset_model, (teams, allow_global) in referenced_assets.items():
+                if asset_model.id in orm_refs:
+                    orm_refs[asset_model.id].allow_producer_teams = teams
+                    orm_refs[asset_model.id].allow_global_producers = allow_global
+            session.bulk_save_objects(
+                DagScheduleAssetReference(
+                    asset_id=asset_model.id,
+                    dag_id=dag_id,
+                    allow_producer_teams=teams,
+                    allow_global_producers=allow_global,
+                )
+                for asset_model, (teams, allow_global) in referenced_assets.items()
+                if asset_model.id not in orm_refs
+            )
+
+    def add_dag_asset_alias_references(
+        self,
+        dags: dict[str, DagModel],
+        aliases: dict[str, AssetAliasModel],
+        *,
+        session: Session,
+    ) -> None:
+        # Optimization: No aliases means there are no references to update.
+        if not aliases:
+            return
+        for dag_id, references in self.schedule_asset_alias_references.items():
+            # Optimization: no references at all; this is faster than repeated delete().
+            if not references:
+                dags[dag_id].schedule_asset_alias_references = []
+                continue
+            referenced_alias_ids = {alias.id for alias in (aliases[r.name] for r in references)}
+            orm_refs = {a.alias_id: a for a in dags[dag_id].schedule_asset_alias_references}
+            for alias_id, ref in orm_refs.items():
+                if alias_id not in referenced_alias_ids:
+                    session.delete(ref)
+            session.bulk_save_objects(
+                DagScheduleAssetAliasReference(alias_id=alias_id, dag_id=dag_id)
+                for alias_id in referenced_alias_ids
+                if alias_id not in orm_refs
+            )
+
+    @staticmethod
+    def _add_dag_asset_references(
+        references: set[tuple[str, str]],
+        model: type[DagScheduleAssetNameReference] | type[DagScheduleAssetUriReference],
+        attr: str,
+        *,
+        session: Session,
+    ) -> None:
+        if not references:
+            return
+        orm_refs = {
+            (str(row[0]), str(row[1]))
+            for row in session.execute(
+                select(model.dag_id, getattr(model, attr)).where(
+                    model.dag_id.in_(dag_id for dag_id, _ in references)
+                )
+            )
+        }
+        new_refs = references - orm_refs
+        old_refs = orm_refs - references
+        if old_refs:
+            session.execute(delete(model).where(tuple_(model.dag_id, getattr(model, attr)).in_(old_refs)))
+        if new_refs:
+            session.execute(insert(model), [{"dag_id": d, attr: r} for d, r in new_refs])
+
+    def add_dag_asset_name_uri_references(self, *, session: Session) -> None:
+        self._add_dag_asset_references(
+            self.schedule_asset_name_references,
+            DagScheduleAssetNameReference,
+            "name",
+            session=session,
+        )
+        self._add_dag_asset_references(
+            self.schedule_asset_uri_references,
+            DagScheduleAssetUriReference,
+            "uri",
+            session=session,
+        )
+
+    def add_task_asset_references(
+        self,
+        dags: dict[str, DagModel],
+        assets: dict[tuple[str, str], AssetModel],
+        *,
+        session: Session,
+    ) -> None:
+        # Optimization: No assets means there are no references to update.
+        if not assets:
+            return
+        for dag_id, references in self.inlet_references.items():
+            # Optimization: no references at all; this is faster than repeated delete().
+            if not references:
+                dags[dag_id].task_inlet_asset_references = []
+                continue
+            referenced_inlets = {
+                (task_id, asset.id)
+                for task_id, asset in ((task_id, assets[d.name, d.uri]) for task_id, d in references)
+            }
+            orm_refs = {(r.task_id, r.asset_id): r for r in dags[dag_id].task_inlet_asset_references}
+            for key, ref in orm_refs.items():
+                if key not in referenced_inlets:
+                    session.delete(ref)
+            session.bulk_save_objects(
+                TaskInletAssetReference(asset_id=asset_id, dag_id=dag_id, task_id=task_id)
+                for task_id, asset_id in referenced_inlets
+                if (task_id, asset_id) not in orm_refs
+            )
+        for dag_id, references in self.outlet_references.items():
+            # Optimization: no references at all; this is faster than repeated delete().
+            if not references:
+                dags[dag_id].task_outlet_asset_references = []
+                continue
+            referenced_outlets = {
+                (task_id, assets[d.name, d.uri]): (
+                    d.access_control.get("consumer_teams"),
+                    d.access_control.get("allow_global", True),
+                )
+                for task_id, d in references
+            }
+            referenced_outlet_keys = {(task_id, asset.id) for (task_id, asset) in referenced_outlets}
+            orm_refs = {(r.task_id, r.asset_id): r for r in dags[dag_id].task_outlet_asset_references}
+            for key, ref in orm_refs.items():
+                if key not in referenced_outlet_keys:
+                    session.delete(ref)
+            for (task_id, asset_model), (consumer_teams, allow_global) in referenced_outlets.items():
+                if (task_id, asset_model.id) in orm_refs:
+                    orm_refs[(task_id, asset_model.id)].allow_consumer_teams = consumer_teams
+                    orm_refs[(task_id, asset_model.id)].allow_global_consumers = allow_global
+            session.bulk_save_objects(
+                TaskOutletAssetReference(
+                    asset_id=asset_model.id,
+                    dag_id=dag_id,
+                    task_id=task_id,
+                    allow_consumer_teams=consumer_teams,
+                    allow_global_consumers=allow_global,
+                )
+                for (task_id, asset_model), (consumer_teams, allow_global) in referenced_outlets.items()
+                if (task_id, asset_model.id) not in orm_refs
+            )
+
+    def add_asset_trigger_references(
+        self,
+        assets: dict[tuple[str, str], AssetModel],
+        *,
+        team_name: str | None = None,
+        session: Session,
+    ) -> None:
+        from airflow.serialization.encoders import encode_trigger
+
+        # Update references from assets being used
+        refs_to_add: dict[tuple[str, str], set[int]] = {}
+        refs_to_remove: dict[tuple[str, str], set[int]] = {}
+        triggers: dict[int, dict] = {}
+
+        # Optimization: if no asset collected, skip fetching active assets
+        active_assets = _find_active_assets(self.assets, session=session) if self.assets else {}
+
+        for name_uri, asset in self.assets.items():
+            # If the asset belong to a DAG not active or paused, consider there is no watcher associated to it
+            asset_watcher_triggers = (
+                [
+                    {**encode_trigger(watcher.trigger), "watcher_name": watcher.name}
+                    for watcher in asset.watchers
+                ]
+                if name_uri in active_assets
+                else []
+            )
+            trigger_hash_to_trigger_dict: dict[int, dict] = {
+                BaseEventTrigger.hash(trigger["classpath"], trigger["kwargs"]): trigger
+                for trigger in asset_watcher_triggers
+            }
+            triggers.update(trigger_hash_to_trigger_dict)
+            trigger_hash_from_asset: set[int] = set(trigger_hash_to_trigger_dict.keys())
+
+            asset_model = assets[name_uri]
+            trigger_hash_from_asset_model: set[int] = {
+                BaseEventTrigger.hash(trigger.classpath, trigger.kwargs) for trigger in asset_model.triggers
+            }
+
+            # Optimization: no diff between the DB and DAG definitions, no update needed
+            if trigger_hash_from_asset == trigger_hash_from_asset_model:
+                continue
+
+            diff_to_add = trigger_hash_from_asset - trigger_hash_from_asset_model
+            diff_to_remove = trigger_hash_from_asset_model - trigger_hash_from_asset
+            if diff_to_add:
+                refs_to_add[name_uri] = diff_to_add
+            if diff_to_remove:
+                refs_to_remove[name_uri] = diff_to_remove
+
+        if refs_to_add:
+            all_trigger_hashes: set[int] = {
+                trigger_hash for trigger_hashes in refs_to_add.values() for trigger_hash in trigger_hashes
+            }
+
+            all_trigger_keys: set[tuple[str, str]] = {
+                (
+                    triggers[trigger_hash]["classpath"],
+                    Trigger.encrypt_kwargs(triggers[trigger_hash]["kwargs"]),
+                )
+                for trigger_hashes in refs_to_add.values()
+                for trigger_hash in trigger_hashes
+            }
+            orm_triggers: dict[int, Trigger] = {
+                BaseEventTrigger.hash(trigger.classpath, trigger.kwargs): trigger
+                for trigger in session.scalars(
+                    select(Trigger).where(
+                        tuple_(Trigger.classpath, Trigger.encrypted_kwargs).in_(all_trigger_keys)
+                    )
+                )
+            }
+
+            # Create new triggers
+            new_trigger_models = [
+                trigger
+                for trigger in [
+                    Trigger(
+                        classpath=triggers[trigger_hash]["classpath"],
+                        kwargs=triggers[trigger_hash]["kwargs"],
+                        team_name=team_name,
+                        queue=triggers[trigger_hash].get("queue"),
+                    )
+                    for trigger_hash in all_trigger_hashes
+                    if trigger_hash not in orm_triggers
+                ]
+            ]
+            session.add_all(new_trigger_models)
+            session.flush()  # Flush to get the IDs assigned
+            orm_triggers.update(
+                (BaseEventTrigger.hash(trigger.classpath, trigger.kwargs), trigger)
+                for trigger in new_trigger_models
+            )
+
+            # Add new references
+            for name_uri, trigger_hashes in refs_to_add.items():
+                asset_model = assets[name_uri]
+
+                for trigger_hash in trigger_hashes:
+                    trigger = triggers.get(trigger_hash)
+                    orm_trigger = orm_triggers.get(trigger_hash)
+                    if orm_trigger and trigger:
+                        asset_model.add_trigger(orm_trigger, trigger["watcher_name"])
+
+        if refs_to_remove:
+            # Remove old references
+            for name_uri, trigger_hashes in refs_to_remove.items():
+                asset_model = assets[name_uri]
+                asset_model.watchers = [
+                    watcher
+                    for watcher in asset_model.watchers
+                    if watcher.trigger is not None
+                    and BaseEventTrigger.hash(watcher.trigger.classpath, watcher.trigger.kwargs)
+                    not in trigger_hashes
+                ]
+
+        # Remove references from assets no longer used
+        orphan_assets = session.scalars(
+            select(AssetModel).filter(~AssetModel.scheduled_dags.any()).filter(AssetModel.triggers.any())
+        )
+        for asset_model in orphan_assets:
+            if (asset_model.name, asset_model.uri) not in self.assets:
+                # Delete all watchers for this orphaned asset
+                asset_model.watchers = []

@@ -1,0 +1,295 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+import os
+import shutil
+import tempfile
+from datetime import timedelta
+from unittest.mock import patch
+
+import pytest
+
+from airflow.models.dag import DAG
+from airflow.providers.common.compat.sdk import (
+    AirflowException,
+    AirflowSensorTimeout,
+    TaskDeferred,
+    timezone,
+)
+from airflow.providers.standard.sensors.filesystem import FileSensor
+from airflow.providers.standard.triggers.file import FileTrigger
+
+pytestmark = pytest.mark.db_test
+
+
+TEST_DAG_ID = "unit_tests_file_sensor"
+DEFAULT_DATE = timezone.datetime(2015, 1, 1)
+
+
+class TestFileSensor:
+    def setup_method(self):
+        from airflow.providers.standard.hooks.filesystem import FSHook
+
+        hook = FSHook()
+        args = {"owner": "airflow", "start_date": DEFAULT_DATE}
+        dag = DAG(TEST_DAG_ID + "test_schedule_dag_once", schedule=timedelta(days=1), default_args=args)
+        self.hook = hook
+        self.dag = dag
+
+    def test_simple(self):
+        with tempfile.NamedTemporaryFile() as tmp:
+            task = FileSensor(
+                task_id="test",
+                filepath=tmp.name[1:],
+                fs_conn_id="fs_default",
+                dag=self.dag,
+                timeout=0,
+            )
+            task._hook = self.hook
+            task.execute({})
+
+    def test_file_in_nonexistent_dir(self):
+        temp_dir = tempfile.mkdtemp()
+        task = FileSensor(
+            task_id="test",
+            filepath=temp_dir[1:] + "/file",
+            fs_conn_id="fs_default",
+            dag=self.dag,
+            timeout=0,
+            poke_interval=1,
+        )
+        task._hook = self.hook
+        try:
+            with pytest.raises(AirflowSensorTimeout):
+                task.execute({})
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_empty_dir(self):
+        temp_dir = tempfile.mkdtemp()
+        task = FileSensor(
+            task_id="test",
+            filepath=temp_dir[1:],
+            fs_conn_id="fs_default",
+            dag=self.dag,
+            timeout=0,
+            poke_interval=1,
+        )
+        task._hook = self.hook
+        try:
+            with pytest.raises(AirflowSensorTimeout):
+                task.execute({})
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_file_in_dir(self):
+        temp_dir = tempfile.mkdtemp()
+        task = FileSensor(
+            task_id="test",
+            filepath=temp_dir[1:],
+            fs_conn_id="fs_default",
+            dag=self.dag,
+            timeout=0,
+        )
+        task._hook = self.hook
+        try:
+            # `touch` the dir
+            open(temp_dir + "/file", "a").close()
+            task.execute({})
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_default_fs_conn_id(self):
+        with tempfile.NamedTemporaryFile() as tmp:
+            task = FileSensor(
+                task_id="test",
+                filepath=tmp.name[1:],
+                dag=self.dag,
+                timeout=0,
+            )
+            task._hook = self.hook
+            task.execute({})
+
+    def test_wildcard_file(self):
+        suffix = ".txt"
+        with tempfile.NamedTemporaryFile(suffix=suffix) as tmp:
+            fileglob = os.path.join(os.path.dirname(tmp.name), "*" + suffix)
+            task = FileSensor(
+                task_id="test",
+                filepath=fileglob,
+                fs_conn_id="fs_default",
+                dag=self.dag,
+                timeout=0,
+            )
+            task._hook = self.hook
+            task.execute({})
+
+    def test_wildcard_empty_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with tempfile.TemporaryDirectory(suffix="subdir", dir=temp_dir):
+                task = FileSensor(
+                    task_id="test",
+                    filepath=os.path.join(temp_dir, "*dir"),
+                    fs_conn_id="fs_default",
+                    dag=self.dag,
+                    timeout=0,
+                )
+                task._hook = self.hook
+
+                # No files in dir
+                with pytest.raises(AirflowSensorTimeout):
+                    task.execute({})
+
+    def test_wildcard_directory_with_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with tempfile.TemporaryDirectory(suffix="subdir", dir=temp_dir) as subdir:
+                task = FileSensor(
+                    task_id="test",
+                    filepath=os.path.join(temp_dir, "*dir"),
+                    fs_conn_id="fs_default",
+                    dag=self.dag,
+                    timeout=0,
+                )
+                task._hook = self.hook
+
+                # `touch` the file in subdir
+                open(os.path.join(subdir, "file"), "a").close()
+                task.execute({})
+
+    def test_wildcared_directory(self):
+        temp_dir = tempfile.mkdtemp()
+        subdir = tempfile.mkdtemp(dir=temp_dir)
+        task = FileSensor(
+            task_id="test",
+            filepath=temp_dir + "/**",
+            fs_conn_id="fs_default",
+            dag=self.dag,
+            timeout=0,
+            poke_interval=1,
+            recursive=True,
+        )
+        task._hook = self.hook
+
+        try:
+            # `touch` the file in subdir
+            open(subdir + "/file", "a").close()
+            task.execute({})
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_subdirectory_not_empty(self):
+        suffix = ".txt"
+        temp_dir = tempfile.mkdtemp()
+        subdir = tempfile.mkdtemp(dir=temp_dir)
+
+        with tempfile.NamedTemporaryFile(suffix=suffix, dir=subdir):
+            task = FileSensor(
+                task_id="test",
+                filepath=temp_dir,
+                fs_conn_id="fs_default",
+                dag=self.dag,
+                timeout=0,
+            )
+            task._hook = self.hook
+            task.execute({})
+        shutil.rmtree(temp_dir)
+
+    def test_subdirectory_empty(self, tmp_path):
+        (tmp_path / "subdir").mkdir()
+
+        task = FileSensor(
+            task_id="test",
+            filepath=tmp_path.as_posix(),
+            fs_conn_id="fs_default",
+            dag=self.dag,
+            timeout=0,
+            poke_interval=1,
+        )
+        task._hook = self.hook
+
+        with pytest.raises(AirflowSensorTimeout):
+            task.execute({})
+
+    def test_task_defer(self):
+        task = FileSensor(
+            task_id="test",
+            filepath="temp_dir",
+            fs_conn_id="fs_default",
+            deferrable=True,
+            dag=self.dag,
+        )
+
+        with pytest.raises(TaskDeferred) as exc:
+            task.execute({})
+
+        assert isinstance(exc.value.trigger, FileTrigger), "Trigger is not a FileTrigger"
+
+    def test_start_trigger_args_are_not_shared_between_tasks(self):
+        """Each task must carry its own trigger arguments.
+
+        ``start_trigger_args`` is a class attribute, so assigning through it made every task
+        built from this operator advertise the path and timeout of whichever was constructed
+        last.
+        """
+        with DAG(
+            dag_id="test_start_trigger_args_not_shared",
+            schedule=None,
+            start_date=timezone.datetime(2020, 1, 1),
+        ):
+            first = FileSensor(
+                task_id="first", filepath="first.txt", deferrable=True, start_from_trigger=True, timeout=60
+            )
+            second = FileSensor(
+                task_id="second", filepath="second.txt", deferrable=True, start_from_trigger=True, timeout=999
+            )
+
+        assert first.start_trigger_args is not second.start_trigger_args
+        assert first.start_trigger_args.trigger_kwargs["filepath"] == first.path
+        assert second.start_trigger_args.trigger_kwargs["filepath"] == second.path
+        assert first.start_trigger_args.timeout == timedelta(seconds=60)
+        assert second.start_trigger_args.timeout == timedelta(seconds=999)
+
+    def test_non_deferrable_sensor_does_not_defer_after_the_sync_path(self):
+        """
+        A sensor the caller did not make deferrable must never defer.
+
+        The sync path pokes until the file appears and then returns. Poking a second time
+        afterwards means a file consumed in between defers the task, and on a deployment with no
+        triggerer it then sits in ``deferred`` until execution_timeout.
+        """
+        task = FileSensor(
+            task_id="test_no_defer",
+            filepath="temp_dir",
+            fs_conn_id="fs_default",
+            dag=self.dag,
+            timeout=0,
+        )
+
+        # The file is there for the sync path's poke and gone by any second one.
+        with patch.object(FileSensor, "poke", side_effect=[True, False]) as mock_poke:
+            task.execute({})
+
+        assert mock_poke.call_count == 1, "the sensor poked again after the sync path completed"
+
+    def test_execute_complete_failure_names_the_task_and_path(self):
+        """The message interpolates the task and path rather than rendering as a tuple of format args."""
+        sensor = FileSensor(task_id="waiting_for_drop", filepath="incoming_data.csv")
+
+        with pytest.raises(AirflowException, match="waiting_for_drop task failed as .*incoming_data.csv"):
+            sensor.execute_complete(context={}, event=False)

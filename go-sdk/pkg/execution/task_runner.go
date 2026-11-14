@@ -1,0 +1,315 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package execution
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"runtime/debug"
+	"time"
+
+	"github.com/apache/airflow/go-sdk/internal/bundle"
+	"github.com/apache/airflow/go-sdk/pkg/binding"
+	"github.com/apache/airflow/go-sdk/pkg/execution/genmodels"
+	"github.com/apache/airflow/go-sdk/pkg/sdkcontext"
+	"github.com/apache/airflow/go-sdk/sdk"
+)
+
+// RunTask executes a task based on StartupDetails received from the supervisor.
+//
+// It looks up the task in the bundle, creates a CoordinatorClient for SDK
+// calls, deletes the XComs that ti_context.xcom_keys_to_clear lists, executes
+// the task, and returns the terminal body to ship as the final response frame:
+// one of genmodels.SucceedTask, TaskState, RetryTask, or DeferTask. A task from airflow.TriggerDagRun
+// is the only one that defers, and RunTask runs it without a Go function. When RunTask cannot
+// delete an XCom, or arg_bindings is invalid, the task fails without running.
+//
+// The supervisor owns the Execution-API state transitions, so the runtime only
+// invokes the user's task function and returns its terminal response.
+//
+// ctx is the task's root context; Serve derives it from SIGINT/SIGTERM, so a
+// cooperative task that honors ctx returns promptly on a supervisor shutdown.
+func RunTask(
+	ctx context.Context,
+	b bundle.Bundle,
+	details *genmodels.StartupDetails,
+	comm *CoordinatorComm,
+	logger *slog.Logger,
+) any {
+	task, exists := b.LookupTask(details.TI.DagID, details.TI.TaskID)
+	if !exists {
+		logger.Error("Task not registered",
+			"dag_id", details.TI.DagID,
+			"task_id", details.TI.TaskID,
+		)
+		return genmodels.TaskState{
+			State:   genmodels.TaskStateStateRemoved,
+			EndDate: genmodels.TimePtr(time.Now().UTC()),
+		}
+	}
+
+	client := NewCoordinatorClient(comm, details.TI.ID)
+
+	// runtimeContext carries the task instance and Dag run that binding puts
+	// on the task's airflow.Context. The scheduling timestamps live on the
+	// nested dag_run object in the supervisor's TIRunContext schema. The base
+	// context is a placeholder, because binding reads only the task instance
+	// and Dag run from this value and builds the airflow.Context around the
+	// live task context.
+	ti := taskInstanceOf(details)
+	dagRun := details.TIContext.DagRun
+	var conf map[string]any
+	if dagRun.Conf != nil {
+		conf = *dagRun.Conf
+	}
+	runtimeContext := sdk.NewTIRunContext(
+		context.Background(),
+		ti,
+		sdk.DagRun{
+			DagID:             details.TI.DagID,
+			RunID:             details.TI.RunID,
+			LogicalDate:       (*time.Time)(dagRun.LogicalDate),
+			DataIntervalStart: (*time.Time)(dagRun.DataIntervalStart),
+			DataIntervalEnd:   (*time.Time)(dagRun.DataIntervalEnd),
+			RunAfter:          time.Time(dagRun.RunAfter),
+			RunType:           dagRun.RunType,
+			Conf:              conf,
+		},
+	)
+
+	ctx = context.WithValue(ctx, sdkcontext.SdkClientContextKey, sdk.Client(client))
+	ctx = context.WithValue(ctx, sdkcontext.RuntimeContextKey, runtimeContext)
+	ctx = bundle.WithSkipDownstreamTasks(ctx, client.skipDownstreamTasks)
+
+	// Airflow keeps the XComs that a task instance already has when it starts a new try. It lists
+	// their keys in xcom_keys_to_clear, and the runtime deletes them before the task runs, as the
+	// Python task runner does before it renders templates. The list is empty when the task resumes
+	// from a deferral.
+	for _, key := range details.TIContext.XcomKeysToClear {
+		logger.Debug("Clearing XCom with key", "key", key)
+		if err := client.deleteXCom(ctx, ti, key); err != nil {
+			logger.Error("Unable to clear XCom",
+				"dag_id", details.TI.DagID,
+				"task_id", details.TI.TaskID,
+				"key", key,
+				"error", err,
+			)
+			return failTask(details.TIContext.ShouldRetry, err)
+		}
+	}
+
+	// The runtime runs a TriggerDagRun task itself. It has no Go function to bind arguments to.
+	if trigger, ok := task.(*bundle.TriggerTask); ok {
+		return runTriggerDagRun(ctx, details, trigger.Spec, client, logger, defaultTriggerEnv)
+	}
+
+	args, err := convertArgBindings(details.TIContext.ArgBindings)
+	if err != nil {
+		logger.Error("Invalid arg_bindings spec from supervisor",
+			"dag_id", details.TI.DagID,
+			"task_id", details.TI.TaskID,
+			"error", err,
+		)
+		return failTask(details.TIContext.ShouldRetry, err)
+	}
+
+	return executeTask(ctx, task, args, details.TIContext.ShouldRetry, logger)
+}
+
+func taskInstanceOf(details *genmodels.StartupDetails) sdk.TaskInstance {
+	return sdk.TaskInstance{
+		DagID:     details.TI.DagID,
+		RunID:     details.TI.RunID,
+		TaskID:    details.TI.TaskID,
+		MapIndex:  mapIndexPtr(details.TI.MapIndex),
+		TryNumber: details.TI.TryNumber,
+	}
+}
+
+// failTask returns the terminal body for a task that fails before it runs: RetryTask when
+// ti_context.should_retry is set, otherwise a FAILED TaskState.
+func failTask(shouldRetry bool, err error) any {
+	if shouldRetry {
+		return genmodels.RetryTask{
+			EndDate:     genmodels.Time(time.Now().UTC()),
+			RetryReason: err.Error(),
+		}
+	}
+	return genmodels.TaskState{
+		State:   genmodels.TaskStateStateFailed,
+		EndDate: genmodels.TimePtr(time.Now().UTC()),
+	}
+}
+
+func convertArgBindings(specsPtr *genmodels.ArgBindings) ([]binding.Arg, error) {
+	if specsPtr == nil || len(*specsPtr) == 0 {
+		return nil, nil
+	}
+	specs := *specsPtr
+	args := make([]binding.Arg, len(specs))
+	for i, raw := range specs {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("arg_bindings[%d]: unexpected wire shape %T", i, raw)
+		}
+		name, ok := m["name"].(string)
+		if !ok || name == "" {
+			return nil, fmt.Errorf("arg_bindings[%d]: missing or empty name", i)
+		}
+		valueSchema, err := argValueSchema(m["value_schema"])
+		if err != nil {
+			return nil, fmt.Errorf("arg_bindings[%d] (%q): %w", i, name, err)
+		}
+		switch kind, _ := m["kind"].(string); kind {
+		case "xcom":
+			taskID, ok := m["task_id"].(string)
+			if !ok || taskID == "" {
+				return nil, fmt.Errorf(
+					"arg_bindings[%d] (%q): missing or empty task_id for xcom kind",
+					i,
+					name,
+				)
+			}
+			args[i] = binding.XComArg{
+				Kind:        kind,
+				Name:        name,
+				TaskID:      taskID,
+				ValueSchema: valueSchema,
+			}
+		case "literal":
+			fromDefault, err := optionalBool(m["from_default"])
+			if err != nil {
+				return nil, fmt.Errorf("arg_bindings[%d] (%q): %w", i, name, err)
+			}
+			args[i] = binding.LiteralArg{
+				Kind:        kind,
+				Name:        name,
+				Value:       m["value"],
+				ValueSchema: valueSchema,
+				FromDefault: fromDefault,
+			}
+		default:
+			return nil, fmt.Errorf("arg_bindings[%d]: unknown kind %q", i, kind)
+		}
+	}
+	return args, nil
+}
+
+func argValueSchema(raw any) (*genmodels.ArgValueSchema, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	m, ok := raw.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("value_schema has unexpected wire shape %T", raw)
+	}
+	if len(m) == 0 {
+		return nil, nil
+	}
+	schema := make(genmodels.ArgValueSchema, len(m))
+	for k, v := range m {
+		schema[k] = v
+	}
+	return &schema, nil
+}
+
+func optionalBool(raw any) (bool, error) {
+	if raw == nil {
+		return false, nil
+	}
+	b, ok := raw.(bool)
+	if !ok {
+		return false, fmt.Errorf("from_default has unexpected wire shape %T", raw)
+	}
+	return b, nil
+}
+
+// mapIndexPtr normalizes the supervisor's map_index into the optional form
+// exposed on sdk.TaskInstance: nil for an unmapped task,
+// otherwise a pointer to the index. The wire field is itself optional now, so an
+// unmapped task arrives as either nil (key absent) or a pointer to the -1
+// sentinel; both collapse to nil here.
+func mapIndexPtr(mapIndex *int) *int {
+	if mapIndex == nil || *mapIndex < 0 {
+		return nil
+	}
+	idx := *mapIndex
+	return &idx
+}
+
+// executeTask runs the task, handling success, failure, and panics, and returns
+// the terminal body: genmodels.SucceedTask, TaskState, or RetryTask.
+func executeTask(
+	ctx context.Context,
+	task bundle.Task,
+	args []binding.Arg,
+	shouldRetry bool,
+	logger *slog.Logger,
+) (result any) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("Recovered panic in task",
+				"error", r,
+				"stack", string(debug.Stack()),
+			)
+			if shouldRetry {
+				result = genmodels.RetryTask{
+					EndDate:     genmodels.Time(time.Now().UTC()),
+					RetryReason: fmt.Sprintf("panic: %v", r),
+				}
+			} else {
+				result = genmodels.TaskState{
+					State:   genmodels.TaskStateStateFailed,
+					EndDate: genmodels.TimePtr(time.Now().UTC()),
+				}
+			}
+		}
+	}()
+
+	err := task.Execute(ctx, logger, args)
+	if err != nil {
+		logger.ErrorContext(ctx, "Task failed", "error", err)
+		// A task that fails when ti_context.should_retry is set is reported as
+		// UP_FOR_RETRY via RetryTask; otherwise it terminates as FAILED.
+		if shouldRetry {
+			return genmodels.RetryTask{
+				EndDate:     genmodels.Time(time.Now().UTC()),
+				RetryReason: err.Error(),
+			}
+		}
+		return genmodels.TaskState{
+			State:   genmodels.TaskStateStateFailed,
+			EndDate: genmodels.TimePtr(time.Now().UTC()),
+		}
+	}
+
+	return succeedTask()
+}
+
+// succeedTask returns the terminal body of a task that succeeded. task_outlets / outlet_events must
+// be sent as empty lists, not omitted: the supervisor's SucceedTask validation rejects a
+// null/absent value ("Input should be a valid list"). A task that emits no asset events reports
+// empty collections rather than None.
+func succeedTask() genmodels.SucceedTask {
+	return genmodels.SucceedTask{
+		EndDate:      genmodels.Time(time.Now().UTC()),
+		TaskOutlets:  &genmodels.TaskOutlets{},
+		OutletEvents: &genmodels.OutletEvents{},
+	}
+}

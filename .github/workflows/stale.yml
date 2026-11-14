@@ -27,9 +27,11 @@ permissions:
   issues: write
 jobs:
   stale:
-    runs-on: ubuntu-20.04
+    if: github.repository == 'apache/airflow'
+    runs-on: ["ubuntu-slim"]
     steps:
-      - uses: actions/stale@v5
+      # Handle all PRs (45-day stale) and pending-response issues (14-day stale)
+      - uses: actions/stale@4391f3da665fdf50b6810c1a66712fb9ba21aa93  # v11.0.0
         with:
           stale-pr-message: >
             This pull request has been automatically marked as stale because it has not had
@@ -37,13 +39,32 @@ jobs:
             for your contributions.
           days-before-pr-stale: 45
           days-before-pr-close: 5
-          exempt-pr-labels: 'pinned,security'
+          operations-per-run: 500
+          exempt-pr-labels: 'pinned,security,pending-response'
           only-issue-labels: 'pending-response'
-          days-before-issue-stale: 30
+          remove-stale-when-updated: true
+          days-before-issue-stale: 14
           days-before-issue-close: 7
           stale-issue-message: >
-            This issue has been automatically marked as stale because it has been open for 30 days
+            This issue has been automatically marked as stale because it has been open for 14 days
             with no response from the author. It will be closed in next 7 days if no further
             activity occurs from the issue author.
           close-issue-message: >
             This issue has been closed because it has not received response from the issue author.
+      # Handle PRs with pending-response label (7-day stale, faster response expected)
+      - uses: actions/stale@4391f3da665fdf50b6810c1a66712fb9ba21aa93  # v11.0.0
+        with:
+          only-pr-labels: 'pending-response'
+          days-before-pr-stale: 7
+          days-before-pr-close: 7
+          stale-pr-message: >
+            This pull request has been automatically marked as stale because the author has not
+            responded to a request for more information. It will be closed in 7 days if no further
+            activity occurs. Thank you for your contributions.
+          close-pr-message: >
+            This pull request has been closed because the author has not responded to a request
+            for more information.
+          labels-to-remove-when-unstale: 'pending-response,stale'
+          remove-stale-when-updated: true
+          days-before-issue-stale: -1
+          days-before-issue-close: -1

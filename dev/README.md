@@ -22,11 +22,14 @@
 
 - [Apache Airflow source releases](#apache-airflow-source-releases)
   - [Apache Airflow Package](#apache-airflow-package)
-  - [Provider packages](#provider-packages)
+  - [Provider distributions](#provider-distributions)
+- [Preinstalled providers](#preinstalled-providers)
 - [Prerequisites for the release manager preparing the release](#prerequisites-for-the-release-manager-preparing-the-release)
-  - [Upload Public keys to id.apache.org](#upload-public-keys-to-idapacheorg)
+  - [Upload Public keys to id.apache.org and GitHub](#upload-public-keys-to-idapacheorg-and-github)
   - [Configure PyPI uploads](#configure-pypi-uploads)
+  - [Setup and authorize GitHub client](#setup-and-authorize-github-client)
   - [Hardware used to prepare and verify the packages](#hardware-used-to-prepare-and-verify-the-packages)
+- [How to backport PR with `cherry-picker` CLI](#how-to-backport-pr-with-cherry-picker-cli)
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
 
@@ -39,7 +42,7 @@ The Apache Airflow releases are one of the two types:
 
 ## Apache Airflow Package
 
-This package contains sources that allow the user building fully-functional Apache Airflow 2.0 package.
+This package contains sources that allow the user to build the Apache Airflow package.
 They contain sources for:
 
  * "apache-airflow" python package that installs "airflow" Python package and includes
@@ -47,11 +50,11 @@ They contain sources for:
  * Dockerfile and corresponding scripts that build and use an official DockerImage
  * Breeze development environment that helps with building images and testing locally
    apache airflow built from sources
- * Provider packages - containing Airflow's providers - separate package per each service Airflow integrates
+ * Provider distributions - containing Airflow's providers - separate package per each service Airflow integrates
    with.
 
-We also plan to release the official Helm Chart sources that will allow the user to install Apache Airflow
-via helm 3.0 chart in a distributed fashion.
+The official Helm Chart sources are also part of this source release, allowing users to install Apache Airflow
+via a Helm chart in a distributed fashion.
 
 The Source releases are the only "official" Apache Software Foundation releases, and they are distributed
 via [Official Apache Download sources](https://downloads.apache.org/)
@@ -66,13 +69,14 @@ cannot or do not want to build the packages themselves can use them as a conveni
 Apache Airflow, however they are not considered as "official source releases". You can read more
 details about it in the [ASF Release Policy](http://www.apache.org/legal/release-policy.html).
 
-Detailed instruction of releasing Provider Packages can be found in the
+Detailed instruction of releasing provider distributions can be found in the
 [README_RELEASE_AIRFLOW.md](README_RELEASE_AIRFLOW.md)
 
-## Provider packages
+## Provider distributions
 
-The Provider packages are packages (per provider) that make it possible to easily install Hooks,
-Operators, Sensors, and Secrets for different providers (external services used by Airflow).
+The Provider distributions are distributions (separate one per provider) that make it possible to
+easily install Hooks,  Operators, Sensors, and Secrets for different providers
+(external services used by Airflow).
 
 Once you release the packages, you can simply install them with:
 
@@ -81,47 +85,54 @@ pip install apache-airflow-providers-<PROVIDER>[<EXTRAS>]
 ```
 
 Where `<PROVIDER>` is the provider id and `<EXTRAS>` are optional extra packages to install.
-You can find the provider packages dependencies and extras in the README.md files in each provider
-package (in `airflow/providers/<PROVIDER>` folder) as well as in the PyPI installation page.
+You can find the provider distributions dependencies and extras in the README.md files in each provider
+package (in `providers/<PROVIDER>` folder of this repository) as well as in the PyPI installation page.
 
-The sources released in SVN allow to build all the provider packages by the user, following the
-instructions and scripts provided. Those are also "official_source releases" as described in the
+The sources released in SVN allow to build all the provider distributions by the user, following the
+instructions and scripts provided. Those are also "official source releases" as described in the
 [ASF Release Policy](http://www.apache.org/legal/release-policy.html) and they are available
 via [Official Apache Download for providers](https://downloads.apache.org/airflow/providers/).
 
 The full provider's list can be found here:
-[Provider Packages Reference](https://s.apache.org/airflow-docs)
+[Provider distributions reference](https://s.apache.org/airflow-docs)
 
-There are also convenience packages released as "apache-airflow-providers"separately in PyPI.
+There are also convenience packages released as "apache-airflow-providers" separately in PyPI.
 [PyPI query for providers](https://pypi.org/search/?q=apache-airflow-providers)
-
-We also have legacy backport providers available for Airflow 1.10.* series:
-[Official Apache Download for backport-providers](https://downloads.apache.org/airflow/backport-providers/)
 
 And available in PyPI:
 [PyPI query for backport providers](https://pypi.org/search/?q=apache-airflow-backport-providers).
 
-Note that Backport Providers for Airflow 1.10.* series are not released any more. The last release
+Note that Backport Providers for Airflow 1.10.* series are not released anymore. The last release
 of Backport Providers was done  on March 17, 2021.
 
-Detailed instruction of releasing Provider Packages can be found in the
-[README_RELEASE_PROVIDER_PACKAGES.md](README_RELEASE_PROVIDER_PACKAGES.md)
+Detailed instruction of releasing provider distributions can be found in the
+[README_RELEASE_PROVIDERS.md](README_RELEASE_PROVIDERS.md)
+
+# Preinstalled providers
+
+The `dev/preinstalled-providers.json` file contains the list of provider ids that are pre-installed.
+Those providers are dynamically added to generated standard wheel packages that are released in PyPI.
+Those packages are not present in pyproject.toml as dependencies, and
+they are not installed when you install Airflow for editable installation for development.
+This way, when you develop Airflow you can work on Airflow and Providers together from the same
+Source tree - without polluting your editable installation with installed provider distributions.
 
 # Prerequisites for the release manager preparing the release
 
 The person acting as release manager has to fulfill certain pre-requisites. More details and FAQs are
 available in the [ASF Release Policy](http://www.apache.org/legal/release-policy.html) but here some important
-pre-requisites are listed below. Note that release manager does not have to be a PMC - it is enough
+pre-requisites are listed below. Note that release manager does not have to be a PMC member - it is enough
 to be committer to assume the release manager role, but there are final steps in the process (uploading
 final releases to SVN) that can only be done by PMC member. If needed, the release manager
-can ask PMC to perform that final step of release.
+can ask a PMC member to perform that final step of release.
 
-## Upload Public keys to id.apache.org
+## Upload Public keys to id.apache.org and GitHub
 
 Make sure your public key is on id.apache.org and in KEYS. You will need to sign the release artifacts
 with your pgp key. After you have created a key, make sure you:
 
-- Add your GPG pub key to https://dist.apache.org/repos/dist/release/airflow/KEYS , follow the instructions at the top of that file. Upload your GPG public key to https://pgp.mit.edu
+- Add your GPG pub key to https://dist.apache.org/repos/dist/release/airflow/KEYS, follow the instructions at the top of that file. Upload your GPG public key to https://pgp.mit.edu
+- Add your GPG pub key to GPG keys in https://github.com/settings/keys
 - Add your key fingerprint to https://id.apache.org/ (login with your apache credentials, paste your fingerprint into the pgp fingerprint field and hit save).
 
 ```shell script
@@ -150,7 +161,6 @@ http://www.apache.org/dev/release-signing.html#basic-facts
 In order to not reveal your password in plain text, it's best if you create and configure API Upload tokens.
 You can add and copy the tokens here:
 
-* [Test PyPI](https://test.pypi.org/manage/account/token/)
 * [Prod PyPI](https://pypi.org/manage/account/token/)
 
 
@@ -160,14 +170,8 @@ Create a `~/.pypirc` file:
 [distutils]
 index-servers =
   pypi
-  pypitest
 
 [pypi]
-username=__token__
-password=<API Upload Token>
-
-[pypitest]
-repository=https://test.pypi.org/legacy/
 username=__token__
 password=<API Upload Token>
 ```
@@ -178,18 +182,21 @@ Set proper permissions for the pypirc file:
 chmod 600 ~/.pypirc
 ```
 
-- Install [twine](https://pypi.org/project/twine/) if you do not have it already (it can be done
-  in a separate virtual environment).
+- Install [twine](https://pypi.org/project/twine/) if you do not have it already
 
 ```shell script
-pip install twine
+uv tool install twine
 ```
 
-(more details [here](https://peterdowns.com/posts/first-time-with-pypi.html).)
 
 - Set proper permissions for the pypirc file:
 `$ chmod 600 ~/.pypirc`
 
+
+## Setup and authorize GitHub client
+
+Breeze can not install GitHub client for you thus it is required to set it manually.
+Follow instructions listed in `Prerequisites <dev/breeze/doc/01_installation.rst#The ``gh`` cli needed for release managers>`_ to install GitHub client.
 
 ## Hardware used to prepare and verify the packages
 
@@ -198,3 +205,68 @@ by the committer acting as release manager. While strictly speaking, releases mu
 on hardware owned and controlled by the committer, for practical reasons it's best if the packages are
 prepared using such hardware. More information can be found in this
 [FAQ](http://www.apache.org/legal/release-policy.html#owned-controlled-hardware)
+
+# How to backport PR with `cherry-picker` CLI
+
+Backporting via CLI might be more convenient for some users. Also, it is necessary if you want to backport
+PR that has conflicts. It also allows to backport commit to multiple branches in the same command.
+
+To backport PRs to any branch (for example: `v2-11-test`, `v3-2-test` or `chart/v1-2x-test`), you can use the following command:
+
+It's easiest to install it (and keep cherry-picker up-to-date) using `uv tool`:
+
+```bash
+uv tool install cherry-picker
+````
+
+And upgrade it with:
+
+```bash
+uv tool upgrade cherry-picker
+```
+
+Then, in order to backport a commit to a branch, you can use the following command:
+
+```bash
+cherry_picker COMMIT_SHA BRANCH_NAME1 [BRANCH_NAME2 ...]
+```
+
+If you are using your fork repository while keeping Airflow repository as remote (i.e. `apache`), please use
+
+```bash
+cherry_picker COMMIT_SHA BRANCH_NAME1 [BRANCH_NAME2 ...]  --upstream-remote [REMOTE_REPOSITORY_NAME]
+```
+
+This will create a new branch with the cherry-picked commit and open a PR against the target branch in
+your browser.
+
+If the GH_AUTH environment variable is set in your command line, the cherry-picker automatically creates a new pull request when there are no conflicts. To set GH_AUTH, use the token from your GitHub repository.
+
+To set GH_AUTH run this:
+
+```bash
+export GH_AUTH={token}
+```
+
+Sometimes it might result with conflict. In such case, you should manually resolve the conflicts.
+Some IDEs like IntelliJ has a fantastic conflict resolution tool - just follow `Git -> Resolve conflicts`
+menu after you get the conflict. But you can also resolve the conflicts manually; see [How conflicts are
+are presented](https://git-scm.com/docs/git-merge#_how_conflicts_are_presented) and
+[How to resolve conflicts](https://git-scm.com/docs/git-merge#_how_to_resolve_conflicts) for more details.
+
+```bash
+cherry_picker --status  # Should show if all conflicts are resolved
+cherry_picker --continue  # Should continue cherry-picking process
+```
+
+> [!WARNING]
+> Sometimes, when you stop cherry-picking process in the middle, you might end up with your repo in a bad
+> state and cherry-picker might print this message:
+>
+> > 🐍 🍒 ⛏
+> >
+> > You're not inside a cpython repo right now! 🙅
+>
+> You should then run `cherry-picker --abort` to clean up the mess and start over. If that does not work
+> you might need to run `git config --local --remove-section cherry-picker` to clean up the configuration
+> stored in `.git/config`.

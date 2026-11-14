@@ -1,90 +1,194 @@
 # Core
-/airflow/executors/ @kaxil @XD-DENG @ashb @o-nikolas
-/airflow/jobs/ @kaxil @ashb @XD-DENG
-/airflow/models/ @kaxil @XD-DENG @ashb
+/airflow-core/src/airflow/executors/ @XD-DENG @ashb @o-nikolas @pierrejeambrun @hussein-awala @dheerajturaga
+/airflow-core/src/airflow/jobs/ @ashb @XD-DENG
+/airflow-core/src/airflow/models/ @XD-DENG @ashb
 
-# DAG Serialization
-/airflow/serialization/ @kaxil @ashb
+# Dag Serialization
+/airflow-core/src/airflow/serialization/ @ashb @bolkedebruin
 
-# DAG Parsing
-/airflow/dag_processing @jedcunningham @ephraimbuddy
-
-# Kubernetes
-/airflow/kubernetes/ @dstandish @jedcunningham
-/airflow/kubernetes_executor_templates/ @dstandish @jedcunningham
-/airflow/executors/celery_kubernetes_executor.py @dstandish @jedcunningham
-/airflow/executors/kubernetes_executor.py @dstandish @jedcunningham
+# Dag Parsing
+/airflow-core/src/airflow/dag_processing @jedcunningham @ephraimbuddy
 
 # Helm Chart
-/chart/ @dstandish @jedcunningham
+/chart/ @jedcunningham @hussein-awala @jscheffl @bugraoz93 @Miretpl
 
-# Docs (without Providers)
-/docs/apache-airflow @potiuk
-/docs/docker-stack @potiuk
-/docs/helm-chart @dstandish @jedcunningham
-/docs/*.py @kaxil @potiuk
+# Docs
+/docs/*.py @potiuk @ashb @gopidesupavan @amoghrajesh @jscheffl @bugraoz93 @jason810496
 
 # API
-/airflow/api/ @ephraimbuddy
-/airflow/api_connexion/ @ephraimbuddy
+/airflow-core/src/airflow/api/ @ephraimbuddy @pierrejeambrun @jason810496
+/airflow-core/src/airflow/api_fastapi/ @ephraimbuddy @pierrejeambrun @jason810496 @bugraoz93 @shubhamraj-git @choo121600 @henry3260
+/airflow-core/src/airflow/api_fastapi/execution_api/ @ashb @amoghrajesh
 
-# WWW
-/airflow/www/ @ryanahamilton @ashb @bbovenzi
+# Airflow CTL
+/airflow-ctl/ @bugraoz93 @potiuk @dheerajturaga @henry3260
+
+# Airflow CLI
+/airflow-core/src/airflow/cli/ @bugraoz93 @potiuk @dheerajturaga @henry3260
+
+# Auth manager
+/airflow-core/src/airflow/api_fastapi/auth/ @vincbeck
+
+# UI
+/airflow-core/src/airflow/ui/ @bbovenzi @pierrejeambrun @ryanahamilton @shubhamraj-git @guan404ming @vatsrahul1001 @choo121600
+
+# UI e2e tests
+/airflow-core/src/airflow/ui/tests/e2e/ @vatsrahul1001 @choo121600
+
+# Translation Owners (i18n)
+# Note: Non committer engaged translators are listed in comments prevent making file syntax invalid
+# See: https://github.com/apache/airflow/blob/main/airflow-core/src/airflow/ui/public/i18n/README.md#43-engaged-translator
+airflow-core/src/airflow/ui/public/i18n/locales/ar/ @shahar1 @hussein-awala # + @ahmadtfarhan
+airflow-core/src/airflow/ui/public/i18n/locales/ca/ @jscheffl @bugraoz93 # + @ecodina @oscarhernandezrodriguez
+airflow-core/src/airflow/ui/public/i18n/locales/de/ @jscheffl # + @TJaniF @m1racoli
+airflow-core/src/airflow/ui/public/i18n/locales/el/ @ashb # + @PApostol @xBis7
+airflow-core/src/airflow/ui/public/i18n/locales/es/ @bbovenzi # + @aoelvp94
+airflow-core/src/airflow/ui/public/i18n/locales/fr/ @pierrejeambrun @vincbeck
+airflow-core/src/airflow/ui/public/i18n/locales/he/ @shahar1 @romsharon98 # +@Dev-iL
+airflow-core/src/airflow/ui/public/i18n/locales/hi/ @vatsrahul1001
+airflow-core/src/airflow/ui/public/i18n/locales/hu/ @jscheffl @potiuk # +@majorosdonat
+airflow-core/src/airflow/ui/public/i18n/locales/id/ @Lee-W # + @lutfizuchri
+airflow-core/src/airflow/ui/public/i18n/locales/it/ @bbovenzi # + @aoelvp94
+airflow-core/src/airflow/ui/public/i18n/locales/ja/ @uranusjr @sekikn # + @rsanda
+airflow-core/src/airflow/ui/public/i18n/locales/ko/ @choo121600 # + @onestn @noeunkim @yuseok89 @windylung @kamothi
+airflow-core/src/airflow/ui/public/i18n/locales/nl/ @BasPH # + @DjVinnii
+airflow-core/src/airflow/ui/public/i18n/locales/pl/ @potiuk @mobuchowski # + @kacpermuda
+airflow-core/src/airflow/ui/public/i18n/locales/pt/ @potiuk  # + @aoelvp94 @victoru2
+airflow-core/src/airflow/ui/public/i18n/locales/ru/ @jscheffl # + @puzzle-rpa-team @renat-sagut
+airflow-core/src/airflow/ui/public/i18n/locales/th/ @potiuk # + @zkan @blackbass64 @lifnaja @Aphinan-Th @chonla @Srabasti
+airflow-core/src/airflow/ui/public/i18n/locales/tr/ @bugraoz93 # +@hasancatalgol
+airflow-core/src/airflow/ui/public/i18n/locales/zh-CN/ @potiuk # + @Fortytwoo @gyli
+airflow-core/src/airflow/ui/public/i18n/locales/zh-TW/ @Lee-W @jason810496 @guan404ming @henry3260 # + @RoyLee1224
 
 # Security/Permissions
-/airflow/security/permissions.py @jhtimmins
-/airflow/www/security.py @jhtimmins
-/airflow/api_connexion/security.py @jhtimmins
+/airflow-core/src/airflow/security/permissions.py @vincbeck
 
-# Calendar/Timetables
-/airflow/timetables/ @uranusjr
+# Calendar/Timetables/Assets/Partitions
+/airflow-core/src/airflow/assets @uranusjr @Lee-W
+/airflow-core/src/airflow/partition_mappers @dstandish @Lee-W
+/airflow-core/src/airflow/timetables/ @uranusjr @Lee-W
 /docs/apache-airflow/concepts/timetable.rst @uranusjr
 
 # Task expansion, scheduling, and rendering
-/airflow/models/abstractoperator.py @uranusjr
-/airflow/models/baseoperator.py @uranusjr
-/airflow/models/expandinput.py @uranusjr
-/airflow/models/mappedoperator.py @uranusjr
-/airflow/models/operator.py @uranusjr
-/airflow/models/xcom_arg.py @uranusjr
+/airflow-core/src/airflow/models/abstractoperator.py @uranusjr
+/airflow-core/src/airflow/models/baseoperator.py @uranusjr
+/airflow-core/src/airflow/models/expandinput.py @uranusjr
+/airflow-core/src/airflow/models/mappedoperator.py @uranusjr
+/airflow-core/src/airflow/models/operator.py @uranusjr
+/airflow-core/src/airflow/models/xcom_arg.py @uranusjr
 /docs/apache-airflow/concepts/dynamic-task-mapping.rst @uranusjr
 
 # Async Operators & Triggerer
-/airflow/jobs/triggerer_job.py @dstandish
-/airflow/cli/commands/triggerer_command.py @dstandish
-/airflow/models/trigger.py @dstandish
-/docs/apache-airflow/concepts/deferring.rst @dstandish
+/airflow-core/src/airflow/cli/commands/triggerer_command.py @dstandish @hussein-awala
+/airflow-core/src/airflow/jobs/triggerer_job_runner.py @dstandish @hussein-awala
+/docs/apache-airflow/authoring-and-scheduling/deferring.rst @dstandish @hussein-awala
 
 # Secrets Backends
-/airflow/secrets  @dstandish @kaxil @potiuk @ashb
+/airflow-core/src/airflow/secrets @dstandish @ashb
 
 # Providers
-/airflow/providers/snowflake/ @potiuk @mik-laj
-/airflow/providers/cncf/kubernetes @jedcunningham
-/airflow/providers/dbt/cloud/ @josh-fell
-/airflow/providers/tabular/ @Fokko
-/airflow/providers/amazon/ @eladkal @o-nikolas
-/airflow/providers/common/sql/ @eladkal
-/airflow/providers/slack/ @eladkal
-/docs/apache-airflow-providers-amazon/ @eladkal @o-nikolas
-/docs/apache-airflow-providers-common-sql/ @eladkal
-/docs/apache-airflow-providers-slack/ @eladkal
-/docs/apache-airflow-providers-cncf-kubernetes @jedcunningham
-/tests/providers/amazon/ @eladkal @o-nikolas
-/tests/providers/common/sql/ @eladkal
-/tests/providers/slack/ @eladkal
+/providers/akeyless/ @eladkal # + @baraka-akeyless @deanshak
+/providers/amazon/ @o-nikolas
+/providers/anthropic/ @kaxil @gopidesupavan
+/providers/apache/iceberg/ @Fokko
+/providers/celery/ @hussein-awala @dheerajturaga
+/providers/cncf/kubernetes @jedcunningham @hussein-awala @jscheffl @henry3260 @shahar1
+/providers/common/messaging/ @vincbeck
+/providers/common/ai/ @gopidesupavan @kaxil @Lee-W @ashb
+/providers/dbt/cloud/ @josh-fell
+/providers/duckdb/ @o-nikolas @vincbeck
+/providers/edge3/ @jscheffl @dheerajturaga @shubhamraj-git
+/providers/fab/ @vincbeck
+/providers/google/ @shahar1
+/providers/hashicorp/ @hussein-awala
+/providers/ibm/mq/ @dabla
+/providers/informatica/ @RNHTTR # + @cetingokhan @sertaykabuk @umutozel
+/providers/keycloak/ @vincbeck @bugraoz93
+/providers/microsoft/azure/docs/**/msgraph.rst @dabla
+/providers/microsoft/azure/src/**/msgraph.py @dabla
+/providers/microsoft/azure/tests/**/*msgraph.py @dabla
+/providers/modal/ @kaxil
+/providers/openai/ @kaxil
+/providers/openlineage/ @mobuchowski
+/providers/smtp/ @hussein-awala
+/providers/snowflake/ @potiuk
+/providers/vespa/ @potiuk # + @radu-gheorghe @thomasht86
+
+
+# Generated metadata
+/generated/provider_metadata.json @potiuk @eladkal @shahar1 @vincbeck @jscheffl
+
+# Provider Registry
+/registry/ @kaxil @amoghrajesh
+/dev/registry/ @kaxil @amoghrajesh
+/dev/breeze/src/airflow_breeze/commands/registry_commands*.py @kaxil @amoghrajesh
+/dev/breeze/src/airflow_breeze/utils/publish_registry_versions.py @kaxil @amoghrajesh
+/dev/breeze/tests/test_publish_registry_versions.py @kaxil @amoghrajesh
 
 # Dev tools
-/.github/workflows/ @potiuk @ashb @kaxil
-Dockerfile @potiuk @ashb
-Dockerfile.ci @potiuk @ashb
-/dev/ @potiuk @ashb @jedcunningham
-/provider_packages/ @potiuk @ashb
-/scripts/ @potiuk @ashb
-/docker_tests/ @potiuk @ashb
+/.github/workflows/ @potiuk @ashb @gopidesupavan @amoghrajesh @jscheffl @bugraoz93 @jason810496
+/dev/ @potiuk @ashb @gopidesupavan @amoghrajesh @jscheffl @bugraoz93 @jason810496 @jedcunningham @ephraimbuddy @choo121600 @vatsrahul1001
+/dev/mypy/ @hussein-awala
+/dev/react-plugin-tools/ @pierrejeambrun @bbovenzi
+/docker-tests/ @potiuk @ashb @gopidesupavan @jason810496
+/kubernetes-tests/ @potiuk @ashb @gopidesupavan @jason810496
+/scripts/ @potiuk @ashb @gopidesupavan @amoghrajesh @jscheffl @bugraoz93 @jason810496
+Dockerfile @potiuk @ashb @gopidesupavan @amoghrajesh @jscheffl @bugraoz93 @jason810496
+Dockerfile.ci @potiuk @ashb @gopidesupavan @amoghrajesh @jscheffl @bugraoz93 @jason810496
 
-# Releasing Guides & Project Guidelines
-/dev/README_RELEASE_*.md  @kaxil
-/dev/README.md  @kaxil
-/dev/PROJECT_GUIDELINES.md  @kaxil
-/dev/PROVIDER_PACKAGE_DETAILS.md  @kaxil
+# E2E integration tests
+/airflow-e2e-tests/ @potiuk @ashb @gopidesupavan @amoghrajesh @jscheffl @bugraoz93 @jason810496
+
+# Task SDK integration tests
+/task-sdk-integration-tests/ @potiuk @ashb @gopidesupavan @amoghrajesh @bugraoz93 @jason810496
+
+# airflowctl integration tests
+/airflow-ctl-tests/ @potiuk @ashb @gopidesupavan @amoghrajesh @bugraoz93 @jason810496 @henry3260
+
+# Issue triage process
+# ISSUE_TRIAGE_PROCESS.rst
+
+# AIP-52 - Setup and Teardown
+/airflow-core/src/airflow/decorators/setup_teardown.py @jedcunningham @ephraimbuddy @dstandish
+/airflow-core/src/airflow/example_dags/example_setup_teardown*.py @jedcunningham @ephraimbuddy @dstandish
+/airflow-core/src/airflow/utils/setup_teardown.py @jedcunningham @ephraimbuddy @dstandish
+
+# AIP-58 - Object Storage
+/airflow-core/src/airflow/io/ @bolkedebruin
+/providers/**/fs/ @bolkedebruin
+/providers/common/io/ @bolkedebruin
+/docs/apache-airflow/core-concepts/objectstorage.rst @bolkedebruin
+
+# Migrations
+/airflow-core/src/airflow/migrations/ @ephraimbuddy
+/providers/fab/src/airflow-core/src/airflow/providers/fab/migrations/ @ephraimbuddy
+
+# AIP-72 - Task SDK
+# Python SDK
+/task-sdk/ @ashb @amoghrajesh
+
+# AIP-108 - Coordinators
+/task-sdk/src/airflow/sdk/coordinators/ @jason810496 @uranusjr
+/task-sdk/src/airflow/sdk/execution_time/coordinator.py @jason810496 @uranusjr
+/task-sdk/tests/task_sdk/coordinators/ @jason810496 @uranusjr
+/task-sdk/tests/task_sdk/execution_time/test_coordinator.py @jason810496 @uranusjr
+
+# Golang SDK
+/go-sdk/ @ashb @amoghrajesh @jason810496
+
+# Java SDK
+/java-sdk/ @uranusjr @jason810496
+
+# Shared Libraries
+/shared/ @ashb @amoghrajesh @potiuk
+
+# Agentic instructions
+/AGENTS.md @potiuk @jscheffl @amoghrajesh @ashb @jason810496 @shahar1 @choo121600
+/.github/instructions/ @potiuk @jscheffl @amoghrajesh @ashb @jason810496 @shahar1 @choo121600
+/airflow-core/src/airflow/api_fastapi/execution_api/AGENTS.md @potiuk @jscheffl @amoghrajesh @ashb @jason810496 @shahar1 @choo121600
+/providers/AGENTS.md @potiuk @jscheffl @amoghrajesh @ashb @jason810496 @shahar1 @choo121600
+/.github/skills/ @potiuk @jscheffl @amoghrajesh @ashb @jason810496 @shahar1 @choo121600
+/.claude/skills/ @potiuk @jscheffl @amoghrajesh @ashb @jason810496 @shahar1 @choo121600
+
+# RMs on release documents
+/dev/README_RELEASE_*.md @potiuk @jscheffl @vincbeck @shahar1 @jedcunningham @bugraoz93

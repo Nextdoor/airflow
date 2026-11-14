@@ -1,0 +1,1433 @@
+#!/usr/bin/env python3
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+"""
+Airflow Registry Parameter & Module Extractor
+
+Discovers provider modules (operators, hooks, sensors, triggers, etc.) at runtime
+and extracts constructor/function parameters via MRO or signature inspection.
+Produces both modules.json (the full module catalog) and per-provider
+parameters.json files.
+
+Must be run inside breeze where all providers are installed.
+
+Usage:
+    breeze run python dev/registry/extract_parameters.py
+
+Output:
+    - dev/registry/modules.json (+ registry/src/_data/modules.json on host)
+    - dev/registry/output/versions/{provider_id}/{version}/parameters.json
+    - registry/src/_data/versions/{provider_id}/{version}/parameters.json
+    - dev/registry/runtime_modules.json (debug stats)
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import concurrent.futures
+import importlib
+import inspect
+import json
+import logging
+import re
+import sys
+import textwrap
+import typing
+from collections import defaultdict
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+
+import yaml
+from extract_metadata import fetch_provider_inventory, read_inventory
+from extract_versions import detect_layout, git_tag_exists, read_guide_docs as read_guide_docs_at_tag
+from registry_contract_models import validate_modules_catalog, validate_provider_parameters
+from registry_tools.docs_guides import attach_guide_urls, collect_guide_anchors, is_guide_page
+from registry_tools.types import (
+    BASE_CLASS_IMPORTS,
+    CLASS_LEVEL_CATEGORY_OVERRIDES,
+    CLASS_LEVEL_SECTIONS,
+    DICT_SHAPED_CLASS_LEVEL_SECTIONS,
+    MODULE_LEVEL_SECTIONS,
+)
+
+AIRFLOW_ROOT = Path(__file__).parent.parent.parent
+SCRIPT_DIR = Path(__file__).parent
+PROVIDERS_DIR = AIRFLOW_ROOT / "providers"
+
+PROVIDERS_JSON_CANDIDATES = [
+    SCRIPT_DIR / "providers.json",
+    AIRFLOW_ROOT / "registry" / "src" / "_data" / "providers.json",
+]
+
+# Inside breeze, write to dev/registry/output/ (mounted).
+# On host, also write to the registry data directory.
+OUTPUT_DIRS = [
+    SCRIPT_DIR / "output",
+    AIRFLOW_ROOT / "registry" / "src" / "_data",
+]
+
+
+@dataclass
+class Module:
+    """A discovered provider module (operator, hook, sensor, etc.)."""
+
+    id: str
+    name: str  # Class name (e.g., SnowflakeOperator)
+    type: str  # operator, hook, sensor, trigger, transfer, etc.
+    import_path: str  # Full import path to the class
+    module_path: str  # Module file path
+    short_description: str
+    docs_url: str
+    source_url: str
+    category: str
+    provider_id: str
+    provider_name: str
+    supports_durable_execution: bool
+    supports_deferrable: bool
+    guide_url: str | None = None
+
+
+def get_category(integration_name: str) -> str:
+    """Slugify an integration name into a category ID."""
+    cat_id = integration_name.lower().replace(" ", "-").replace("(", "").replace(")", "")
+    return re.sub(r"[^a-z0-9-]", "", cat_id)
+
+
+def format_annotation(annotation: type, _depth: int = 0) -> str | None:
+    """Convert a type annotation to a human-readable string."""
+    if _depth > 5:
+        return str(annotation)
+
+    if annotation is inspect.Parameter.empty:
+        return None
+
+    if annotation is type(None):
+        return "None"
+
+    origin = getattr(annotation, "__origin__", None)
+
+    # typing.Union (includes X | Y on 3.10+)
+    if origin is typing.Union:
+        args = typing.get_args(annotation)
+        parts = [format_annotation(a, _depth + 1) for a in args]
+        return " | ".join(p for p in parts if p)
+
+    if origin is not None:
+        args = typing.get_args(annotation)
+        origin_name = getattr(origin, "__name__", str(origin))
+        if args:
+            arg_strs = [format_annotation(a, _depth + 1) or "Any" for a in args]
+            return f"{origin_name}[{', '.join(arg_strs)}]"
+        return origin_name
+
+    if hasattr(annotation, "__name__"):
+        return annotation.__name__
+
+    s = str(annotation)
+    s = re.sub(r"\btyping\.", "", s)
+    s = re.sub(r"\bcollections\.abc\.", "", s)
+    return s
+
+
+def format_default(default: object) -> object:
+    """Convert a default value to a JSON-serializable representation."""
+    if default is inspect.Parameter.empty:
+        return None
+
+    if default is None:
+        return None
+
+    if isinstance(default, (str, int, float, bool)):
+        return default
+
+    if isinstance(default, (list, tuple, dict)):
+        try:
+            json.dumps(default)
+            return default
+        except (TypeError, ValueError):
+            pass
+
+    try:
+        return str(default)
+    except Exception:
+        return repr(default)
+
+
+def get_params_from_signature(sig: inspect.Signature, qualified_origin: str) -> dict[str, dict]:
+    """Convert an inspect.Signature into parameter metadata."""
+    params: dict[str, dict] = {}
+
+    for name, param in sig.parameters.items():
+        if name in ("self", "cls"):
+            continue
+        if name.startswith("_"):
+            continue
+        if param.kind in (param.VAR_KEYWORD, param.VAR_POSITIONAL):
+            continue
+
+        params[name] = {
+            "name": name,
+            "type": format_annotation(param.annotation),
+            "default": format_default(param.default),
+            "required": param.default is inspect.Parameter.empty,
+            "origin": qualified_origin,
+        }
+
+    return params
+
+
+def get_params_from_class(cls: type) -> dict[str, dict]:
+    """
+    Extract all __init__ parameters by walking the MRO in reverse
+    so child class overrides parent for the same parameter name.
+    Records the full qualified origin (module.ClassName) for each param.
+    """
+    params: dict[str, dict] = {}
+
+    for klass in reversed(cls.__mro__):
+        if klass is object:
+            continue
+
+        init = klass.__dict__.get("__init__")
+        if init is None:
+            continue
+
+        try:
+            sig = inspect.signature(init)
+        except (TypeError, ValueError):
+            continue
+
+        qualified_origin = f"{klass.__module__}.{klass.__qualname__}"
+        params.update(get_params_from_signature(sig, qualified_origin))
+
+    return params
+
+
+def get_mro_chain(cls: type) -> list[str]:
+    """Return the full MRO as a list of qualified class names."""
+    return [f"{k.__module__}.{k.__qualname__}" for k in cls.__mro__ if k is not object]
+
+
+def parse_param_descriptions(doc: str) -> dict[str, str]:
+    """Parse ``:param name: description`` entries from a docstring."""
+    descriptions: dict[str, str] = {}
+    if not doc:
+        return descriptions
+
+    for match in re.finditer(
+        r":param\s+(\w+):\s*(.+?)(?=\n\s*:\w|\n\s*\.\.|$)",
+        doc,
+        re.DOTALL,
+    ):
+        name = match.group(1)
+        desc = match.group(2).strip()
+        desc = re.sub(r"\s+", " ", desc)
+        if name not in descriptions:
+            descriptions[name] = desc
+
+    return descriptions
+
+
+def parse_docstring_params(cls: type) -> dict[str, str]:
+    """
+    Parse :param name: description from class and ancestor docstrings.
+    Child class descriptions take priority.
+    """
+    descriptions: dict[str, str] = {}
+
+    for klass in cls.__mro__:
+        if klass is object:
+            continue
+        for name, desc in parse_param_descriptions(getattr(klass, "__doc__", None) or "").items():
+            if name not in descriptions:
+                descriptions[name] = desc
+
+    return descriptions
+
+
+def extract_class_params(cls: type) -> tuple[list[str], list[dict]]:
+    """
+    Extract parameter list for a class, merging signature + docstrings.
+    Only includes params originating from provider classes (airflow.providers.*).
+    Returns (mro_chain, filtered_params).
+    """
+    params = get_params_from_class(cls)
+    descriptions = parse_docstring_params(cls)
+
+    for name, param in params.items():
+        if name in descriptions:
+            param["description"] = descriptions[name]
+        else:
+            param["description"] = None
+
+    provider_params = [p for p in params.values() if p["origin"].startswith("airflow.providers.")]
+    mro = get_mro_chain(cls)
+
+    return mro, provider_params
+
+
+def extract_callable_params(func: typing.Callable[..., typing.Any]) -> tuple[list[str], list[dict]]:
+    """Extract parameter metadata from a callable signature and docstring."""
+    try:
+        sig = inspect.signature(func)
+    except (TypeError, ValueError) as e:
+        raise TypeError(f"Could not inspect callable signature: {e}") from e
+
+    qualified_origin = f"{func.__module__}.{func.__qualname__}"
+    params = get_params_from_signature(sig, qualified_origin)
+    descriptions = parse_param_descriptions(getattr(func, "__doc__", None) or "")
+
+    for name, param in params.items():
+        param["description"] = descriptions.get(name)
+
+    provider_params = [p for p in params.values() if p["origin"].startswith("airflow.providers.")]
+    return [], provider_params
+
+
+def extract_params(obj: object) -> tuple[list[str], list[dict]]:
+    """Extract parameter metadata from either a class or a callable."""
+    if inspect.isclass(obj):
+        return extract_class_params(obj)
+    if callable(obj):
+        return extract_callable_params(typing.cast("typing.Callable[..., typing.Any]", obj))
+    raise TypeError(f"Unsupported import type: {type(obj)!r}")
+
+
+def import_symbol(import_path: str) -> object | None:
+    """Import a symbol from its full dotted path."""
+    parts = import_path.rsplit(".", 1)
+    if len(parts) != 2:
+        return None
+
+    module_path, symbol_name = parts
+    try:
+        module = importlib.import_module(module_path)
+        return getattr(module, symbol_name, None)
+    except Exception as e:
+        print(f"  WARN failed to import {import_path}: {e}")
+        return None
+
+
+def find_json(candidates: list[Path], name: str) -> Path:
+    """Find first existing JSON file from candidates list."""
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    print(f"ERROR: {name} not found. Searched:")
+    for c in candidates:
+        print(f"  - {c}")
+    print(f"\nCopy {name} to dev/registry/ or run extract_metadata.py first.")
+    sys.exit(1)
+
+
+log = logging.getLogger(__name__)
+
+
+def load_base_classes() -> dict[str, type]:
+    """Import base classes for issubclass checks.
+
+    Returns a mapping of type name -> base class (e.g. "sensor" -> BaseSensorOperator).
+    """
+    base_classes: dict[str, type] = {}
+    for type_name, import_path in BASE_CLASS_IMPORTS:
+        module_path, class_name = import_path.rsplit(".", 1)
+        try:
+            mod = importlib.import_module(module_path)
+            base_classes[type_name] = getattr(mod, class_name)
+        except Exception:
+            log.warning("Could not import base class %s", import_path)
+    return base_classes
+
+
+def _should_skip_class(name: str) -> bool:
+    """Return True if a class name should be excluded from discovery."""
+    if name.startswith("_"):
+        return True
+    if name.startswith("Base"):
+        return True
+    if "Abstract" in name or "Mixin" in name:
+        return True
+    return False
+
+
+def _get_first_docstring_line(obj: object) -> str | None:
+    """Return the first non-empty line of a class docstring, or None."""
+    doc = getattr(obj, "__doc__", None)
+    if not doc:
+        return None
+    for line in doc.strip().splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return None
+
+
+def _get_source_line(cls: type) -> int | None:
+    """Return the source line number for a class, or None if unavailable."""
+    try:
+        return inspect.getsourcelines(cls)[1]
+    except (OSError, TypeError):
+        return None
+
+
+def load_resumable_job_mixin() -> type | None:
+    """Import ResumableJobMixin for durable-execution capability checks, or None if unavailable."""
+    try:
+        from airflow.sdk import ResumableJobMixin
+
+        return ResumableJobMixin
+    except ImportError:
+        log.warning("Could not import ResumableJobMixin")
+        return None
+
+
+# Matches an actual self.defer() call or self.deferrable attribute read, but not
+# self.defer_for_approval(). `raise TaskDeferred` catches operators that raise it directly
+# instead of calling self.defer() (e.g. VespaIngestOperator); requiring the `raise` keeps an
+# `except TaskDeferred` handler or a `:raises TaskDeferred:` docstring line from matching.
+_DEFERRAL_TOKEN_RE = re.compile(r"self\.defer\(|self\.deferrable\b|raise TaskDeferred")
+_SELF_CALL_RE = re.compile(r"self\.([A-Za-z_][A-Za-z0-9_]*)\(")
+_SUPER_EXECUTE_RE = re.compile(r"super\(\)\.execute\(")
+# Matches the @task.* decorator idiom of naming the parent class directly instead of using
+# super() (e.g. `AgentOperator.execute(self, context)` in common.ai's @task.agent).
+_EXPLICIT_EXECUTE_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\.execute\(")
+
+# To prevent infinite looping, most cases in the repo are 1-2 hops away.
+_MAX_DEFERRAL_WALK_DEPTH = 6
+
+
+def _get_method_source(cls: type, name: str) -> str | None:
+    method = getattr(cls, name, None)
+    if method is None:
+        return None
+    try:
+        return inspect.getsource(method)
+    except (OSError, TypeError):
+        return None
+
+
+def _find_owner_of_execute(mro: tuple[type, ...], start_idx: int) -> type | None:
+    """Return the first class in `mro[start_idx:]` whose own `__dict__` defines `execute`."""
+    for cls in mro[start_idx:]:
+        if "execute" in cls.__dict__:
+            return cls
+    return None
+
+
+def _next_execute_via_super(origin: type, current: type) -> type | None:
+    """Find what `super().execute()` resolves to from `current`, per `origin`'s MRO.
+
+    Must use `origin`'s MRO, not `current`'s own: with multiple inheritance (e.g. a
+    `@task.kubernetes`-built class) they diverge, and a mixin's own MRO may have no
+    relationship to the class the chain actually needs to reach.
+    """
+    try:
+        idx = origin.__mro__.index(current)
+    except ValueError:
+        return None
+    return _find_owner_of_execute(origin.__mro__, idx + 1)
+
+
+def _strip_comment_lines(source: str) -> str:
+    """Drop whole-line comments so they can't be mistaken for real delegation code.
+
+    A comment can say the opposite of what the code does (e.g. "overrides execute rather
+    than calling super().execute()"), and a raw-text search can't tell the two apart.
+    """
+    return "\n".join(line for line in source.splitlines() if not line.strip().startswith("#"))
+
+
+def _next_execute_hop(origin: type, current: type, source: str) -> type | None:
+    """Find the next class in `source`'s delegation chain, via `super().execute()` or an
+    explicit `ParentClass.execute(...)` call.
+
+    Every explicit match is tried in order, since an unrelated earlier call (e.g.
+    `cursor.execute(...)`) can otherwise shadow the real delegation. The matched class is
+    resolved to whoever actually owns `execute` (it may only inherit one, e.g.
+    `GKEStartPodOperator.execute(self, context)`), the same way a `super()` hop is.
+    """
+    source = _strip_comment_lines(source)
+    if _SUPER_EXECUTE_RE.search(source):
+        return _next_execute_via_super(origin, current)
+
+    mro_by_name = {base.__name__: base for base in origin.__mro__}
+    for match in _EXPLICIT_EXECUTE_RE.finditer(source):
+        named_cls = mro_by_name.get(match.group(1))
+        if named_cls is None:
+            continue
+        owner = _find_owner_of_execute(origin.__mro__, origin.__mro__.index(named_cls))
+        if owner is not None:
+            return owner
+    return None
+
+
+def _find_marker_declaring_class(cls: type) -> type | None:
+    """Return the class in `cls`'s MRO whose own body sets `__supports_durable_execution = True`.
+
+    The lookup is per-class (`_{base.__name__}__supports_durable_execution`), not a fixed
+    string, and only matches a class whose own `__dict__` carries the (mangled) name;
+    inheriting the attribute value from a base doesn't count, only writing it yourself does.
+    Leading underscores in the class name are stripped first, matching Python's own name
+    mangling rule (`_Foo` mangles to `_Foo__x`, not `__Foo__x`).
+    """
+    for base in cls.__mro__:
+        mangled = f"_{base.__name__.lstrip('_')}__supports_durable_execution"
+        if base.__dict__.get(mangled) is True:
+            return base
+    return None
+
+
+def _delegates_execute_to(cls: type, target: type, depth: int) -> bool:
+    """Return True if `cls`'s resolved `execute()` chain reaches `target.execute`.
+
+    Covers a class that never overrides `execute` (inherits `target.execute` directly, e.g.
+    GKEStartPodOperator), one whose override ends in `super().execute(context)` (e.g.
+    EksPodOperator), and one that names the parent class directly instead (e.g.
+    `AgentOperator.execute(self, context)` in `@task.agent`).
+
+    The `super().execute(` check is a text search with no view of control flow, so a class
+    that returns before reaching that call still matches. SparkKubernetesOperator is the
+    live example: its deferrable path returns out of `execute_async(context)` and never
+    reaches the `super().execute(context)` below it. The durable verdict is still right
+    there, but for a reason this function does not test, since KubernetesPodOperator's
+    `execute_sync` and `execute_async` both reach the pod reattach independently. The gap
+    this leaves: a subclass whose `execute` neither reaches the marker-declaring class nor
+    goes through that reattach would inherit the durable claim without earning it.
+    """
+    owner = _find_owner_of_execute(cls.__mro__, 0)
+    remaining = depth
+    while owner is not None:
+        if owner is target:
+            return True
+        if remaining <= 0:
+            return False
+        source = _get_method_source(owner, "execute")
+        if source is None:
+            return False
+        owner = _next_execute_hop(cls, owner, source)
+        remaining -= 1
+    return False
+
+
+def _execute_chain_calls_resumable(cls: type, depth: int) -> bool:
+    """Return True if some class along `cls`'s resolved `execute()` chain calls execute_resumable().
+
+    Same walk as `_delegates_execute_to`: a delegating override's own source may not mention
+    `execute_resumable` even though the class it hands off to does. Only a real call counts,
+    so the match is made on the parsed tree: a comment, docstring or other string literal
+    naming the call is not the call.
+    """
+    owner = _find_owner_of_execute(cls.__mro__, 0)
+    remaining = depth
+    while owner is not None:
+        source = _get_method_source(owner, "execute")
+        if source is None:
+            return False
+        if any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "execute_resumable"
+            for node in ast.walk(ast.parse(textwrap.dedent(source)))
+        ):
+            return True
+        source = _strip_comment_lines(source)
+        if remaining <= 0:
+            return False
+        owner = _next_execute_hop(cls, owner, source)
+        remaining -= 1
+    return False
+
+
+def is_durable_capable(cls: type, resumable_mixin: type | None) -> bool:
+    """Return True if a class implements durable/crash-safe execution.
+
+    Two ways to qualify:
+    1. A class-level `__supports_durable_execution = True` declaration (for operators like
+    KubernetesPodOperator/AgentOperator that implement this directly against
+    task_state_store, without ResumableJobMixin). Inherited by a subclass that hasn't
+    replaced the declaring class's `execute()`, whether by not overriding it at all, or by
+    delegating back via `super().execute()`.
+    2. Genuinely implementing ResumableJobMixin's contract, where `execute()` (or a class it
+    delegates to) calls `execute_resumable()`.
+    """
+    declaring_cls = _find_marker_declaring_class(cls)
+    if declaring_cls is not None and _delegates_execute_to(cls, declaring_cls, _MAX_DEFERRAL_WALK_DEPTH):
+        return True
+
+    if resumable_mixin is None or resumable_mixin not in cls.__mro__:
+        return False
+
+    if inspect.isabstract(cls):
+        return False
+
+    return _execute_chain_calls_resumable(cls, _MAX_DEFERRAL_WALK_DEPTH)
+
+
+def _is_terminal_block(body: list[ast.stmt]) -> bool:
+    """Return True if `body`'s last statement always exits the function (raise or return)."""
+    return bool(body) and isinstance(body[-1], (ast.Raise, ast.Return))
+
+
+def _strip_dead_version_guard_branches(source: str, resolve_global: typing.Callable[[str], object]) -> str:
+    """Blank out code after a terminal `if <flag>: raise ...` whose flag resolves True here.
+
+    Some operators write `if AIRFLOW_V_3_3_PLUS: raise ...` with no `else`, followed by a
+    pre-3.3 `self.defer(...)` fallback that never runs on the core being imported.
+    `resolve_global` looks up the flag by name rather than a fixed list.
+    """
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except SyntaxError:
+        return source
+
+    if not tree.body or not isinstance(tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return source
+
+    dead_from: int | None = None
+    for stmt in tree.body[0].body:
+        if (
+            isinstance(stmt, ast.If)
+            and not stmt.orelse
+            and isinstance(stmt.test, ast.Name)
+            and _is_terminal_block(stmt.body)
+            and resolve_global(stmt.test.id) is True
+        ):
+            dead_from = stmt.end_lineno
+            break
+
+    if dead_from is None:
+        return source
+    return "".join(source.splitlines(keepends=True)[:dead_from])
+
+
+def _get_reachable_method_source(cls: type, name: str) -> str | None:
+    """Like `_get_method_source`, but with comments and dead version-guard branches stripped."""
+    method = getattr(cls, name, None)
+    if method is None:
+        return None
+    try:
+        source = _strip_comment_lines(inspect.getsource(method))
+    except (OSError, TypeError):
+        return None
+
+    # unwrap() undoes a functools.wraps() decorator, whose __globals__ would otherwise
+    # point at the decorator's own module instead of the method's. BaseOperatorMeta wraps
+    # execute on nearly every registered operator, so this is the common case, not an edge
+    # one: without it the version flag resolves to nothing and no dead branch is stripped.
+    func = inspect.unwrap(getattr(method, "__func__", method))
+    module_globals = getattr(func, "__globals__", None)
+    if module_globals is None:
+        return source
+    return _strip_dead_version_guard_branches(source, module_globals.get)
+
+
+def _references_deferral(
+    origin: type, current: type, source: str, visited: set[tuple[int, str, int]], depth: int
+) -> bool:
+    """Return True if `source` (the resolved `execute()` of `current`, called on `origin`) references deferral.
+
+    `origin` stays fixed across recursion so `super().execute()` hops resolve against its
+    real MRO, while `current` walks forward through the chain. `self.<name>()` helpers are
+    resolved against `origin` rather than `current`, matching how they actually dispatch at
+    runtime: past the first hop `current` is an ancestor, whose copy of a helper a more
+    derived class may have overridden. `visited` keys include the remaining depth, so a node
+    first reached with little budget left isn't skipped when re-reached with more.
+    """
+    if _DEFERRAL_TOKEN_RE.search(source):
+        return True
+    if depth <= 0:
+        return False
+
+    next_cls = _next_execute_hop(origin, current, source)
+    if next_cls is not None:
+        key = (id(next_cls), "execute", depth)
+        if key not in visited:
+            visited.add(key)
+            next_source = _get_reachable_method_source(next_cls, "execute")
+            if next_source is not None and _references_deferral(
+                origin, next_cls, next_source, visited, depth - 1
+            ):
+                return True
+
+    for name in _SELF_CALL_RE.findall(source):
+        key = (id(origin), name, depth)
+        if key in visited:
+            continue
+        visited.add(key)
+        helper_source = _get_reachable_method_source(origin, name)
+        if helper_source is not None and _references_deferral(
+            origin, current, helper_source, visited, depth - 1
+        ):
+            return True
+
+    return False
+
+
+def supports_deferrable(cls: type) -> bool:
+    """Return True if the class's resolved execute() actually references deferral.
+
+    Checking for a `deferrable` constructor parameter isn't enough: a subclass can
+    inherit the parameter while overriding execute() with code that never reads it,
+    and an operator that always defers unconditionally has no parameter to find at
+    all. This walks outward from execute() into helper methods it calls via
+    `self.<name>(...)`, and up the MRO through `super().execute(...)` looking for
+    an actual `self.defer(...)` call, a `self.deferrable` read, or a `TaskDeferred`
+    raise, rather than only checking execute()'s own source text. A `defer()` fallback
+    behind a version guard that's False on this core (e.g. `if AIRFLOW_V_3_3_PLUS: raise
+    ...`) is excluded, since it never actually runs here.
+    """
+    source = _get_reachable_method_source(cls, "execute")
+    if source is None:
+        return False
+
+    seed = {(id(cls), "execute", _MAX_DEFERRAL_WALK_DEPTH)}
+    return _references_deferral(cls, cls, source, seed, _MAX_DEFERRAL_WALK_DEPTH)
+
+
+def _resolve_dotted_path(class_path: str) -> tuple[str, str, object] | None:
+    """Split a dotted ``module.name`` path and import ``name`` from that module.
+
+    Returns ``None`` (without logging) if ``class_path`` has no dot, or ``None``
+    (after logging a warning) if the module import fails. Otherwise returns
+    ``(module_path, name, obj)``, where ``obj`` may be ``None`` if the module
+    has no such attribute — callers decide how to treat a missing attribute.
+    """
+    parts = class_path.rsplit(".", 1)
+    if len(parts) != 2:
+        return None
+    module_path, name = parts
+    try:
+        mod = importlib.import_module(module_path)
+        obj = getattr(mod, name, None)
+    except Exception:
+        log.warning("Could not import %s", class_path)
+        return None
+    return module_path, name, obj
+
+
+def _resolve_decorated_operator_class(decorator_fn: object) -> type | None:
+    """Return the operator class a `@task.*` decorator builds, or None.
+
+    A task decorator's registered `class-name` points at the factory function, not at an
+    operator, so capability detection has nothing to inspect without this hop. Every
+    decorator in the tree passes its operator to `task_decorator_factory` as
+    `decorated_operator_class=<Name>`, which is resolved here against the factory's own
+    module. The class itself is private (`_AgentDecoratedOperator`), so the decorator entry
+    is the only place it surfaces in the catalog.
+    """
+    try:
+        source = inspect.getsource(decorator_fn)  # type: ignore[arg-type]
+    except (OSError, TypeError):
+        return None
+
+    match = re.search(r"decorated_operator_class\s*=\s*([A-Za-z_][A-Za-z0-9_]*)", source)
+    if match is None:
+        return None
+
+    func = inspect.unwrap(getattr(decorator_fn, "__func__", decorator_fn))  # type: ignore[arg-type]
+    module_globals = getattr(func, "__globals__", None)
+    if module_globals is None:
+        return None
+
+    candidate = module_globals.get(match.group(1))
+    return candidate if inspect.isclass(candidate) else None
+
+
+def read_guide_docs(docs_dir: Path) -> dict[str, str]:
+    """Read a provider's authored reST docs from the working tree, keyed by path relative to ``docs_dir``."""
+    if not docs_dir.is_dir():
+        return {}
+    docs = {}
+    for path in sorted(docs_dir.rglob("*.rst")):
+        relative = path.relative_to(docs_dir).as_posix()
+        if not is_guide_page(relative):
+            continue
+        docs[relative] = path.read_text(encoding="utf-8")
+    return docs
+
+
+def read_released_guide_docs(
+    provider_id: str, version: str, provider_rel_path: Path
+) -> dict[str, str] | None:
+    """Read a provider's guide docs at its release tag, or None when there is no tag to read.
+
+    The guide links point at ``/stable``, which serves the released docs, so the
+    anchors must come from the same content; the working tree may be ahead of it.
+    A tag from the old flat layout yields an empty dict, meaning no guide links
+    rather than a fallback to the working tree.
+    """
+    if not version:
+        return None
+    tag = f"providers-{provider_id}/{version}"
+    if not git_tag_exists(tag):
+        return None
+    dir_path = provider_rel_path.as_posix()
+    layout = detect_layout(tag, dir_path)
+    if layout is None:
+        return None
+    return read_guide_docs_at_tag(tag, layout, dir_path)
+
+
+def discover_classes_from_provider(
+    provider_yaml_path: Path,
+    base_classes: dict[str, type],
+    resumable_mixin: type | None = None,
+    inventory: dict[str, str] | None = None,
+    version: str = "",
+) -> list[dict]:
+    """Discover classes from a single provider by importing its modules at runtime.
+
+    Reads the provider.yaml to find which modules/classes to inspect, imports them,
+    and returns metadata for each discovered class with every required `Module`
+    dataclass field, plus ``guide_url`` when a how-to guide documents the class.
+    """
+    with open(provider_yaml_path) as f:
+        provider_yaml = yaml.safe_load(f)
+
+    provider_id = provider_yaml.get("package-name", "").replace("apache-airflow-providers-", "")
+    if not provider_id:
+        return []
+
+    provider_name = provider_yaml.get("name", provider_id.replace("-", " ").title())
+    provider_rel_path = provider_yaml_path.parent.relative_to(PROVIDERS_DIR)
+    tag = f"providers-{provider_id}/{version}" if version else "main"
+    base_docs_url = f"https://airflow.apache.org/docs/apache-airflow-providers-{provider_id}/stable"
+    base_source_url = f"https://github.com/apache/airflow/blob/{tag}/providers/{provider_rel_path}/src"
+
+    # Build integration-name lookup for module-level sections
+    # Maps (section_name, module_path) -> integration_name
+    integration_by_module: dict[tuple[str, str], str] = {}
+    for section_name in list(MODULE_LEVEL_SECTIONS) + ["bundles"]:
+        for group in provider_yaml.get(section_name, []):
+            integration = group.get("integration-name", "")
+            for mp in group.get("python-modules", []):
+                integration_by_module[(section_name, mp)] = integration
+
+    def resolve_docs_url(full_class_path: str, module_path: str) -> str:
+        """Look up docs URL from inventory, falling back to manual construction."""
+        if inventory and full_class_path in inventory:
+            return f"{base_docs_url}/{inventory[full_class_path]}"
+        api_ref_path = module_path.replace(".", "/")
+        return f"{base_docs_url}/_api/{api_ref_path}/index.html#{full_class_path}"
+
+    def make_source_url(cls: type, module_path: str) -> str:
+        """Construct a GitHub source URL with line number when available."""
+        url = f"{base_source_url}/{module_path.replace('.', '/')}.py"
+        line = _get_source_line(cls)
+        if line:
+            url += f"#L{line}"
+        return url
+
+    def make_entry(
+        cls_or_obj: type,
+        name: str,
+        module_type: str,
+        import_path: str,
+        module_path: str,
+        integration: str = "",
+        category: str = "",
+        transfer_desc: str | None = None,
+    ) -> dict:
+        """Build a full module entry dict with all fields."""
+        module_name = module_path.split(".")[-1]
+        docstring = _get_first_docstring_line(cls_or_obj)
+        short_desc = docstring or transfer_desc or f"{integration} {module_type}".strip()
+
+        return {
+            "id": f"{provider_id}-{module_name}-{name}",
+            "name": name,
+            "type": module_type,
+            "import_path": import_path,
+            "module_path": module_path,
+            "short_description": short_desc,
+            "docs_url": resolve_docs_url(import_path, module_path),
+            "source_url": make_source_url(cls_or_obj, module_path),
+            "category": category or get_category(integration),
+            "provider_id": provider_id,
+            "provider_name": provider_name,
+            "supports_durable_execution": is_durable_capable(cls_or_obj, resumable_mixin),
+            "supports_deferrable": supports_deferrable(cls_or_obj),
+        }
+
+    discovered: list[dict] = []
+
+    # --- Module-level sections (operators, hooks, sensors, triggers, bundles) ---
+    for section_name, module_type in MODULE_LEVEL_SECTIONS.items():
+        expected_base = base_classes.get(module_type)
+        for group in provider_yaml.get(section_name, []):
+            integration = group.get("integration-name", "")
+            category = get_category(integration)
+            for module_path in group.get("python-modules", []):
+                try:
+                    mod = importlib.import_module(module_path)
+                except Exception:
+                    log.warning("Could not import module %s", module_path)
+                    continue
+
+                for name, cls in inspect.getmembers(mod, inspect.isclass):
+                    if cls.__module__ != mod.__name__:
+                        continue
+                    if _should_skip_class(name):
+                        continue
+                    if expected_base and not issubclass(cls, expected_base):
+                        continue
+
+                    discovered.append(
+                        make_entry(
+                            cls,
+                            name,
+                            module_type,
+                            f"{module_path}.{name}",
+                            module_path,
+                            integration,
+                            category,
+                        )
+                    )
+
+    # --- Transfers (module-level, singular python-module key) ---
+    transfer_base = base_classes.get("operator")
+    for transfer in provider_yaml.get("transfers", []):
+        module_path = transfer.get("python-module", "")
+        if not module_path:
+            continue
+        source = transfer.get("source-integration-name", "")
+        target = transfer.get("target-integration-name", "")
+        transfer_desc = f"Transfer from {source} to {target}" if source and target else None
+        category = get_category(source) if source else ""
+
+        try:
+            mod = importlib.import_module(module_path)
+        except Exception:
+            log.warning("Could not import module %s", module_path)
+            continue
+
+        for name, cls in inspect.getmembers(mod, inspect.isclass):
+            if cls.__module__ != mod.__name__:
+                continue
+            if _should_skip_class(name):
+                continue
+            if transfer_base and not issubclass(cls, transfer_base):
+                continue
+
+            discovered.append(
+                make_entry(
+                    cls,
+                    name,
+                    "transfer",
+                    f"{module_path}.{name}",
+                    module_path,
+                    source,
+                    category,
+                    transfer_desc,
+                )
+            )
+
+    # --- Class-level sections (notifications, secrets-backends, logging, executors) ---
+    for section_name, module_type in CLASS_LEVEL_SECTIONS.items():
+        for class_path in provider_yaml.get(section_name, []):
+            if not class_path or not isinstance(class_path, str):
+                continue
+            if (resolved := _resolve_dotted_path(class_path)) is None:
+                continue
+            module_path, class_name, candidate = resolved
+            if candidate is None or not inspect.isclass(candidate):
+                log.warning("%s is not a class", class_path)
+                continue
+            cls = candidate
+
+            discovered.append(
+                make_entry(
+                    cls,
+                    class_name,
+                    module_type,
+                    class_path,
+                    module_path,
+                    category=CLASS_LEVEL_CATEGORY_OVERRIDES.get(section_name, section_name),
+                )
+            )
+
+    # --- Dict-shaped class-level sections (plugins, dialects; each entry is a
+    # dict carrying an integration-name field plus a class-path field, see types.py) ---
+    for section_name, (
+        module_type,
+        class_field,
+        integration_field,
+    ) in DICT_SHAPED_CLASS_LEVEL_SECTIONS.items():
+        for entry in provider_yaml.get(section_name, []):
+            if not isinstance(entry, dict):
+                continue
+            if not (class_path := entry.get(class_field, "")):
+                continue
+            if (resolved := _resolve_dotted_path(class_path)) is None:
+                continue
+            module_path, class_name, candidate = resolved
+            if candidate is None or not inspect.isclass(candidate):
+                log.warning("%s is not a class", class_path)
+                continue
+
+            discovered.append(
+                make_entry(
+                    candidate,
+                    class_name,
+                    module_type,
+                    class_path,
+                    module_path,
+                    integration=entry.get(integration_field, ""),
+                    category=CLASS_LEVEL_CATEGORY_OVERRIDES.get(section_name, section_name),
+                )
+            )
+
+    # --- Task decorators (class-name key in each entry) ---
+    for decorator in provider_yaml.get("task-decorators", []):
+        if not (class_path := decorator.get("class-name", "")):
+            continue
+        if (resolved := _resolve_dotted_path(class_path)) is None:
+            continue
+        module_path, func_name, obj = resolved
+        if obj is None:
+            continue
+
+        decorator_name = decorator.get("name", "")
+        display_name = f"@task.{decorator_name}" if decorator_name else func_name
+        docstring = _get_first_docstring_line(obj) if hasattr(obj, "__doc__") else None
+        short_desc = docstring or f"Task decorator for {decorator_name or func_name}"
+
+        # Capabilities belong to the operator the decorator builds, not to the factory
+        # function the provider registers, so they're read off the resolved class.
+        decorated_cls = _resolve_decorated_operator_class(obj)
+
+        discovered.append(
+            {
+                "id": f"{provider_id}-decorator-{decorator_name or func_name}",
+                "name": display_name,
+                "type": "decorator",
+                "import_path": class_path,
+                "module_path": module_path,
+                "short_description": short_desc,
+                "docs_url": resolve_docs_url(class_path, module_path),
+                "source_url": f"{base_source_url}/{module_path.replace('.', '/')}.py",
+                "category": "decorators",
+                "provider_id": provider_id,
+                "provider_name": provider_name,
+                "supports_durable_execution": (
+                    is_durable_capable(decorated_cls, resumable_mixin) if decorated_cls else False
+                ),
+                "supports_deferrable": supports_deferrable(decorated_cls) if decorated_cls else False,
+            }
+        )
+
+    guide_docs = read_released_guide_docs(provider_id, version, provider_rel_path)
+    if guide_docs is None:
+        guide_docs = read_guide_docs(provider_yaml_path.parent / "docs")
+    attach_guide_urls(discovered, collect_guide_anchors(guide_docs), base_docs_url)
+
+    return discovered
+
+
+def compare_with_ast(
+    runtime_classes: list[dict],
+    modules_json_path: Path,
+) -> dict:
+    """Compare runtime-discovered classes against AST-produced modules.json.
+
+    Returns a stats dict with counts of phantoms, misses, and type mismatches.
+    """
+    with open(modules_json_path) as f:
+        ast_data = json.load(f)
+
+    ast_modules = ast_data.get("modules", [])
+
+    ast_by_path: dict[str, dict] = {}
+    for m in ast_modules:
+        path = m.get("import_path", "")
+        if path:
+            ast_by_path[path] = m
+
+    runtime_by_path: dict[str, dict] = {}
+    for r in runtime_classes:
+        path = r.get("import_path", "")
+        if path:
+            runtime_by_path[path] = r
+
+    ast_paths = set(ast_by_path)
+    runtime_paths = set(runtime_by_path)
+
+    phantoms = sorted(ast_paths - runtime_paths)
+    misses = sorted(runtime_paths - ast_paths)
+    common = ast_paths & runtime_paths
+
+    type_mismatches = []
+    for path in sorted(common):
+        ast_type = ast_by_path[path].get("type", "")
+        runtime_type = runtime_by_path[path].get("type", "")
+        if ast_type != runtime_type:
+            type_mismatches.append(
+                {
+                    "import_path": path,
+                    "ast_type": ast_type,
+                    "runtime_type": runtime_type,
+                }
+            )
+
+    # Print comparison table
+    print("\n" + "=" * 60)
+    print("Runtime vs AST Comparison")
+    print("=" * 60)
+    print(f"  AST classes:      {len(ast_paths)}")
+    print(f"  Runtime classes:  {len(runtime_paths)}")
+    print(f"  In common:        {len(common)}")
+    print(f"  AST phantoms:     {len(phantoms)} (in AST, not runtime)")
+    print(f"  AST misses:       {len(misses)} (in runtime, not AST)")
+    print(f"  Type mismatches:  {len(type_mismatches)}")
+
+    if phantoms:
+        print(f"\nAST Phantoms ({len(phantoms)}):")
+        for p in phantoms[:20]:
+            ast_type = ast_by_path[p].get("type", "?")
+            print(f"  [{ast_type}] {p}")
+        if len(phantoms) > 20:
+            print(f"  ... and {len(phantoms) - 20} more")
+
+    if misses:
+        print(f"\nAST Misses ({len(misses)}):")
+        for p in misses[:20]:
+            rt_type = runtime_by_path[p].get("type", "?")
+            print(f"  [{rt_type}] {p}")
+        if len(misses) > 20:
+            print(f"  ... and {len(misses) - 20} more")
+
+    if type_mismatches:
+        print(f"\nType Mismatches ({len(type_mismatches)}):")
+        for m in type_mismatches[:20]:
+            print(f"  {m['import_path']}: AST={m['ast_type']} Runtime={m['runtime_type']}")
+        if len(type_mismatches) > 20:
+            print(f"  ... and {len(type_mismatches) - 20} more")
+
+    print("=" * 60)
+
+    return {
+        "ast_phantoms": len(phantoms),
+        "ast_misses": len(misses),
+        "type_mismatches": len(type_mismatches),
+        "phantom_paths": phantoms,
+        "miss_paths": misses,
+        "mismatch_details": type_mismatches,
+    }
+
+
+def _extract_params_from_modules(
+    modules: list[dict],
+) -> tuple[dict[str, dict[str, dict]], dict[str, str], int, int, int]:
+    """Extract parameters from a list of module dicts.
+
+    Returns (provider_classes, provider_names, total_processed, total_failed, total_params).
+    """
+    provider_classes: dict[str, dict[str, dict]] = defaultdict(dict)
+    provider_names: dict[str, str] = {}
+    total_processed = 0
+    total_failed = 0
+    total_params = 0
+
+    for i, module in enumerate(modules, 1):
+        import_path = module.get("import_path", "")
+        provider_id = module.get("provider_id", "")
+        provider_name = module.get("provider_name", module.get("provider_id", ""))
+        module_type = module.get("type", "")
+        class_name = module.get("name", "")
+
+        if not import_path or not provider_id:
+            continue
+
+        provider_names[provider_id] = provider_name
+
+        obj = import_symbol(import_path)
+        if obj is None:
+            total_failed += 1
+            continue
+
+        try:
+            mro, params = extract_params(obj)
+        except Exception as e:
+            print(f"  ERROR extracting params for {import_path}: {e}")
+            total_failed += 1
+            continue
+
+        provider_classes[provider_id][import_path] = {
+            "name": class_name,
+            "type": module_type,
+            "mro": mro,
+            "parameters": params,
+        }
+
+        total_processed += 1
+        total_params += len(params)
+
+        if i % 100 == 0:
+            print(f"  Processed {i}/{len(modules)} modules...")
+
+    return provider_classes, provider_names, total_processed, total_failed, total_params
+
+
+def _write_parameter_files(
+    provider_classes: dict[str, dict[str, dict]],
+    provider_names: dict[str, str],
+    provider_versions: dict[str, str],
+    generated_at: str,
+) -> None:
+    """Write per-provider parameter JSON files."""
+    for output_dir in OUTPUT_DIRS:
+        if not output_dir.parent.exists():
+            continue
+
+        written = 0
+        for pid, classes in provider_classes.items():
+            version = provider_versions.get(pid)
+            if not version:
+                print(f"  WARN: no version found for {pid}, skipping")
+                continue
+
+            version_dir = output_dir / "versions" / pid / version
+            version_dir.mkdir(parents=True, exist_ok=True)
+
+            provider_data = validate_provider_parameters(
+                {
+                    "provider_id": pid,
+                    "provider_name": provider_names.get(pid, pid),
+                    "version": version,
+                    "generated_at": generated_at,
+                    "classes": classes,
+                }
+            )
+            with open(version_dir / "parameters.json", "w") as f:
+                json.dump(provider_data, f, separators=(",", ":"))
+            written += 1
+
+        print(f"Wrote {written} provider parameter files to {output_dir}/versions/")
+
+
+def _fetch_inventories(
+    provider_ids: set[str],
+    provider_yamls: dict[str, dict],
+) -> dict[str, dict[str, str]]:
+    """Fetch Sphinx inventory files in parallel for all providers."""
+    package_names: dict[str, str] = {}
+    for pid in provider_ids:
+        py = provider_yamls.get(pid, {})
+        package_names[pid] = py.get("package-name", f"apache-airflow-providers-{pid}")
+
+    def _fetch_and_parse(pid: str) -> tuple[str, dict[str, str] | None]:
+        inv_path = fetch_provider_inventory(package_names[pid])
+        if inv_path:
+            try:
+                return pid, read_inventory(inv_path)
+            except Exception as e:
+                print(f"    Warning: Could not parse inventory for {pid}: {e}")
+                return pid, None
+        return pid, None
+
+    inventories: dict[str, dict[str, str]] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(_fetch_and_parse, pid): pid for pid in provider_ids}
+        for future in concurrent.futures.as_completed(futures):
+            pid, inv = future.result()
+            if inv:
+                inventories[pid] = inv
+
+    return inventories
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Extract provider parameters and modules")
+    parser.add_argument(
+        "--provider",
+        default=None,
+        help=(
+            "Only process these provider ID(s) (space-separated, e.g. 'amazon google'). "
+            "Writes a partial modules.json containing only the requested providers; "
+            "merge_registry_data.py replaces those providers' entries in the global catalog "
+            "while preserving everyone else."
+        ),
+    )
+    parser.add_argument(
+        "--providers-json",
+        default=None,
+        help="Path to providers.json (overrides default search paths).",
+    )
+    args = parser.parse_args()
+
+    print("Airflow Registry Parameter & Module Extractor")
+    print("=" * 50)
+
+    if args.providers_json:
+        providers_json_path = Path(args.providers_json)
+    else:
+        providers_json_path = find_json(PROVIDERS_JSON_CANDIDATES, "providers.json")
+    with open(providers_json_path) as f:
+        providers_data = json.load(f)
+
+    provider_versions: dict[str, str] = {}
+    for p in providers_data.get("providers", []):
+        provider_versions[p["id"]] = p["version"]
+
+    generated_at = datetime.now(UTC).isoformat()
+    _main_discover(
+        provider_versions,
+        generated_at,
+        requested_providers=_parse_requested_providers(args.provider),
+    )
+
+    print("\nDone!")
+
+
+def _parse_requested_providers(provider_arg: str | None) -> set[str] | None:
+    """Parse --provider argument into a set of provider IDs.
+
+    Accepts a space-separated string (matching extract_metadata.py and
+    extract_connections.py). Returns None when the argument is empty so
+    callers can distinguish "all providers" from "explicit empty set".
+    """
+    if not provider_arg:
+        return None
+    return {pid.strip() for pid in provider_arg.split() if pid.strip()}
+
+
+def _main_discover(
+    provider_versions: dict[str, str],
+    generated_at: str,
+    requested_providers: set[str] | None = None,
+) -> None:
+    """Runtime discovery: find classes from provider.yaml files, produce modules.json and parameters.
+
+    When ``requested_providers`` is set, only those providers are scanned and the resulting
+    modules.json is partial (covers only the requested providers). ``merge_registry_data.py``
+    handles incremental merges by replacing entries for provider IDs present in the new
+    modules.json while preserving all others, so partial output is safe.
+    """
+    provider_yaml_paths = sorted(PROVIDERS_DIR.rglob("provider.yaml"))
+    print(f"Found {len(provider_yaml_paths)} provider.yaml files")
+
+    base_classes = load_base_classes()
+    print(f"Loaded {len(base_classes)} base classes: {', '.join(sorted(base_classes))}")
+
+    resumable_mixin = load_resumable_job_mixin()
+
+    # Load all provider.yaml data and map provider_id -> yaml dict / path
+    provider_yamls_by_id: dict[str, dict] = {}
+    provider_paths_by_id: dict[str, Path] = {}
+    for yaml_path in provider_yaml_paths:
+        with open(yaml_path) as f:
+            py = yaml.safe_load(f)
+        pid = py.get("package-name", "").replace("apache-airflow-providers-", "")
+        if pid:
+            provider_yamls_by_id[pid] = py
+            provider_paths_by_id[pid] = yaml_path
+
+    # Filter to requested provider(s) if specified
+    if requested_providers:
+        missing = requested_providers - set(provider_paths_by_id)
+        if missing:
+            print(f"ERROR: provider(s) not found in provider.yaml files: {sorted(missing)}")
+            sys.exit(1)
+        provider_paths_by_id = {pid: provider_paths_by_id[pid] for pid in requested_providers}
+        provider_yamls_by_id = {pid: provider_yamls_by_id[pid] for pid in requested_providers}
+        print(f"Filtering to provider(s): {', '.join(sorted(requested_providers))}")
+
+    # Fetch Sphinx inventories in parallel
+    print("Fetching Sphinx inventory files ...")
+    inventories = _fetch_inventories(set(provider_yamls_by_id), provider_yamls_by_id)
+    print(f"  {len(inventories)}/{len(provider_yamls_by_id)} inventories loaded")
+
+    all_discovered: list[dict] = []
+    providers_seen: set[str] = set()
+
+    for pid, yaml_path in sorted(provider_paths_by_id.items()):
+        version = provider_versions.get(pid, "")
+        discovered = discover_classes_from_provider(
+            yaml_path,
+            base_classes,
+            resumable_mixin,
+            inventory=inventories.get(pid),
+            version=version,
+        )
+        all_discovered.extend(discovered)
+        for d in discovered:
+            providers_seen.add(d["provider_id"])
+
+    print(f"\nDiscovered {len(all_discovered)} classes from {len(providers_seen)} providers")
+
+    # Deduplicate by ID
+    seen_ids: set[str] = set()
+    unique_modules: list[dict] = []
+    for m in all_discovered:
+        mid = m["id"]
+        if mid not in seen_ids:
+            seen_ids.add(mid)
+            unique_modules.append(m)
+    all_discovered = unique_modules
+    print(f"Deduplicated to {len(all_discovered)} unique modules")
+
+    # Write modules.json. In --provider mode this is partial (covers only the
+    # requested providers); merge_registry_data.py drives module replacement
+    # off the provider IDs present in this file, so non-requested providers'
+    # entries are preserved untouched in the global catalog.
+    modules_json = validate_modules_catalog({"modules": all_discovered})
+    scope_label = (
+        f"partial, providers: {', '.join(sorted(requested_providers))}" if requested_providers else "full"
+    )
+    output_dirs = [SCRIPT_DIR, AIRFLOW_ROOT / "registry" / "src" / "_data"]
+    for out_dir in output_dirs:
+        if not out_dir.parent.exists():
+            continue
+        out_dir.mkdir(parents=True, exist_ok=True)
+        with open(out_dir / "modules.json", "w") as f:
+            json.dump(modules_json, f, indent=2)
+        print(f"Wrote {len(all_discovered)} modules ({scope_label}) to {out_dir / 'modules.json'}")
+
+    # Write runtime_modules.json (debug/stats file). Only meaningful for full
+    # builds; skip in --provider mode since it would only show partial stats.
+    if not requested_providers:
+        runtime_output = {
+            "generated_at": generated_at,
+            "discovery_method": "runtime",
+            "stats": {
+                "total_classes": len(all_discovered),
+                "total_providers": len(providers_seen),
+            },
+            "classes": all_discovered,
+        }
+        runtime_json_path = SCRIPT_DIR / "runtime_modules.json"
+        with open(runtime_json_path, "w") as f:
+            json.dump(runtime_output, f, indent=2)
+        print(f"Wrote {runtime_json_path}")
+
+    # Extract parameters
+    print("\nExtracting parameters from runtime-discovered classes...")
+    provider_classes, provider_names, total_processed, total_failed, total_params = (
+        _extract_params_from_modules(all_discovered)
+    )
+
+    print(f"\nProcessed {total_processed} classes, {total_failed} failed imports")
+    print(f"Extracted {total_params} total parameters")
+    print(f"Across {len(provider_classes)} providers")
+
+    _write_parameter_files(provider_classes, provider_names, provider_versions, generated_at)
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

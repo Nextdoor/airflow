@@ -1,0 +1,232 @@
+/*!
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import { useEffect, useState } from "react";
+
+import { Box, Button, Input, Text, VStack } from "@chakra-ui/react";
+import { useQueryClient } from "@tanstack/react-query";
+import { useTranslation } from "react-i18next";
+
+import {
+  useXcomServiceCreateXcomEntry,
+  useXcomServiceGetXcomEntriesKey,
+  useXcomServiceGetXcomEntry,
+  useXcomServiceGetXcomEntryKey,
+  useXcomServiceUpdateXcomEntry,
+} from "openapi/queries";
+import type { XComResponseNative } from "openapi/requests/types.gen";
+
+import { Modal, ProgressBar, toaster } from "src/system-components";
+
+import { JsonEditor } from "src/components/JsonEditor";
+
+type XComModalProps = {
+  readonly dagId: string;
+  readonly isOpen: boolean;
+  readonly mapIndex: number;
+  readonly mode: "add" | "edit";
+  readonly onClose: () => void;
+  readonly regionId?: string;
+  readonly regionIndex?: number;
+  readonly runId: string;
+  readonly taskId: string;
+  readonly xcomKey?: string;
+};
+
+const XComModal = ({
+  dagId,
+  isOpen,
+  mapIndex,
+  mode,
+  onClose,
+  regionId,
+  regionIndex,
+  runId,
+  taskId,
+  xcomKey,
+}: XComModalProps) => {
+  const { t: translate } = useTranslation(["browse", "common"]);
+  const queryClient = useQueryClient();
+  const [key, setKey] = useState("");
+  const [value, setValue] = useState("");
+
+  const isEditMode = mode === "edit";
+
+  // Fetch existing XCom data when in edit mode
+  const { data, isLoading } = useXcomServiceGetXcomEntry<XComResponseNative>(
+    {
+      dagId,
+      dagRunId: runId,
+      // Editing needs the stored type; display deserialization can parse JSON-looking strings.
+      deserialize: false,
+      mapIndex,
+      regionId,
+      regionIndex,
+      stringify: false,
+      taskId,
+      xcomKey: xcomKey ?? "",
+    },
+    undefined,
+    { enabled: isOpen && isEditMode && Boolean(xcomKey) },
+  );
+
+  // Populate form when editing
+  useEffect(() => {
+    if (isOpen && isEditMode && data) {
+      const val = data.value;
+
+      setValue(JSON.stringify(val, undefined, 2));
+    }
+  }, [data, isEditMode, isOpen]);
+
+  // Reset form when modal closes
+  useEffect(() => {
+    if (!isOpen) {
+      setKey("");
+      setValue("");
+    }
+  }, [isOpen]);
+
+  // Create mutation
+  const { isPending: isCreating, mutate: createXCom } = useXcomServiceCreateXcomEntry({
+    onError: () => {
+      toaster.create({
+        description: translate("browse:xcom.add.error"),
+        title: translate("browse:xcom.add.errorTitle"),
+        type: "error",
+      });
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({
+        queryKey: [useXcomServiceGetXcomEntriesKey],
+      });
+      onClose();
+      toaster.create({
+        description: translate("browse:xcom.add.success"),
+        title: translate("browse:xcom.add.successTitle"),
+        type: "success",
+      });
+    },
+  });
+
+  // Update mutation
+  const { isPending: isUpdating, mutate: updateXCom } = useXcomServiceUpdateXcomEntry({
+    onError: () => {
+      toaster.create({
+        description: translate("browse:xcom.edit.error"),
+        title: translate("browse:xcom.edit.errorTitle"),
+        type: "error",
+      });
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({
+        queryKey: [useXcomServiceGetXcomEntriesKey],
+      });
+      await queryClient.invalidateQueries({
+        queryKey: [useXcomServiceGetXcomEntryKey],
+      });
+      onClose();
+      toaster.create({
+        description: translate("browse:xcom.edit.success"),
+        title: translate("browse:xcom.edit.successTitle"),
+        type: "success",
+      });
+    },
+  });
+
+  const onSave = () => {
+    let parsedValue: unknown = value;
+
+    try {
+      parsedValue = JSON.parse(value) as unknown;
+    } catch {
+      // use string
+    }
+
+    if (isEditMode && xcomKey !== undefined) {
+      updateXCom({
+        dagId,
+        dagRunId: runId,
+        requestBody: {
+          map_index: mapIndex,
+          region_id: regionId,
+          region_index: regionIndex,
+          value: parsedValue,
+        },
+        taskId,
+        xcomKey,
+      });
+    } else {
+      createXCom({
+        dagId,
+        dagRunId: runId,
+        requestBody: {
+          key,
+          map_index: mapIndex,
+          region_id: regionId,
+          region_index: regionIndex,
+          value: parsedValue,
+        },
+        taskId,
+      });
+    }
+  };
+
+  const isPending = isCreating || isUpdating;
+  const title = isEditMode ? translate("browse:xcom.edit.title") : translate("browse:xcom.add.title");
+
+  return (
+    <Modal
+      footerActions={
+        <Button disabled={isLoading || (!isEditMode && !key)} loading={isPending} onClick={onSave}>
+          {translate("common:modal.save")}
+        </Button>
+      }
+      lazyMount
+      onOpenChange={onClose}
+      open={isOpen}
+      size="lg"
+      title={title}
+    >
+      {isLoading ? (
+        <ProgressBar size="xs" />
+      ) : (
+        <VStack gap={4}>
+          <Box width="100%">
+            <Text fontWeight="bold" mb={2}>
+              {translate("browse:xcom.key")}
+            </Text>
+            {isEditMode ? (
+              <Text>{xcomKey}</Text>
+            ) : (
+              <Input onChange={(event) => setKey(event.target.value)} value={key} />
+            )}
+          </Box>
+          <Box width="100%">
+            <Text fontWeight="bold" mb={2}>
+              {translate("browse:xcom.value")}
+            </Text>
+            <JsonEditor onChange={(val) => setValue(val)} value={value} />
+          </Box>
+        </VStack>
+      )}
+    </Modal>
+  );
+};
+
+export default XComModal;

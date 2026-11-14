@@ -1,0 +1,644 @@
+#!/usr/bin/env python
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+"""Builds documentation and runs spell checking."""
+
+from __future__ import annotations
+
+import itertools
+import multiprocessing
+import os
+import re
+import shutil
+import subprocess
+import sys
+from collections import defaultdict
+from collections.abc import Callable, Iterable, Sequence
+from pathlib import Path
+from typing import TYPE_CHECKING, NamedTuple, TypeVar
+
+if TYPE_CHECKING:
+    from click import Context, Parameter
+
+import rich_click as click
+from click import Choice
+from rich.console import Console
+from tabulate import tabulate
+
+from sphinx_exts.docs_build import dev_index_generator
+from sphinx_exts.docs_build.code_utils import AIRFLOW_CONTENT_ROOT_PATH, CONSOLE_WIDTH, GENERATED_PATH
+from sphinx_exts.docs_build.docs_builder import (
+    AirflowDocsBuilder,
+    get_available_packages,
+    get_long_form,
+    get_short_form,
+)
+from sphinx_exts.docs_build.errors import DocBuildError, display_errors_summary
+from sphinx_exts.docs_build.fetch_inventories import fetch_inventories
+from sphinx_exts.docs_build.github_action_utils import with_group
+from sphinx_exts.docs_build.package_filter import find_packages_to_build
+from sphinx_exts.docs_build.spelling_checks import (
+    SpellingError,
+    display_spelling_error_summary,
+    emit_github_annotations,
+)
+
+TEXT_RED = "\033[31m"
+TEXT_RESET = "\033[0m"
+
+CHANNEL_INVITATION = """\
+If you need help, write to #documentation channel on Airflow's Slack.
+Channel link: https://apache-airflow.slack.com/archives/CJ1LVREHX
+Invitation link: https://s.apache.org/airflow-slack\
+"""
+
+ERRORS_ELIGIBLE_TO_REBUILD = [
+    "failed to reach any of the inventories with the following issues",
+    "toctree contains reference to nonexisting document",
+    "undefined label:",
+    "unknown document:",
+    "Error loading airflow.providers",
+]
+
+ON_GITHUB_ACTIONS = os.environ.get("GITHUB_ACTIONS", "false") == "true"
+
+MERMAID_DIRECTIVE = re.compile(r"^\s*\.\. mermaid::", re.MULTILINE)
+INSTALL_MERMAID_CLI_SCRIPT = AIRFLOW_CONTENT_ROOT_PATH / "scripts" / "in_container" / "install_mermaid_cli.sh"
+CHROMIUM_PATH = Path("/usr/bin/chromium")
+
+console = Console(force_terminal=True, color_system="standard", width=CONSOLE_WIDTH)
+
+T = TypeVar("T")
+
+
+class BetterChoice(Choice):
+    """
+    Nicer formatted choice class for click.
+
+    We have a lot of parameters sometimes, and formatting
+    them without spaces causes ugly artifacts as the words are broken. This one adds spaces so
+    that when the long list of choices does not wrap on words.
+    """
+
+    name = "BetterChoice"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.all_choices: Sequence[str] = self.choices
+
+    def get_metavar(self, param: Parameter, ctx: Context) -> str | None:
+        choices_str = " | ".join(self.all_choices)
+        # Use curly braces to indicate a required argument.
+        if param.required and param.param_type_name == "argument":
+            return f"{{{choices_str}}}"
+
+        if param.param_type_name == "argument" and param.nargs == -1:
+            # avoid double [[ for multiple args
+            return f"{choices_str}"
+
+        # Use square braces to indicate an option or optional argument.
+        return f"[{choices_str}]"
+
+
+def partition(pred: Callable[[T], bool], iterable: Iterable[T]) -> tuple[Iterable[T], Iterable[T]]:
+    """Use a predicate to partition entries into false entries and true entries"""
+    iter_1, iter_2 = itertools.tee(iterable)
+    return itertools.filterfalse(pred, iter_1), filter(pred, iter_2)
+
+
+def _promote_new_flags():
+    console.print()
+    console.print("[yellow]Tired of waiting for documentation to be built?[/]")
+    console.print()
+    console.print("You can quickly build documentation locally with just one command.\n")
+    console.print("    [bright_blue]cd DISTRIBUTION_FOLDER[/]")
+    console.print("    [bright_blue]uv run --group docs build-docs[/]")
+    console.print()
+    console.print("If you want to interactively work on your documentation you can add --autobuild flag.\n")
+    console.print("    [bright_blue]cd DISTRIBUTION_FOLDER[/]")
+    console.print("    [bright_blue]uv run --group docs build-docs --autobuild[/]")
+    console.print()
+    console.print("You can build several documentation packages together if they are modified together:")
+    console.print("    [bright_blue]uv run --group docs build-docs PACKAGE1 PACKAGE2[/]")
+    console.print()
+    console.print("In the root of Airflow repo, you can build all packages together:")
+    console.print("    [bright_blue]uv run --group docs build-docs[/]")
+    console.print()
+    console.print("You can list all packages you can build:")
+    console.print()
+    console.print("   [bright_blue]--list-packages   - Shows the list of packages you can build[/]")
+    console.print()
+    console.print("You can run clean build - refreshing inter-sphinx inventories or refresh airflow ones.\n")
+    console.print(
+        "   [bright_blue]--clean-build                 - Clean build files (without cleaning inventory cache)[/]"
+    )
+    console.print("   [bright_blue]--clean-inventory-cache        - Clean inventory cache before fetching[/]")
+    console.print(
+        "   [bright_blue]--refresh-airflow-inventories - Force refresh only airflow inventories (without cleaning build files or external inventories).[/]"
+    )
+    console.print()
+    console.print("For more info:")
+    console.print("   [bright_blue]uv run build-docs --help[/]")
+    console.print()
+
+
+class BuildSpecification(NamedTuple):
+    """Specification of single build."""
+
+    package_name: str
+    is_autobuild: bool
+    verbose: bool
+
+
+class BuildDocsResult(NamedTuple):
+    """Result of building documentation."""
+
+    package_name: str
+    log_file_name: Path
+    errors: list[DocBuildError]
+    spelling_errors: list[SpellingError]
+
+
+def perform_docs_build_for_single_package(build_specification: BuildSpecification) -> BuildDocsResult:
+    """Performs single package docs build."""
+    builder = AirflowDocsBuilder(package_name=build_specification.package_name)
+    builder.is_autobuild = build_specification.is_autobuild
+    console.print(
+        f"[bright_blue]{build_specification.package_name:60}:[/] Building documentation"
+        + (" (autobuild)" if build_specification.is_autobuild else "")
+    )
+    errors, spelling_errors = builder.build_sphinx_docs(verbose=build_specification.verbose)
+    return BuildDocsResult(
+        package_name=build_specification.package_name,
+        log_file_name=builder.log_build_filename,
+        errors=errors,
+        spelling_errors=spelling_errors,
+    )
+
+
+def build_docs_for_packages(
+    packages_to_build: list[str],
+    is_autobuild: bool,
+    jobs: int,
+    verbose: bool,
+) -> tuple[dict[str, list[DocBuildError]], dict[str, list[SpellingError]]]:
+    """Builds documentation for all packages and combines errors."""
+    all_build_errors: dict[str, list[DocBuildError]] = defaultdict(list)
+    all_spelling_errors: dict[str, list[SpellingError]] = defaultdict(list)
+    with with_group("Cleaning documentation files"):
+        for package_name in packages_to_build:
+            console.print(f"[bright_blue]{package_name:60}:[/] Cleaning files")
+            builder = AirflowDocsBuilder(package_name=package_name)
+            builder.is_autobuild = is_autobuild
+            builder.clean_files()
+    build_specifications = [
+        BuildSpecification(package_name=package_name, is_autobuild=is_autobuild, verbose=verbose)
+        for package_name in sort_heaviest_first(packages_to_build)
+    ]
+    with with_group("Running docs building"):
+        console.print()
+        if jobs > 1 and len(packages_to_build) > 1:
+            with multiprocessing.Pool(processes=jobs) as pool:
+                # chunksize=1 hands packages out one at a time, so a worker that finishes early picks up
+                # the next package instead of the fixed chunk pool.map would have pre-assigned to it.
+                results = list(
+                    pool.imap_unordered(
+                        perform_docs_build_for_single_package, build_specifications, chunksize=1
+                    )
+                )
+        else:
+            results = [perform_docs_build_for_single_package(spec) for spec in build_specifications]
+    for result in results:
+        if result.errors:
+            all_build_errors[result.package_name].extend(result.errors)
+            print_build_output(result)
+        if result.spelling_errors:
+            all_spelling_errors[result.package_name].extend(result.spelling_errors)
+    return all_build_errors, all_spelling_errors
+
+
+def print_build_output(result: BuildDocsResult):
+    """Prints output of docs build job."""
+    with with_group(f"{TEXT_RED}Output for documentation build {result.package_name}{TEXT_RESET}"):
+        console.print()
+        console.print(f"[bright_blue]{result.package_name:60}: " + "#" * 80)
+        with open(result.log_file_name) as output:
+            for line in output.read().splitlines():
+                console.print(f"{result.package_name:60} {line}")
+        console.print(f"[bright_blue]{result.package_name:60}: " + "#" * 80)
+
+
+_API_SOURCE_ROOTS = {
+    "apache-airflow": AIRFLOW_CONTENT_ROOT_PATH / "airflow-core" / "src",
+    "task-sdk": AIRFLOW_CONTENT_ROOT_PATH / "task-sdk" / "src",
+    "apache-airflow-ctl": AIRFLOW_CONTENT_ROOT_PATH / "airflow-ctl" / "src",
+}
+
+
+def _estimated_build_weight(package_name: str) -> int:
+    """Number of Python files autoapi will parse: the rough cost of building one package."""
+    builder = AirflowDocsBuilder(package_name=package_name)
+    source_root = (
+        builder.provider_path / "src" if builder.is_provider else _API_SOURCE_ROOTS.get(package_name)
+    )
+    if source_root is None or not source_root.exists():
+        return 0
+    return sum(1 for _ in source_root.rglob("*.py"))
+
+
+def sort_heaviest_first(packages: list[str]) -> list[str]:
+    """
+    Order packages so the long builds start first.
+
+    With a handful of workers, starting google/amazon/apache-airflow last would leave the other workers
+    idle at the end; starting them first lets the many small packages fill in around them.
+    """
+    return sorted(packages, key=lambda package_name: (-_estimated_build_weight(package_name), package_name))
+
+
+def display_packages_summary(
+    build_errors: dict[str, list[DocBuildError]], spelling_errors: dict[str, list[SpellingError]]
+):
+    """Displays a summary that contains information on the number of errors in each packages"""
+    packages_names = {*build_errors.keys(), *spelling_errors.keys()}
+    tabular_data = [
+        {
+            "Package name": f"[bright_blue]{package_name}[/]",
+            "Count of doc build errors": len(build_errors.get(package_name, [])),
+            "Count of spelling errors": len(spelling_errors.get(package_name, [])),
+        }
+        for package_name in sorted(packages_names, key=lambda k: k or "")
+    ]
+    console.print("#" * 20, " Packages errors summary ", "#" * 20)
+    console.print(tabulate(tabular_data=tabular_data, headers="keys"))
+    console.print("#" * 50)
+
+
+def print_build_errors_and_exit(
+    build_errors: dict[str, list[DocBuildError]],
+    spelling_errors: dict[str, list[SpellingError]],
+) -> None:
+    """Prints build errors and exists."""
+    if build_errors or spelling_errors:
+        if build_errors:
+            display_errors_summary(build_errors)
+            console.print()
+        if spelling_errors:
+            display_spelling_error_summary(spelling_errors)
+            console.print()
+            emit_github_annotations(spelling_errors)
+        console.print("The documentation has errors.")
+        display_packages_summary(build_errors, spelling_errors)
+        console.print()
+        console.print(CHANNEL_INVITATION)
+        sys.exit(1)
+    else:
+        console.print("[green]Documentation build is successful[/]")
+
+
+def do_list_packages():
+    available_packages = get_available_packages()
+    console.print(
+        "\nAvailable packages (in parenthesis the short form of the"
+        " package is shown if it has a short form):\n"
+    )
+    for package in available_packages:
+        short_package_name = get_short_form(package)
+        if short_package_name:
+            console.print(f"[bright_blue]{package} ({short_package_name}) [/] ")
+        else:
+            console.print(f"[bright_blue]{package} [/] ")
+    console.print()
+
+
+def is_command_available(command):
+    """Check if a command is available in the system's PATH."""
+    return shutil.which(command) is not None
+
+
+def _uses_mermaid(package_name: str) -> bool:
+    src_dir = AirflowDocsBuilder(package_name=package_name)._src_dir
+    return any(MERMAID_DIRECTIVE.search(rst.read_text()) for rst in src_dir.rglob("*.rst"))
+
+
+def ensure_mermaid_cli(packages_to_build: Iterable[str]) -> None:
+    """
+    Make mermaid-cli available when a package to build contains a ``.. mermaid::`` diagram.
+
+    The diagrams are drawn at build time (see ``sphinx_exts/mermaid_svg.py``). mermaid-cli and
+    Chromium are installed into the breeze container on demand rather than baked into the CI image,
+    which every CI job loads, because only a handful of packages have diagrams.
+    """
+    if not any(_uses_mermaid(package_name) for package_name in packages_to_build):
+        return
+    if not is_command_available("mmdc"):
+        if os.environ.get("BREEZE", "").lower() != "true":
+            console.print(
+                "[yellow]A package to build contains mermaid diagrams, and mermaid-cli (mmdc) is not "
+                "installed. Run `breeze build-docs`, or install it with "
+                "`npm install --global @mermaid-js/mermaid-cli`.[/]"
+            )
+            return
+        with with_group("Installing mermaid-cli to draw mermaid diagrams"):
+            subprocess.run([INSTALL_MERMAID_CLI_SCRIPT.as_posix()], check=True)
+    if CHROMIUM_PATH.exists():
+        # Point puppeteer at Debian's chromium; mermaid-cli was installed without puppeteer's own.
+        os.environ.setdefault("PUPPETEER_EXECUTABLE_PATH", CHROMIUM_PATH.as_posix())
+
+
+click.rich_click.OPTION_GROUPS = {
+    "build-docs": [
+        {
+            "name": "Type of build",
+            "options": ["--autobuild", "--one-pass-only"],
+        },
+        {
+            "name": "Cleaning inventories",
+            "options": [
+                "--clean-build",
+                "--clean-inventory-cache",
+                "--refresh-airflow-inventories",
+                "--fail-on-missing-third-party-inventories",
+            ],
+        },
+        {
+            "name": "Filtering options",
+            "options": [
+                "--package-filter",
+                "--list-packages",
+            ],
+        },
+        {
+            "name": "Miscellaneous options",
+            "options": [
+                "--include-commits",
+                "--jobs",
+                "--verbose",
+            ],
+        },
+    ],
+}
+
+
+@click.command(name="build-docs")
+@click.option(
+    "--autobuild",
+    is_flag=True,
+    help="Starts server, serving the build docs (sphinx-autobuild) rebuilding and "
+    "refreshing the docs when they change on the disk. "
+    "Implies --verbose and --one-pass-only",
+)
+@click.option("--one-pass-only", is_flag=True, help="Do not attempt multiple builds on error")
+@click.option(
+    "--package-filter",
+    "package_filters",
+    multiple=True,
+    help="Filter(s) to use more than one can be specified. You can use glob pattern matching the full "
+    "package name, for example `apache-airflow-providers-*`. "
+    "Useful when you want to select several similarly named packages together. "
+    "When no filtering is specified and the command is run inside one of the distribution packages with docs, "
+    "only that package is selected to build. "
+    "If the command is run in the root of the Airflow repo, all packages are selected to be built.",
+)
+@click.option(
+    "--include-commits", help="Include commits in the documentation.", envvar="INCLUDE_COMMITS", is_flag=True
+)
+@click.option(
+    "-j",
+    "--jobs",
+    default=os.cpu_count(),
+    show_default=True,
+    type=int,
+    help="Number of parallel processes that will be spawned to build the docs. If not set, default - equal "
+    "to the number of CPU cores - will be used. If set to 1, the build will be done sequentially.",
+)
+@click.option(
+    "--list-packages",
+    is_flag=True,
+    help="Lists all available packages. You can use it to check the names of the packages you want to build.",
+)
+@click.option(
+    "--clean-build",
+    is_flag=True,
+    help="Cleans the build directory before building the documentation. "
+    "Does not delete inventory cache (use --clean-inventory-cache for that).",
+)
+@click.option(
+    "--clean-inventory-cache",
+    is_flag=True,
+    help="Cleans the inventory cache before fetching inventories.",
+)
+@click.option(
+    "--refresh-airflow-inventories",
+    is_flag=True,
+    help="When set, only airflow package inventories will be refreshed, regardless "
+    "if they are already downloaded. With `--clean-build` - everything is cleaned.",
+)
+@click.option(
+    "--fail-on-missing-third-party-inventories",
+    is_flag=True,
+    help="Fail the build if any third-party inventory cannot be downloaded. "
+    "By default, missing third-party inventories are warned about but do not fail the build.",
+)
+@click.option(
+    "-v",
+    "--verbose",
+    is_flag=True,
+    help="Increases the verbosity of the script i.e. always displays a full log of "
+    "the build process, not just when it encounters errors",
+)
+@click.argument(
+    "packages",
+    nargs=-1,
+    type=BetterChoice(get_available_packages(short_form=True)),
+)
+def build_docs(
+    autobuild,
+    one_pass_only,
+    package_filters,
+    clean_build,
+    clean_inventory_cache,
+    include_commits,
+    jobs,
+    list_packages,
+    refresh_airflow_inventories,
+    fail_on_missing_third_party_inventories,
+    verbose,
+    packages,
+):
+    """Builds documentation and runs spell checking for all distribution packages of airflow.."""
+    if list_packages:
+        do_list_packages()
+        sys.exit(0)
+    command = "sphinx-autobuild" if autobuild else "sphinx-build"
+    if not is_command_available(command):
+        console.print(
+            f"\n[red]Command '{command}' is not available. "
+            "Please use `--group docs` after the `uv run` when running the command:[/]\n"
+        )
+        console.print("uv run --group docs build-docs ...\n")
+        sys.exit(1)
+    available_packages = get_available_packages()
+    filters_to_add = []
+    for package_name in packages:
+        if package_name in available_packages:
+            filters_to_add.append(package_name)
+        else:
+            long_form = get_long_form(package_name)
+            if long_form:
+                filters_to_add.append(long_form)
+            else:
+                console.print("[red]Bad package specified as argument[/]:", package_name)
+                sys.exit(1)
+    if filters_to_add:
+        package_filters = tuple(set(package_filters).union(set(filters_to_add)))
+    packages_to_build = find_packages_to_build(available_packages, package_filters)
+    for package_name in packages_to_build:
+        builder = AirflowDocsBuilder(package_name=package_name)
+        api_dir = builder._api_dir
+        if api_dir.exists():
+            try:
+                if api_dir.iterdir():
+                    shutil.rmtree(api_dir)
+            except StopIteration:
+                pass
+    ensure_mermaid_cli(packages_to_build)
+    with with_group("Fetching inventories"):
+        # Inventories that could not be retrieved should be built first. This may mean this is a
+        # new package.
+        packages_without_inventories = fetch_inventories(
+            clean_build=clean_build,
+            refresh_airflow_inventories=refresh_airflow_inventories,
+            fail_on_missing_third_party=fail_on_missing_third_party_inventories,
+            clean_inventory_cache=clean_inventory_cache,
+        )
+    normal_packages, priority_packages = partition(
+        lambda d: d in packages_without_inventories, packages_to_build
+    )
+    normal_packages, priority_packages = list(normal_packages), list(priority_packages)
+    if len(packages_to_build) > 1 and autobuild:
+        console.print("[red]You cannot use more than 1 package with --autobuild. Quitting.[/]")
+        sys.exit(1)
+    if autobuild:
+        console.print("[yellow]Autobuild mode is enabled. Forcing --one-pass-only and --verbose[/]")
+        verbose = True
+        one_pass_only = True
+
+    if len(packages_to_build) == 1:
+        console.print(
+            "[yellow]Building one package. Forcing --one-pass-only and --jobs to 1 as only one pass is needed."
+        )
+        one_pass_only = True
+        jobs = 1
+
+    with with_group(
+        f"Documentation will be built for {len(packages_to_build)} package(s)"
+        + (f"with up to {jobs} parallel jobs," if jobs > 1 else "")
+    ):
+        for pkg_no, pkg in enumerate(packages_to_build, start=1):
+            console.print(f"{pkg_no}. {pkg}")
+    os.environ["INCLUDE_COMMITS"] = "true" if include_commits else "false"
+    all_build_errors: dict[str | None, list[DocBuildError]] = {}
+    all_spelling_errors: dict[str | None, list[SpellingError]] = {}
+    if priority_packages:
+        # Build priority packages
+        package_build_errors, package_spelling_errors = build_docs_for_packages(
+            packages_to_build=priority_packages,
+            is_autobuild=autobuild,
+            jobs=jobs,
+            verbose=verbose,
+        )
+        if package_build_errors:
+            all_build_errors.update(package_build_errors)
+        if package_spelling_errors:
+            all_spelling_errors.update(package_spelling_errors)
+
+    # Build normal packages
+    # If only one inventory is missing, the remaining packages are correct. If we are missing
+    # two or more inventories, it is better to try to build for all packages as the previous packages
+    # may have failed as well.
+    package_build_errors, package_spelling_errors = build_docs_for_packages(
+        packages_to_build=packages_to_build if len(priority_packages) > 1 else normal_packages,
+        is_autobuild=autobuild,
+        jobs=jobs,
+        verbose=verbose,
+    )
+    if package_build_errors:
+        all_build_errors.update(package_build_errors)
+    if package_spelling_errors:
+        all_spelling_errors.update(package_spelling_errors)
+
+    if not one_pass_only:
+        # Packages that failed on a cross-reference to a package built later in the same pass are
+        # built again now that the inventory exists. The second retry covers a change spanning
+        # A -> B -> C dependencies.
+        for _ in range(2):
+            package_build_errors = retry_building_docs_if_needed(
+                all_build_errors=all_build_errors,
+                all_spelling_errors=all_spelling_errors,
+                autobuild=autobuild,
+                jobs=jobs,
+                verbose=verbose,
+                package_build_errors=package_build_errors,
+            )
+
+    dev_index_generator.generate_index(f"{GENERATED_PATH}/_build/index.html")
+
+    if not package_filters:
+        _promote_new_flags()
+
+    print_build_errors_and_exit(all_build_errors, all_spelling_errors)
+
+
+def retry_building_docs_if_needed(
+    all_build_errors: dict[str, list[DocBuildError]],
+    all_spelling_errors: dict[str, list[SpellingError]],
+    autobuild: bool,
+    jobs: int,
+    verbose: bool,
+    package_build_errors: dict[str, list[DocBuildError]],
+) -> dict[str, list[DocBuildError]]:
+    to_retry_packages = [
+        package_name
+        for package_name, errors in package_build_errors.items()
+        if any(any((m in e.message) for m in ERRORS_ELIGIBLE_TO_REBUILD) for e in errors)
+    ]
+    if not to_retry_packages:
+        console.print("[green]No packages to retry. No more passes are needed.[/]")
+        return package_build_errors
+    console.print("[warning] Some packages failed to build due to dependencies. We need another pass.[/]")
+    console.print(f"[bright_blue]Packages to rebuild: {to_retry_packages}[/]")
+    for package_name in to_retry_packages:
+        if package_name in all_build_errors:
+            del all_build_errors[package_name]
+        if package_name in all_spelling_errors:
+            del all_spelling_errors[package_name]
+    package_build_errors, package_spelling_errors = build_docs_for_packages(
+        packages_to_build=to_retry_packages,
+        is_autobuild=autobuild,
+        jobs=jobs,
+        verbose=verbose,
+    )
+    if package_build_errors:
+        all_build_errors.update(package_build_errors)
+    if package_spelling_errors:
+        all_spelling_errors.update(package_spelling_errors)
+    return package_build_errors
+
+
+if __name__ == "__main__":
+    build_docs()

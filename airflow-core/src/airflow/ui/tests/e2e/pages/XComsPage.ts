@@ -1,0 +1,157 @@
+/*!
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import { expect, type Locator, type Page } from "@playwright/test";
+
+import { BasePage } from "tests/e2e/pages/BasePage";
+import { DATA_ROWS } from "tests/e2e/utils/ui/selectors";
+
+export class XComsPage extends BasePage {
+  public static get xcomsUrl(): string {
+    return "/xcoms";
+  }
+
+  public readonly addFilterButton: Locator;
+  public readonly tableRows: Locator;
+  public readonly xcomsTable: Locator;
+
+  public constructor(page: Page) {
+    super(page);
+    this.addFilterButton = page.getByTestId("add-filter-button");
+    this.xcomsTable = page.getByTestId("table-list");
+    this.tableRows = this.xcomsTable.locator(DATA_ROWS);
+  }
+
+  public async applyFilter(filterName: string, value: string): Promise<void> {
+    await expect(this.addFilterButton).toBeVisible({ timeout: 30_000 });
+    await this.addFilterButton.click();
+
+    const filterMenu = this.page.getByRole("menu");
+
+    await expect(filterMenu).toBeVisible({ timeout: 30_000 });
+
+    const filterOption = filterMenu.getByRole("menuitem", { name: filterName });
+
+    await filterOption.click();
+
+    // The newly added pill enters edit mode immediately, and `filter-pill-input` is only
+    // rendered on the pill that is actively being edited — so this resolves to exactly one
+    // element. Previously this scoped through `page.locator("div").filter({ hasText: ... })`,
+    // which matches any ancestor whose descendant text contains "<filterName>:" and broke
+    // (matched 12 elements instead of 1) once #71554 restructured the filter bar's DOM.
+    const filterInput = this.page.getByTestId("filter-pill-input");
+
+    await expect(filterInput).toBeVisible({ timeout: 30_000 });
+    await filterInput.fill(value);
+    await filterInput.press("Enter");
+
+    await expect(this.tableRows.first()).toBeVisible({ timeout: 30_000 });
+  }
+
+  public async navigate(): Promise<void> {
+    await expect(async () => {
+      await this.navigateTo(XComsPage.xcomsUrl);
+      await this.page.waitForURL(/.*xcoms/, { timeout: 15_000 });
+      await expect(this.xcomsTable).toBeVisible({ timeout: 30_000 });
+    }).toPass({ intervals: [2000, 5000], timeout: 60_000 });
+  }
+
+  public async verifyDagDisplayNameFiltering(dagDisplayNamePattern: string): Promise<void> {
+    await this.navigate();
+    await this.applyFilter("Dag ID", dagDisplayNamePattern);
+
+    await expect(async () => {
+      const firstLink = this.tableRows.first().locator("a[href*='/dags/']").first();
+
+      await expect(firstLink).toContainText(dagDisplayNamePattern, { ignoreCase: true });
+    }).toPass({ timeout: 30_000 });
+
+    const rows = this.xcomsTable.locator(DATA_ROWS);
+
+    await expect(rows).not.toHaveCount(0);
+
+    const rowCount = await rows.count();
+
+    for (let i = 0; i < Math.min(rowCount, 3); i++) {
+      const dagIdLink = rows.nth(i).locator("a[href*='/dags/']").first();
+
+      await expect(dagIdLink).toContainText(dagDisplayNamePattern, { ignoreCase: true });
+    }
+  }
+
+  public async verifyKeyPatternFiltering(keyPattern: string): Promise<void> {
+    await this.navigate();
+    await this.applyFilter("Key", keyPattern);
+
+    await expect(async () => {
+      const firstKeyCell = this.tableRows.first().locator("td").first();
+
+      await expect(firstKeyCell).toContainText(keyPattern, { ignoreCase: true });
+    }).toPass({ timeout: 30_000 });
+
+    const rows = this.xcomsTable.locator(DATA_ROWS);
+
+    await expect(rows).not.toHaveCount(0);
+
+    const rowCount = await rows.count();
+
+    for (let i = 0; i < Math.min(rowCount, 3); i++) {
+      const keyCell = rows.nth(i).locator("td").first();
+
+      await expect(keyCell).toContainText(keyPattern, { ignoreCase: true });
+    }
+  }
+
+  public async verifyXComDetailsDisplay(): Promise<void> {
+    const firstRow = this.tableRows.first();
+
+    await expect(firstRow).toBeVisible();
+
+    const keyCell = firstRow.locator("td").first();
+
+    await expect(keyCell).not.toBeEmpty();
+
+    const dagIdLink = firstRow.locator("a[href*='/dags/']").first();
+
+    await expect(dagIdLink).toBeVisible();
+    await expect(dagIdLink).not.toBeEmpty();
+
+    const runIdLink = firstRow.locator("a[href*='/runs/']").first();
+
+    await expect(runIdLink).toBeVisible();
+    await expect(runIdLink).not.toBeEmpty();
+
+    const taskIdLink = firstRow.locator("a[href*='/tasks/']").first();
+
+    await expect(taskIdLink).toBeVisible();
+    await expect(taskIdLink).not.toBeEmpty();
+  }
+
+  public async verifyXComsExist(): Promise<void> {
+    const dataLinks = this.xcomsTable.locator("a[href*='/dags/']");
+
+    await expect(dataLinks.first()).toBeVisible({ timeout: 30_000 });
+  }
+
+  public async verifyXComValuesDisplayed(): Promise<void> {
+    const firstRow = this.tableRows.first();
+
+    await expect(firstRow).toBeVisible();
+    await expect(firstRow.getByTestId("xcom-value")).toBeVisible();
+  }
+}

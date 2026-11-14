@@ -1,0 +1,56 @@
+{
+  "filters": {
+    "body": "Тело",
+    "createdAt": "Создано",
+    "response": {
+      "all": "Все",
+      "pending": "В ожидании",
+      "received": "Просмотрено"
+    }
+  },
+  "requiredAction_few": "Необходимых действия",
+  "requiredAction_many": "Необходимых действий",
+  "requiredAction_one": "Необходимое действие",
+  "requiredAction_other": "Необходимые действия",
+  "requiredActionCount_few": "Необходимых действия ({{count, number}})",
+  "requiredActionCount_many": "Необходимых действий ({{count, number}})",
+  "requiredActionCount_one": "Необходимое действие ({{count, number}})",
+  "requiredActionCount_other": "Необходимых действий ({{count, number}})",
+  "requiredActionState": "Состояние необходимого действия",
+  "response": {
+    "created": "Ответ создан ",
+    "error": "Ошибка ответа",
+    "optionsDescription": "Выберите ваши опции для этого экземпляра задачи",
+    "optionsLabel": "Опции",
+    "received": "Ответ получен ",
+    "respond": "Ответить",
+    "responded_by_user_name": "Ответил (Имя пользователя)",
+    "success": "Ответ {{taskId}} успешен",
+    "title": "Экземпляр задачи для человека - {{taskId}}"
+  },
+  "review": {
+    "detail": {
+      "selectRequiredAction": "Выберите необходимое действие, чтобы увидеть детали"
+    },
+    "list": {
+      "completedRequiredActions": "Выполненные необходимые действия ({{count, number}})",
+      "loadError": "Не удалось загрузить необходимые действия",
+      "loadingActions": "Загрузка необходимых действий...",
+      "pendingRequiredActions": "Ожидающие необходимые действия ({{count, number}})"
+    },
+    "openReviewDrawer": "Открыть панель проверки",
+    "pageLimitHint": "Здесь показаны только первые несколько действий. Используйте «$t(review.viewAll)», чтобы увидеть все.",
+    "viewAll": "Просмотреть все необходимые действия"
+  },
+  "state": {
+    "approvalReceived": "Одобрение получено",
+    "approvalRequired": "Необходимо одобрение",
+    "choiceReceived": "Выбор получен",
+    "choiceRequired": "Необходим выбор",
+    "noResponseReceived": "Ответ не получен",
+    "rejectionReceived": "Отказ получен",
+    "responseReceived": "Ответ получен",
+    "responseRequired": "Необходим ответ"
+  },
+  "subject": "Тема"
+}
